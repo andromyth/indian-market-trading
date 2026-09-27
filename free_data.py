@@ -201,6 +201,21 @@ def download_equity_symbol(symbol: str, source: str = "2026", force: bool = Fals
         "sha256": _sha256(destination) if destination.exists() else None,
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
     }
+    # 2026 is the current-year archive and is mirrored into the append-oriented
+    # persistent store so new daily observations have a durable home. Older
+    # backfill archives remain available locally and can be explicitly synced
+    # from the dashboard without forcing a large partitioning job on every run.
+    if ok and source == "2026":
+        try:
+            from persistent_store import persist_local_1m_file
+            persistent = persist_local_1m_file(destination, root, source=f"free_archive_{source}", sync_drive=True)
+            entry["persistent_store"] = {
+                "status": persistent.get("status"),
+                "rows_added": persistent.get("rows_added", 0),
+                "partitions": len(persistent.get("partitions", [])),
+            }
+        except Exception as exc:
+            entry["persistent_store"] = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
     manifest = load_manifest()
     manifest.setdefault("files", {})[f"equity_1m:{source}:{root}"] = entry
     save_manifest(manifest)
@@ -365,6 +380,19 @@ def local_history_provider(symbol: str, period: str = "2y", interval: str = "1d"
         days_map = {"5d": 7, "1mo": 40, "3mo": 100, "6mo": 220, "1y": 380, "2y": 760, "5y": 1900, "10y": 3800}
         days = days_map.get(period, 760)
         start = now - pd.Timedelta(days=days)
+        # Permanent store first; hosted Streamlit storage is only ephemeral.
+        try:
+            from persistent_store import load_persistent_1m
+            persistent = load_persistent_1m(symbol, start=start, end=now)
+            if not persistent.empty:
+                if interval in {"1m", "1min"}:
+                    return persistent
+                if interval in {"5m", "5min"}:
+                    return resample_intraday(persistent, "5min")
+                if interval in {"1d", "D", "day", "daily"}:
+                    return resample_daily(persistent)
+        except Exception:
+            persistent = pd.DataFrame()
         try:
             local = load_local_equity(symbol, start=start, end=now, interval=interval)
         except Exception:

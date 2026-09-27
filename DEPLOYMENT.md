@@ -36,3 +36,5 @@ The sidebar now includes **Historical Replay**. Select a past date, a symbol, an
 Intraday uses the certified `target_30m` 137-feature production model. Delivery uses the existing causal rule engine with a selectable forward holding horizon. The replay never injects today's news or F&O chain into a past prediction. Timestamped historical news is best-effort from public Google News RSS search; historical option-chain/OI/IV replay is explicitly not substituted and the F&O option is labelled as an underlying replay.
 
 The replay ledger can be exported to CSV from the dashboard for later prediction-vs-actual analysis.
+
+NSE official primary layer + Colab model builder added.

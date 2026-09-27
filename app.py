@@ -50,6 +50,14 @@ from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
+from nse_data_layer import source_status as nse_source_status, fetch_equity_history as nse_fetch_equity_history, fetch_intraday_1m_current as nse_fetch_intraday_1m_current, fetch_corporate_actions as nse_fetch_corporate_actions
+from persistent_store import (
+    drive_status as persistent_drive_status,
+    persist_1m_frame,
+    scan_coverage as persistent_scan_coverage,
+    storage_summary as persistent_storage_summary,
+    sync_pending as persistent_sync_pending,
+)
 
 st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
@@ -365,7 +373,7 @@ if style == "Delivery":
     interval, period, fast, slow = "1d", "1y", 20, 50
     stop_atr, target_atr, max_hold = 1.8, 3.0, 20
 else:
-    interval, period, fast, slow = "5m", "5d", 9, 21
+    interval, period, fast, slow = "1m", "5d", 9, 21
     stop_atr, target_atr, max_hold = 1.2, 2.0, 30
 
 st.sidebar.subheader("Signal weights")
@@ -384,7 +392,110 @@ if st.sidebar.button("Refresh now"):
 status = "Market OPEN" if market_is_open() else "Market CLOSED (last available data)"
 st.sidebar.info(status)
 
+# ------------------------------------------------ Persistent historical store ---
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_persistent_storage_summary():
+    return persistent_storage_summary()
+
+pstore = cached_persistent_storage_summary()
+st.sidebar.subheader("Permanent historical store")
+drive_info = pstore.get("google_drive", {}) or {}
+if drive_info.get("configured") and drive_info.get("reachable", True) is not False:
+    st.sidebar.success("Google Drive persistent store configured")
+    if drive_info.get("root_name"):
+        st.sidebar.caption(f"Drive folder: {drive_info['root_name']}")
+elif drive_info.get("configured"):
+    st.sidebar.warning("Google Drive configured but not reachable from this deployment")
+    st.sidebar.caption(str(drive_info.get("reason", "Drive check failed")))
+else:
+    st.sidebar.info("Local persistent store active. Add Google Drive secrets for durable cloud storage.")
+st.sidebar.caption(f"Local persistent 1m: {pstore.get('local_files', 0)} partitions · {pstore.get('local_gb', 0):.4f} GB")
+
+if st.sidebar.button("Capture current 1-minute data", help="Fetch the latest 1-minute bars for the current watchlist and append them to the persistent store."):
+    capture_results = []
+    with st.spinner("Capturing latest 1-minute bars…"):
+        for symbol in symbols:
+            try:
+                df_1m = get_historical(symbol, period="5d", interval="1m")
+                persisted = persist_1m_frame(symbol, df_1m, source="yfinance_1m_capture", sync_drive=True)
+                capture_results.append({"symbol": symbol, "status": persisted.get("status"), "rows_added": persisted.get("rows_added", 0), "partitions": len(persisted.get("partitions", [])), "drive_synced": sum(1 for q in persisted.get("partitions", []) if q.get("drive_sync") == "OK")})
+            except Exception as exc:
+                capture_results.append({"symbol": symbol, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"})
+    st.session_state["persistent_capture_results"] = pd.DataFrame(capture_results)
+    cached_persistent_storage_summary.clear()
+
+if st.sidebar.button("Sync local 1-minute archive to Google Drive"):
+    with st.spinner("Syncing persistent 1-minute partitions to Google Drive…"):
+        st.session_state["persistent_sync_result"] = persistent_sync_pending(max_files=500)
+    cached_persistent_storage_summary.clear()
+
+if st.sidebar.button("Scan permanent 1-minute archive"):
+    st.session_state["persistent_coverage"] = persistent_scan_coverage(symbols)
+
+if "persistent_capture_results" in st.session_state:
+    with st.expander("Latest 1-minute capture", expanded=False):
+        st.dataframe(st.session_state["persistent_capture_results"], use_container_width=True, hide_index=True)
+if "persistent_sync_result" in st.session_state:
+    with st.expander("Google Drive sync result", expanded=False):
+        st.write(st.session_state["persistent_sync_result"])
+if "persistent_coverage" in st.session_state and not st.session_state["persistent_coverage"].empty:
+    with st.expander("Permanent 1-minute archive coverage", expanded=False):
+        st.dataframe(st.session_state["persistent_coverage"], use_container_width=True, hide_index=True)
+
 # --------------------------------------------------------------- DhanHQ ---
+# --------------------------------------------------------------- NSE official data layer ---
+st.sidebar.subheader("NSE official data layer")
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_nse_source_status():
+    return nse_source_status()
+try:
+    nse_state = cached_nse_source_status()
+except Exception as exc:
+    nse_state = {"status":"ERROR", "error":f"{type(exc).__name__}: {exc}"}
+if nse_state.get("status") == "PASS":
+    st.sidebar.success("NSE official source reachable")
+    if nse_state.get("last_price") is not None:
+        st.sidebar.caption(f"NSE RELIANCE LTP: ₹{float(nse_state['last_price']):,.2f}")
+else:
+    st.sidebar.warning("NSE official source unavailable right now")
+    st.sidebar.caption(str(nse_state.get("error", "Request failed or rate-limited")))
+
+nse_col1, nse_col2 = st.sidebar.columns(2)
+if nse_col1.button("Pull NSE EOD"):
+    nse_rows = []
+    with st.spinner("Pulling official NSE EOD data…"):
+        for sym in symbols:
+            try:
+                root = sym.replace(".NS", "").replace(".BO", "")
+                end = pd.Timestamp.now(tz="Asia/Kolkata").date()
+                start = end - pd.Timedelta(days=365)
+                df_nse = nse_fetch_equity_history(root, start.date() if hasattr(start, 'date') else start, end, sync_drive=True)
+                nse_rows.append({"symbol":root,"status":"OK","rows":len(df_nse),"source":"NSE_OFFICIAL"})
+            except Exception as exc:
+                nse_rows.append({"symbol":root,"status":"ERROR","error":f"{type(exc).__name__}: {exc}"})
+    st.session_state["nse_pull_result"] = pd.DataFrame(nse_rows)
+
+if nse_col2.button("Capture NSE 1-minute"):
+    nse_rows = []
+    with st.spinner("Capturing current NSE quote-chart data…"):
+        for sym in symbols:
+            try:
+                root = sym.replace(".NS", "").replace(".BO", "")
+                df_nse = nse_fetch_intraday_1m_current(root, sync_drive=True)
+                nse_rows.append({"symbol":root,"status":"OK","rows":len(df_nse),"source":"NSE_OFFICIAL_CHART"})
+            except Exception as exc:
+                nse_rows.append({"symbol":root,"status":"ERROR","error":f"{type(exc).__name__}: {exc}"})
+    st.session_state["nse_1m_result"] = pd.DataFrame(nse_rows)
+
+if "nse_pull_result" in st.session_state:
+    with st.expander("NSE EOD pull", expanded=False):
+        st.dataframe(st.session_state["nse_pull_result"], use_container_width=True, hide_index=True)
+if "nse_1m_result" in st.session_state:
+    with st.expander("NSE 1-minute capture", expanded=False):
+        st.dataframe(st.session_state["nse_1m_result"], use_container_width=True, hide_index=True)
+
+st.sidebar.caption("NSE is primary for official exchange data. The public chart path is LTP-based; missing minute volume is never fabricated. Historical data and normalized archives are mirrored to Google Drive when configured.")
+
 st.sidebar.subheader("DhanHQ data provider")
 dhan_cfg = DhanConfig.from_env()
 dhan_stat = dhan_status(dhan_cfg)
@@ -542,8 +653,8 @@ if "audit_result" in st.session_state:
     )
 
 # --------------------------------------------------------- free data manager
-st.sidebar.subheader("Free Historical Data")
-st.sidebar.caption("Downloads public research archives to this laptop. Live quotes are still fetched separately.")
+st.sidebar.subheader("Legacy Third-party Research Archive")
+st.sidebar.caption("Optional research-only archives. They are not the primary exchange data layer; NSE official data is primary.")
 data_choice = st.sidebar.selectbox(
     "Download universe",
     ["Current watchlist", "19-stock audit core", "NIFTY 500"],
@@ -617,7 +728,7 @@ if st.sidebar.button("Reconcile to NSE (recent window)"):
 if "storage" in st.session_state:
     st.sidebar.write(st.session_state["storage"])
 
-with st.expander("Free historical-data manager & authenticity check", expanded=False):
+with st.expander("Legacy research archive & NSE authenticity check", expanded=False):
     st.write(
         "Public research archives are treated as third-party inputs, not as exchange-authoritative truth. "
         "Use **Validate local data** for bar integrity, then **Reconcile to NSE** to compare daily aggregates "
@@ -641,8 +752,7 @@ with st.expander("Free historical-data manager & authenticity check", expanded=F
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
-    "When a valid Dhan access token is configured, NSE cash historical/live quote requests prefer Dhan. "
-    "Otherwise the dashboard falls back to the existing free sources. No order APIs are used."
+    "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
 )
 
 @st.cache_data(ttl=60)

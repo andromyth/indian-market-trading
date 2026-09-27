@@ -1,0 +1,17 @@
+{
+  "version": "2026-09-27",
+  "primary_source": "NSE_OFFICIAL",
+  "equity_eod": "https://www.nseindia.com/historical/price-and-volume-data-per-security",
+  "equity_quote": "https://www.nseindia.com/get-quote/equity/RELIANCE/Reliance-Industries-Limited",
+  "fno_historical": "https://www.nseindia.com/report-detail/fo_eq_security",
+  "corporate_actions": "https://www.nseindia.com/companies-listing/corporate-filings-actions",
+  "corporate_announcements": "https://www.nseindia.com/companies-listing/corporate-filings-announcements-xbrl",
+  "policy": "https://www.nseindia.com/static/market-data/nse-data-policy",
+  "notes": [
+    "NSE is the primary exchange-data layer for public interfaces used by this project.",
+    "Streamlit local storage is cache only; durable historical data are mirrored to Google Drive.",
+    "GitHub stores code and small model release artifacts, not historical datasets or secrets.",
+    "NSE public web endpoints can rate-limit or change; the client fails explicitly rather than silently substituting another provider.",
+    "Public NSE quote-chart intraday data is treated as LTP-based 1-minute data; missing volume is not fabricated."
+  ]
+}

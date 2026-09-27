@@ -31,6 +31,7 @@ from free_data import (
     resample_intraday,
     INDEX_RELEASE_URL,
 )
+from persistent_store import load_persistent_1m
 from signals import combined_signal, market_regime_score, news_metrics, technical_score
 from triggers import announcement_to_news, event_risk_score
 
@@ -136,27 +137,35 @@ def historical_price(symbol: str, start: pd.Timestamp, end: pd.Timestamp, interv
     root = normalize_root_symbol(symbol)
     start = _date_only(start)
     end = pd.Timestamp(end)
+    # Permanent store first: Streamlit's container filesystem is only a cache.
     try:
-        local = load_local_equity(root, start=start, end=end, interval="1m")
+        persistent = load_persistent_1m(root, start=start, end=end)
     except Exception:
-        local = pd.DataFrame()
-    if not local.empty:
-        x = local.copy()
+        persistent = pd.DataFrame()
+    if not persistent.empty:
+        x = persistent.copy()
     else:
-        years = []
-        if start.year <= 2025 <= end.year:
-            years.append("2018_2025")
-        if start.year <= 2026 <= end.year or end.year >= 2026:
-            years.append("2026")
-        if not years:
-            years = ["2018_2025"]
-        frames = []
-        for src in years:
-            try:
-                frames.append(_remote_equity(root, src))
-            except Exception:
-                continue
-        x = pd.concat(frames).sort_index() if frames else pd.DataFrame()
+        try:
+            local = load_local_equity(root, start=start, end=end, interval="1m")
+        except Exception:
+            local = pd.DataFrame()
+        if not local.empty:
+            x = local.copy()
+        else:
+            years = []
+            if start.year <= 2025 <= end.year:
+                years.append("2018_2025")
+            if start.year <= 2026 <= end.year or end.year >= 2026:
+                years.append("2026")
+            if not years:
+                years = ["2018_2025"]
+            frames = []
+            for src in years:
+                try:
+                    frames.append(_remote_equity(root, src))
+                except Exception:
+                    continue
+            x = pd.concat(frames).sort_index() if frames else pd.DataFrame()
         if not x.empty:
             x = x[~x.index.duplicated(keep="last")]
     if x.empty:

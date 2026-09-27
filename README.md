@@ -400,3 +400,44 @@ The headline sentiment is shown as a perception score with its coverage and
 freshness; it is not a probability. The 1-year historical audit remains a
 price/market-only validation because the live RSS feed has no corresponding
 point-in-time news archive. No orders are placed.
+
+## Permanent 1-minute historical store (v4)
+
+The deployed app now treats the Streamlit filesystem as an ephemeral cache and maintains an append-oriented local store under `data/persistent_market_data/intraday_1m/YYYY/MM/DD/SYMBOL.parquet`. The same store can be mirrored to Google Drive.
+
+For Streamlit Cloud, configure a Drive service account in App Settings -> Secrets using the structure in `STREAMLIT_SECRETS_GDRIVE.example.toml`, and share the chosen Drive root folder with that service-account email as Editor. See `PERSISTENT_DATA_SETUP.md` for the full procedure.
+
+The new sidebar controls are:
+- Capture current 1-minute data
+- Sync local 1-minute archive to Google Drive
+- Scan permanent 1-minute archive
+
+Dhan 1-minute downloads and current-year free 1-minute archive downloads are automatically partitioned into the persistent store. Historical replay reads the persistent store first.
+
+## NSE-first data layer (v5)
+
+The production data policy is now **NSE-first**. The current NSE site exposes
+CSV downloads for security-wise historical price/volume data and historical
+contract-wise F&O data, plus corporate-actions/announcements interfaces.
+The dashboard therefore treats NSE as the primary exchange-data source and
+stores normalized NSE observations in the persistent Google Drive archive.
+See `NSE_DATA_LAYER_ARCHITECTURE.md`.
+
+### Training/deployment split
+
+- **Google Drive:** historical NSE data and durable prediction/data ledgers.
+- **Google Colab:** training, compilation and validation only.
+- **Private GitHub:** source code + small model artifacts/manifests; no large datasets and no secrets.
+- **Streamlit:** model serving, dashboard, live/current acquisition and replay; no training.
+
+`colab_build_nse_model.py` prepares a chronological 30-minute Logistic Regression
+candidate with an explicit and tested target convention. It does not auto-promote
+it to production.
+
+### Official-source caveat
+
+NSE's public website/report interfaces are the primary source in this project,
+but public web endpoints can be rate-limited or changed and are not a substitute
+for a separately licensed market-data feed where NSE's terms require one.
+The project caches, slows and records provenance, and does not attempt to bypass
+anti-bot controls.

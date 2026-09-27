@@ -1,9 +1,8 @@
 """Market/news data adapters used by the dashboard.
 
-Free mode:
-* yfinance for historical/intraday OHLCV (unofficial Yahoo endpoints)
-* NSE website JSON endpoints for F&O and corporate announcements (undocumented)
-* public RSS feeds for current news
+NSE is the primary data layer for NSE-listed equities. Dhan may be used for
+execution-grade live fields only when configured, while public providers are
+reference-only fallbacks and are never silently labelled as NSE data.
 
 No order execution is included.
 """
@@ -12,6 +11,11 @@ from __future__ import annotations
 import os
 import datetime as dt
 from zoneinfo import ZoneInfo
+
+try:
+    from nse_data_layer import fetch_equity_history, fetch_intraday_1m_current, fetch_quote
+except Exception:
+    fetch_equity_history = fetch_intraday_1m_current = fetch_quote = None
 
 import feedparser
 import requests
@@ -112,7 +116,30 @@ def _dhan_history(symbol: str, period: str, interval: str):
 
 
 def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
-    if _dhan_configured() and str(symbol).upper().endswith(".NS"):
+    """NSE-first historical provider for NSE symbols; fallbacks are explicit."""
+    is_nse = str(symbol).upper().endswith(".NS")
+    root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+    if is_nse and fetch_equity_history is not None and interval.lower() in {"1d", "d", "day", "daily"}:
+        try:
+            days = _period_days(period)
+            end = dt.datetime.now(IST).date()
+            start = end - dt.timedelta(days=days)
+            nse_df = fetch_equity_history(root, start, end, sync_drive=True)
+            if not nse_df.empty:
+                nse_df = nse_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+                if "date" in nse_df.columns:
+                    nse_df = nse_df.set_index("date")
+                return nse_df
+        except Exception:
+            pass
+    if is_nse and interval.lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
+        try:
+            nse_1m = fetch_intraday_1m_current(root, sync_drive=True)
+            if not nse_1m.empty:
+                return nse_1m
+        except Exception:
+            pass
+    if _dhan_configured() and is_nse:
         try:
             df = _dhan_history(symbol, period, interval)
             if not df.empty:
@@ -122,7 +149,14 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
     return yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
 
 
-def get_intraday(symbol: str, interval: str = "5m"):
+def get_intraday(symbol: str, interval: str = "1m"):
+    if str(symbol).upper().endswith(".NS") and str(interval).lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
+        try:
+            nse_1m = fetch_intraday_1m_current(str(symbol).upper().replace(".NS", ""), sync_drive=True)
+            if not nse_1m.empty:
+                return nse_1m
+        except Exception:
+            pass
     if _dhan_configured() and str(symbol).upper().endswith(".NS"):
         try:
             df = _dhan_history(symbol, "5d", interval)
@@ -134,6 +168,14 @@ def get_intraday(symbol: str, interval: str = "5m"):
 
 
 def get_latest_price(symbol: str) -> float | None:
+    if str(symbol).upper().endswith(".NS") and fetch_quote is not None:
+        try:
+            quote = fetch_quote(str(symbol).upper().replace(".NS", ""))
+            value = quote.get("priceInfo", {}).get("lastPrice")
+            if value is not None:
+                return float(value)
+        except Exception:
+            pass
     if _dhan_configured() and str(symbol).upper().endswith(".NS"):
         try:
             cfg = DhanConfig.from_env()

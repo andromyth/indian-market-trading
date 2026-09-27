@@ -77,8 +77,15 @@ def download_symbol(symbol: str, start: str, end: str, interval: str = "1m", ove
                 df = df[~df.index.duplicated(keep="last")]
         except Exception:
             pass
+    persistent = None
     if not df.empty:
         _write(df, out_path)
+        if interval.lower() in {"1m", "1min"}:
+            try:
+                from persistent_store import persist_local_1m_file
+                persistent = persist_local_1m_file(out_path, root, source="DhanHQ v2", sync_drive=True)
+            except Exception as exc:
+                persistent = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
     m = load_manifest()
     key = f"{interval}:{root}"
     m["files"][key] = {
@@ -92,6 +99,12 @@ def download_symbol(symbol: str, start: str, end: str, interval: str = "1m", ove
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source": "DhanHQ v2",
         "status": "OK" if not df.empty else "NO_DATA",
+        "persistent_store": ({
+            "status": persistent.get("status"),
+            "rows_added": persistent.get("rows_added", 0),
+            "partitions": len(persistent.get("partitions", [])),
+            "drive_synced": sum(1 for p in persistent.get("partitions", []) if p.get("drive_sync") == "OK"),
+        } if isinstance(persistent, dict) else None),
     }
     save_manifest(m)
     return m["files"][key]
