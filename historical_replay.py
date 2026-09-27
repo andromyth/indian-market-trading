@@ -317,10 +317,12 @@ def actual_outcome(price_df: pd.DataFrame, decision_ts: pd.Timestamp, signal: st
                     if lo <= target: target_hit = True
                     if hi >= stop: stop_hit = True
                 if target_hit or stop_hit:
-                    touches = []
-                    if target_hit: touches.append((idx, "TARGET"))
-                    if stop_hit: touches.append((idx, "STOP"))
-                    first_touch = sorted(touches, key=lambda x: x[0])[0][1]
+                    if target_hit and stop_hit:
+                        first_touch = "AMBIGUOUS_SAME_BAR"
+                    elif target_hit:
+                        first_touch = "TARGET"
+                    else:
+                        first_touch = "STOP"
                     break
         correct = None
         if signal == "BUY": correct = move > 0

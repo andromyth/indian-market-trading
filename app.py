@@ -114,7 +114,7 @@ if analysis_view == "Historical Replay":
     )
     if replay_mode == "Intraday" or replay_mode.startswith("F&O"):
         replay_time = st.sidebar.time_input("Historical time (IST)", value=pd.Timestamp("10:30").time(), step=60)
-        replay_horizon = st.sidebar.selectbox("Prediction horizon", [15, 30, 45, 60], index=1, format_func=lambda x: f"{x} minutes")
+        replay_horizon = st.sidebar.selectbox("Production ML horizon", [30], index=0, format_func=lambda x: f"{x} minutes")
     else:
         replay_time = pd.Timestamp("15:30").time()
         replay_horizon = st.sidebar.selectbox("Holding horizon", [1, 3, 5, 10, 20], index=2, format_func=lambda x: f"{x} trading day(s)")
@@ -247,8 +247,10 @@ if analysis_view == "Historical Replay":
                         m1,m2,m3,m4 = st.columns(4)
                         m1.metric("ML Signal", ml["signal"])
                         m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
-                        m3.metric("Confidence", ml["confidence"])
+                        m3.metric("Model confidence", ml["confidence"])
                         m4.metric("Data readiness", f"{ml['data_readiness_score']:.0%}")
+                        if float(ml.get("data_readiness_score", 0.0)) < 0.70:
+                            st.warning("DATA-LIMITED REPLAY: the certified model produced a 30-minute probability, but fewer than 70% of the required information groups were historically available. Treat the model probability as model output, not as full-data trading confidence.")
                         r1,r2,r3,r4 = st.columns(4)
                         r1.metric("Decision price", f"₹{entry_info.get('entry_reference', float('nan')):,.2f}")
                         tgt = entry_info.get('entry_reference', 0)+entry_info.get('target_distance', 0) if ml["signal"] == "BUY" else entry_info.get('entry_reference', 0)-entry_info.get('target_distance', 0)
@@ -271,6 +273,7 @@ if analysis_view == "Historical Replay":
                             "historical news": bool(hist_news),
                             "corporate announcements": bool(hist_ann),
                             "historical F&O chain": False,
+                            "historical fundamentals": False,
                         }
                         st.markdown("#### Point-in-time data availability")
                         st.dataframe(pd.DataFrame([{
