@@ -1,0 +1,11 @@
+streamlit
+yfinance
+feedparser
+pandas
+vaderSentiment
+requests
+numpy
+pyarrow
+
+# Required for remote Parquet range/metadata access
+fsspec[http]
