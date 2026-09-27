@@ -43,6 +43,7 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
+from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status
 
 st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
@@ -51,9 +52,9 @@ st.caption(
     "Signals are not guarantees and no orders are placed. In cash-equity mode, SELL means exit/avoid a long position; the backtest is long-only."
 )
 
-st.warning(
-    "Machine-learning clearance: NOT CLEARED. Step 52 is research-only; its six walk-forward AUCs are 0.486–0.522, near chance. "
-    "The live BUY/SELL/HOLD cards below remain rule-based evidence summaries, not calibrated probabilities."
+st.info(
+    "Production ML model: CONNECTED for Intraday mode. It predicts the next 30-minute direction using the certified 137-feature production contract. "
+    "Delivery mode continues to use the existing rule-based engine because the certified model target is 30-minute direction."
 )
 with st.expander("Step 52 PIT walk-forward audit", expanded=False):
     st.write(
@@ -395,26 +396,23 @@ def load_announcements(symbol):
 
 news_items = tag_news_items(load_news())
 
+# ---------------------------------------------------------------- Production ML
+# Fetch all watchlist inputs first so the model can compute cross-sectional
+# ranks/breadth across the user's actual watchlist rather than one symbol at a time.
+live_records = []
 for symbol in symbols:
-    st.markdown(f"## {symbol}")
     raw_df = load_history(symbol, period, interval)
     if raw_df.empty or len(raw_df) < slow + 15:
-        st.warning(f"Insufficient price history returned for {symbol}.")
         continue
-
     company_root = symbol.replace(".NS", "").replace(".BO", "")
     benchmark_symbol = benchmark_for_symbol(symbol)
     market_df = load_benchmark(benchmark_symbol, period, interval)
     df = add_indicators(raw_df, fast=fast, slow=slow)
     mkt_df = add_indicators(market_df, fast=fast, slow=slow) if not market_df.empty else market_df
-
-    t_score = technical_score(df, fast=fast, slow=slow)
-    m_score = market_regime_score(mkt_df, fast=fast, slow=slow) if not mkt_df.empty else 0.0
     aliases = stock_news_keywords(symbol)
     matched_news = news_for_symbol(aliases, news_items)
     news_stat = news_metrics(matched_news)
     news_perception_label, news_freshness = news_perception(news_stat)
-
     announcements_raw = load_announcements(company_root)
     announcements = []
     for item in announcements_raw[:5]:
@@ -429,36 +427,101 @@ for symbol in symbols:
     all_event_news = matched_news + event_items
     event_risk = event_risk_score(matched_news, announcements)
     live_news_score = news_metrics(all_event_news)["score"] if all_event_news else 0.0
+    if company_root in INDEX_SYMBOLS:
+        fo_symbol, is_index = company_root, True
+    else:
+        fo_symbol, is_index = company_root, False
+    raw_chain = load_option_chain(fo_symbol, is_index)
+    fo = fo_summarize(raw_chain) if raw_chain else {}
+    live_records.append({
+        "symbol": symbol, "raw_df": raw_df, "df": df, "market_df": market_df,
+        "mkt_df": mkt_df, "benchmark_symbol": benchmark_symbol,
+        "matched_news": matched_news, "news_stat": news_stat,
+        "news_perception_label": news_perception_label, "news_freshness": news_freshness,
+        "announcements": announcements, "event_risk": event_risk,
+        "live_news_score": live_news_score, "fo": fo,
+        "t_score": technical_score(df, fast=fast, slow=slow),
+        "m_score": market_regime_score(mkt_df, fast=fast, slow=slow) if not mkt_df.empty else 0.0,
+    })
+
+production_results = {}
+if style == "Intraday" and live_records:
+    try:
+        feature_items = [
+            {
+                "symbol": r["symbol"], "price_df": r["raw_df"], "market_df": r["market_df"],
+                "matched_news": r["matched_news"], "announcements": r["announcements"],
+                "event_risk": r["event_risk"], "fo": r["fo"],
+            }
+            for r in live_records
+        ]
+        feature_frame = build_feature_rows(feature_items)
+        production_results = {
+            x["symbol"]: x for x in production_predict(feature_frame)
+        }
+    except Exception as exc:
+        st.error(f"Production ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
+        production_results = {}
+
+for rec in live_records:
+    symbol = rec["symbol"]
+    st.markdown(f"## {symbol}")
+    raw_df = rec["raw_df"]
+    df = rec["df"]
+    market_df = rec["market_df"]
+    benchmark_symbol = rec["benchmark_symbol"]
+    matched_news = rec["matched_news"]
+    news_stat = rec["news_stat"]
+    news_perception_label = rec["news_perception_label"]
+    news_freshness = rec["news_freshness"]
+    announcements = rec["announcements"]
+    event_risk = rec["event_risk"]
+    live_news_score = rec["live_news_score"]
+    fo = rec["fo"]
+    t_score = rec["t_score"]
+    m_score = rec["m_score"]
+
     label, combined = combined_signal(
         t_score, live_news_score, m_score, event_risk,
         tech_weight, news_weight, market_weight,
     )
-
     last = df.iloc[-1]
     latest_close = float(last["Close"])
     previous_close = float(df["Close"].iloc[-2])
     pct_change = (latest_close - previous_close) / previous_close * 100 if previous_close else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Signal", label, f"score {combined:+.2f}")
+    c1.metric("Rule Signal", label, f"score {combined:+.2f}")
     c2.metric("Last", f"₹{latest_close:,.2f}", f"bar {pct_change:+.2f}%")
     c3.metric("Technical", f"{t_score:+.2f}")
-    c4.metric(
-        "News perception",
-        news_perception_label,
-        f"{news_stat['count']} RSS matches · {news_freshness}",
-    )
+    c4.metric("News perception", news_perception_label, f"{news_stat['count']} RSS matches · {news_freshness}")
     c5.metric("Market regime", f"{m_score:+.2f}", benchmark_symbol.replace("^", ""))
 
+    ml = production_results.get(symbol)
+    if style == "Intraday":
+        st.markdown("### Production ML — next 30-minute direction")
+        if ml:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("ML Signal", ml["signal"])
+            m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
+            m3.metric("Confidence", ml["confidence"])
+            m4.metric("Data readiness", f"{ml['data_readiness_score']:.0%}")
+            st.caption(
+                "Certified logistic-regression production model · 137-feature contract · target_30m. "
+                "The probability is the model output, not a guarantee of profit. Missing optional live groups are explicitly represented and handled by the trained imputer."
+            )
+        else:
+            st.warning("Production ML prediction unavailable for this symbol; the rule-based signal remains available.")
+    else:
+        st.caption("Production ML is an intraday 30-minute model; Delivery mode remains rule-based.")
+
     if event_risk > 0:
-        st.warning(
-            f"Trigger/event risk is elevated ({event_risk:.2f}). The engine reduces conviction when material events are present; it does not assume those events are bullish or bearish."
-        )
+        st.warning(f"Trigger/event risk is elevated ({event_risk:.2f}). The engine reduces conviction when material events are present; it does not assume those events are bullish or bearish.")
     if abs(pct_change) >= 3.0:
         st.warning(f"Large move: {pct_change:+.2f}% on the latest bar. Check the trigger/news section before acting.")
 
     comp = technical_components(df, fast=fast, slow=slow)
-    with st.expander("Why the signal looks this way", expanded=True):
+    with st.expander("Why the rule-based signal looks this way", expanded=True):
         st.write({k: round(v, 3) for k, v in comp.items()})
         st.write({
             "technical_weighted": round(tech_weight * t_score, 3),
@@ -466,10 +529,7 @@ for symbol in symbols:
             "market_weighted": round(market_weight * m_score, 3),
             "event_risk": round(event_risk, 3),
         })
-        st.caption(
-            "News perception is a headline-level VADER/keyword score. The Step 52 machine-learning model is not cleared for live use. "
-            "Neither score is a calibrated probability of profit."
-        )
+        st.caption("News perception is a headline-level VADER/keyword score. The Production ML probability is shown separately and is not blended into this legacy rule score.")
 
     st.line_chart(df[["Close", f"SMA{fast}", f"SMA{slow}"]].tail(300))
 
@@ -497,40 +557,23 @@ for symbol in symbols:
         )
         st.write(summary)
         if summary.get("trades", 0):
-            baseline = random_baseline(
-                raw_df, trade_durations=trades_df["holding_bars"].tolist(),
-                cost_bps=cost_bps, slippage_bps=slippage_bps,
-            )
-            holdout = holdout_backtest(
-                raw_df, style, market_df=market_df, fast=fast, slow=slow,
-                stop_atr=stop_atr, target_atr=target_atr, max_hold=max_hold,
-                cost_bps=cost_bps, slippage_bps=slippage_bps,
-            )
+            baseline = random_baseline(raw_df, trade_durations=trades_df["holding_bars"].tolist(), cost_bps=cost_bps, slippage_bps=slippage_bps)
+            holdout = holdout_backtest(raw_df, style, market_df=market_df, fast=fast, slow=slow, stop_atr=stop_atr, target_atr=target_atr, max_hold=max_hold, cost_bps=cost_bps, slippage_bps=slippage_bps)
             st.write("Matched-duration random benchmark:", baseline)
             st.write("Last 30% holdout period:", holdout["summary"])
-            st.caption(
-                "Validation uses price/market data only. Reliable historical news archives are not included in this free build, so the live news component is not falsely presented as historically validated."
-            )
+            st.caption("Validation uses price/market data only. Reliable historical news archives are not included in this free build, so the live news component is not falsely presented as historically validated.")
             st.dataframe(trades_df, use_container_width=True)
 
     with st.expander("F&O context"):
-        if symbol in INDEX_TICKER_MAP:
-            fo_symbol, is_index = INDEX_TICKER_MAP[symbol], True
-        else:
-            fo_symbol, is_index = company_root, company_root in INDEX_SYMBOLS
-        raw_chain = load_option_chain(fo_symbol, is_index)
-        fo = fo_summarize(raw_chain) if raw_chain else {}
         if not fo:
             st.info("No F&O snapshot was returned. NSE may have rate-limited the request or the security may not have a listed derivative.")
         else:
             a, b, c, d = st.columns(4)
-            a.metric("Spot", fo.get("spot"))
-            b.metric("PCR", fo.get("pcr"))
-            c.metric("Max pain", fo.get("max_pain"))
-            d.metric("Expiry", str(fo.get("expiry")))
+            a.metric("Spot", fo.get("spot")); b.metric("PCR", fo.get("pcr")); c.metric("Max pain", fo.get("max_pain")); d.metric("Expiry", str(fo.get("expiry")))
             st.write(f"ATM call OI read: **{fo.get('call_read') or 'not available'}**")
             st.write(f"ATM put OI read: **{fo.get('put_read') or 'not available'}**")
             st.caption("F&O figures are contextual inputs; PCR/Max Pain are not treated as validated directional predictors.")
             near_atm = fo.get("near_atm_chain")
             if near_atm is not None and not near_atm.empty:
                 st.dataframe(near_atm, use_container_width=True)
+

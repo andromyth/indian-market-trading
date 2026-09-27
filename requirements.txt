@@ -6,6 +6,6 @@ vaderSentiment
 requests
 numpy
 pyarrow
-
-# Required for remote Parquet range/metadata access
 fsspec[http]
+scikit-learn==1.6.1
+joblib
