@@ -129,7 +129,13 @@ if analysis_view == "Historical Replay":
                 # Pull several calendar years around the target date; local 1-minute archives are preferred.
                 price_df = historical_price(replay_symbol, decision_ts - pd.Timedelta(days=420), decision_ts + pd.Timedelta(days=45), interval="1m")
                 benchmark_symbol = benchmark_for_symbol(replay_symbol)
-                benchmark_df = get_historical(benchmark_symbol, period="10y", interval="1d")
+                try:
+                    benchmark_df = get_historical(benchmark_symbol, period="10y", interval="1d")
+                except Exception:
+                    # Historical replay must remain usable when a benchmark
+                    # provider is temporarily unavailable; missing context is
+                    # surfaced in the readiness panel instead of crashing.
+                    benchmark_df = pd.DataFrame()
                 hist_news = historical_news(replay_symbol, decision_ts)
                 hist_ann = historical_announcements(replay_symbol, decision_ts)
                 ann_news = announcement_to_news(hist_ann)

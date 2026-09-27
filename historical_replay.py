@@ -77,9 +77,21 @@ def historical_benchmark(symbol: str, end: pd.Timestamp) -> pd.DataFrame:
     if symbol == "^NSEI":
         path = REPLAY_CACHE / "NIFTY_5min_5yr_2021_2026.csv"
         if not path.exists() or path.stat().st_size == 0:
-            r = requests.get(INDEX_RELEASE_URL, timeout=(15, 180), headers={"User-Agent": "IndianStockSignalDashboard/1.0"})
-            r.raise_for_status()
-            path.write_bytes(r.content)
+            # Public index archive is optional. A failed download must not abort
+            # the entire replay; the production model can explicitly handle
+            # missing market-context features through its trained imputer.
+            try:
+                r = requests.get(
+                    INDEX_RELEASE_URL,
+                    timeout=(15, 180),
+                    headers={"User-Agent": "IndianStockSignalDashboard/1.0"},
+                )
+                r.raise_for_status()
+                tmp = path.with_suffix(path.suffix + ".part")
+                tmp.write_bytes(r.content)
+                tmp.replace(path)
+            except requests.RequestException:
+                pass
         try:
             x = pd.read_csv(path)
             rename = {}
