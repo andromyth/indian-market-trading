@@ -44,7 +44,8 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
-from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status
+from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
+from historical_audit import run_batch_intraday_audit
 from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
@@ -105,6 +106,56 @@ if analysis_view == "Historical Replay":
         "Pick a past date/time. The replay uses only information available up to that timestamp, then compares the prediction with what actually happened afterward. "
         "Unavailable historical news/F&O sources are shown as missing rather than replaced with current data."
     )
+    with st.expander("Production target/data-model contract", expanded=False):
+        try:
+            st.json(model_target_contract())
+            st.caption("The certified target is target_30m. Class 1 means the future 30-minute return is positive (UP). A BUY followed by an actual DOWN move is therefore a model miss, not a BUY/SELL label inversion.")
+        except Exception as exc:
+            st.error(f"Production target contract check failed: {type(exc).__name__}: {exc}")
+
+    batch_audit = st.sidebar.checkbox("Batch historical audit", value=False, help="Run many historical 30-minute predictions and compare each with the subsequent actual move.")
+    if batch_audit:
+        st.sidebar.subheader("Batch audit settings")
+        batch_start = st.sidebar.date_input("Audit start date", value=pd.Timestamp("2026-09-01").date(), min_value=pd.Timestamp("2018-01-01").date(), max_value=pd.Timestamp.now().date(), key="batch_start")
+        batch_end = st.sidebar.date_input("Audit end date", value=pd.Timestamp("2026-09-25").date(), min_value=pd.Timestamp("2018-01-01").date(), max_value=pd.Timestamp.now().date(), key="batch_end")
+        batch_start_time = st.sidebar.time_input("First decision time (IST)", value=pd.Timestamp("10:00").time(), step=60, key="batch_start_time")
+        batch_end_time = st.sidebar.time_input("Last decision time (IST)", value=pd.Timestamp("14:00").time(), step=60, key="batch_end_time")
+        batch_step = st.sidebar.selectbox("Decision interval", [30, 60], index=0, format_func=lambda x: f"Every {x} minutes", key="batch_step")
+        batch_symbols = [normalize_symbol(x) for x in st.sidebar.text_area("Batch symbols", ", ".join(symbols[:10]), key="batch_symbols").split(",") if x.strip()]
+        run_batch = st.sidebar.button("Run Batch Audit", type="primary", key="run_batch_audit")
+        st.markdown("## Batch Historical Prediction Audit")
+        st.caption("Each 30-minute prediction is reconstructed point-in-time across the selected universe. The production target is UP when the next 30-minute return is positive. Predictions with less than 70% information-group readiness are retained but excluded from the headline eligible accuracy.")
+        if run_batch:
+            with st.spinner("Running point-in-time batch audit…"):
+                try:
+                    audit_df, audit_summary = run_batch_intraday_audit(batch_symbols, batch_start, batch_end, batch_start_time, batch_end_time, batch_step)
+                    st.success(f"Batch audit completed: {audit_summary['total_predictions']:,} prediction rows.")
+                    q1,q2,q3,q4 = st.columns(4)
+                    q1.metric("Predictions", f"{audit_summary['total_predictions']:,}")
+                    q2.metric("Actuals available", f"{audit_summary['eligible_predictions']:,}")
+                    q3.metric("Directional accuracy", "N/A" if audit_summary['directional_accuracy'] is None else f"{audit_summary['directional_accuracy']:.1%}")
+                    q4.metric("Data-limited", f"{audit_summary['data_limited_predictions']:,}")
+                    st.write({
+                        "full_data_eligible_predictions": audit_summary.get("full_data_eligible_predictions", 0),
+                        "full_data_directional_accuracy": audit_summary.get("full_data_directional_accuracy"),
+                        "mean_brier_error": audit_summary.get("mean_brier_error"),
+                        "average_actual_move_pct": audit_summary.get("average_actual_move_pct"),
+                        "average_signed_move_pct": audit_summary.get("average_signed_move_pct"),
+                    })
+                    if audit_summary['directional_accuracy'] is not None:
+                        st.write({k:v for k,v in audit_summary.items() if k not in {"symbols_requested","symbols_scored"}})
+                    if not audit_df.empty:
+                        st.markdown("### Prediction vs actual ledger")
+                        st.dataframe(audit_df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+                        csv = audit_df.to_csv(index=False).encode("utf-8")
+                        st.download_button("Download batch audit CSV", csv, file_name="historical_prediction_audit.csv", mime="text/csv")
+                        mistakes = audit_df[(audit_df["direction_match"] == False) & (audit_df["audit_eligible"])]
+                        if not mistakes.empty:
+                            with st.expander("Eligible wrong-direction predictions", expanded=False):
+                                st.dataframe(mistakes.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+                except Exception as exc:
+                    st.error(f"Batch historical audit failed: {type(exc).__name__}: {exc}")
+        st.stop()
 
     replay_mode = st.sidebar.radio("Replay mode", ["Delivery", "Intraday", "F&O (underlying replay)"], index=1)
     replay_symbol = normalize_symbol(st.sidebar.text_input("Replay stock", symbols[0] if symbols else "BHARTIARTL.NS"))
@@ -269,7 +320,8 @@ if analysis_view == "Historical Replay":
                         else:
                             st.warning(outcome.get("status", "Future data unavailable."))
                         readiness = {
-                            "price/market": bool(np.isfinite(float(feature_frame.iloc[0].get("close", np.nan))) and np.isfinite(float(feature_frame.iloc[0].get("nifty_close", np.nan)))),
+                            "price/volume": bool(np.isfinite(float(feature_frame.iloc[0].get("close", np.nan)))),
+                            "market context": bool(np.isfinite(float(feature_frame.iloc[0].get("nifty_close", np.nan)))),
                             "historical news": bool(hist_news),
                             "corporate announcements": bool(hist_ann),
                             "historical F&O chain": False,
@@ -289,7 +341,7 @@ if analysis_view == "Historical Replay":
                                 for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
                         if replay_mode.startswith("F&O"):
                             st.warning("This F&O replay currently uses the underlying stock's production 30-minute model. Historical option-chain/OI/IV fields are not substituted with today's chain; they remain unavailable until a timestamped historical derivatives archive is wired in.")
-                        st.caption("Production model: certified Logistic Regression · 137-feature contract · target_30m. Historical replay uses only data at or before the selected timestamp; missing groups remain missing.")
+                        st.caption("Production model: certified Logistic Regression · 137-feature contract · target_30m. Class 1/BUY means the model estimates a positive future 30-minute return. Historical replay actual direction uses future close vs decision close over the same 30-minute horizon.")
                         ledger = {
                             "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": replay_mode,
                             "prediction": ml["signal"], "probability_up_30m": ml["probability_up_30m"],

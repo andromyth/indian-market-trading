@@ -68,6 +68,29 @@ def _model():
     return _MODEL
 
 
+
+def model_target_contract() -> dict[str, Any]:
+    """Return the verified binary-class semantics for the certified model.
+
+    The production target is target_30m. The training runner defines class 1 as
+    future 30-minute return > 0, i.e. UP, and class 0 as non-positive/down.
+    This check prevents an accidental BUY/SELL inversion in the dashboard layer.
+    """
+    model = _model()
+    classes = list(getattr(model.named_steps.get("model"), "classes_", []))
+    if classes != [0, 1]:
+        raise RuntimeError(f"Unexpected production model classes: {classes}; expected [0, 1]")
+    return {
+        "target": _MANIFEST.get("target"),
+        "positive_class": 1,
+        "positive_class_meaning": "UP: future 30-minute return > 0",
+        "negative_class": 0,
+        "negative_class_meaning": "DOWN/FLAT: future 30-minute return <= 0",
+        "probability_column": "probability_up_30m",
+        "signal_policy": "BUY if p>=0.55, SELL if p<=0.45, otherwise HOLD",
+        "classes": [int(x) for x in classes],
+    }
+
 def _safe_float(v):
     try:
         x = float(v)
@@ -256,6 +279,7 @@ def build_feature_rows(items: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def predict(feature_df: pd.DataFrame) -> list[dict[str, Any]]:
+    contract = model_target_contract()
     model = _model()
     missing = [c for c in FEATURES if c not in feature_df.columns]
     if missing:
@@ -274,5 +298,6 @@ def predict(feature_df: pd.DataFrame) -> list[dict[str, Any]]:
             "feature_count": len(FEATURES),
             "data_readiness_score": float(row.get("data_readiness_score", np.nan)),
             "model_family": _MANIFEST.get("model_family"), "target": _MANIFEST.get("target"),
+            "positive_class": contract["positive_class"], "positive_class_meaning": contract["positive_class_meaning"],
         })
     return out

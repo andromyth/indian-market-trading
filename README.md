@@ -126,6 +126,10 @@ The replay never substitutes **today's** news, F&O chain or corporate-event stat
 
 Each replay can be appended to a session ledger and exported as CSV for later analysis. The replay is designed to become the foundation for a larger prediction-vs-actual ledger and repeated daily audit without rebuilding the production ML model.
 
+The Historical Replay view also includes a **Batch Historical Prediction Audit**. It can replay the certified 30-minute Intraday model across a selected stock universe, date range, and decision interval. Cross-sectional features are built across the selected universe at each historical timestamp, and each prediction is joined to the next 30-minute actual outcome. Rows with incomplete optional information remain in the ledger and are flagged as data-limited rather than being silently discarded.
+
+The file `MODEL_DATA_MODEL_CONTRACT.md` documents the production target semantics: class 1 is UP (future 30-minute return > 0), class 0 is DOWN/FLAT, and `predict_proba()[:,1]` is therefore the UP probability. A BUY followed by a DOWN actual is a model miss; the dashboard does not invert the labels to make the prediction appear correct.
+
 ## Free Historical Data Manager
 
 The dashboard now includes a **Free Historical Data** manager. It downloads public research archives directly to the laptop; no broker API is required for the historical equity bootstrap.
