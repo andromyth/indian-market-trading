@@ -5,6 +5,7 @@ The dashboard produces decision-support signals only. It does not place orders.
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import subprocess
 import sys
@@ -44,6 +45,10 @@ from free_data import (
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status
+from historical_replay import (
+    historical_price, historical_benchmark, historical_news, historical_announcements,
+    actual_outcome, replay_rule_delivery, _entry_exit_metrics,
+)
 
 st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
@@ -88,6 +93,211 @@ def normalize_symbol(value: str) -> str:
     return f"{s}.NS"
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
+
+analysis_view = st.sidebar.radio(
+    "View", ["Live Dashboard", "Historical Replay"], index=0,
+    help="Historical Replay reconstructs a past timestamp and compares the model/rule prediction with subsequent actual prices."
+)
+
+if analysis_view == "Historical Replay":
+    st.markdown("## Historical Prediction Replay & Audit")
+    st.caption(
+        "Pick a past date/time. The replay uses only information available up to that timestamp, then compares the prediction with what actually happened afterward. "
+        "Unavailable historical news/F&O sources are shown as missing rather than replaced with current data."
+    )
+
+    replay_mode = st.sidebar.radio("Replay mode", ["Delivery", "Intraday", "F&O (underlying replay)"], index=1)
+    replay_symbol = normalize_symbol(st.sidebar.text_input("Replay stock", symbols[0] if symbols else "BHARTIARTL.NS"))
+    replay_date = st.sidebar.date_input(
+        "Historical date", value=pd.Timestamp("2026-09-25").date(),
+        min_value=pd.Timestamp("2018-01-01").date(), max_value=pd.Timestamp.now().date(),
+    )
+    if replay_mode == "Intraday" or replay_mode.startswith("F&O"):
+        replay_time = st.sidebar.time_input("Historical time (IST)", value=pd.Timestamp("10:30").time(), step=60)
+        replay_horizon = st.sidebar.selectbox("Prediction horizon", [15, 30, 45, 60], index=1, format_func=lambda x: f"{x} minutes")
+    else:
+        replay_time = pd.Timestamp("15:30").time()
+        replay_horizon = st.sidebar.selectbox("Holding horizon", [1, 3, 5, 10, 20], index=2, format_func=lambda x: f"{x} trading day(s)")
+
+    replay_run = st.sidebar.button("Run Historical Replay", type="primary")
+
+    if replay_run:
+        from datetime import time as _time
+        decision_ts = pd.Timestamp.combine(pd.Timestamp(replay_date).date(), replay_time)
+        if replay_mode == "Delivery":
+            with st.spinner("Reconstructing the historical daily information set and checking forward actuals…"):
+                # Pull several calendar years around the target date; local 1-minute archives are preferred.
+                price_df = historical_price(replay_symbol, decision_ts - pd.Timedelta(days=420), decision_ts + pd.Timedelta(days=45), interval="1m")
+                benchmark_symbol = benchmark_for_symbol(replay_symbol)
+                benchmark_df = get_historical(benchmark_symbol, period="10y", interval="1d")
+                hist_news = historical_news(replay_symbol, decision_ts)
+                hist_ann = historical_announcements(replay_symbol, decision_ts)
+                ann_news = announcement_to_news(hist_ann)
+                all_hist_news = tag_news_items(hist_news) + ann_news
+                try:
+                    delivery_parts = replay_rule_delivery(
+                        replay_symbol, price_df, benchmark_df, decision_ts,
+                        tech_weight=tech_weight, news_weight=news_weight, market_weight=market_weight,
+                        horizon_days=int(replay_horizon),
+                    )
+                    hist = price_df[price_df.index <= decision_ts]
+                    hist_daily = __import__("free_data").resample_daily(hist)
+                    mkt_hist = benchmark_df[benchmark_df.index <= decision_ts] if not benchmark_df.empty else benchmark_df
+                    t_score = delivery_parts["t_score"]
+                    m_score = delivery_parts["m_score"]
+                    n_score = news_metrics(all_hist_news)["score"] if all_hist_news else 0.0
+                    ev_risk = event_risk_score(hist_news, hist_ann)
+                    label, combined = combined_signal(t_score, n_score, m_score, ev_risk, tech_weight, news_weight, market_weight)
+                    entry_info = _entry_exit_metrics(hist_daily, decision_ts, "Delivery", int(replay_horizon))
+                    outcome = actual_outcome(price_df, decision_ts, label, "Delivery", int(replay_horizon), entry_info)
+                    readiness_groups = {
+                        "price/market": bool(not hist.empty and not mkt_hist.empty),
+                        "historical news": bool(hist_news),
+                        "corporate announcements": bool(hist_ann),
+                        "F&O historical chain": False,
+                    }
+                    st.markdown(f"### {replay_symbol} — Delivery replay")
+                    st.write(f"**Decision timestamp:** {decision_ts} IST")
+                    a,b,c,d = st.columns(4)
+                    a.metric("Prediction", label)
+                    b.metric("Rule score", f"{combined:+.2f}")
+                    c.metric("Decision price", f"₹{entry_info.get('entry_reference', float('nan')):,.2f}")
+                    d.metric("Data readiness", f"{sum(readiness_groups.values())}/{len(readiness_groups)} groups")
+                    e1,e2,e3,e4 = st.columns(4)
+                    e1.metric("Buy zone", f"₹{entry_info.get('buy_zone_low', float('nan')):,.2f}–₹{entry_info.get('buy_zone_high', float('nan')):,.2f}")
+                    e2.metric("Target", f"₹{entry_info.get('entry_reference', 0)+entry_info.get('target_distance', 0):,.2f}" if label == "BUY" else f"₹{entry_info.get('entry_reference', 0)-entry_info.get('target_distance', 0):,.2f}")
+                    e3.metric("Stop", f"₹{entry_info.get('entry_reference', 0)-entry_info.get('stop_distance', 0):,.2f}" if label == "BUY" else f"₹{entry_info.get('entry_reference', 0)+entry_info.get('stop_distance', 0):,.2f}")
+                    e4.metric("Historical news", "Available" if hist_news else "Not available")
+                    st.markdown("#### Prediction vs actual")
+                    if outcome.get("status") == "OK":
+                        o1,o2,o3,o4 = st.columns(4)
+                        o1.metric("Actual price", f"₹{outcome['actual_price']:,.2f}")
+                        o2.metric("Actual move", f"{outcome['actual_move_pct']:+.2f}%")
+                        o3.metric("Actual direction", outcome["actual_direction"])
+                        o4.metric("Direction match", "YES" if outcome.get("correct_direction") else "NO" if outcome.get("correct_direction") is not None else "N/A")
+                        st.write({
+                            "target_hit": outcome.get("target_hit"), "stop_hit": outcome.get("stop_hit"),
+                            "first_touch": outcome.get("first_touch"), "horizon": outcome.get("horizon_label"),
+                            "actual_entry": outcome.get("actual_entry"),
+                        })
+                    else:
+                        st.warning(outcome.get("status", "Future data unavailable."))
+                    st.markdown("#### Information available at the replay timestamp")
+                    st.dataframe(pd.DataFrame([{
+                        "group": k, "available": v
+                    } for k,v in readiness_groups.items()]), use_container_width=True, hide_index=True)
+                    if hist_news:
+                        st.markdown("#### Historical news found")
+                        for n in hist_news[:15]:
+                            st.write(f"**{n.get('title','')}** — {n.get('published','')} — {n.get('source','')}")
+                            if n.get("link"): st.caption(n["link"])
+                    else:
+                        st.info("No timestamped historical news was retrieved for this date from the public RSS search source.")
+                    if hist_ann:
+                        st.markdown("#### Historical corporate announcements")
+                        for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
+                    st.caption("The Step 52 audit is research context, not an input to this replay. No current/future news or F&O snapshot is injected into a past decision.")
+                    ledger = {
+                        "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": "Delivery",
+                        "prediction": label, "score": combined, "decision_price": entry_info.get("entry_reference"),
+                        "target": (entry_info.get("entry_reference", 0)+entry_info.get("target_distance", 0)) if label == "BUY" else (entry_info.get("entry_reference", 0)-entry_info.get("target_distance", 0)),
+                        "stop": (entry_info.get("entry_reference", 0)-entry_info.get("stop_distance", 0)) if label == "BUY" else (entry_info.get("entry_reference", 0)+entry_info.get("stop_distance", 0)),
+                        "actual_move_pct": outcome.get("actual_move_pct"), "correct": outcome.get("correct_direction"),
+                        "news_available": bool(hist_news), "announcements_available": bool(hist_ann), "fo_historical_available": False,
+                    }
+                    st.session_state.setdefault("replay_ledger", []).append(ledger)
+                    st.download_button("Export replay record", pd.DataFrame(st.session_state["replay_ledger"]).to_csv(index=False).encode("utf-8"), file_name="historical_replay_ledger.csv", mime="text/csv")
+                except Exception as exc:
+                    st.error(f"Historical Delivery replay failed: {type(exc).__name__}: {exc}")
+
+        else:
+            with st.spinner("Reconstructing minute-level history and running the production 30-minute model…"):
+                start = decision_ts - pd.Timedelta(days=20)
+                end = decision_ts + pd.Timedelta(minutes=int(replay_horizon) + 5)
+                price_df = historical_price(replay_symbol, start, end, interval="1m")
+                if price_df.empty or len(price_df) < 60:
+                    st.error("Historical minute data could not be loaded for this symbol/date. Download the relevant 1-minute archive in the Free Historical Data manager or choose a date covered by the public archive.")
+                else:
+                    benchmark_symbol = benchmark_for_symbol(replay_symbol)
+                    # NIFTY 5-minute index data is optional; if unavailable the production model explicitly receives missing market context.
+                    benchmark_df = historical_benchmark(benchmark_symbol, decision_ts)
+                    if not benchmark_df.empty:
+                        benchmark_df = benchmark_df[benchmark_df.index <= decision_ts]
+                    hist_news = tag_news_items(historical_news(replay_symbol, decision_ts))
+                    hist_ann = historical_announcements(replay_symbol, decision_ts)
+                    ann_news = announcement_to_news(hist_ann)
+                    item = [{
+                        "symbol": replay_symbol, "price_df": price_df[price_df.index <= decision_ts],
+                        "market_df": benchmark_df, "matched_news": hist_news, "announcements": hist_ann,
+                        "event_risk": event_risk_score(hist_news, hist_ann), "fo": {}, "decision_ts": decision_ts,
+                    }]
+                    try:
+                        feature_frame = build_feature_rows(item)
+                        ml = production_predict(feature_frame)[0]
+                        entry_info = _entry_exit_metrics(price_df[price_df.index <= decision_ts], decision_ts, "Intraday", int(replay_horizon))
+                        outcome = actual_outcome(price_df, decision_ts, ml["signal"], "Intraday", int(replay_horizon), entry_info)
+                        st.markdown(f"### {replay_symbol} — {replay_mode} replay")
+                        st.write(f"**Decision timestamp:** {decision_ts} IST")
+                        m1,m2,m3,m4 = st.columns(4)
+                        m1.metric("ML Signal", ml["signal"])
+                        m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
+                        m3.metric("Confidence", ml["confidence"])
+                        m4.metric("Data readiness", f"{ml['data_readiness_score']:.0%}")
+                        r1,r2,r3,r4 = st.columns(4)
+                        r1.metric("Decision price", f"₹{entry_info.get('entry_reference', float('nan')):,.2f}")
+                        tgt = entry_info.get('entry_reference', 0)+entry_info.get('target_distance', 0) if ml["signal"] == "BUY" else entry_info.get('entry_reference', 0)-entry_info.get('target_distance', 0)
+                        stp = entry_info.get('entry_reference', 0)-entry_info.get('stop_distance', 0) if ml["signal"] == "BUY" else entry_info.get('entry_reference', 0)+entry_info.get('stop_distance', 0)
+                        r2.metric("Target", f"₹{tgt:,.2f}")
+                        r3.metric("Stop", f"₹{stp:,.2f}")
+                        r4.metric("News", "Available" if hist_news else "Not available")
+                        st.markdown("#### Prediction vs actual")
+                        if outcome.get("status") == "OK":
+                            o1,o2,o3,o4 = st.columns(4)
+                            o1.metric("Actual price", f"₹{outcome['actual_price']:,.2f}")
+                            o2.metric("Actual move", f"{outcome['actual_move_pct']:+.2f}%")
+                            o3.metric("Actual direction", outcome["actual_direction"])
+                            o4.metric("Direction match", "YES" if outcome.get("correct_direction") else "NO" if outcome.get("correct_direction") is not None else "N/A")
+                            st.write({"target_hit": outcome.get("target_hit"), "stop_hit": outcome.get("stop_hit"), "first_touch": outcome.get("first_touch"), "horizon": outcome.get("horizon_label")})
+                        else:
+                            st.warning(outcome.get("status", "Future data unavailable."))
+                        readiness = {
+                            "price/market": bool(np.isfinite(float(feature_frame.iloc[0].get("close", np.nan))) and np.isfinite(float(feature_frame.iloc[0].get("nifty_close", np.nan)))),
+                            "historical news": bool(hist_news),
+                            "corporate announcements": bool(hist_ann),
+                            "historical F&O chain": False,
+                        }
+                        st.markdown("#### Point-in-time data availability")
+                        st.dataframe(pd.DataFrame([{
+                            "group": k, "available": v
+                        } for k,v in readiness.items()]), use_container_width=True, hide_index=True)
+                        if hist_news:
+                            with st.expander("Historical news used by replay", expanded=False):
+                                for n in hist_news[:15]: st.write(f"**{n.get('title','')}** — {n.get('published','')} — {n.get('source','')}")
+                        else:
+                            st.info("No timestamped historical news was retrieved. The production model was not given today's headlines.")
+                        if hist_ann:
+                            with st.expander("Historical corporate announcements", expanded=False):
+                                for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
+                        if replay_mode.startswith("F&O"):
+                            st.warning("This F&O replay currently uses the underlying stock's production 30-minute model. Historical option-chain/OI/IV fields are not substituted with today's chain; they remain unavailable until a timestamped historical derivatives archive is wired in.")
+                        st.caption("Production model: certified Logistic Regression · 137-feature contract · target_30m. Historical replay uses only data at or before the selected timestamp; missing groups remain missing.")
+                        ledger = {
+                            "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": replay_mode,
+                            "prediction": ml["signal"], "probability_up_30m": ml["probability_up_30m"],
+                            "confidence": ml["confidence"], "data_readiness": ml["data_readiness_score"],
+                            "decision_price": entry_info.get("entry_reference"), "target": tgt, "stop": stp,
+                            "actual_move_pct": outcome.get("actual_move_pct"), "correct": outcome.get("correct_direction"),
+                            "news_available": bool(hist_news), "announcements_available": bool(hist_ann), "fo_historical_available": False,
+                        }
+                        st.session_state.setdefault("replay_ledger", []).append(ledger)
+                        st.download_button("Export replay record", pd.DataFrame(st.session_state["replay_ledger"]).to_csv(index=False).encode("utf-8"), file_name="historical_replay_ledger.csv", mime="text/csv")
+                    except Exception as exc:
+                        st.error(f"Historical {replay_mode} replay failed: {type(exc).__name__}: {exc}")
+
+    if "replay_ledger" in st.session_state and st.session_state["replay_ledger"]:
+        with st.expander("Replay ledger from this session", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state["replay_ledger"]), use_container_width=True, hide_index=True)
+    st.stop()
 
 style = st.sidebar.radio("Mode", ["Delivery", "Intraday"])
 if style == "Delivery":

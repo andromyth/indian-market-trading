@@ -114,6 +114,18 @@ The audit intentionally does **not** inject current RSS headlines into historica
 Run it from the sidebar with **Run 1-Year Prediction Audit**. You can download the full prediction replay CSV from the dashboard.
 
 
+## Historical Prediction Replay & Audit
+
+The dashboard now has a **Historical Replay** view. Pick a past date, a stock, a mode and a prediction/holding horizon. The engine reconstructs the selected point-in-time input set, produces a prediction, then compares it with the subsequent **actual market move**.
+
+For Intraday replay, the certified `target_30m` production model is run on the historical 1-minute price history through the selected timestamp. The result includes the ML signal, probability, confidence, data-readiness, reference price, ATR-based target/stop and the actual outcome after the selected minute horizon.
+
+For Delivery replay, the existing causal rule engine is evaluated at the selected EOD date, with a configurable 1/3/5/10/20-trading-day forward horizon. The comparison uses the next trading day's open as the historical entry reference and reports subsequent return, target/stop touches and directional match.
+
+The replay never substitutes **today's** news, F&O chain or corporate-event state into a past prediction. Historical headlines are retrieved on a best-effort basis from Google News RSS date search; this is not a complete timestamped news archive. Historical option-chain/OI/IV data is not yet connected to the replay, so the F&O mode is explicitly labelled **underlying replay** rather than presented as a contract-level historical F&O forecast.
+
+Each replay can be appended to a session ledger and exported as CSV for later analysis. The replay is designed to become the foundation for a larger prediction-vs-actual ledger and repeated daily audit without rebuilding the production ML model.
+
 ## Free Historical Data Manager
 
 The dashboard now includes a **Free Historical Data** manager. It downloads public research archives directly to the laptop; no broker API is required for the historical equity bootstrap.

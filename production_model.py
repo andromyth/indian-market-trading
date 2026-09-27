@@ -175,7 +175,14 @@ def build_feature_rows(items: list[dict[str, Any]]) -> pd.DataFrame:
         # News/event fields. The dashboard's current RSS pull is the authoritative
         # live input here; missing windows remain explicitly missing.
         matched = item.get("matched_news") or []
-        now = pd.Timestamp.now(tz="UTC")
+        decision_ts = item.get("decision_ts")
+        try:
+            now = pd.Timestamp(decision_ts) if decision_ts is not None else pd.Timestamp.now(tz="UTC")
+            if now.tzinfo is None:
+                now = now.tz_localize("Asia/Kolkata")
+            now = now.tz_convert("UTC")
+        except Exception:
+            now = pd.Timestamp.now(tz="UTC")
         scores = {"1h": [], "6h": [], "24h": []}
         for n in matched:
             try:
