@@ -13,9 +13,9 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 try:
-    from nse_data_layer import fetch_equity_history, fetch_intraday_1m_current, fetch_quote
+    from nse_data_layer import fetch_equity_history, fetch_intraday_1m_current, fetch_quote, fetch_nse_bulk_symbol_history, nse_last_diagnostic
 except Exception:
-    fetch_equity_history = fetch_intraday_1m_current = fetch_quote = None
+    fetch_equity_history = fetch_intraday_1m_current = fetch_quote = nse_last_diagnostic = None
 
 import feedparser
 import requests
@@ -309,42 +309,64 @@ def _yahoo_history(symbol: str, period: str, interval: str):
     """Yahoo reference fallback without yfinance."""
     return _yahoo_chart_history(symbol, period, interval)
 
+def source_diagnostics() -> dict:
+    """Return safe, compact diagnostics for the most recent official NSE attempt."""
+    try:
+        return nse_last_diagnostic() if nse_last_diagnostic else {}
+    except Exception:
+        return {}
+
 def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_refresh: bool = False):
-    """NSE-first historical provider with explicit local/remote fallbacks."""
+    """NSE-first historical provider with explicit source precedence.
+
+    For NSE-listed daily equities the preferred path is:
+      1. cached official NSE bulk CM-UDiFF data;
+      2. one bounded official NSE security-wise request;
+      3. persistent/local archive;
+      4. optional Dhan;
+      5. Yahoo reference fallback.
+
+    The UI never makes the NSE quote endpoint a prerequisite for history.
+    """
     is_nse = str(symbol).upper().endswith(".NS")
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+    iv = str(interval).lower()
 
-    # 1) Persistent/local history is cheapest and avoids unnecessary remote calls.
-    if not force_refresh:
-        local = _local_persistent_history(symbol, period, interval)
-        if not local.empty:
-            return local
-
-    # 2) NSE official daily history for NSE equities.
-    if is_nse and fetch_equity_history is not None and interval.lower() in {"1d", "d", "day", "daily"}:
+    if is_nse and iv in {"1d", "d", "day", "daily"}:
+        days = _period_days(period)
+        end = dt.datetime.now(IST).date()
+        start = end - dt.timedelta(days=days)
+        # First use already-downloaded official NSE bulk days. Only backfill
+        # missing history from NSE when explicitly requested or when there is no
+        # usable local official archive. A bounded security-wise request remains
+        # available for a fast path on environments where it is reachable.
         try:
-            days = _period_days(period)
-            end = dt.datetime.now(IST).date()
-            start = end - dt.timedelta(days=days)
-            # Interactive serving must not upload chunks to Google Drive.
-            # Persistence is handled by the ingestion/scheduled data layer;
-            # blocking the Streamlit request on Drive sync can make a simple
-            # stock search appear to hang. NSE remains the first remote source.
+            bulk = fetch_nse_bulk_symbol_history(root, start, end, sync_drive=False, max_days=min(days + 10, 150), download_missing=False)
+            if not bulk.empty and len(bulk) >= 2:
+                return _normalize_historical_frame(bulk.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}).set_index("date"))
+        except Exception:
+            pass
+        try:
             nse_df = fetch_equity_history(root, start, end, sync_drive=False)
             if not nse_df.empty:
                 nse_df = nse_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
                 if "date" in nse_df.columns:
                     nse_df = nse_df.set_index("date")
                 normalized = _normalize_historical_frame(nse_df)
-                if not normalized.empty:
+                if not normalized.empty and len(normalized) >= 2:
                     return normalized
         except Exception:
             pass
 
-    # 3) NSE quote-chart 1m for current-session intraday.
-    if is_nse and interval.lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
+    # Persistent/local archive is the cached copy of prior official ingestion.
+    if not force_refresh:
+        local = _local_persistent_history(symbol, period, interval)
+        if not local.empty:
+            return local
+
+    if is_nse and iv in {"1m", "1min"} and fetch_intraday_1m_current is not None:
         try:
-            nse_1m = fetch_intraday_1m_current(root, sync_drive=True)
+            nse_1m = fetch_intraday_1m_current(root, sync_drive=False)
             if not nse_1m.empty:
                 normalized = _normalize_historical_frame(nse_1m)
                 if not normalized.empty:
@@ -352,7 +374,6 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_
         except Exception:
             pass
 
-    # 4) Dhan when configured.
     if _dhan_configured() and is_nse:
         try:
             df = _dhan_history(symbol, period, interval)
@@ -363,14 +384,13 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_
         except Exception:
             pass
 
-    # 5) Yahoo reference fallback.
     return _yahoo_history(symbol, period, interval)
 
 
 def get_intraday(symbol: str, interval: str = "1m"):
     if str(symbol).upper().endswith(".NS") and str(interval).lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
         try:
-            nse_1m = fetch_intraday_1m_current(str(symbol).upper().replace(".NS", ""), sync_drive=True)
+            nse_1m = fetch_intraday_1m_current(str(symbol).upper().replace(".NS", ""), sync_drive=False)
             if not nse_1m.empty:
                 return _normalize_historical_frame(nse_1m)
         except Exception:

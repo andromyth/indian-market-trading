@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import time
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,13 +34,22 @@ IST = ZoneInfo("Asia/Kolkata")
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "application/json,text/plain,*/*",
-    "Referer": "https://www.nseindia.com/",
-    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://www.nseindia.com/report-detail/eq_security",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
+
 
 EQUITY_HISTORY_ENDPOINT = "/api/historicalOR/generateSecurityWiseHistoricalData"
 EQUITY_QUOTE_ENDPOINT = "/api/quote-equity"
@@ -54,6 +64,9 @@ NORMALIZED_ROOT = LOCAL_ROOT / "normalized"
 MANIFEST = LOCAL_ROOT / "manifest.json"
 
 _last_request = 0.0
+_nse_session: requests.Session | None = None
+_nse_session_at = 0.0
+_last_nse_diagnostic: dict[str, Any] = {}
 
 
 def root_symbol(symbol: str) -> str:
@@ -74,37 +87,74 @@ def _sleep_rate_limit(min_interval: float = 1.5) -> None:
 
 
 def _session() -> requests.Session:
+    global _nse_session, _nse_session_at
+    now = time.monotonic()
+    if _nse_session is not None and (now - _nse_session_at) < 600 and _nse_session.cookies:
+        return _nse_session
     s = requests.Session()
     s.headers.update(HEADERS)
-    # Prime the NSE session. Public website endpoints commonly rely on the
-    # session cookies established by the landing/report page.
-    s.get(NSE_BASE + "/report-detail/eq_security", timeout=15)
+    # Prime both the site root and the historical-report page so the cookies
+    # and anti-bot context expected by current NSE endpoints are established.
+    for url in (NSE_BASE, NSE_BASE + "/report-detail/eq_security"):
+        try:
+            s.get(url, timeout=4)
+        except requests.RequestException:
+            pass
+    _nse_session = s
+    _nse_session_at = time.monotonic()
     return s
 
 
 def _request(path: str, *, params: dict[str, Any] | None = None,
              accept: str | None = None, retries: int = 3,
              min_interval: float = 1.5) -> requests.Response:
+    global _last_nse_diagnostic, _nse_session, _nse_session_at
     last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             _sleep_rate_limit(min_interval)
             s = _session()
-            headers = {"Accept": accept} if accept else {}
-            r = s.get(NSE_BASE + path, params=params, headers=headers, timeout=30)
+            headers = {
+                "Accept": accept or "application/json,text/plain,*/*",
+                "Referer": "https://www.nseindia.com/report-detail/eq_security",
+                "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
+            r = s.get(NSE_BASE + path, params=params, headers=headers, timeout=(3, 8))
+            _last_nse_diagnostic = {
+                "path": path, "status_code": r.status_code,
+                "content_type": r.headers.get("content-type", ""),
+                "bytes": len(r.content), "attempt": attempt + 1,
+            }
             if r.status_code == 200:
                 return r
-            if r.status_code in (429, 403, 503):
-                time.sleep(2.0 * (attempt + 1))
+            if r.status_code in (401, 403, 408, 429, 500, 502, 503, 504):
+                # Refresh the cookie session before the next attempt.
+                _nse_session = None
+                _nse_session_at = 0.0
+                time.sleep(min(8.0, 1.5 * (attempt + 1)))
                 continue
             r.raise_for_status()
         except Exception as exc:
             last_exc = exc
+            _last_nse_diagnostic = {
+                "path": path, "attempt": attempt + 1,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            _nse_session = None
+            _nse_session_at = 0.0
             if attempt + 1 < retries:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(min(8.0, 1.5 * (attempt + 1)))
     if last_exc:
         raise RuntimeError(f"NSE request failed: {type(last_exc).__name__}: {last_exc}") from last_exc
     raise RuntimeError(f"NSE request failed after {retries} attempts: {path}")
+
+
+def nse_last_diagnostic() -> dict[str, Any]:
+    """Return the last NSE transport diagnostic without exposing response bodies."""
+    return dict(_last_nse_diagnostic)
 
 
 def _ensure_local() -> None:
@@ -193,25 +243,44 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
     cursor = start_d
     while cursor <= end_d:
         chunk_end = min(cursor + timedelta(days=89), end_d)
-        params = {
+        base_params = {
             "from": cursor.strftime("%d-%m-%Y"),
             "to": chunk_end.strftime("%d-%m-%Y"),
             "symbol": s,
             "type": "priceVolumeDeliverable",
-            "series": series,
-            "csv": "true",
         }
-        r = _request(EQUITY_HISTORY_ENDPOINT, params=params,
-                      accept="text/csv,application/csv,*/*")
-        text = r.content
+        # Current NSE deployments have been observed returning either JSON or
+        # CSV depending on the request. Try the current-series JSON contract
+        # first, then the CSV contract, and finally ALL-series variants.
+        request_variants = [
+            {**base_params, "series": series},
+            {**base_params, "series": "ALL"},
+        ]
+        r = None
+        csv = pd.DataFrame()
+        for params in request_variants:
+            try:
+                rr = _request(EQUITY_HISTORY_ENDPOINT, params=params,
+                               accept="application/json,text/csv,application/csv,*/*", retries=1, min_interval=0.75)
+                ctype = (rr.headers.get("content-type") or "").lower()
+                if "json" in ctype or rr.text.lstrip().startswith(("{", "[")):
+                    payload = rr.json()
+                    rows = payload.get("data", payload if isinstance(payload, list) else [])
+                    csv = pd.DataFrame(rows)
+                else:
+                    csv = pd.read_csv(io.BytesIO(rr.content), thousands=",")
+                if not csv.empty:
+                    r = rr
+                    break
+                r = rr
+            except Exception:
+                continue
+        if r is None:
+            raise RuntimeError(f"NSE returned no response for {s} {cursor}..{chunk_end}")
         raw_dir = RAW_ROOT / "equity" / s
         raw_dir.mkdir(parents=True, exist_ok=True)
         raw_path = raw_dir / f"{cursor:%Y%m%d}_{chunk_end:%Y%m%d}.csv"
-        raw_path.write_bytes(text)
-        try:
-            csv = pd.read_csv(io.BytesIO(text), thousands=",")
-        except Exception:
-            csv = pd.DataFrame()
+        raw_path.write_bytes(r.content)
         normalized = normalize_equity_history(csv, s)
         if not normalized.empty:
             frames.append(normalized)
@@ -237,6 +306,193 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
     out = pd.concat(frames, ignore_index=True)
     return out.sort_values("date").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
 
+
+
+NSE_CM_UDIFF_URL_TEMPLATE = (
+    "https://nsearchives.nseindia.com/content/cm/"
+    "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
+)
+BULK_EOD_ROOT = NORMALIZED_ROOT / "bulk_eod"
+BULK_EOD_MANIFEST = BULK_EOD_ROOT / "manifest.json"
+
+
+def _parse_nse_csv_bytes(payload: bytes) -> pd.DataFrame:
+    """Read a CSV payload while tolerating UTF-8/BOM and alternate delimiters."""
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            frame = pd.read_csv(io.BytesIO(payload), encoding=encoding)
+            if len(frame.columns) > 1:
+                return frame
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _normalize_udiff_common_bhavcopy(frame: pd.DataFrame, trade_date: date) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    x = frame.copy()
+    x.columns = [str(c).strip() for c in x.columns]
+    aliases = {
+        "TradDt": "date", "TRADING_DATE": "date", "Date": "date",
+        "TckrSymb": "symbol", "CH_SYMBOL": "symbol", "Symbol": "symbol",
+        "SctySrs": "series", "CH_SERIES": "series", "Series": "series",
+        "OpnPric": "open", "CH_OPENING_PRICE": "open", "Open": "open",
+        "HghPric": "high", "CH_TRADE_HIGH_PRICE": "high", "High": "high",
+        "LwPric": "low", "CH_TRADE_LOW_PRICE": "low", "Low": "low",
+        "ClsPric": "close", "CH_CLOSING_PRICE": "close", "Close": "close",
+        "LastPric": "ltp", "CH_LAST_TRADED_PRICE": "ltp", "Last": "ltp",
+        "PrvsClsgPric": "prev_close", "CH_PREVIOUS_CLS_PRICE": "prev_close",
+        "TtlTradgVol": "volume", "CH_TOT_TRADED_QTY": "volume", "Volume": "volume",
+        "TtlTrfVal": "traded_value", "CH_TOT_TRADED_VAL": "traded_value",
+        "TtlNbOfTxsExctd": "num_trades", "CH_TOTAL_TRADES": "num_trades",
+    }
+    ren = {c: aliases[c] for c in x.columns if c in aliases}
+    x = x.rename(columns=ren)
+    if "date" not in x.columns:
+        x["date"] = pd.Timestamp(trade_date)
+    x["date"] = pd.to_datetime(x["date"], errors="coerce", dayfirst=True)
+    if x["date"].isna().all():
+        x["date"] = pd.Timestamp(trade_date)
+    if "symbol" not in x.columns:
+        return pd.DataFrame()
+    x["symbol"] = x["symbol"].astype(str).str.strip().str.upper()
+    if "series" in x.columns:
+        x["series"] = x["series"].astype(str).str.strip().str.upper()
+    else:
+        x["series"] = "EQ"
+    # Retain equity-like series; exclude ETFs/ETNs/debt from the stock universe.
+    x = x[x["series"].isin({"EQ", "BE", "BZ", "SM", "ST", "SZ", "GB", "RR"})].copy()
+    for c in ("open", "high", "low", "close", "ltp", "prev_close", "volume", "traded_value", "num_trades"):
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    if "close" not in x.columns and "ltp" in x.columns:
+        x["close"] = x["ltp"]
+    required = {"symbol", "date", "open", "high", "low", "close"}
+    if not required.issubset(x.columns):
+        return pd.DataFrame()
+    x["source"] = "NSE_OFFICIAL_UDIFF_BHAVCOPY"
+    x["provenance"] = "nsearchives.nseindia.com CM-UDiFF Common Bhavcopy"
+    return x.sort_values(["symbol", "date"]).drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+
+
+def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False,
+                           force_refresh: bool = False) -> pd.DataFrame:
+    """Fetch one official NSE CM-UDiFF common bhavcopy containing all equity symbols.
+
+    This is the bulk-EOD path used to expand coverage without issuing one NSE
+    request per security. The downloaded day is cached locally and can be
+    mirrored to Google Drive when explicitly requested.
+    """
+    d = pd.Timestamp(trade_date).date()
+    key = d.strftime("%Y%m%d")
+    out_dir = BULK_EOD_ROOT / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = out_dir / f"BhavCopy_NSE_CM_0_0_0_{key}_F_0000.parquet"
+    zip_path = out_dir / f"BhavCopy_NSE_CM_0_0_0_{key}_F_0000.csv.zip"
+    if parquet_path.exists() and parquet_path.stat().st_size > 0 and not force_refresh:
+        return pd.read_parquet(parquet_path)
+    url = NSE_CM_UDIFF_URL_TEMPLATE.format(date=key)
+    # Archive endpoint is a direct static download; use one bounded attempt.
+    _sleep_rate_limit(0.25)
+    try:
+        r = requests.get(url, headers={**HEADERS, "Accept": "application/zip,text/plain,*/*"}, timeout=(3, 8))
+        r.raise_for_status()
+    except Exception as exc:
+        _last_nse_diagnostic.update({"path": url, "error": f"{type(exc).__name__}: {exc}"})
+        raise RuntimeError(f"NSE EOD bhavcopy unavailable for {key}: {type(exc).__name__}: {exc}") from exc
+    zip_path.write_bytes(r.content)
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+        if not names:
+            return pd.DataFrame()
+        # Prefer the main CM CSV, otherwise first CSV-like member.
+        name = next((n for n in names if n.lower().endswith(".csv")), names[0])
+        raw = zf.read(name)
+    frame = _parse_nse_csv_bytes(raw)
+    normalized = _normalize_udiff_common_bhavcopy(frame, d)
+    if normalized.empty:
+        raise RuntimeError(f"NSE EOD bhavcopy parsed but yielded no equity rows for {key}")
+    normalized.to_parquet(parquet_path, index=False)
+    if sync_drive:
+        _drive_upload(zip_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{zip_path.name}", "application/zip")
+        _drive_upload(parquet_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{parquet_path.name}", "application/octet-stream")
+    m = json.loads(BULK_EOD_MANIFEST.read_text()) if BULK_EOD_MANIFEST.exists() else {"version": "nse-cm-udiff-v1", "days": {}}
+    m.setdefault("days", {})[key] = {
+        "source": "NSE_OFFICIAL_UDIFF_BHAVCOPY", "url": url,
+        "parquet": str(parquet_path), "rows": int(len(normalized)),
+        "retrieved_at": datetime.now(tz=IST).isoformat(),
+    }
+    BULK_EOD_MANIFEST.write_text(json.dumps(m, indent=2, sort_keys=True, default=str))
+    return normalized
+
+
+def fetch_nse_bulk_symbol_history(symbol: str, start: date | datetime, end: date | datetime,
+                                  sync_drive: bool = False, max_days: int | None = None,
+                                  download_missing: bool = False) -> pd.DataFrame:
+    """Build per-symbol daily history from official NSE bulk CM-UDiFF day files.
+
+    Cached days are read locally; missing days are downloaded one at a time. The
+    function is intended for scheduled/backfill jobs, not tight UI loops.
+    """
+    s = root_symbol(symbol)
+    start_d = pd.Timestamp(start).date(); end_d = pd.Timestamp(end).date()
+    days = pd.date_range(start_d, end_d, freq="B")
+    if max_days is not None:
+        days = days[-int(max_days):]
+    pieces = []
+    for day in days:
+        try:
+            d = day.date()
+            cache = BULK_EOD_ROOT / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}" / f"BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.parquet"
+            if cache.exists():
+                df = pd.read_parquet(cache)
+            elif download_missing:
+                df = fetch_nse_eod_bhavcopy(d, sync_drive=sync_drive)
+            else:
+                continue
+            part = df[df["symbol"].astype(str).str.upper() == s]
+            if not part.empty:
+                pieces.append(part)
+        except Exception:
+            continue
+    if not pieces:
+        return pd.DataFrame()
+    out = pd.concat(pieces, ignore_index=True)
+    return out.sort_values("date").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+
+EQUITY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
+def fetch_nse_equity_universe(force_refresh: bool = False) -> pd.DataFrame:
+    """Fetch the current NSE-listed/available-for-trading equity universe.
+
+    This is the official NSE securities CSV linked from the current
+    "Securities available for Trading" page.
+    """
+    cache = NORMALIZED_ROOT / "universe" / "EQUITY_L.csv"
+    if cache.exists() and not force_refresh and (time.time() - cache.stat().st_mtime) < 86400:
+        return pd.read_csv(cache)
+    _ensure_local()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        r = requests.get(EQUITY_UNIVERSE_URL, headers=HEADERS, timeout=(3, 8))
+        r.raise_for_status()
+        cache.write_bytes(r.content)
+        df = pd.read_csv(io.BytesIO(r.content))
+    except Exception:
+        if cache.exists():
+            return pd.read_csv(cache)
+        raise
+    return df
+
+def nse_equity_symbols(force_refresh: bool = False) -> list[str]:
+    df = fetch_nse_equity_universe(force_refresh=force_refresh)
+    col = next((c for c in df.columns if str(c).strip().upper() in {"SYMBOL", "SYMBOL_NAME", "CH_SYMBOL"}), None)
+    if col is None:
+        raise ValueError(f"NSE equity universe has no symbol column: {list(df.columns)}")
+    vals = (df[col].astype(str).str.strip().str.upper()
+            .replace({"NAN": "", "NONE": ""}))
+    return sorted({v for v in vals if v and v not in {"SYMBOL", "SCRIPCODE"}})
 
 def fetch_quote(symbol: str, trade_info: bool = False) -> dict[str, Any]:
     s = root_symbol(symbol)
@@ -343,15 +599,16 @@ def fetch_fno_history(symbol: str, start: date | datetime, end: date | datetime,
 
 
 def source_status() -> dict[str, Any]:
+    """Non-blocking NSE status based on official universe archive reachability/cache.
+
+    Quote-equity is intentionally not used as a startup health gate because a
+    transient quote-endpoint block must not prevent historical/data-backed
+    predictions.
+    """
     try:
-        quote = fetch_quote("RELIANCE")
-        return {
-            "status": "PASS",
-            "source": "NSE_OFFICIAL",
-            "endpoint": EQUITY_QUOTE_ENDPOINT,
-            "symbol": root_symbol("RELIANCE"),
-            "last_price": quote.get("priceInfo", {}).get("lastPrice"),
-            "quote_available": bool(quote),
-        }
+        df = fetch_nse_equity_universe(force_refresh=False)
+        col = next((c for c in df.columns if str(c).strip().upper() in {"SYMBOL", "CH_SYMBOL"}), None)
+        count = int(df[col].astype(str).str.strip().nunique()) if col else 0
+        return {"status": "PASS" if count else "ERROR", "source": "NSE_OFFICIAL", "endpoint": EQUITY_UNIVERSE_URL, "universe_symbols": count, "quote_health_check": False}
     except Exception as exc:
-        return {"status": "ERROR", "source": "NSE_OFFICIAL", "error": f"{type(exc).__name__}: {exc}"}
+        return {"status": "ERROR", "source": "NSE_OFFICIAL", "endpoint": EQUITY_UNIVERSE_URL, "error": f"{type(exc).__name__}: {exc}", "quote_health_check": False}

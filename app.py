@@ -20,6 +20,7 @@ from data_fetcher import (
     market_is_open,
     news_for_symbol,
     stock_news_keywords,
+    source_diagnostics,
 )
 from signals import (
     add_indicators,
@@ -54,7 +55,7 @@ from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
-from nse_data_layer import source_status as nse_source_status, fetch_equity_history as nse_fetch_equity_history, fetch_intraday_1m_current as nse_fetch_intraday_1m_current, fetch_corporate_actions as nse_fetch_corporate_actions
+from nse_data_layer import fetch_equity_history as nse_fetch_equity_history, fetch_intraday_1m_current as nse_fetch_intraday_1m_current, fetch_corporate_actions as nse_fetch_corporate_actions, fetch_nse_equity_universe, nse_equity_symbols, nse_last_diagnostic
 from persistent_store import (
     drive_status as persistent_drive_status,
     persist_1m_frame,
@@ -134,6 +135,15 @@ def normalize_symbol(value: str) -> str:
     return f"{s}.NS"
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
+
+# Validate NSE symbols against the official securities universe when the
+# universe file is available. This is an eligibility/provenance check only; it
+# does not pretend that every NSE-listed security already has a validated ML model.
+if _nse_symbol_count and _nse_symbol_col:
+    _known_nse = set(_nse_universe[_nse_symbol_col].astype(str).str.strip().str.upper())
+    _unknown_nse_inputs = [s for s in symbols if s.endswith(".NS") and s[:-3] not in _known_nse]
+    if _unknown_nse_inputs:
+        st.sidebar.warning("Not found in the current NSE securities file: " + ", ".join(_unknown_nse_inputs))
 
 st.caption(f"Active watchlist: {', '.join(symbols)} · Analysis refresh {int(st.session_state.get('watchlist_revision', 0))}")
 
@@ -483,20 +493,22 @@ if "persistent_coverage" in st.session_state and not st.session_state["persisten
 # --------------------------------------------------------------- DhanHQ ---
 # --------------------------------------------------------------- NSE official data layer ---
 st.sidebar.subheader("NSE official data layer")
-@st.cache_data(ttl=120, show_spinner=False)
-def cached_nse_source_status():
-    return nse_source_status()
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_nse_universe():
+    return fetch_nse_equity_universe(force_refresh=False)
+
 try:
-    nse_state = cached_nse_source_status()
+    _nse_universe = cached_nse_universe()
+    _nse_symbol_col = next((c for c in _nse_universe.columns if str(c).strip().upper() in {"SYMBOL", "CH_SYMBOL"}), None)
+    _nse_symbol_count = int(_nse_universe[_nse_symbol_col].astype(str).str.strip().replace({"nan":""}).loc[lambda x: x.ne("")].nunique()) if _nse_symbol_col else 0
+    st.sidebar.success(f"NSE official equity universe: {_nse_symbol_count:,} symbols")
+    st.sidebar.caption("Universe source: NSE Securities available for Equity segment")
 except Exception as exc:
-    nse_state = {"status":"ERROR", "error":f"{type(exc).__name__}: {exc}"}
-if nse_state.get("status") == "PASS":
-    st.sidebar.success("NSE official source reachable")
-    if nse_state.get("last_price") is not None:
-        st.sidebar.caption(f"NSE RELIANCE LTP: ₹{float(nse_state['last_price']):,.2f}")
-else:
-    st.sidebar.warning("NSE official source unavailable right now")
-    st.sidebar.caption(str(nse_state.get("error", "Request failed or rate-limited")))
+    _nse_universe = pd.DataFrame()
+    _nse_symbol_col = None
+    _nse_symbol_count = 0
+    st.sidebar.warning(f"NSE equity-universe file unavailable: {type(exc).__name__}")
 
 nse_col1, nse_col2 = st.sidebar.columns(2)
 if nse_col1.button("Pull NSE EOD"):
@@ -768,9 +780,8 @@ if "storage" in st.session_state:
 
 with st.expander("Legacy research archive & NSE authenticity check", expanded=False):
     st.write(
-        "Public research archives are treated as third-party inputs, not as exchange-authoritative truth. "
-        "Use **Validate local data** for bar integrity, then **Reconcile to NSE** to compare daily aggregates "
-        "against NSE's official historical equity endpoint. A failed NSE request is recorded as an error, not a pass."
+        "NSE is the primary exchange-data source. Cached NSE bulk/EOD files are treated as the persisted exchange layer; "
+        "direct NSE requests are used when available. Other public providers remain explicit fallbacks and are never labelled as NSE."
     )
     st.markdown("### Source provenance")
     st.dataframe(source_provenance_table(), width="stretch", hide_index=True)
@@ -790,7 +801,7 @@ with st.expander("Legacy research archive & NSE authenticity check", expanded=Fa
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
-    "Build: 2026-09-29-HOTFIX9"
+    "Build: 2026-09-29-NSE-FIRST11"
 )
 st.sidebar.caption(
     "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
@@ -949,7 +960,11 @@ if not live_records:
     st.error("No stock analysis result was produced from the active watchlist.")
     if data_diagnostics:
         st.dataframe(pd.DataFrame(data_diagnostics), width="stretch", hide_index=True)
-    st.info("Click Analyze after entering the symbols. The dashboard now retries data through persistent/local history, NSE official data, Dhan (when configured), and Yahoo Finance.")
+    diag = source_diagnostics()
+    if diag:
+        with st.expander("NSE transport diagnostic", expanded=True):
+            st.json(diag)
+    st.info("NSE official data is the first remote source for NSE equities. Persistent/local data is used as cache; Dhan and Yahoo are fallbacks only when NSE cannot provide usable history.")
 
 for rec in live_records:
     symbol = rec["symbol"]

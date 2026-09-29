@@ -84,3 +84,19 @@ exchange-data layer for historical/EOD data.
 2. Fresh NSE official pull.
 3. Dhan live/historical only where the NSE public interface cannot supply the required live field, and the provenance is shown.
 4. Other public providers are reference-only and never silently presented as NSE.
+
+
+## NSE-first universe expansion
+
+The application discovers the current NSE equity universe from the official
+Securities available for Equity segment file. For scalable historical coverage,
+the ingestion job uses the NSE CM-UDiFF Common Bhavcopy, which contains the
+daily equity market dataset for all traded securities, instead of requesting one
+historical endpoint per symbol. Missing daily bulk files are downloaded by the
+scheduled ingestion job and then cached/mirrored; the interactive Streamlit
+search reads cached official data first and does not attempt a large backfill in
+the request path.
+
+An NSE-listed security is discoverable independently of ML coverage. A production
+BUY/HOLD/SELL signal is emitted only when a model contract has been trained and
+validated for the relevant universe.

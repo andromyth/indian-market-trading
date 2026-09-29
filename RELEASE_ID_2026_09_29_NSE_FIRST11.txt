@@ -1,0 +1,4 @@
+INDIAN MARKET TRADING — NSE-FIRST ARCHITECTURE BUILD
+Release: 2026-09-29-NSE-FIRST11
+Primary exchange-data source: NSE official
+No automatic order placement
