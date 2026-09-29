@@ -5,18 +5,11 @@ import types
 feedparser = types.SimpleNamespace(parse=lambda *args, **kwargs: types.SimpleNamespace(entries=[]))
 sys.modules.setdefault('feedparser', feedparser)
 
-class _DummyTicker:
-    def __init__(self, *args, **kwargs):
-        pass
-    def history(self, *args, **kwargs):
-        return None
-
-sys.modules.setdefault('yfinance', types.SimpleNamespace(Ticker=_DummyTicker))
-
 import numpy as np
 import pandas as pd
 
-from data_fetcher import _normalize_historical_frame
+from data_fetcher import _normalize_historical_frame, _yahoo_chart_history
+import data_fetcher
 
 
 def test_multiindex_field_ticker_shape():
@@ -54,3 +47,30 @@ def test_flat_lowercase_shape():
 
 def test_bad_shape_returns_empty_frame():
     assert _normalize_historical_frame(pd.DataFrame({'foo': [1, 2]})).empty
+
+
+class _Response:
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return {
+            "chart": {"result": [{
+                "timestamp": [1788250500, 1788250560],
+                "indicators": {
+                    "quote": [{
+                        "open": [100, 101], "high": [102, 103],
+                        "low": [99, 100], "close": [101, 102],
+                        "volume": [1000, 1100],
+                    }]
+                }
+            }]}
+        }
+
+def test_yahoo_chart_adapter(monkeypatch):
+    monkeypatch.setattr(data_fetcher.requests, "get", lambda *args, **kwargs: _Response())
+    out = _yahoo_chart_history("BHARTIARTL.NS", "5d", "1d")
+    assert not out.empty
+    assert list(out[["Open", "High", "Low", "Close", "Volume"]].columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert float(out["Close"].iloc[-1]) == 102.0
+
+print("yahoo chart adapter test: PASS")

@@ -19,7 +19,6 @@ except Exception:
 
 import feedparser
 import requests
-import yfinance as yf
 import pandas as pd
 
 try:
@@ -241,38 +240,74 @@ def _local_persistent_history(symbol: str, period: str, interval: str):
     return pd.DataFrame()
 
 
-def _yahoo_history(symbol: str, period: str, interval: str):
-    """Use yf.download first because it is more consistent across yfinance releases."""
+def _yahoo_period_bounds(period: str, interval: str):
+    """Return epoch bounds for Yahoo's public chart endpoint."""
+    end = dt.datetime.now(dt.timezone.utc)
+    days = _period_days(period)
+    # Yahoo limits 1m intraday history; keep the requested period but cap it
+    # conservatively so the endpoint responds quickly instead of retrying.
+    if str(interval).lower() in {"1m", "1min"}:
+        days = min(days, 7)
+    elif str(interval).lower() in {"2m", "5m", "15m", "30m", "60m", "90m", "1h"}:
+        days = min(days, 60)
+    start = end - dt.timedelta(days=days)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _yahoo_chart_history(symbol: str, period: str, interval: str):
+    """Fetch Yahoo history through the public chart JSON API.
+
+    This deliberately avoids yfinance's internal cookie/session machinery,
+    which can fail on hosted runtimes with repeated `Connection already opened`
+    OperationalErrors. A fresh HTTP request is used for each fetch.
+    """
+    period1, period2 = _yahoo_period_bounds(period, interval)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "period1": period1,
+        "period2": period2,
+        "interval": str(interval).lower().replace("min", "m"),
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
     try:
-        frame = yf.download(
-            tickers=symbol, period=period, interval=interval,
-            auto_adjust=False, progress=False, threads=False,
-            group_by="column", multi_level_index=False,
-        )
-        normalized = _normalize_historical_frame(frame)
-        if not normalized.empty:
-            return normalized
-    except TypeError:
-        # Older yfinance releases may not support multi_level_index.
-        try:
-            frame = yf.download(
-                tickers=symbol, period=period, interval=interval,
-                auto_adjust=False, progress=False, threads=False, group_by="column",
-            )
-            normalized = _normalize_historical_frame(frame)
-            if not normalized.empty:
-                return normalized
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        return _normalize_historical_frame(
-            yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-        )
+        response = requests.get(url, params=params, headers=headers, timeout=(5, 15))
+        response.raise_for_status()
+        payload = response.json()
+        result = (payload.get("chart") or {}).get("result") or []
+        if not result:
+            return pd.DataFrame()
+        result0 = result[0]
+        timestamps = result0.get("timestamp") or []
+        indicators = result0.get("indicators") or {}
+        quote_list = indicators.get("quote") or []
+        if not timestamps or not quote_list:
+            return pd.DataFrame()
+        quote = quote_list[0]
+        adj_list = indicators.get("adjclose") or []
+        adj = adj_list[0].get("adjclose", []) if adj_list else []
+        frame = pd.DataFrame({
+            "Open": quote.get("open", []),
+            "High": quote.get("high", []),
+            "Low": quote.get("low", []),
+            "Close": quote.get("close", []),
+            "Volume": quote.get("volume", []),
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+        if len(adj) == len(frame):
+            frame["Adj Close"] = adj
+        frame.index.name = "Datetime"
+        return _normalize_historical_frame(frame)
     except Exception:
         return pd.DataFrame()
 
+
+def _yahoo_history(symbol: str, period: str, interval: str):
+    """Yahoo reference fallback without yfinance."""
+    return _yahoo_chart_history(symbol, period, interval)
 
 def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_refresh: bool = False):
     """NSE-first historical provider with explicit local/remote fallbacks."""
@@ -343,8 +378,7 @@ def get_intraday(symbol: str, interval: str = "1m"):
                 return _normalize_historical_frame(df)
         except Exception:
             pass
-    yf_frame = yf.Ticker(symbol).history(period="5d", interval=interval, auto_adjust=False)
-    return _normalize_historical_frame(yf_frame)
+    return _yahoo_chart_history(symbol, "5d", interval)
 
 
 def get_latest_price(symbol: str) -> float | None:
@@ -367,10 +401,10 @@ def get_latest_price(symbol: str) -> float | None:
                 return float(value)
         except Exception:
             pass
-    df = yf.Ticker(symbol).history(period="1d", interval="1m", auto_adjust=False)
-    if df.empty:
+    df = _yahoo_chart_history(symbol, "1d", "1m")
+    if df.empty or "Close" not in df.columns:
         return None
-    value = df["Close"].dropna()
+    value = pd.to_numeric(df["Close"], errors="coerce").dropna()
     return float(value.iloc[-1]) if not value.empty else None
 
 

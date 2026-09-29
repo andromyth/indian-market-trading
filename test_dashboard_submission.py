@@ -7,6 +7,9 @@ assert 'st.session_state["watchlist_revision"]' in app
 assert 'load_history(symbol, period, interval, revision)' in app
 assert 'data_diagnostics' in app
 assert 'def _yahoo_history' in fetcher
-assert 'multi_level_index=False' in fetcher
+assert 'def _yahoo_chart_history' in fetcher
+assert 'requests.get(url, params=params' in fetcher
+assert 'import yfinance' not in fetcher
+assert 'yf.' not in fetcher
 assert '_local_persistent_history' in fetcher
 print("dashboard submission/fallback tests: PASS")

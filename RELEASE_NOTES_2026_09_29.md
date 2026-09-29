@@ -13,3 +13,9 @@ Fixes the watchlist interaction in Streamlit.
 - History loading now falls back local/persistent -> NSE -> Dhan -> yfinance.download -> Ticker.history.
 - Empty/insufficient data produces an explicit diagnostic instead of a blank dashboard.
 - Build marker: 2026-09-29-HOTFIX5.
+
+HOTFIX7
+- Removed yfinance from runtime market-data path.
+- Added direct Yahoo public Chart API adapter with bounded timeout.
+- Removed repeated yfinance `Connection already opened` failure mode.
+- Updated get_historical/get_intraday/get_latest_price fallbacks.

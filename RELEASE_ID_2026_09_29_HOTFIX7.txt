@@ -1,0 +1,1 @@
+HOTFIX7 — replace yfinance live history with direct Yahoo Chart HTTP adapter; eliminate Connection already opened regression.
