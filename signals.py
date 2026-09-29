@@ -59,75 +59,6 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-_OHLCV_ALIASES = {
-    "open": "Open", "opening": "Open",
-    "high": "High", "low": "Low",
-    "close": "Close", "adj close": "Close", "adj_close": "Close", "ltp": "Close",
-    "volume": "Volume", "vol": "Volume",
-}
-
-
-def normalize_ohlcv_frame(df: pd.DataFrame, require_volume: bool = False) -> pd.DataFrame:
-    """Return a flat, numeric OHLC(V) frame from Yahoo/NSE-style inputs.
-
-    Yahoo Finance can return MultiIndex columns (especially for single-symbol
-    requests), while NSE/Dhan adapters may return lower-case names. Indicators
-    should not crash merely because the provider used a different column shape.
-    Missing Volume is preserved as NaN unless explicitly required.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = df.copy()
-    if isinstance(x.columns, pd.MultiIndex):
-        # Prefer the level containing canonical OHLCV field names. For a
-        # one-symbol frame this removes the ticker level without data loss.
-        fields = {"open", "high", "low", "close", "adj close", "volume", "ltp", "vol"}
-        chosen = None
-        for level in range(x.columns.nlevels):
-            vals = {str(v).strip().lower() for v in x.columns.get_level_values(level)}
-            if vals & fields:
-                chosen = level
-                break
-        if chosen is not None:
-            x.columns = [str(v).strip() for v in x.columns.get_level_values(chosen)]
-        else:
-            x.columns = ["_".join(str(v) for v in tup if str(v) != "") for tup in x.columns]
-    else:
-        x.columns = [str(c).strip() for c in x.columns]
-
-    ren = {}
-    for c in x.columns:
-        key = str(c).strip().lower()
-        if key in _OHLCV_ALIASES:
-            ren[c] = _OHLCV_ALIASES[key]
-    x = x.rename(columns=ren)
-
-    # If both Close and Adj Close collapsed to Close, duplicate names can be
-    # produced. Keep the first usable numeric series for each canonical field.
-    for field in ["Open", "High", "Low", "Close", "Volume"]:
-        if field in x.columns:
-            col = x[field]
-            if isinstance(col, pd.DataFrame):
-                col = col.iloc[:, 0]
-            x[field] = pd.to_numeric(col, errors="coerce")
-
-    missing = [c for c in ["Open", "High", "Low", "Close"] if c not in x.columns]
-    if missing:
-        raise ValueError(f"History is missing required OHLC columns: {missing}; available columns: {list(x.columns)}")
-    if "Volume" not in x.columns:
-        x["Volume"] = pd.Series(float("nan"), index=x.index)
-    if require_volume and x["Volume"].notna().sum() == 0:
-        raise ValueError(f"History is missing usable Volume data; available columns: {list(x.columns)}")
-
-    try:
-        idx = pd.to_datetime(x.index, errors="coerce")
-        x.index = idx
-    except Exception:
-        pass
-    x = x[~pd.isna(x.index)]
-    return x.sort_index()
-
-
 def add_indicators(
     df: pd.DataFrame,
     fast: int = 20,
@@ -136,7 +67,7 @@ def add_indicators(
     atr_period: int = 14,
 ) -> pd.DataFrame:
     """Add causal indicators. Current-row indicators use current/past data only."""
-    df = normalize_ohlcv_frame(df)
+    df = df.copy()
     if df.empty:
         return df
 

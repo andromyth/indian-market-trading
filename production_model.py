@@ -91,34 +91,6 @@ def model_target_contract() -> dict[str, Any]:
         "classes": [int(x) for x in classes],
     }
 
-def _normalize_price_frame(df: pd.DataFrame | None) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = df.copy()
-    if isinstance(x.columns, pd.MultiIndex):
-        fields = {"open", "high", "low", "close", "adj close", "volume", "ltp", "vol"}
-        chosen = None
-        for level in range(x.columns.nlevels):
-            vals = {str(v).strip().lower() for v in x.columns.get_level_values(level)}
-            if vals & fields:
-                chosen = level; break
-        if chosen is not None:
-            x.columns = [str(v).strip() for v in x.columns.get_level_values(chosen)]
-    else:
-        x.columns = [str(c).strip() for c in x.columns]
-    aliases={"open":"Open","high":"High","low":"Low","close":"Close","adj close":"Close","adj_close":"Close","ltp":"Close","volume":"Volume","vol":"Volume"}
-    x=x.rename(columns={c:aliases.get(str(c).strip().lower(),c) for c in x.columns})
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in x.columns:
-            v=x[c]
-            if isinstance(v,pd.DataFrame): v=v.iloc[:,0]
-            x[c]=pd.to_numeric(v,errors="coerce")
-    if "Volume" not in x.columns: x["Volume"]=np.nan
-    if any(c not in x.columns for c in ["Open","High","Low","Close"]):
-        return pd.DataFrame()
-    return x.sort_index()
-
-
 def _safe_float(v):
     try:
         x = float(v)
@@ -183,9 +155,6 @@ def _price_features(df: pd.DataFrame) -> dict[str, float]:
 def _market_features(market_df: pd.DataFrame | None) -> dict[str, float]:
     if market_df is None or market_df.empty:
         return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
-    market_df = _normalize_price_frame(market_df)
-    if market_df.empty or "Close" not in market_df.columns:
-        return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
     c = pd.to_numeric(market_df["Close"], errors="coerce")
     return {
         "nifty_close": _safe_float(c.iloc[-1]), "market_ret_1": _returns(c, 1),
@@ -216,9 +185,7 @@ def build_feature_rows(items: list[dict[str, Any]]) -> pd.DataFrame:
     """
     rows: list[dict[str, Any]] = []
     for item in items:
-        price_df = _normalize_price_frame(item["price_df"])
-        if price_df.empty:
-            continue
+        price_df = item["price_df"]
         pf = _price_features(price_df)
         mf = _market_features(item.get("market_df"))
         row: dict[str, Any] = {**pf, **mf}

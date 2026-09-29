@@ -45,10 +45,6 @@ from free_data import (
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
-from autonomous_engine import delivery_prediction
-from prediction_ledger import load_records, save_validation_results
-from prediction_validation import validate_ledger, rolling_7day_scorecard
-from model_health import assess_delivery_health
 from historical_audit import run_batch_intraday_audit
 from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
@@ -66,15 +62,13 @@ from persistent_store import (
 st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
 st.caption(
-    "Multi-factor decision-support dashboard for NSE/BSE cash equity with F&O context. "
-    "Signals are not guarantees and no orders are placed. Delivery uses the certified next-session model; Intraday uses the certified 30-minute production model."
+    "Rule-based decision support for NSE/BSE cash equity with F&O context. "
+    "Signals are not guarantees and no orders are placed. In cash-equity mode, SELL means exit/avoid a long position; the backtest is long-only."
 )
 
 st.info(
-    "Production ML is connected for supported Delivery and Intraday workflows. "
-    "Delivery uses the certified next-session classifier/regressor; Intraday uses the certified 30-minute production model. "
-    "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
-    "No orders are placed."
+    "Production ML model: CONNECTED for Intraday mode. It predicts the next 30-minute direction using the certified 137-feature production contract. "
+    "Delivery mode continues to use the existing rule-based engine because the certified model target is 30-minute direction."
 )
 with st.expander("Step 52 PIT walk-forward audit", expanded=False):
     st.write(
@@ -89,33 +83,12 @@ with st.expander("Step 52 PIT walk-forward audit", expanded=False):
 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
-default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS"
+default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, HDFCBANK.NS, TCS.NS, INFY.NS"
 st.sidebar.header("Watchlist")
-
-# Keep text entry separate from the active watchlist so typing does not trigger
-# a full analysis on every keystroke. The explicit Analyze button is the
-# authoritative submit action; it also fixes the previous Ctrl+Enter confusion
-# where the text area was not inside a Streamlit form.
-if "active_watchlist" not in st.session_state:
-    st.session_state["active_watchlist"] = default_watchlist
-
-with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
-    watchlist_input = st.text_area(
-        "NSE/BSE symbols (suffix optional)",
-        st.session_state.get("active_watchlist", default_watchlist),
-        key="watchlist_input",
-        height=90,
-        help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
-    )
-    analyze_watchlist = st.form_submit_button("Analyze", type="primary", use_container_width=True)
-
-if analyze_watchlist:
-    cleaned = ", ".join([part.strip() for part in watchlist_input.split(",") if part.strip()])
-    if cleaned:
-        st.session_state["active_watchlist"] = cleaned
-
-raw_symbols = st.session_state.get("active_watchlist", default_watchlist)
-
+raw_symbols = st.sidebar.text_area(
+    "NSE/BSE symbols (suffix optional)", default_watchlist,
+    help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
+)
 def normalize_symbol(value: str) -> str:
     """Normalize user input for Yahoo Finance. Bare Indian symbols default to NSE."""
     s = value.strip().upper()
@@ -395,7 +368,7 @@ if analysis_view == "Historical Replay":
             st.dataframe(pd.DataFrame(st.session_state["replay_ledger"]), use_container_width=True, hide_index=True)
     st.stop()
 
-style = st.sidebar.radio("Mode", ["Delivery", "Intraday"], index=0)
+style = st.sidebar.radio("Mode", ["Delivery", "Intraday"])
 if style == "Delivery":
     interval, period, fast, slow = "1d", "1y", 20, 50
     stop_atr, target_atr, max_hold = 1.8, 3.0, 20
@@ -779,9 +752,6 @@ with st.expander("Legacy research archive & NSE authenticity check", expanded=Fa
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
-    "Build: 2026-09-29-HOTFIX3"
-)
-st.sidebar.caption(
     "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
 )
 
@@ -791,19 +761,11 @@ def load_news():
 
 @st.cache_data(ttl=60)
 def load_history(symbol, period, interval):
-    try:
-        return get_historical(symbol, period=period, interval=interval)
-    except Exception as exc:
-        # A provider/data-shape failure for one symbol must not crash the entire dashboard.
-        st.warning(f"{symbol}: historical data could not be loaded ({type(exc).__name__}: {exc})")
-        return pd.DataFrame()
+    return get_historical(symbol, period=period, interval=interval)
 
 @st.cache_data(ttl=60)
 def load_benchmark(symbol, period, interval):
-    try:
-        return get_historical(symbol, period=period, interval=interval)
-    except Exception:
-        return pd.DataFrame()
+    return get_historical(symbol, period=period, interval=interval)
 
 @st.cache_data(ttl=90)
 def load_option_chain(nse_symbol, is_index):
@@ -814,21 +776,6 @@ def load_announcements(symbol):
     return get_corporate_announcements(symbol)
 
 news_items = tag_news_items(load_news())
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_delivery_validation():
-    records = [r for r in load_records() if str(r.get("mode", "")).lower() == "delivery"][-100:]
-    if not records:
-        return pd.DataFrame(), {"status": "NO_DATA"}, {"status": "NO_DATA", "retraining_candidate": False}
-    histories = {}
-    def provider(symbol):
-        if symbol not in histories:
-            histories[symbol] = load_history(symbol, "2y", "1d")
-        return histories[symbol]
-    validated = validate_ledger(records, provider)
-    if not validated.empty:
-        save_validation_results(validated.to_dict("records"), sync_drive=True)
-    return validated, rolling_7day_scorecard(validated), assess_delivery_health(validated)
 
 # ---------------------------------------------------------------- Production ML
 # Fetch all watchlist inputs first so the model can compute cross-sectional
@@ -841,16 +788,8 @@ for symbol in symbols:
     company_root = symbol.replace(".NS", "").replace(".BO", "")
     benchmark_symbol = benchmark_for_symbol(symbol)
     market_df = load_benchmark(benchmark_symbol, period, interval)
-    try:
-        df = add_indicators(raw_df, fast=fast, slow=slow)
-    except ValueError as exc:
-        # A provider returning a malformed/partial history must not crash the whole dashboard.
-        st.warning(f"{symbol}: market history could not be normalized for technical indicators ({exc}).")
-        df = pd.DataFrame()
-    try:
-        mkt_df = add_indicators(market_df, fast=fast, slow=slow) if not market_df.empty else market_df
-    except ValueError:
-        mkt_df = pd.DataFrame()
+    df = add_indicators(raw_df, fast=fast, slow=slow)
+    mkt_df = add_indicators(market_df, fast=fast, slow=slow) if not market_df.empty else market_df
     aliases = stock_news_keywords(symbol)
     matched_news = news_for_symbol(aliases, news_items)
     news_stat = news_metrics(matched_news)
@@ -887,7 +826,6 @@ for symbol in symbols:
     })
 
 production_results = {}
-delivery_results = {}
 if style == "Intraday" and live_records:
     try:
         feature_items = [
@@ -905,29 +843,6 @@ if style == "Intraday" and live_records:
     except Exception as exc:
         st.error(f"Production ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
         production_results = {}
-
-if style == "Delivery" and live_records:
-    try:
-        for r in live_records:
-            company_root = r["symbol"].replace(".NS", "").replace(".BO", "")
-            item = {
-                "symbol": company_root,
-                "price_df": r["raw_df"],
-                "market_df": r["market_df"],
-                "news": {"available": 1.0 if r.get("matched_news") else 0.0},
-                "event": {
-                    "available": 1.0 if r.get("announcements") else 0.0,
-                    "high_impact": 1.0 if r.get("announcements") else 0.0,
-                },
-                "fno": {**(r.get("fo") or {}), "available": 1.0 if r.get("fo") else 0.0},
-                "decision_timestamp": str(r["raw_df"].index[-1]),
-            }
-            result = delivery_prediction(item, sync_drive=True)
-            delivery_results[r["symbol"]] = result
-        cached_delivery_validation.clear()
-    except Exception as exc:
-        st.error(f"Delivery ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
-        delivery_results = {}
 
 for rec in live_records:
     symbol = rec["symbol"]
@@ -956,12 +871,10 @@ for rec in live_records:
     previous_close = float(df["Close"].iloc[-2])
     pct_change = (latest_close - previous_close) / previous_close * 100 if previous_close else 0.0
 
-    primary = delivery_results.get(symbol) if style == "Delivery" else production_results.get(symbol)
-    primary_signal = primary.get("signal") if primary else label
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Primary Signal", primary_signal)
+    c1.metric("Rule Signal", label, f"score {combined:+.2f}")
     c2.metric("Last", f"₹{latest_close:,.2f}", f"bar {pct_change:+.2f}%")
-    c3.metric("Technical context", f"{t_score:+.2f}")
+    c3.metric("Technical", f"{t_score:+.2f}")
     c4.metric("News perception", news_perception_label, f"{news_stat['count']} RSS matches · {news_freshness}")
     c5.metric("Market regime", f"{m_score:+.2f}", benchmark_symbol.replace("^", ""))
 
@@ -979,43 +892,9 @@ for rec in live_records:
                 "The probability is the model output, not a guarantee of profit. Missing optional live groups are explicitly represented and handled by the trained imputer."
             )
         else:
-            st.warning("Production ML prediction unavailable for this symbol; the rule-based context remains available.")
+            st.warning("Production ML prediction unavailable for this symbol; the rule-based signal remains available.")
     else:
-        dlv = delivery_results.get(symbol)
-        st.markdown("### Production ML — next-session delivery signal")
-        if dlv and dlv.get("prediction_status") == "PASS":
-            d1, d2, d3, d4, d5 = st.columns(5)
-            d1.metric("Delivery Signal", dlv["signal"])
-            d2.metric("P(up) next session", f"{dlv['probability_up_next_session']:.1%}")
-            d3.metric("Expected move", f"{dlv['predicted_return_next_session']:+.2%}")
-            d4.metric("Confidence", dlv["confidence"])
-            d5.metric("Model inputs", f"{dlv['feature_count']}")
-            st.caption("Next-session delivery model · 53-feature contract · prediction stored automatically for actual-vs-predicted validation.")
-        elif dlv and dlv.get("prediction_status") == "BLOCKED":
-            st.error(f"Delivery prediction blocked: {dlv.get("reason", "unknown")}")
-            st.caption(f"Validated delivery universe: {', '.join(dlv.get('trained_symbols', []))}")
-        else:
-            st.warning("Delivery production prediction unavailable for this symbol.")
-
-    if style == "Delivery":
-        with st.expander("Continuous 7-day prediction validation", expanded=True):
-            try:
-                vdf, vscore, vhealth = cached_delivery_validation()
-                st.write({
-                    "rolling_7_completed_predictions": vscore.get("completed_predictions", 0),
-                    "rolling_7_directional_accuracy": vscore.get("directional_accuracy_7_predictions"),
-                    "mean_absolute_price_error_pct": vscore.get("mean_absolute_percentage_price_error"),
-                    "model_health": vhealth.get("status"),
-                    "retraining_candidate": vhealth.get("retraining_candidate", False),
-                })
-                root = symbol.replace(".NS", "").replace(".BO", "").upper()
-                if not vdf.empty and "symbol" in vdf.columns:
-                    sub = vdf[vdf["symbol"].astype(str).str.upper() == root].sort_values("decision_timestamp", ascending=False).head(7)
-                    if not sub.empty:
-                        st.dataframe(sub, use_container_width=True, hide_index=True)
-                st.caption("D+1 is the target-aligned next-session validation. D+2 through D+7 are preserved as follow-through observations, not counted as extra next-session targets.")
-            except Exception as exc:
-                st.warning(f"Continuous validation unavailable: {type(exc).__name__}: {exc}")
+        st.caption("Production ML is an intraday 30-minute model; Delivery mode remains rule-based.")
 
     if event_risk > 0:
         st.warning(f"Trigger/event risk is elevated ({event_risk:.2f}). The engine reduces conviction when material events are present; it does not assume those events are bullish or bearish.")

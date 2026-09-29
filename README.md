@@ -1,10 +1,8 @@
 # Indian Stock Signal Dashboard — upgraded
 
-A Streamlit dashboard for NSE/BSE cash-equity decision support with current
-stock news, corporate-event triggers and F&O context. It generates ML-backed
-Delivery and Intraday signals for the currently validated universe, records every
-production prediction, continuously checks completed Delivery predictions against
-actual next-session prices, and **never places orders**.
+A local Streamlit dashboard for NSE/BSE cash-equity decision support with
+current stock news, corporate-event triggers and an F&O options-chain snapshot.
+It generates signals for manual review and **never places orders**.
 
 ## What changed in this version
 
@@ -26,24 +24,7 @@ Delivery and intraday use different ATR-based risk settings:
 
 All values can be changed from the sidebar.
 
-### 3. Production ML delivery + intraday routing
-
-The dashboard now routes Delivery mode to the existing certified `next_session`
-classifier/regressor and Intraday mode to the certified `target_30m` production
-model. A signal is displayed directly after a stock is searched. Unknown symbols
-are blocked instead of receiving an unvalidated score.
-
-### 4. Continuous seven-prediction validation
-
-Every production Delivery prediction is written to an idempotent prediction ledger.
-When the next trading-session actual becomes available, the system compares the
-predicted return/price with the real close, records the validation, and preserves
-D+2 through D+7 follow-through observations as monitoring. A rolling seven-
-completed-prediction scorecard is shown in the dashboard. A miss does not cause
-immediate model replacement; the model-health monitor can raise a retraining
-candidate flag after enough completed observations.
-
-### 5. More evidence, not more certainty
+### 3. More evidence, not more certainty
 The live score now combines:
 
 * price trend, MACD, RSI, volume, breakout and volatility information;
@@ -54,12 +35,12 @@ The live score now combines:
 F&O PCR, Max Pain and OI reads remain contextual because the available live
 snapshot alone is not enough for an honest historical predictive test.
 
-### 6. Better news matching
+### 4. Better news matching
 Common Indian-company aliases are supported. For example, `BHARTIARTL.NS`
 will match `Bharti Airtel`, `Airtel`, and related naming variants rather than
 only looking for the ticker string.
 
-### 7. More honest validation
+### 5. More honest validation
 The dashboard reports:
 
 * net strategy return after configurable cost/slippage assumptions;
@@ -98,10 +79,9 @@ Open `http://localhost:8501`.
 
 ## Important interpretation note
 
-`BUY`, `SELL`, and `HOLD` are model classifications for decision support, not
-guarantees of return. Delivery's trained universe is currently limited to the
-validated symbols in the bundled delivery model. Unknown or unvalidated symbols
-are blocked rather than silently generalized. No order execution is implemented.
+`BUY`, `SELL`, and `HOLD` are classifications produced by the rule engine,
+not guarantees or probabilities. The system is intended to help you inspect
+converging evidence and risk before making a manual decision.
 
 ## Next upgrade path
 
