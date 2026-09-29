@@ -91,10 +91,31 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS"
 st.sidebar.header("Watchlist")
-raw_symbols = st.sidebar.text_area(
-    "NSE/BSE symbols (suffix optional)", default_watchlist,
-    help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
-)
+
+# Keep text entry separate from the active watchlist so typing does not trigger
+# a full analysis on every keystroke. The explicit Analyze button is the
+# authoritative submit action; it also fixes the previous Ctrl+Enter confusion
+# where the text area was not inside a Streamlit form.
+if "active_watchlist" not in st.session_state:
+    st.session_state["active_watchlist"] = default_watchlist
+
+with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
+    watchlist_input = st.text_area(
+        "NSE/BSE symbols (suffix optional)",
+        st.session_state.get("active_watchlist", default_watchlist),
+        key="watchlist_input",
+        height=90,
+        help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
+    )
+    analyze_watchlist = st.form_submit_button("Analyze", type="primary", use_container_width=True)
+
+if analyze_watchlist:
+    cleaned = ", ".join([part.strip() for part in watchlist_input.split(",") if part.strip()])
+    if cleaned:
+        st.session_state["active_watchlist"] = cleaned
+
+raw_symbols = st.session_state.get("active_watchlist", default_watchlist)
+
 def normalize_symbol(value: str) -> str:
     """Normalize user input for Yahoo Finance. Bare Indian symbols default to NSE."""
     s = value.strip().upper()
