@@ -38,3 +38,27 @@ Intraday uses the certified `target_30m` 137-feature production model. Delivery 
 The replay ledger can be exported to CSV from the dashboard for later prediction-vs-actual analysis.
 
 NSE official primary layer + Colab model builder added.
+
+## Continuous validation + Delivery ML release (2026-09-29)
+
+The current application release adds the existing next-session Delivery
+classifier/regressor without retraining it, plus a persistent prediction ledger,
+a validation ledger, a rolling seven-completed-prediction scorecard, and a model-
+health flag. Delivery predictions are recorded automatically when a supported
+stock is searched in Delivery mode.
+
+The current validated Delivery universe remains the three symbols declared in
+`production_delivery_model/PREDICTION_ENGINE_MANIFEST_V2_2026.json`. Unknown
+symbols are blocked rather than silently generalized.
+
+New runtime files:
+- `delivery_model.py`
+- `autonomous_engine.py`
+- `prediction_ledger.py`
+- `prediction_validation.py`
+- `model_health.py`
+- `production_delivery_model/` (small delivery model artifacts)
+
+Historical datasets remain outside GitHub and should remain in Google Drive.
+Run `python deployment_smoke_test.py` before deployment. No order-placement code
+is added by this release.
