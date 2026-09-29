@@ -81,7 +81,7 @@ with st.expander("Step 52 PIT walk-forward audit", expanded=False):
         f"Frozen pilot: {', '.join(STEP52_SYMBOLS)} · {STEP52_JOINED_ROWS:,} joined rows · "
         f"{STEP52_PREDICTORS} predictors · latest holdout date {STEP52_LAST_TEST_DATE}."
     )
-    st.dataframe(pd.DataFrame(STEP52_AUDIT), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(STEP52_AUDIT), width="stretch", hide_index=True)
     st.caption(
         "The Step 52 model has not been connected to live signals. Its out-of-sample results do not establish a tradable edge. "
         "No order execution is available in this dashboard."
@@ -110,7 +110,7 @@ with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
         height=90,
         help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
     )
-    analyze_watchlist = st.form_submit_button("Analyze", type="primary", use_container_width=True)
+    analyze_watchlist = st.form_submit_button("Analyze", type="primary", width="stretch")
 
 if analyze_watchlist:
     cleaned = ", ".join([part.strip() for part in watchlist_input.split(",") if part.strip()])
@@ -188,13 +188,13 @@ if analysis_view == "Historical Replay":
                         st.write({k:v for k,v in audit_summary.items() if k not in {"symbols_requested","symbols_scored"}})
                     if not audit_df.empty:
                         st.markdown("### Prediction vs actual ledger")
-                        st.dataframe(audit_df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+                        st.dataframe(audit_df.sort_values("timestamp", ascending=False), width="stretch", hide_index=True)
                         csv = audit_df.to_csv(index=False).encode("utf-8")
                         st.download_button("Download batch audit CSV", csv, file_name="historical_prediction_audit.csv", mime="text/csv")
                         mistakes = audit_df[(audit_df["direction_match"] == False) & (audit_df["audit_eligible"])]
                         if not mistakes.empty:
                             with st.expander("Eligible wrong-direction predictions", expanded=False):
-                                st.dataframe(mistakes.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+                                st.dataframe(mistakes.sort_values("timestamp", ascending=False), width="stretch", hide_index=True)
                 except Exception as exc:
                     st.error(f"Batch historical audit failed: {type(exc).__name__}: {exc}")
         st.stop()
@@ -284,7 +284,7 @@ if analysis_view == "Historical Replay":
                     st.markdown("#### Information available at the replay timestamp")
                     st.dataframe(pd.DataFrame([{
                         "group": k, "available": v
-                    } for k,v in readiness_groups.items()]), use_container_width=True, hide_index=True)
+                    } for k,v in readiness_groups.items()]), width="stretch", hide_index=True)
                     if hist_news:
                         st.markdown("#### Historical news found")
                         for n in hist_news[:15]:
@@ -372,7 +372,7 @@ if analysis_view == "Historical Replay":
                         st.markdown("#### Point-in-time data availability")
                         st.dataframe(pd.DataFrame([{
                             "group": k, "available": v
-                        } for k,v in readiness.items()]), use_container_width=True, hide_index=True)
+                        } for k,v in readiness.items()]), width="stretch", hide_index=True)
                         if hist_news:
                             with st.expander("Historical news used by replay", expanded=False):
                                 for n in hist_news[:15]: st.write(f"**{n.get('title','')}** — {n.get('published','')} — {n.get('source','')}")
@@ -399,12 +399,15 @@ if analysis_view == "Historical Replay":
 
     if "replay_ledger" in st.session_state and st.session_state["replay_ledger"]:
         with st.expander("Replay ledger from this session", expanded=False):
-            st.dataframe(pd.DataFrame(st.session_state["replay_ledger"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(st.session_state["replay_ledger"]), width="stretch", hide_index=True)
     st.stop()
 
 style = st.sidebar.radio("Mode", ["Delivery", "Intraday"], index=0)
 if style == "Delivery":
-    interval, period, fast, slow = "1d", "1y", 20, 50
+    # The next-session model needs roughly 50+ trading bars. 120 calendar
+    # days gives sufficient warm-up without repeatedly downloading a full year
+    # during an interactive stock search.
+    interval, period, fast, slow = "1d", "120d", 20, 50
     stop_atr, target_atr, max_hold = 1.8, 3.0, 20
 else:
     interval, period, fast, slow = "1m", "5d", 9, 21
@@ -469,13 +472,13 @@ if st.sidebar.button("Scan permanent 1-minute archive"):
 
 if "persistent_capture_results" in st.session_state:
     with st.expander("Latest 1-minute capture", expanded=False):
-        st.dataframe(st.session_state["persistent_capture_results"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["persistent_capture_results"], width="stretch", hide_index=True)
 if "persistent_sync_result" in st.session_state:
     with st.expander("Google Drive sync result", expanded=False):
         st.write(st.session_state["persistent_sync_result"])
 if "persistent_coverage" in st.session_state and not st.session_state["persistent_coverage"].empty:
     with st.expander("Permanent 1-minute archive coverage", expanded=False):
-        st.dataframe(st.session_state["persistent_coverage"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["persistent_coverage"], width="stretch", hide_index=True)
 
 # --------------------------------------------------------------- DhanHQ ---
 # --------------------------------------------------------------- NSE official data layer ---
@@ -524,10 +527,10 @@ if nse_col2.button("Capture NSE 1-minute"):
 
 if "nse_pull_result" in st.session_state:
     with st.expander("NSE EOD pull", expanded=False):
-        st.dataframe(st.session_state["nse_pull_result"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["nse_pull_result"], width="stretch", hide_index=True)
 if "nse_1m_result" in st.session_state:
     with st.expander("NSE 1-minute capture", expanded=False):
-        st.dataframe(st.session_state["nse_1m_result"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["nse_1m_result"], width="stretch", hide_index=True)
 
 st.sidebar.caption("NSE is primary for official exchange data. The public chart path is LTP-based; missing minute volume is never fabricated. Historical data and normalized archives are mirrored to Google Drive when configured.")
 
@@ -582,7 +585,7 @@ if st.sidebar.button("Download selected history from Dhan"):
 
 if "dhan_download_results" in st.session_state:
     with st.expander("Dhan download results", expanded=False):
-        st.dataframe(st.session_state["dhan_download_results"], use_container_width=True)
+        st.dataframe(st.session_state["dhan_download_results"], width="stretch")
 
 # ------------------------------------------------------------------ audit ---
 st.sidebar.subheader("1-Year Prediction Audit")
@@ -652,7 +655,7 @@ if "audit_result" in st.session_state:
             horizon_cols += [f"fwd_{h}d_pct", f"correct_{h}d"]
         display_cols = ["symbol", "decision_date", "signal", "combined_score", "technical_score", "market_score"] + horizon_cols
         with st.expander("All individual prediction dates", expanded=False):
-            st.dataframe(records_all[display_cols], use_container_width=True)
+            st.dataframe(records_all[display_cols], width="stretch")
             st.download_button(
                 "Download prediction replay CSV",
                 records_all.to_csv(index=False).encode("utf-8"),
@@ -665,7 +668,7 @@ if "audit_result" in st.session_state:
         stock_display = ["symbol", "size_bucket", "decision_bars", "buy_signals", "sell_signals"]
         stock_display += [f"hit_rate_{h}d_pct" for h in [1, 3, 5, 10, 20]]
         stock_display += [f"avg_signed_edge_{h}d_pct" for h in [1, 3, 5, 10, 20]]
-        st.dataframe(stocks_all[stock_display], use_container_width=True)
+        st.dataframe(stocks_all[stock_display], width="stretch")
 
         bucket = stocks_all.groupby("size_bucket", dropna=False).agg(
             stocks=("symbol", "count"),
@@ -674,11 +677,11 @@ if "audit_result" in st.session_state:
             edge_5d=("avg_signed_edge_5d_pct", "mean"),
         ).reset_index()
         st.markdown("### Results by universe bucket")
-        st.dataframe(bucket.round(3), use_container_width=True)
+        st.dataframe(bucket.round(3), width="stretch")
 
     if sens_all is not None and not sens_all.empty:
         st.markdown("### Signal-threshold sensitivity")
-        st.dataframe(sens_all.round(3), use_container_width=True)
+        st.dataframe(sens_all.round(3), width="stretch")
         st.line_chart(sens_all.set_index("threshold")[["hit_rate_pct", "avg_signed_edge_pct"]])
 
     st.info(
@@ -770,24 +773,24 @@ with st.expander("Legacy research archive & NSE authenticity check", expanded=Fa
         "against NSE's official historical equity endpoint. A failed NSE request is recorded as an error, not a pass."
     )
     st.markdown("### Source provenance")
-    st.dataframe(source_provenance_table(), use_container_width=True, hide_index=True)
+    st.dataframe(source_provenance_table(), width="stretch", hide_index=True)
     if "source_check" in st.session_state:
         st.markdown("### Online source availability")
-        st.dataframe(st.session_state["source_check"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["source_check"], width="stretch", hide_index=True)
         st.download_button("Export source-availability check", st.session_state["source_check"].to_csv(index=False).encode("utf-8"), file_name="source_availability_check.csv", mime="text/csv")
     if "coverage" in st.session_state and not st.session_state["coverage"].empty:
         st.markdown("### Local coverage")
-        st.dataframe(st.session_state["coverage"], use_container_width=True)
+        st.dataframe(st.session_state["coverage"], width="stretch")
         st.download_button("Export local-data manifest", pd.DataFrame(st.session_state["coverage"]).to_csv(index=False).encode("utf-8"), file_name="local_historical_coverage.csv", mime="text/csv")
     else:
         st.info("Use 'Scan local archive' in the sidebar after your first download.")
     if "quality" in st.session_state and not st.session_state["quality"].empty:
         st.markdown("### Data-quality / NSE reconciliation")
-        st.dataframe(st.session_state["quality"], use_container_width=True)
+        st.dataframe(st.session_state["quality"], width="stretch")
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
-    "Build: 2026-09-29-HOTFIX5"
+    "Build: 2026-09-29-HOTFIX9"
 )
 st.sidebar.caption(
     "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
@@ -797,7 +800,7 @@ st.sidebar.caption(
 def load_news():
     return get_news()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120, show_spinner=False)
 def load_history(symbol, period, interval, revision=0):
     try:
         return get_historical(symbol, period=period, interval=interval)
@@ -805,7 +808,7 @@ def load_history(symbol, period, interval, revision=0):
         st.warning(f"{symbol}: historical data could not be loaded ({type(exc).__name__}: {exc})")
         return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120, show_spinner=False)
 def load_benchmark(symbol, period, interval, revision=0):
     try:
         return get_historical(symbol, period=period, interval=interval)
@@ -830,7 +833,7 @@ def cached_delivery_validation():
     histories = {}
     def provider(symbol):
         if symbol not in histories:
-            histories[symbol] = load_history(symbol, "2y", "1d")
+            histories[symbol] = load_history(symbol, "45d", "1d")
         return histories[symbol]
     validated = validate_ledger(records, provider)
     if not validated.empty:
@@ -945,7 +948,7 @@ if style == "Delivery" and live_records:
 if not live_records:
     st.error("No stock analysis result was produced from the active watchlist.")
     if data_diagnostics:
-        st.dataframe(pd.DataFrame(data_diagnostics), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(data_diagnostics), width="stretch", hide_index=True)
     st.info("Click Analyze after entering the symbols. The dashboard now retries data through persistent/local history, NSE official data, Dhan (when configured), and Yahoo Finance.")
 
 for rec in live_records:
@@ -1031,7 +1034,7 @@ for rec in live_records:
                 if not vdf.empty and "symbol" in vdf.columns:
                     sub = vdf[vdf["symbol"].astype(str).str.upper() == root].sort_values("decision_timestamp", ascending=False).head(7)
                     if not sub.empty:
-                        st.dataframe(sub, use_container_width=True, hide_index=True)
+                        st.dataframe(sub, width="stretch", hide_index=True)
                 st.caption("D+1 is the target-aligned next-session validation. D+2 through D+7 are preserved as follow-through observations, not counted as extra next-session targets.")
             except Exception as exc:
                 st.warning(f"Continuous validation unavailable: {type(exc).__name__}: {exc}")
@@ -1083,7 +1086,7 @@ for rec in live_records:
             st.write("Matched-duration random benchmark:", baseline)
             st.write("Last 30% holdout period:", holdout["summary"])
             st.caption("Validation uses price/market data only. Reliable historical news archives are not included in this free build, so the live news component is not falsely presented as historically validated.")
-            st.dataframe(trades_df, use_container_width=True)
+            st.dataframe(trades_df, width="stretch")
 
     with st.expander("F&O context"):
         if not fo:
@@ -1096,5 +1099,5 @@ for rec in live_records:
             st.caption("F&O figures are contextual inputs; PCR/Max Pain are not treated as validated directional predictors.")
             near_atm = fo.get("near_atm_chain")
             if near_atm is not None and not near_atm.empty:
-                st.dataframe(near_atm, use_container_width=True)
+                st.dataframe(near_atm, width="stretch")
 

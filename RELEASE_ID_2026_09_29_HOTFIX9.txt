@@ -1,0 +1,4 @@
+2026-09-29 HOTFIX9
+NSE-first interactive serving stabilization.
+Key fixes: prevent local-provider recursion; avoid Drive uploads during interactive NSE history fetch; reduce live Delivery history window to 120 calendar days (enough warm-up for 50-bar features); reduce 7-day validation fetch window to 45 days; suppress cache spinner for history/benchmark loaders.
+Existing production model artifacts and target contracts are unchanged.

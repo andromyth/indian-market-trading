@@ -399,8 +399,11 @@ def local_history_provider(symbol: str, period: str = "2y", interval: str = "1d"
             local = pd.DataFrame()
         if not local.empty and len(local) >= 20:
             return local
-    from data_fetcher import get_historical
-    return get_historical(symbol, period=period, interval=interval)
+    # Do not call data_fetcher.get_historical() here: that function already
+    # calls _local_persistent_history(), which would recurse back into this
+    # provider when local data is unavailable. Provider fallback belongs to
+    # data_fetcher.get_historical().
+    return pd.DataFrame()
 
 
 def scan_coverage(symbols: Iterable[str] | None = None) -> pd.DataFrame:

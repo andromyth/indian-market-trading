@@ -1,21 +1,15 @@
-# Hotfix 4 — 2026-09-29
+# Release notes — 2026-09-29 HOTFIX9
 
-Fixes the watchlist interaction in Streamlit.
+This release addresses interactive-dashboard latency/regression without changing the trained production model artifacts.
 
-- Watchlist text entry is now inside a Streamlit form.
-- Added explicit **Analyze** submit button.
-- Typed text is not treated as the active watchlist until Analyze is submitted.
-- Existing production ML, data normalization, persistent ledger, and validation logic are preserved.
-- No order execution added.
+## Root cause
+The Streamlit page spinner labeled `load_history(...)` occurs before model inference. For NSE daily Delivery mode the application was attempting persistent/local lookup, then NSE historical retrieval, and in some deployments Drive synchronization. The previous local fallback also contained a recursive provider path. These could make a simple search take a long time or repeat provider attempts.
 
-## Hotfix 5
-- Analyze submission increments a cache-busting watchlist revision.
-- History loading now falls back local/persistent -> NSE -> Dhan -> yfinance.download -> Ticker.history.
-- Empty/insufficient data produces an explicit diagnostic instead of a blank dashboard.
-- Build marker: 2026-09-29-HOTFIX5.
-
-HOTFIX7
-- Removed yfinance from runtime market-data path.
-- Added direct Yahoo public Chart API adapter with bounded timeout.
-- Removed repeated yfinance `Connection already opened` failure mode.
-- Updated get_historical/get_intraday/get_latest_price fallbacks.
+## Changes
+- NSE remains the first remote source for `.NS` daily history.
+- Interactive NSE history fetches no longer block the user request on Google Drive upload.
+- Local-provider recursion removed; fallback ownership is centralized in `data_fetcher.get_historical()`.
+- Delivery live history window reduced to 120 calendar days, sufficient for the 50-day rolling feature and 48-bar return feature with trading-day margin.
+- 7-day validation history lookup reduced to 45 calendar days.
+- Streamlit cache loaders for history/benchmark use `show_spinner=False` so the UI does not imply that the ML model itself is loading while market data is being fetched.
+- Production model files/contracts are unchanged.

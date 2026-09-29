@@ -231,7 +231,7 @@ def _normalize_historical_frame(df):
 def _local_persistent_history(symbol: str, period: str, interval: str):
     """Best-effort local/Drive-backed history before public-provider fallback."""
     try:
-        from free_data import local_history_provider, resample_daily, resample_intraday
+        from free_data import local_history_provider
         df = local_history_provider(symbol, period=period, interval=interval)
         if df is not None and not df.empty:
             return _normalize_historical_frame(df)
@@ -326,7 +326,11 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_
             days = _period_days(period)
             end = dt.datetime.now(IST).date()
             start = end - dt.timedelta(days=days)
-            nse_df = fetch_equity_history(root, start, end, sync_drive=True)
+            # Interactive serving must not upload chunks to Google Drive.
+            # Persistence is handled by the ingestion/scheduled data layer;
+            # blocking the Streamlit request on Drive sync can make a simple
+            # stock search appear to hang. NSE remains the first remote source.
+            nse_df = fetch_equity_history(root, start, end, sync_drive=False)
             if not nse_df.empty:
                 nse_df = nse_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
                 if "date" in nse_df.columns:
