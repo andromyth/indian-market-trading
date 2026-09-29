@@ -20,6 +20,7 @@ except Exception:
 import feedparser
 import requests
 import yfinance as yf
+import pandas as pd
 
 try:
     from dhan_client import DhanConfig, historical_daily, historical_intraday, resolve_equity_symbol, get_access_token
@@ -116,48 +117,116 @@ def _dhan_history(symbol: str, period: str, interval: str):
 
 
 def _normalize_historical_frame(df):
-    """Normalize provider-specific OHLC(V) shapes for all dashboard callers."""
+    """Normalize provider-specific OHLC(V) shapes for all dashboard callers.
+
+    Defensive boundary: provider frames may be flat, MultiIndex, or contain
+    lower-case/alternate field names. This function must never depend on an
+    external variable named ``x`` and must return either a valid canonical
+    frame or an empty frame.
+    """
     if df is None or getattr(df, "empty", True):
         return pd.DataFrame()
-    x = df.copy()
-    if isinstance(x.columns, pd.MultiIndex):
-        fields = {"open", "high", "low", "close", "adj close", "volume", "ltp", "vol"}
-        chosen = None
-        for level in range(x.columns.nlevels):
-            vals = {str(v).strip().lower() for v in x.columns.get_level_values(level)}
-            if vals & fields:
-                chosen = level
-                break
-        if chosen is not None:
-            x.columns = [str(v).strip() for v in x.columns.get_level_values(chosen)]
-    else:
-        x.columns = [str(c).strip() for c in x.columns]
+
+    frame = df.copy()
+
+    # Flatten Yahoo-style MultiIndex columns deterministically.  Some Yahoo
+    # responses use (field, ticker), others (ticker, field).
+    try:
+        columns = frame.columns
+        if isinstance(columns, pd.MultiIndex):
+            field_names = {
+                "open", "high", "low", "close", "adj close",
+                "adj_close", "volume", "ltp", "vol"
+            }
+            chosen_level = None
+            for level in range(columns.nlevels):
+                values = {
+                    str(v).strip().lower()
+                    for v in columns.get_level_values(level)
+                }
+                if values & field_names:
+                    chosen_level = level
+                    break
+
+            if chosen_level is not None:
+                frame.columns = [
+                    str(v).strip()
+                    for v in columns.get_level_values(chosen_level)
+                ]
+            else:
+                frame.columns = [
+                    "_".join(
+                        str(v).strip()
+                        for v in tup
+                        if str(v).strip()
+                    )
+                    for tup in columns.to_list()
+                ]
+        else:
+            frame.columns = [str(c).strip() for c in columns]
+    except Exception:
+        # Final conservative fallback: stringified columns. Never let a
+        # provider column-shape problem crash the dashboard.
+        frame.columns = [str(c).strip() for c in frame.columns]
+
     aliases = {
-        "open":"Open", "high":"High", "low":"Low", "close":"Close",
-        "adj close":"Close", "adj_close":"Close", "ltp":"Close",
-        "volume":"Volume", "vol":"Volume",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adj close": "Close",
+        "adj_close": "Close",
+        "ltp": "Close",
+        "last price": "Close",
+        "lastprice": "Close",
+        "volume": "Volume",
+        "vol": "Volume",
     }
-    ren={}
-    for c in x.columns:
-        k=str(c).strip().lower()
-        if k in aliases: ren[c]=aliases[k]
-    x=x.rename(columns=ren)
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in x.columns:
-            v=x[c]
-            if isinstance(v,pd.DataFrame): v=v.iloc[:,0]
-            x[c]=pd.to_numeric(v,errors="coerce")
-    if "Close" not in x.columns and "Adj Close" in x.columns:
-        x["Close"]=pd.to_numeric(x["Adj Close"],errors="coerce")
-    if "Volume" not in x.columns:
-        x["Volume"]=float("nan")
-    idx=pd.to_datetime(x.index,errors="coerce")
-    x.index=idx
-    x=x[~x.index.isna()].sort_index()
-    required=["Open","High","Low","Close"]
-    if any(c not in x.columns for c in required):
+
+    rename = {}
+    for column in frame.columns:
+        key = str(column).strip().lower()
+        if key in aliases:
+            rename[column] = aliases[key]
+    frame = frame.rename(columns=rename)
+
+    # Canonicalize required numeric columns.  With duplicate canonical column
+    # names pandas returns a DataFrame; take the first column in that case.
+    for field in ["Open", "High", "Low", "Close", "Volume"]:
+        if field not in frame.columns:
+            continue
+        value = frame[field]
+        if isinstance(value, pd.DataFrame):
+            value = value.iloc[:, 0]
+        frame[field] = pd.to_numeric(value, errors="coerce")
+
+    if "Close" not in frame.columns:
+        # Handle any remaining case where Adj Close survived under its original
+        # spelling after an unusual provider response.
+        for candidate in list(frame.columns):
+            if str(candidate).strip().lower() in {"adj close", "adj_close"}:
+                value = frame[candidate]
+                if isinstance(value, pd.DataFrame):
+                    value = value.iloc[:, 0]
+                frame["Close"] = pd.to_numeric(value, errors="coerce")
+                break
+
+    if "Volume" not in frame.columns:
+        frame["Volume"] = float("nan")
+
+    required = ["Open", "High", "Low", "Close"]
+    if any(column not in frame.columns for column in required):
         return pd.DataFrame()
-    return x
+
+    try:
+        index = pd.to_datetime(frame.index, errors="coerce")
+        frame.index = index
+        frame = frame[~frame.index.isna()]
+    except Exception:
+        # Keep the frame if the provider uses a non-datetime index.
+        pass
+
+    return frame.sort_index()
 
 
 def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
@@ -191,7 +260,8 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
                 return _normalize_historical_frame(df)
         except Exception:
             pass
-    return _normalize_historical_frame(yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False))
+    yf_frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    return _normalize_historical_frame(yf_frame)
 
 
 def get_intraday(symbol: str, interval: str = "1m"):
@@ -209,7 +279,8 @@ def get_intraday(symbol: str, interval: str = "1m"):
                 return _normalize_historical_frame(df)
         except Exception:
             pass
-    return _normalize_historical_frame(yf.Ticker(symbol).history(period="5d", interval=interval, auto_adjust=False))
+    yf_frame = yf.Ticker(symbol).history(period="5d", interval=interval, auto_adjust=False)
+    return _normalize_historical_frame(yf_frame)
 
 
 def get_latest_price(symbol: str) -> float | None:

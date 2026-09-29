@@ -1,0 +1,6 @@
+Production model policy
+=======================
+Current production artifact is the certified Logistic Regression contract already deployed.
+A new NSE-first candidate is built in Google Colab from the persistent Google Drive archive.
+Do not overwrite production until the chronological holdout, target-semantics test, calibration, and historical replay review pass.
+GitHub stores only small release artifacts; historical data remains in Google Drive.

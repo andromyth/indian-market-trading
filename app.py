@@ -758,6 +758,9 @@ with st.expander("Legacy research archive & NSE authenticity check", expanded=Fa
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
+    "Build: 2026-09-29-HOTFIX3"
+)
+st.sidebar.caption(
     "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
 )
 
@@ -767,11 +770,19 @@ def load_news():
 
 @st.cache_data(ttl=60)
 def load_history(symbol, period, interval):
-    return get_historical(symbol, period=period, interval=interval)
+    try:
+        return get_historical(symbol, period=period, interval=interval)
+    except Exception as exc:
+        # A provider/data-shape failure for one symbol must not crash the entire dashboard.
+        st.warning(f"{symbol}: historical data could not be loaded ({type(exc).__name__}: {exc})")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=60)
 def load_benchmark(symbol, period, interval):
-    return get_historical(symbol, period=period, interval=interval)
+    try:
+        return get_historical(symbol, period=period, interval=interval)
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=90)
 def load_option_chain(nse_symbol, is_index):

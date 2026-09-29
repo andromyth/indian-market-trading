@@ -1,0 +1,60 @@
+{
+  "engine_version": "2026.09-stage2",
+  "as_of": "2026-09-26T23:59:59",
+  "trained_symbols": [
+    "BHARTIARTL",
+    "RELIANCE",
+    "SBIN"
+  ],
+  "deployment_scope_warning": "Current deployment models are trained on the available research universe only; wider-universe validation remains required before generalizing to every Indian stock.",
+  "data_layers": {
+    "market_price": true,
+    "market_context": true,
+    "news": true,
+    "corporate_events": true,
+    "fno": true,
+    "fundamentals": false
+  },
+  "feature_groups": {
+    "market_price": 15,
+    "market_context": 10,
+    "news": 1,
+    "events": 2,
+    "fno": 7,
+    "fundamentals": 18
+  },
+  "artifacts": {
+    "30m": {
+      "model": "logistic",
+      "classifier_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_30m_logistic_classifier_2026.joblib",
+      "feature_count": 53,
+      "training_rows": 37869,
+      "note": "Deployment model trained on full available PIT history after OOS evaluation; not used for historical OOS metrics.",
+      "return_regressor_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_30m_hgb_return_regressor_2026.joblib"
+    },
+    "60m": {
+      "model": "logistic",
+      "classifier_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_60m_logistic_classifier_2026.joblib",
+      "feature_count": 53,
+      "training_rows": 34593,
+      "note": "Deployment model trained on full available PIT history after OOS evaluation; not used for historical OOS metrics.",
+      "return_regressor_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_60m_hgb_return_regressor_2026.joblib"
+    },
+    "next_session": {
+      "model": "logistic",
+      "classifier_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_next_session_logistic_classifier_2026.joblib",
+      "feature_count": 53,
+      "training_rows": 40926,
+      "note": "Deployment model trained on full available PIT history after OOS evaluation; not used for historical OOS metrics.",
+      "return_regressor_path": "/content/drive/MyDrive/Indian_Market_Research/models/deployment_next_session_hgb_return_regressor_2026.joblib"
+    }
+  },
+  "latest_predictions": "/content/drive/MyDrive/Indian_Market_Research/models/LATEST_PREDICTIONS_V2_2026.csv",
+  "oos_audit": "/content/drive/MyDrive/Indian_Market_Research/reports/STEP29_FINAL_MODEL_AUDIT_2026.json",
+  "research_policy": {
+    "no_auto_orders": true,
+    "point_in_time": true,
+    "walkforward_oos": true,
+    "missing_data_explicit": true
+  }
+}

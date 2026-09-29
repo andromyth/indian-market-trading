@@ -1,0 +1,8 @@
+Release: 2026-09-29-HOTFIX3
+Fixes:
+- Robust provider OHLCV normalization with flat/MultiIndex handling.
+- Explicit pandas dependency in data_fetcher.py.
+- Defensive history/benchmark loading so one malformed provider response does not crash the dashboard.
+- Deployment fingerprint shown in sidebar.
+Production model artifacts unchanged.
+No order execution.

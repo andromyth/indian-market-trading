@@ -1,0 +1,6 @@
+Release: 2026-09-29-HOTFIX3
+Fix: provider OHLCV normalization NameError/shape handling.
+Fix: explicit pandas dependency in data_fetcher.py.
+Fix: robust flat/MultiIndex Yahoo/NSE/Dhan normalization.
+Production model artifacts are unchanged.
+No order execution added.

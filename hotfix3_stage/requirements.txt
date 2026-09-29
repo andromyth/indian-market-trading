@@ -1,0 +1,13 @@
+streamlit
+yfinance
+feedparser
+pandas
+vaderSentiment
+requests
+numpy
+pyarrow
+fsspec[http]
+scikit-learn==1.6.1
+joblib
+google-api-python-client
+google-auth
