@@ -157,7 +157,12 @@ def _relative_or_absolute(path: Path) -> str:
 
 def gdrive_config() -> dict:
     """Resolve Google Drive configuration without failing when unconfigured."""
-    root_id = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+    # GitHub Actions uses GOOGLE_DRIVE_ROOT_ID, while Streamlit/local
+    # deployments historically use GDRIVE_ROOT_FOLDER_ID. Accept both.
+    root_id = (
+        os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+        or os.getenv("GOOGLE_DRIVE_ROOT_ID", "").strip()
+    )
     service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     try:
         import streamlit as st  # lazy: module also works outside Streamlit
@@ -230,7 +235,14 @@ class GoogleDriveStore:
         q = f"name = '{self._q(name)}' and '{parent_id}' in parents and trashed = false"
         if mime_type:
             q += f" and mimeType = '{mime_type}'"
-        resp = self.service.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute()
+        resp = self.service.files().list(
+            q=q,
+            spaces="drive",
+            fields="files(id,name,mimeType)",
+            pageSize=10,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
         files = resp.get("files", [])
         return files[0] if files else None
 

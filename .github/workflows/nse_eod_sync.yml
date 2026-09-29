@@ -4,19 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       start:
-        description: 'First NSE trading-day date (YYYY-MM-DD)'
-        required: true
-        default: '2026-09-29'
+        description: 'Optional first NSE date (YYYY-MM-DD) for manual backfill'
+        required: false
+        default: ''
       end:
-        description: 'Last NSE trading-day date (YYYY-MM-DD)'
-        required: true
-        default: '2026-09-29'
+        description: 'Optional last NSE date (YYYY-MM-DD) for manual backfill'
+        required: false
+        default: ''
+      repair_days:
+        description: 'Recent calendar days to gap-check in automatic mode'
+        required: false
+        default: '14'
+
   schedule:
     - cron: '15 13 * * 1-5'
 
 jobs:
   sync-nse-eod:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,17 +34,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync official NSE EOD bulk data
+      - name: Continuous NSE EOD incremental and gap-repair sync
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            START='${{ inputs.start }}'
-            END='${{ inputs.end }}'
-          else
-            START=$(TZ=Asia/Kolkata date +%Y-%m-%d)
-            END=$START
-          fi
 
-          python nse_bulk_eod_ingest.py --start "$START" --end "$END" --sync-drive
+        run: |
+          set -x
+          echo "NSE EOD sync job starting at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          START='${{ inputs.start }}'
+          END='${{ inputs.end }}'
+          REPAIR_DAYS='${{ inputs.repair_days }}'
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$START" ] && [ -n "$END" ]; then
+            PYTHONUNBUFFERED=1 python -u nse_bulk_eod_ingest.py \
+              --start "$START" \
+              --end "$END" \
+              --sync-drive
+          else
+            if [ -z "$REPAIR_DAYS" ]; then
+              REPAIR_DAYS=14
+            fi
+
+            PYTHONUNBUFFERED=1 python -u nse_bulk_eod_ingest.py \
+              --auto \
+              --repair-days "$REPAIR_DAYS" \
+              --sync-drive
+          fi

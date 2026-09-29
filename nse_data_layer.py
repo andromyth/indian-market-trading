@@ -216,7 +216,7 @@ def normalize_equity_history(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     x["symbol"] = x["symbol"].astype(str).str.upper()
     if "date" not in x.columns:
         raise ValueError(f"NSE equity response has no date column: {list(x.columns)}")
-    x["date"] = pd.to_datetime(x["date"], errors="coerce", dayfirst=True)
+    x["date"] = pd.to_datetime(x["date"], errors="coerce", format="mixed", dayfirst=True)
     for c in ("open", "high", "low", "close", "ltp", "prev_close", "vwap", "volume", "traded_value", "num_trades", "delivery_qty", "delivery_pct"):
         if c in x.columns:
             x[c] = pd.to_numeric(x[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
@@ -351,7 +351,7 @@ def _normalize_udiff_common_bhavcopy(frame: pd.DataFrame, trade_date: date) -> p
     x = x.rename(columns=ren)
     if "date" not in x.columns:
         x["date"] = pd.Timestamp(trade_date)
-    x["date"] = pd.to_datetime(x["date"], errors="coerce", dayfirst=True)
+    x["date"] = pd.to_datetime(x["date"], errors="coerce", format="mixed", dayfirst=True)
     if x["date"].isna().all():
         x["date"] = pd.Timestamp(trade_date)
     if "symbol" not in x.columns:
@@ -396,11 +396,44 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
     # Archive endpoint is a direct static download; use one bounded attempt.
     _sleep_rate_limit(0.25)
     try:
-        r = requests.get(url, headers={**HEADERS, "Accept": "application/zip,text/plain,*/*"}, timeout=(3, 8))
+        r = requests.get(
+            url,
+            headers={**HEADERS, "Accept": "application/zip,text/plain,*/*"},
+            timeout=(3, 8),
+        )
+        _last_nse_diagnostic = {
+            "path": url,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "bytes": len(r.content),
+        }
         r.raise_for_status()
-    except Exception as exc:
-        _last_nse_diagnostic.update({"path": url, "error": f"{type(exc).__name__}: {exc}"})
-        raise RuntimeError(f"NSE EOD bhavcopy unavailable for {key}: {type(exc).__name__}: {exc}") from exc
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        _last_nse_diagnostic.update(
+            {
+                "path": url,
+                "status_code": status_code,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        raise RuntimeError(
+            f"NSE EOD bhavcopy unavailable for {key}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    except requests.RequestException as exc:
+        _last_nse_diagnostic.update(
+            {
+                "path": url,
+                "status_code": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        raise RuntimeError(
+            f"NSE EOD bhavcopy unavailable for {key}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     zip_path.write_bytes(r.content)
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         names = [n for n in zf.namelist() if not n.endswith("/")]
