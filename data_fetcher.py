@@ -229,10 +229,63 @@ def _normalize_historical_frame(df):
     return frame.sort_index()
 
 
-def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
-    """NSE-first historical provider for NSE symbols; fallbacks are explicit."""
+def _local_persistent_history(symbol: str, period: str, interval: str):
+    """Best-effort local/Drive-backed history before public-provider fallback."""
+    try:
+        from free_data import local_history_provider, resample_daily, resample_intraday
+        df = local_history_provider(symbol, period=period, interval=interval)
+        if df is not None and not df.empty:
+            return _normalize_historical_frame(df)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _yahoo_history(symbol: str, period: str, interval: str):
+    """Use yf.download first because it is more consistent across yfinance releases."""
+    try:
+        frame = yf.download(
+            tickers=symbol, period=period, interval=interval,
+            auto_adjust=False, progress=False, threads=False,
+            group_by="column", multi_level_index=False,
+        )
+        normalized = _normalize_historical_frame(frame)
+        if not normalized.empty:
+            return normalized
+    except TypeError:
+        # Older yfinance releases may not support multi_level_index.
+        try:
+            frame = yf.download(
+                tickers=symbol, period=period, interval=interval,
+                auto_adjust=False, progress=False, threads=False, group_by="column",
+            )
+            normalized = _normalize_historical_frame(frame)
+            if not normalized.empty:
+                return normalized
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        return _normalize_historical_frame(
+            yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_refresh: bool = False):
+    """NSE-first historical provider with explicit local/remote fallbacks."""
     is_nse = str(symbol).upper().endswith(".NS")
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+
+    # 1) Persistent/local history is cheapest and avoids unnecessary remote calls.
+    if not force_refresh:
+        local = _local_persistent_history(symbol, period, interval)
+        if not local.empty:
+            return local
+
+    # 2) NSE official daily history for NSE equities.
     if is_nse and fetch_equity_history is not None and interval.lower() in {"1d", "d", "day", "daily"}:
         try:
             days = _period_days(period)
@@ -243,25 +296,36 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
                 nse_df = nse_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
                 if "date" in nse_df.columns:
                     nse_df = nse_df.set_index("date")
-                return _normalize_historical_frame(nse_df)
+                normalized = _normalize_historical_frame(nse_df)
+                if not normalized.empty:
+                    return normalized
         except Exception:
             pass
+
+    # 3) NSE quote-chart 1m for current-session intraday.
     if is_nse and interval.lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
         try:
             nse_1m = fetch_intraday_1m_current(root, sync_drive=True)
             if not nse_1m.empty:
-                return _normalize_historical_frame(nse_1m)
+                normalized = _normalize_historical_frame(nse_1m)
+                if not normalized.empty:
+                    return normalized
         except Exception:
             pass
+
+    # 4) Dhan when configured.
     if _dhan_configured() and is_nse:
         try:
             df = _dhan_history(symbol, period, interval)
             if not df.empty:
-                return _normalize_historical_frame(df)
+                normalized = _normalize_historical_frame(df)
+                if not normalized.empty:
+                    return normalized
         except Exception:
             pass
-    yf_frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-    return _normalize_historical_frame(yf_frame)
+
+    # 5) Yahoo reference fallback.
+    return _yahoo_history(symbol, period, interval)
 
 
 def get_intraday(symbol: str, interval: str = "1m"):

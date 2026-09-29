@@ -76,6 +76,7 @@ st.info(
     "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
     "No orders are placed."
 )
+st.caption(f"Active watchlist: {', '.join(symbols)} · Analysis refresh {int(st.session_state.get('watchlist_revision', 0))}")
 with st.expander("Step 52 PIT walk-forward audit", expanded=False):
     st.write(
         f"Frozen pilot: {', '.join(STEP52_SYMBOLS)} · {STEP52_JOINED_ROWS:,} joined rows · "
@@ -91,6 +92,9 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS"
 st.sidebar.header("Watchlist")
+
+if "watchlist_revision" not in st.session_state:
+    st.session_state["watchlist_revision"] = 0
 
 # Keep text entry separate from the active watchlist so typing does not trigger
 # a full analysis on every keystroke. The explicit Analyze button is the
@@ -113,6 +117,8 @@ if analyze_watchlist:
     cleaned = ", ".join([part.strip() for part in watchlist_input.split(",") if part.strip()])
     if cleaned:
         st.session_state["active_watchlist"] = cleaned
+        st.session_state["watchlist_revision"] = int(st.session_state.get("watchlist_revision", 0)) + 1
+        st.session_state["analysis_requested"] = True
 
 raw_symbols = st.session_state.get("active_watchlist", default_watchlist)
 
@@ -415,6 +421,7 @@ slippage_bps = st.sidebar.number_input("Slippage per side (bps)", min_value=0.0,
 
 if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
+    st.session_state["watchlist_revision"] = int(st.session_state.get("watchlist_revision", 0)) + 1
 
 status = "Market OPEN" if market_is_open() else "Market CLOSED (last available data)"
 st.sidebar.info(status)
@@ -779,7 +786,7 @@ with st.expander("Legacy research archive & NSE authenticity check", expanded=Fa
         st.download_button("Export data-quality report", st.session_state["quality"].to_csv(index=False).encode("utf-8"), file_name="historical_data_quality.csv", mime="text/csv")
 
 st.sidebar.caption(
-    "Build: 2026-09-29-HOTFIX3"
+    "Build: 2026-09-29-HOTFIX5"
 )
 st.sidebar.caption(
     "NSE official data is the primary exchange-data layer. Dhan is optional for live/broker-specific fields; other public providers are fallbacks only and their provenance is preserved. No order APIs are used."
@@ -790,16 +797,15 @@ def load_news():
     return get_news()
 
 @st.cache_data(ttl=60)
-def load_history(symbol, period, interval):
+def load_history(symbol, period, interval, revision=0):
     try:
         return get_historical(symbol, period=period, interval=interval)
     except Exception as exc:
-        # A provider/data-shape failure for one symbol must not crash the entire dashboard.
         st.warning(f"{symbol}: historical data could not be loaded ({type(exc).__name__}: {exc})")
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
-def load_benchmark(symbol, period, interval):
+def load_benchmark(symbol, period, interval, revision=0):
     try:
         return get_historical(symbol, period=period, interval=interval)
     except Exception:
@@ -834,13 +840,19 @@ def cached_delivery_validation():
 # Fetch all watchlist inputs first so the model can compute cross-sectional
 # ranks/breadth across the user's actual watchlist rather than one symbol at a time.
 live_records = []
+data_diagnostics = []
+revision = int(st.session_state.get("watchlist_revision", 0))
 for symbol in symbols:
-    raw_df = load_history(symbol, period, interval)
-    if raw_df.empty or len(raw_df) < slow + 15:
+    raw_df = load_history(symbol, period, interval, revision)
+    if raw_df.empty:
+        data_diagnostics.append({"symbol": symbol, "status": "NO_DATA", "reason": "No usable history returned by NSE/persistent/Dhan/Yahoo providers."})
+        continue
+    if len(raw_df) < slow + 15:
+        data_diagnostics.append({"symbol": symbol, "status": "INSUFFICIENT_HISTORY", "rows": int(len(raw_df)), "required": int(slow + 15)})
         continue
     company_root = symbol.replace(".NS", "").replace(".BO", "")
     benchmark_symbol = benchmark_for_symbol(symbol)
-    market_df = load_benchmark(benchmark_symbol, period, interval)
+    market_df = load_benchmark(benchmark_symbol, period, interval, revision)
     try:
         df = add_indicators(raw_df, fast=fast, slow=slow)
     except ValueError as exc:
@@ -928,6 +940,12 @@ if style == "Delivery" and live_records:
     except Exception as exc:
         st.error(f"Delivery ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
         delivery_results = {}
+
+if not live_records:
+    st.error("No stock analysis result was produced from the active watchlist.")
+    if data_diagnostics:
+        st.dataframe(pd.DataFrame(data_diagnostics), use_container_width=True, hide_index=True)
+    st.info("Click Analyze after entering the symbols. The dashboard now retries data through persistent/local history, NSE official data, Dhan (when configured), and Yahoo Finance.")
 
 for rec in live_records:
     symbol = rec["symbol"]
