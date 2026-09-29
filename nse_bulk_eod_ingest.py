@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Continuous NSE-first EOD ingestion with incremental catch-up and gap repair.
 
-Normal scheduled mode:
-* discovers dates already persisted in the Google Drive NSE bulk archive;
-* fetches all newly missing weekdays through today;
-* also checks a recent repair window for gaps;
-* preserves manual --start/--end backfill support;
-* records per-date status without treating a missing NSE archive file as a
-  successful trading day.
+Normal scheduled mode is compatible with the existing workflow: when the
+workflow supplies today's date, this script ignores the one-day range and
+looks at Google Drive first, then fetches every missing NSE weekday through
+India's current date. Manual historical backfills still use --start/--end.
 
 This job is ingestion only. It does not train models or place orders.
 """
@@ -19,10 +16,12 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from nse_data_layer import fetch_nse_eod_bhavcopy, nse_last_diagnostic
 from persistent_store import GoogleDriveStore
 
+IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_BOOTSTRAP_START = date(2026, 1, 1)
 DEFAULT_REPAIR_DAYS = 14
 DATE_RE = re.compile(r"_(\d{8})_F_0000(?:\.csv\.zip|\.parquet)$", re.I)
@@ -60,8 +59,7 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
         for item in resp.get("files", []):
             if item.get("mimeType") == "application/vnd.google-apps.folder":
                 continue
-            name = str(item.get("name") or "")
-            match = DATE_RE.search(name)
+            match = DATE_RE.search(str(item.get("name") or ""))
             if not match:
                 continue
             try:
@@ -83,7 +81,6 @@ def _write_local_sync_manifest(payload: dict) -> None:
 
 
 def _sync_manifest(store: GoogleDriveStore | None, payload: dict) -> None:
-    """Persist a compact run manifest locally and, when configured, in Drive."""
     _write_local_sync_manifest(payload)
     if store is None:
         return
@@ -95,11 +92,6 @@ def _sync_manifest(store: GoogleDriveStore | None, payload: dict) -> None:
         )
         payload["manifest_drive_sync"] = result
         _write_local_sync_manifest(payload)
-        store.upload_or_update(
-            LOCAL_SYNC_MANIFEST,
-            "production_data/nse_official/bulk_eod/sync_manifest.json",
-            mime_type="application/json",
-        )
     except Exception as exc:
         payload["manifest_drive_sync"] = {
             "status": "NOT_SYNCED",
@@ -109,7 +101,11 @@ def _sync_manifest(store: GoogleDriveStore | None, payload: dict) -> None:
 
 
 def _now_ist() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(IST).isoformat()
+
+
+def _today_ist() -> date:
+    return datetime.now(IST).date()
 
 
 def _build_auto_candidates(
@@ -185,8 +181,11 @@ def main() -> None:
     if not args.auto and (not args.start or not args.end):
         ap.error("manual mode requires --start and --end, or use --auto")
 
+    today = _today_ist()
+    bootstrap_start = date.fromisoformat(args.bootstrap_start)
     store = None
     remote_dates: set[date] = set()
+
     if args.sync_drive:
         try:
             store = GoogleDriveStore()
@@ -197,16 +196,24 @@ def main() -> None:
                 f"{type(exc).__name__}: {exc}"
             )
 
-    today = datetime.now().astimezone().date()
-    bootstrap_start = date.fromisoformat(args.bootstrap_start)
+    # The existing scheduled workflow passes today's date as start=end. Treat
+    # that invocation as automatic incremental mode so the workflow itself
+    # does not need to know the Drive archive's latest date.
+    scheduled_today_call = (
+        not args.auto
+        and args.sync_drive
+        and date.fromisoformat(args.start) == today
+        and date.fromisoformat(args.end) == today
+    )
 
-    if args.auto:
+    if args.auto or scheduled_today_call:
         candidates, mode_reason = _build_auto_candidates(
             remote_dates=remote_dates,
             today=today,
             repair_days=args.repair_days,
             bootstrap_start=bootstrap_start,
         )
+        mode = "AUTO"
     else:
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end)
@@ -214,12 +221,14 @@ def main() -> None:
             raise SystemExit("--end cannot be before --start")
         candidates = list(business_days(start, end))
         mode_reason = "MANUAL_BACKFILL"
+        mode = "MANUAL"
 
     run = {
         "version": "nse-eod-continuous-sync-v1",
         "started_at": _now_ist(),
-        "mode": "AUTO" if args.auto else "MANUAL",
-        "today": today.isoformat(),
+        "mode": mode,
+        "today_ist": today.isoformat(),
+        "scheduled_today_call": scheduled_today_call,
         "repair_days": int(args.repair_days),
         "bootstrap_start": bootstrap_start.isoformat(),
         "remote_dates_seen_before_run": len(remote_dates),
@@ -231,7 +240,7 @@ def main() -> None:
 
     print("NSE EOD CONTINUOUS SYNC")
     print(f"Mode             : {run['mode']}")
-    print(f"Today            : {run['today']}")
+    print(f"Today IST        : {run['today_ist']}")
     print(f"Drive dates      : {run['remote_dates_seen_before_run']}")
     print(f"Latest Drive date: {run['latest_remote_date_before_run']}")
     print(f"Candidates       : {len(candidates)}")
@@ -271,6 +280,8 @@ def main() -> None:
                 "latest_remote_date_after_run": max(after_dates).isoformat() if after_dates else None,
                 "missing_candidate_dates_after_run": [d.isoformat() for d in missing_after],
             }
+            # 404/no-archive dates are unresolved and should make the run visible
+            # as incomplete so the next scheduled run retries them.
             errors += len(missing_after)
     else:
         run["drive_postcheck"] = {"status": "SKIPPED"}
