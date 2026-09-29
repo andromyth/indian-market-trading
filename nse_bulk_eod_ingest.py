@@ -48,16 +48,26 @@ def business_days(start: date, end: date) -> Iterable[date]:
         d += timedelta(days=1)
 
 
-def _list_children(store: GoogleDriveStore, parent_id: str) -> list[dict]:
-    """List immediate Drive children, including Shared-Drive items when applicable."""
+def _list_children(
+    store: GoogleDriveStore,
+    parent_id: str,
+    *,
+    max_pages: int = 10,
+    page_size: int = 500,
+) -> tuple[list[dict], bool]:
+    """List immediate Drive children with bounded pagination."""
     items: list[dict] = []
     token = None
+    pages = 0
     while True:
+        pages += 1
+        if pages > max_pages:
+            return items, False
         kwargs = {
             "q": f"'{parent_id}' in parents and trashed = false",
             "spaces": "drive",
             "fields": "nextPageToken,files(id,name,mimeType)",
-            "pageSize": 1000,
+            "pageSize": page_size,
             "includeItemsFromAllDrives": True,
             "supportsAllDrives": True,
         }
@@ -67,9 +77,7 @@ def _list_children(store: GoogleDriveStore, parent_id: str) -> list[dict]:
         items.extend(resp.get("files", []))
         token = resp.get("nextPageToken")
         if not token:
-            break
-    return items
-
+            return items, True
 
 def _find_folder_path(store: GoogleDriveStore, relative_path: str) -> str | None:
     """Resolve a folder below the configured root without creating anything."""
@@ -105,16 +113,20 @@ def _find_named_folders_globally(store: GoogleDriveStore, names: set[str]) -> li
 
 
 def _date_from_text(value: str) -> date | None:
-    """Extract common NSE YYYYMMDD or DDMMYYYY date tokens."""
-    text = str(value or "")
-    for token in re.findall(r"(?<!\\d)\\d{8}(?!\\d)", text):
-        for fmt in ("%Y%m%d", "%d%m%Y"):
+    """Extract common NSE date tokens, including separated date formats."""
+    text_value = str(value or "")
+    patterns = (
+        r"(?<!\\d)(20\\d{2})[-_./]?(0[1-9]|1[0-2])[-_./]?([0-3]\\d)(?!\\d)",
+        r"(?<!\\d)([0-3]\\d)[-_./]?(0[1-9]|1[0-2])[-_./]?(20\\d{2})(?!\\d)",
+    )
+    for pattern, fmt in ((patterns[0], "%Y%m%d"), (patterns[1], "%d%m%Y")):
+        for match in re.finditer(pattern, text_value):
+            token = "".join(match.groups())
             try:
                 return datetime.strptime(token, fmt).date()
             except ValueError:
                 continue
     return None
-
 
 def _date_from_path_parts(parts: list[str]) -> date | None:
     """Extract a YYYY/MM/DD-style date from ancestor folder names."""
@@ -209,11 +221,37 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
     # scanning unrelated Drive content and also works for legacy archives
     # whose filenames do not contain the full BhavCopy prefix.
     resolved_paths: list[str] = []
-    for relative_path in ARCHIVE_FOLDER_PATHS:
+    for idx, relative_path in enumerate(ARCHIVE_FOLDER_PATHS):
         folder_id = _find_folder_path(store, relative_path)
-        if folder_id:
-            resolved_paths.append(relative_path)
-            found.update(_collect_dates_under_folder(store, folder_id))
+        if not folder_id:
+            continue
+
+        resolved_paths.append(relative_path)
+        print(f"Drive archive path resolved: {relative_path}", flush=True)
+        before = len(found)
+        found.update(
+            _collect_dates_under_folder(
+                store,
+                folder_id,
+                label=relative_path,
+            )
+        )
+
+        # Do not recursively scan the broad expansion tree when a primary or
+        # legacy NSE archive has already yielded dates.
+        if found and idx < 2:
+            print(
+                f"Drive discovery: dates found in {relative_path}; "
+                "skipping lower-priority archive tree(s).",
+                flush=True,
+            )
+            break
+
+        if len(found) == before:
+            print(
+                f"Drive discovery: {relative_path} added no date tokens.",
+                flush=True,
+            )
 
     # Fallback: if the configured root does not contain the expected path,
     # search for the archive folder names anywhere visible to this credential.
@@ -224,7 +262,13 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
             {"nse_daily_bulk_2026", "2026_expansion", "bulk_eod"},
         )
         for folder_id in fallback_ids:
-            found.update(_collect_dates_under_folder(store, folder_id))
+            found.update(
+                _collect_dates_under_folder(
+                    store,
+                    folder_id,
+                    label=f"global:{folder_id}",
+                )
+            )
 
     print(f"Drive archive path(s) resolved: {resolved_paths or 'none'}")
     print(f"Drive NSE archive dates discovered: {len(found)}")
