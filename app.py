@@ -783,6 +783,41 @@ def load_announcements(symbol):
 
 news_items = tag_news_items(load_news())
 
+def _normalize_dashboard_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize yfinance/NSE/Dhan OHLCV responses to flat Series columns."""
+    x = df.copy()
+    if x.empty:
+        return x
+    wanted = {"open":"Open", "high":"High", "low":"Low", "close":"Close", "volume":"Volume", "adj close":"Adj Close"}
+    if isinstance(x.columns, pd.MultiIndex):
+        data = {}
+        used = set()
+        for target, canonical in wanted.items():
+            chosen = None
+            for col in x.columns:
+                parts = [str(v).strip().lower() for v in (col if isinstance(col, tuple) else (col,))]
+                if target in parts:
+                    chosen = col
+                    if str(col[0]).strip().lower() == target:
+                        break
+            if chosen is not None and canonical not in used:
+                data[canonical] = x[chosen]
+                used.add(canonical)
+        x = pd.DataFrame(data, index=x.index)
+    else:
+        data = {}
+        for col in x.columns:
+            key = str(col).strip().lower().replace("_", " ")
+            canonical = wanted.get(key)
+            if canonical and canonical not in data:
+                data[canonical] = x[col]
+        if data:
+            x = pd.DataFrame(data, index=x.index)
+    if "Close" not in x.columns and "Adj Close" in x.columns:
+        x["Close"] = x["Adj Close"]
+    return x
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_delivery_validation():
     records = [r for r in load_records() if str(r.get("mode", "")).lower() == "delivery"][-100:]
@@ -805,6 +840,14 @@ live_records = []
 for symbol in symbols:
     raw_df = load_history(symbol, period, interval)
     if raw_df.empty or len(raw_df) < slow + 15:
+        continue
+    # Never allow malformed provider schemas to crash the whole dashboard.
+    # add_indicators() performs the same normalization, so this is only a
+    # lightweight guard for a clear user-facing message.
+    try:
+        raw_df = _normalize_dashboard_ohlcv(raw_df)
+    except Exception as _schema_exc:
+        st.warning(f"{symbol}: market-data schema could not be normalized: {_schema_exc}")
         continue
     company_root = symbol.replace(".NS", "").replace(".BO", "")
     benchmark_symbol = benchmark_for_symbol(symbol)

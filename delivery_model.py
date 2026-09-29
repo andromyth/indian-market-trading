@@ -117,6 +117,44 @@ def _safe(v: Any) -> float:
         return np.nan
 
 
+
+
+def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize yfinance/NSE/Dhan OHLCV responses to flat Series columns."""
+    x = df.copy()
+    if x.empty:
+        return x
+    wanted = {"open":"Open", "high":"High", "low":"Low", "close":"Close", "volume":"Volume", "adj close":"Adj Close"}
+    if isinstance(x.columns, pd.MultiIndex):
+        data = {}
+        used = set()
+        for target, canonical in wanted.items():
+            chosen = None
+            for col in x.columns:
+                parts = [str(v).strip().lower() for v in (col if isinstance(col, tuple) else (col,))]
+                if target in parts:
+                    chosen = col
+                    if str(col[0]).strip().lower() == target:
+                        break
+            if chosen is not None and canonical not in used:
+                data[canonical] = x[chosen]
+                used.add(canonical)
+        x = pd.DataFrame(data, index=x.index)
+    else:
+        data = {}
+        for col in x.columns:
+            key = str(col).strip().lower().replace("_", " ")
+            canonical = wanted.get(key)
+            if canonical and canonical not in data:
+                data[canonical] = x[col]
+        if data:
+            x = pd.DataFrame(data, index=x.index)
+    if "Close" not in x.columns and "Adj Close" in x.columns:
+        x["Close"] = x["Adj Close"]
+    return x
+
+
+
 def _series(df: pd.DataFrame, col: str) -> pd.Series:
     if col not in df.columns:
         return pd.Series(index=df.index, dtype="float64")
@@ -166,6 +204,10 @@ def _feature_row(
 ) -> dict[str, float]:
     if price_df is None or price_df.empty:
         raise ValueError("Delivery prediction requires non-empty price history")
+    price_df = _normalize_ohlcv_columns(price_df)
+    missing = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c not in price_df.columns]
+    if missing:
+        raise ValueError(f"Delivery history is missing required OHLCV columns: {missing}")
 
     close = _series(price_df, "Close")
     high = _series(price_df, "High")
@@ -192,7 +234,7 @@ def _feature_row(
         "up_bar": 1.0 if np.isfinite(last_close) and np.isfinite(_safe(open_.iloc[-1])) and last_close > _safe(open_.iloc[-1]) else 0.0 if np.isfinite(last_close) and np.isfinite(_safe(open_.iloc[-1])) else np.nan,
     }
 
-    market = market_df if market_df is not None else pd.DataFrame()
+    market = _normalize_ohlcv_columns(market_df) if market_df is not None else pd.DataFrame()
     mc = _series(market, "Close")
     row.update({
         "market_ret_1": _returns(mc, 1), "market_ret_3": _returns(mc, 3),

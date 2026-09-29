@@ -59,6 +59,41 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize yfinance/NSE/Dhan OHLCV responses to flat Series columns."""
+    x = df.copy()
+    if x.empty:
+        return x
+    wanted = {"open":"Open", "high":"High", "low":"Low", "close":"Close", "volume":"Volume", "adj close":"Adj Close"}
+    if isinstance(x.columns, pd.MultiIndex):
+        data = {}
+        used = set()
+        for target, canonical in wanted.items():
+            chosen = None
+            for col in x.columns:
+                parts = [str(v).strip().lower() for v in (col if isinstance(col, tuple) else (col,))]
+                if target in parts:
+                    chosen = col
+                    if str(col[0]).strip().lower() == target:
+                        break
+            if chosen is not None and canonical not in used:
+                data[canonical] = x[chosen]
+                used.add(canonical)
+        x = pd.DataFrame(data, index=x.index)
+    else:
+        data = {}
+        for col in x.columns:
+            key = str(col).strip().lower().replace("_", " ")
+            canonical = wanted.get(key)
+            if canonical and canonical not in data:
+                data[canonical] = x[col]
+        if data:
+            x = pd.DataFrame(data, index=x.index)
+    if "Close" not in x.columns and "Adj Close" in x.columns:
+        x["Close"] = x["Adj Close"]
+    return x
+
+
 def add_indicators(
     df: pd.DataFrame,
     fast: int = 20,
@@ -67,9 +102,12 @@ def add_indicators(
     atr_period: int = 14,
 ) -> pd.DataFrame:
     """Add causal indicators. Current-row indicators use current/past data only."""
-    df = df.copy()
+    df = _normalize_ohlcv_columns(df)
     if df.empty:
         return df
+    missing = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c not in df.columns]
+    if missing:
+        raise ValueError(f"History is missing required OHLCV columns: {missing}")
 
     df[f"SMA{fast}"] = df["Close"].rolling(fast, min_periods=fast).mean()
     df[f"SMA{slow}"] = df["Close"].rolling(slow, min_periods=slow).mean()

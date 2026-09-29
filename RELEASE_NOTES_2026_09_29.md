@@ -32,3 +32,11 @@ python deployment_smoke_test.py
 ```
 
 before publishing the repository update.
+
+
+## Hotfix — 2026-09-29 live dashboard
+- Normalize yfinance MultiIndex/single-level OHLCV frames before indicator and model feature construction.
+- Block live ML predictions for symbols outside the certified model universe instead of raising an exception.
+- Preserve explicit validated-universe status in dashboard output.
+
+- Unsupported stocks now show an explicit ML BLOCKED status rather than a KeyError or a fabricated production signal.
