@@ -24,7 +24,13 @@ from persistent_store import GoogleDriveStore
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_BOOTSTRAP_START = date(2026, 1, 1)
 DEFAULT_REPAIR_DAYS = 14
-DATE_RE = re.compile(r"_(\d{8})_F_0000(?:\.csv\.zip|\.parquet)$", re.I)
+DATE_RE = re.compile(r"(20\d{6})", re.I)
+FOLDER_MIME = "application/vnd.google-apps.folder"
+ARCHIVE_FOLDER_PATHS = (
+    "production_data/nse_official/bulk_eod",
+    "raw/nse_daily_bulk_2026",
+    "raw/2026_expansion",
+)
 LOCAL_SYNC_MANIFEST = (
     Path(__file__).resolve().parent
     / "data"
@@ -42,9 +48,74 @@ def business_days(start: date, end: date) -> Iterable[date]:
         d += timedelta(days=1)
 
 
-def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
-    """Return all NSE bulk-bhavcopy dates currently visible in Drive."""
+def _list_children(store: GoogleDriveStore, parent_id: str) -> list[dict]:
+    """List immediate Drive children, including Shared-Drive items when applicable."""
+    items: list[dict] = []
+    token = None
+    while True:
+        kwargs = {
+            "q": f"'{parent_id}' in parents and trashed = false",
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name,mimeType)",
+            "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if token:
+            kwargs["pageToken"] = token
+        resp = store.service.files().list(**kwargs).execute()
+        items.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return items
+
+
+def _find_folder_path(store: GoogleDriveStore, relative_path: str) -> str | None:
+    """Resolve a folder below the configured root without creating anything."""
+    parent = store.root_id
+    for part in [p for p in relative_path.replace("\\", "/").split("/") if p]:
+        hit = store._find_child(parent, part, FOLDER_MIME)
+        if not hit:
+            return None
+        parent = hit["id"]
+    return parent
+
+
+def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
+    """Walk a known archive subtree and extract YYYYMMDD date keys from filenames."""
     found: set[date] = set()
+    queue = [folder_id]
+    while queue:
+        current_id = queue.pop()
+        for item in _list_children(store, current_id):
+            if item.get("mimeType") == FOLDER_MIME:
+                queue.append(item["id"])
+                continue
+            match = DATE_RE.search(str(item.get("name") or ""))
+            if not match:
+                continue
+            try:
+                found.add(datetime.strptime(match.group(1), "%Y%m%d").date())
+            except ValueError:
+                continue
+    return found
+
+
+def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
+    """Return NSE EOD dates visible in Drive across current and legacy archive paths."""
+    found: set[date] = set()
+
+    # Prefer the known archive subtrees used by this project. This avoids
+    # scanning unrelated Drive content and also works for legacy archives
+    # whose filenames do not contain the full BhavCopy prefix.
+    for relative_path in ARCHIVE_FOLDER_PATHS:
+        folder_id = _find_folder_path(store, relative_path)
+        if folder_id:
+            found.update(_collect_dates_under_folder(store, folder_id))
+
+    # Also search globally for canonical BhavCopy filenames, including
+    # Shared-Drive content. This catches files whose folder layout changed.
     token = None
     while True:
         kwargs = {
@@ -52,12 +123,14 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
             "spaces": "drive",
             "fields": "nextPageToken,files(id,name,mimeType)",
             "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "corpora": "allDrives",
         }
         if token:
             kwargs["pageToken"] = token
         resp = store.service.files().list(**kwargs).execute()
         for item in resp.get("files", []):
-            if item.get("mimeType") == "application/vnd.google-apps.folder":
+            if item.get("mimeType") == FOLDER_MIME:
                 continue
             match = DATE_RE.search(str(item.get("name") or ""))
             if not match:
@@ -69,6 +142,7 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
         token = resp.get("nextPageToken")
         if not token:
             break
+
     return found
 
 
@@ -113,9 +187,12 @@ def _build_auto_candidates(
     today: date,
     repair_days: int,
     bootstrap_start: date,
+    allow_bootstrap: bool,
 ) -> tuple[list[date], str | None]:
     if not remote_dates:
-        return list(business_days(bootstrap_start, today)), f"BOOTSTRAP_FROM_{bootstrap_start.isoformat()}"
+        if allow_bootstrap:
+            return list(business_days(bootstrap_start, today)), f"BOOTSTRAP_FROM_{bootstrap_start.isoformat()}"
+        return [], "DRIVE_ARCHIVE_EMPTY_OR_UNDISCOVERED"
 
     latest = max(remote_dates)
     candidates: set[date] = set()
@@ -174,6 +251,7 @@ def main() -> None:
     ap.add_argument("--sync-drive", action="store_true")
     ap.add_argument("--repair-days", type=int, default=DEFAULT_REPAIR_DAYS)
     ap.add_argument("--bootstrap-start", default=DEFAULT_BOOTSTRAP_START.isoformat())
+    ap.add_argument("--allow-bootstrap", action="store_true")
     args = ap.parse_args()
 
     if args.auto and (args.start or args.end):
@@ -212,8 +290,16 @@ def main() -> None:
             today=today,
             repair_days=args.repair_days,
             bootstrap_start=bootstrap_start,
+            allow_bootstrap=args.allow_bootstrap,
         )
         mode = "AUTO"
+        if mode_reason == "DRIVE_ARCHIVE_EMPTY_OR_UNDISCOVERED":
+            raise SystemExit(
+                "DRIVE_ARCHIVE_EMPTY_OR_UNDISCOVERED: Google Drive is reachable, "
+                "but no known NSE archive dates were found. Refusing to bootstrap "
+                "2026 history automatically. Use an explicit manual backfill or "
+                "--allow-bootstrap only for a genuinely empty archive."
+            )
     else:
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end)
