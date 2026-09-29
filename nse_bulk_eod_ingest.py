@@ -542,28 +542,34 @@ def main() -> None:
         else:
             missing_after = sorted(d for d in candidates if d not in after_dates)
             run["drive_postcheck"] = {
-                "status": "PASS" if not missing_after else "MISSING_REMOTE_FILES",
+                "status": "PASS" if not missing_after else "INCOMPLETE_RETRY",
                 "remote_dates_after_run": len(after_dates),
                 "latest_remote_date_after_run": max(after_dates).isoformat() if after_dates else None,
                 "missing_candidate_dates_after_run": [d.isoformat() for d in missing_after],
             }
-            # 404/no-archive dates are unresolved and should make the run visible
-            # as incomplete so the next scheduled run retries them.
-            errors += len(missing_after)
     else:
         run["drive_postcheck"] = {"status": "SKIPPED"}
+
+    unresolved = retryable_miss
+    if args.sync_drive:
+        unresolved = len(
+            run.get("drive_postcheck", {}).get("missing_candidate_dates_after_run", [])
+        )
 
     run["summary"] = {
         "candidates": len(candidates),
         "fetched": fetched,
         "no_archive_file_retry": retryable_miss,
+        "unresolved_dates": unresolved,
         "errors": errors,
     }
     run["finished_at"] = _now_ist()
     _sync_manifest(store, run)
 
     print("SUMMARY:", json.dumps(run["summary"], separators=(",", ":"), sort_keys=True))
-    raise SystemExit(1 if errors else 0)
+    # Keep the workflow non-green whenever a date remains unresolved, while
+    # distinguishing retryable archive misses from actual ingestion errors.
+    raise SystemExit(1 if (errors or run["summary"]["unresolved_dates"]) else 0)
 
 
 if __name__ == "__main__":
