@@ -235,7 +235,14 @@ class GoogleDriveStore:
         q = f"name = '{self._q(name)}' and '{parent_id}' in parents and trashed = false"
         if mime_type:
             q += f" and mimeType = '{mime_type}'"
-        resp = self.service.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute()
+        resp = self.service.files().list(
+            q=q,
+            spaces="drive",
+            fields="files(id,name,mimeType)",
+            pageSize=10,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
         files = resp.get("files", [])
         return files[0] if files else None
 
