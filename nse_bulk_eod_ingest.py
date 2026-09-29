@@ -82,6 +82,33 @@ def _find_folder_path(store: GoogleDriveStore, relative_path: str) -> str | None
     return parent
 
 
+def _find_named_folders_globally(store: GoogleDriveStore, names: set[str]) -> list[str]:
+    """Find exact archive folder names anywhere visible to the configured Drive."""
+    ids: list[str] = []
+    token = None
+    wanted = {str(n).strip().lower() for n in names}
+    while True:
+        kwargs = {
+            "q": "trashed = false and mimeType = 'application/vnd.google-apps.folder'",
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name,mimeType)",
+            "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+            "corpora": "allDrives",
+        }
+        if token:
+            kwargs["pageToken"] = token
+        resp = store.service.files().list(**kwargs).execute()
+        for item in resp.get("files", []):
+            if str(item.get("name") or "").strip().lower() in wanted:
+                ids.append(item["id"])
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return ids
+
+
 def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
     """Walk a known archive subtree and extract YYYYMMDD date keys from filenames."""
     found: set[date] = set()
@@ -109,10 +136,29 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
     # Prefer the known archive subtrees used by this project. This avoids
     # scanning unrelated Drive content and also works for legacy archives
     # whose filenames do not contain the full BhavCopy prefix.
+    resolved_paths: list[str] = []
     for relative_path in ARCHIVE_FOLDER_PATHS:
         folder_id = _find_folder_path(store, relative_path)
         if folder_id:
+            resolved_paths.append(relative_path)
             found.update(_collect_dates_under_folder(store, folder_id))
+
+    # Fallback: if the configured root does not contain the expected path,
+    # search for the archive folder names anywhere visible to this credential.
+    # This handles older Drive layouts while still refusing to invent dates.
+    if not found:
+        fallback_ids = _find_named_folders_globally(
+            store,
+            {"nse_daily_bulk_2026", "2026_expansion", "bulk_eod"},
+        )
+        for folder_id in fallback_ids:
+            found.update(_collect_dates_under_folder(store, folder_id))
+
+    print(f"Drive archive path(s) resolved: {resolved_paths or 'none'}")
+    print(f"Drive NSE archive dates discovered: {len(found)}")
+    if found:
+        print(f"Drive earliest date: {min(found).isoformat()}")
+        print(f"Drive latest date  : {max(found).isoformat()}")
 
     # Also search globally for canonical BhavCopy filenames, including
     # Shared-Drive content. This catches files whose folder layout changed.
