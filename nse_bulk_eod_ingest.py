@@ -124,6 +124,7 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
             "fields": "nextPageToken,files(id,name,mimeType)",
             "pageSize": 1000,
             "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
             "corpora": "allDrives",
         }
         if token:
