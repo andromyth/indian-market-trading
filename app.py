@@ -76,7 +76,6 @@ st.info(
     "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
     "No orders are placed."
 )
-st.caption(f"Active watchlist: {', '.join(symbols)} · Analysis refresh {int(st.session_state.get('watchlist_revision', 0))}")
 with st.expander("Step 52 PIT walk-forward audit", expanded=False):
     st.write(
         f"Frozen pilot: {', '.join(STEP52_SYMBOLS)} · {STEP52_JOINED_ROWS:,} joined rows · "
@@ -135,6 +134,8 @@ def normalize_symbol(value: str) -> str:
     return f"{s}.NS"
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
+
+st.caption(f"Active watchlist: {', '.join(symbols)} · Analysis refresh {int(st.session_state.get('watchlist_revision', 0))}")
 
 analysis_view = st.sidebar.radio(
     "View", ["Live Dashboard", "Historical Replay"], index=0,
