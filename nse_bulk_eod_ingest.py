@@ -104,23 +104,50 @@ def _find_named_folders_globally(store: GoogleDriveStore, names: set[str]) -> li
     return sorted(set(ids))
 
 
-def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
-    """Walk a known archive subtree and extract YYYYMMDD date keys from filenames."""
-    found: set[date] = set()
-    queue = [folder_id]
-    while queue:
-        current_id = queue.pop()
-        for item in _list_children(store, current_id):
-            if item.get("mimeType") == FOLDER_MIME:
-                queue.append(item["id"])
-                continue
-            match = DATE_RE.search(str(item.get("name") or ""))
-            if not match:
-                continue
+def _date_from_text(value: str) -> date | None:
+    """Extract common NSE YYYYMMDD or DDMMYYYY date tokens."""
+    text = str(value or "")
+    for token in re.findall(r"(?<!\\d)\\d{8}(?!\\d)", text):
+        for fmt in ("%Y%m%d", "%d%m%Y"):
             try:
-                found.add(datetime.strptime(match.group(1), "%Y%m%d").date())
+                return datetime.strptime(token, fmt).date()
             except ValueError:
                 continue
+    return None
+
+
+def _date_from_path_parts(parts: list[str]) -> date | None:
+    """Extract a YYYY/MM/DD-style date from ancestor folder names."""
+    cleaned = [str(p).strip() for p in parts]
+    for i in range(len(cleaned) - 2):
+        try:
+            y, m, d = int(cleaned[i]), int(cleaned[i + 1]), int(cleaned[i + 2])
+            if 2000 <= y <= 2100:
+                return date(y, m, d)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
+    """Walk a known archive subtree and extract dates from filenames or date folders."""
+    found: set[date] = set()
+    queue: list[tuple[str, list[str]]] = [(folder_id, [])]
+    while queue:
+        current_id, ancestors = queue.pop()
+        for item in _list_children(store, current_id):
+            name = str(item.get("name") or "")
+            if item.get("mimeType") == FOLDER_MIME:
+                next_ancestors = ancestors + [name]
+                folder_date = _date_from_path_parts(next_ancestors)
+                if folder_date:
+                    found.add(folder_date)
+                queue.append((item["id"], next_ancestors))
+                continue
+
+            item_date = _date_from_text(name) or _date_from_path_parts(ancestors)
+            if item_date:
+                found.add(item_date)
     return found
 
 
