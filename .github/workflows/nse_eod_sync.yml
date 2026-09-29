@@ -1,0 +1,43 @@
+name: NSE EOD official data sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'First NSE trading-day date (YYYY-MM-DD)'
+        required: true
+        default: '2026-09-29'
+      end:
+        description: 'Last NSE trading-day date (YYYY-MM-DD)'
+        required: true
+        default: '2026-09-29'
+  schedule:
+    - cron: '15 13 * * 1-5'
+
+jobs:
+  sync-nse-eod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync official NSE EOD bulk data
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            START='${{ inputs.start }}'
+            END='${{ inputs.end }}'
+          else
+            START=$(TZ=Asia/Kolkata date +%Y-%m-%d)
+            END=$START
+          fi
+
+          python nse_bulk_eod_ingest.py --start "$START" --end "$END" --sync-drive
