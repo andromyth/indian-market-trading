@@ -2,11 +2,12 @@
 """Build a broader-NSE next-session Delivery candidate model in Colab.
 
 This job is intentionally separate from Streamlit serving. It consumes the
-cached official NSE CM-UDiFF daily bulk files produced by nse_bulk_eod_ingest.py,
-builds the same 53-feature contract used by the current delivery artifact, and
-walk-forward validates a pooled LogisticRegression/HGB pair across every symbol
-for which sufficient history exists. Optional news/F&O/fundamental enrichment
-can be added later when point-in-time datasets cover the wider universe.
+persisted official NSE CM-UDiFF daily bulk files produced by
+nse_bulk_eod_ingest.py, requires a passing EOD archive audit, builds the same
+53-feature contract used by the current delivery artifact, and walk-forward
+validates a pooled LogisticRegression/HGB pair across every symbol for which
+sufficient history exists. Optional news/F&O/fundamental enrichment remains
+explicitly missing until timestamped wider-universe datasets are available.
 """
 from __future__ import annotations
 import argparse, json, re
@@ -93,8 +94,44 @@ def build_panel(x, min_history=60):
 
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--bulk-root',default='/content/drive/MyDrive/Indian_Market_Research/processed/universe_expansion_2026_v4/bulk_eod'); ap.add_argument('--out',default='/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_candidate_2026'); args=ap.parse_args()
+    ap=argparse.ArgumentParser()
+    ap.add_argument(
+        '--bulk-root',
+        default='/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod',
+    )
+    ap.add_argument(
+        '--audit-report',
+        default='/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod/audit/LATEST_NSE_EOD_ARCHIVE_AUDIT_2026.json',
+    )
+    ap.add_argument(
+        '--out',
+        default='/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_candidate_2026',
+    )
+    ap.add_argument('--allow-audit-bypass', action='store_true')
+    args=ap.parse_args()
+
     root=Path(args.bulk_root); out=Path(args.out); out.mkdir(parents=True,exist_ok=True)
+
+    audit_path=Path(args.audit_report)
+    if not args.allow_audit_bypass:
+        if not audit_path.exists():
+            raise SystemExit(f'EOD archive audit report not found: {audit_path}. Run nse_eod_archive_audit.py first.')
+        try:
+            audit=json.loads(audit_path.read_text())
+        except Exception as exc:
+            raise SystemExit(f'Cannot read EOD archive audit report: {type(exc).__name__}: {exc}')
+        if str(audit.get('audit_status','')).upper() != 'PASS':
+            raise SystemExit('EOD archive audit gate FAILED. Candidate model build is blocked until the persisted NSE EOD archive passes audit.')
+        print(json.dumps({
+            'eod_archive_audit_status': audit.get('audit_status'),
+            'expected_trading_dates': audit.get('expected_trading_dates'),
+            'observed_date_folders': audit.get('observed_date_folders'),
+            'rows': audit.get('rows'),
+            'unique_symbols': audit.get('unique_symbols'),
+        }, indent=2))
+    else:
+        print('WARNING: EOD archive audit gate bypassed explicitly.')
+
     x=load_bulk(root)
     if x.empty: raise SystemExit('No official NSE bulk EOD parquet files found. Run nse_bulk_eod_ingest.py backfill first.')
     # Exclude clearly non-stock series already removed by the bulk normalizer.
