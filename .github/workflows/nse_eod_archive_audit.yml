@@ -1,0 +1,65 @@
+name: NSE EOD archive audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'First date to audit (YYYY-MM-DD)'
+        required: false
+        default: '2026-01-01'
+      end:
+        description: 'Last date to audit (YYYY-MM-DD)'
+        required: false
+        default: ''
+  workflow_run:
+    workflows: ["NSE EOD official data sync"]
+    types: [completed]
+
+concurrency:
+  group: nse-eod-archive-audit
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Audit persisted NSE EOD archive
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -x
+          echo "NSE EOD archive audit starting at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            START='${{ inputs.start }}'
+            END='${{ inputs.end }}'
+          else
+            START='2026-01-01'
+            END="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
+          fi
+
+          if [ -z "$START" ]; then START='2026-01-01'; fi
+          if [ -z "$END" ]; then END="$(TZ=Asia/Kolkata date +%Y-%m-%d)"; fi
+
+          PYTHONUNBUFFERED=1 python -u nse_eod_archive_audit.py             --start "$START"             --end "$END"
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-eod-archive-audit
+          path: /tmp/nse_eod_archive_audit/*.json
+          if-no-files-found: warn
