@@ -129,27 +129,77 @@ def _date_from_path_parts(parts: list[str]) -> date | None:
     return None
 
 
-def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
-    """Walk a known archive subtree and extract dates from filenames or date folders."""
+def _collect_dates_under_folder(
+    store: GoogleDriveStore,
+    folder_id: str,
+    *,
+    label: str,
+    max_depth: int = 8,
+    max_api_calls: int = 300,
+    max_items: int = 30000,
+) -> set[date]:
+    """Walk a known archive subtree, but never allow unbounded Drive enumeration."""
     found: set[date] = set()
-    queue: list[tuple[str, list[str]]] = [(folder_id, [])]
+    queue: list[tuple[str, list[str], int]] = [(folder_id, [], 0)]
+    api_calls = 0
+    scanned_items = 0
+    complete = True
+
+    print(f"Drive discovery: scanning {label}", flush=True)
+
     while queue:
-        current_id, ancestors = queue.pop()
-        for item in _list_children(store, current_id):
+        current_id, ancestors, depth = queue.pop()
+        if depth > max_depth:
+            complete = False
+            continue
+
+        api_calls += 1
+        if api_calls > max_api_calls:
+            complete = False
+            print(f"Drive discovery: LIMIT api_calls={max_api_calls} path={label}", flush=True)
+            break
+
+        children, page_complete = _list_children(
+            store, current_id, max_pages=10, page_size=500
+        )
+        if not page_complete:
+            complete = False
+
+        scanned_items += len(children)
+        if scanned_items > max_items:
+            complete = False
+            print(f"Drive discovery: LIMIT items={max_items} path={label}", flush=True)
+            break
+
+        for item in children:
             name = str(item.get("name") or "")
             if item.get("mimeType") == FOLDER_MIME:
                 next_ancestors = ancestors + [name]
-                folder_date = _date_from_path_parts(next_ancestors)
+                folder_date = _date_from_text(name) or _date_from_path_parts(next_ancestors)
                 if folder_date:
                     found.add(folder_date)
-                queue.append((item["id"], next_ancestors))
+                    # A dated folder already proves the archive date. Do not
+                    # recursively enumerate all files beneath that date.
+                    continue
+                queue.append((item["id"], next_ancestors, depth + 1))
                 continue
 
             item_date = _date_from_text(name) or _date_from_path_parts(ancestors)
             if item_date:
                 found.add(item_date)
-    return found
 
+        if api_calls % 25 == 0:
+            print(
+                f"Drive discovery: {label} folders_scanned={api_calls} dates={len(found)}",
+                flush=True,
+            )
+
+    print(
+        f"Drive discovery: {label} complete dates={len(found)} "
+        f"api_calls={api_calls} items={scanned_items} complete={complete}",
+        flush=True,
+    )
+    return found
 
 def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
     """Return NSE EOD dates visible in Drive across current and legacy archive paths."""
