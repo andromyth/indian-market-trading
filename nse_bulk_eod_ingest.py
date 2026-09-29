@@ -83,30 +83,25 @@ def _find_folder_path(store: GoogleDriveStore, relative_path: str) -> str | None
 
 
 def _find_named_folders_globally(store: GoogleDriveStore, names: set[str]) -> list[str]:
-    """Find exact archive folder names anywhere visible to the configured Drive."""
+    """Find exact archive folder names without scanning every Drive folder."""
     ids: list[str] = []
-    token = None
-    wanted = {str(n).strip().lower() for n in names}
-    while True:
+    for name in sorted({str(n).strip() for n in names if str(n).strip()}):
         kwargs = {
-            "q": "trashed = false and mimeType = 'application/vnd.google-apps.folder'",
+            "q": (
+                "trashed = false and "
+                "mimeType = 'application/vnd.google-apps.folder' and "
+                f"name = '{store._q(name)}'"
+            ),
             "spaces": "drive",
-            "fields": "nextPageToken,files(id,name,mimeType)",
-            "pageSize": 1000,
+            "fields": "files(id,name,mimeType)",
+            "pageSize": 100,
             "includeItemsFromAllDrives": True,
             "supportsAllDrives": True,
             "corpora": "allDrives",
         }
-        if token:
-            kwargs["pageToken"] = token
         resp = store.service.files().list(**kwargs).execute()
-        for item in resp.get("files", []):
-            if str(item.get("name") or "").strip().lower() in wanted:
-                ids.append(item["id"])
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    return ids
+        ids.extend(item["id"] for item in resp.get("files", []))
+    return sorted(set(ids))
 
 
 def _collect_dates_under_folder(store: GoogleDriveStore, folder_id: str) -> set[date]:
@@ -160,35 +155,36 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
         print(f"Drive earliest date: {min(found).isoformat()}")
         print(f"Drive latest date  : {max(found).isoformat()}")
 
-    # Also search globally for canonical BhavCopy filenames, including
-    # Shared-Drive content. This catches files whose folder layout changed.
-    token = None
-    while True:
-        kwargs = {
-            "q": "trashed = false and name contains 'BhavCopy_NSE_CM_0_0_0_'",
-            "spaces": "drive",
-            "fields": "nextPageToken,files(id,name,mimeType)",
-            "pageSize": 1000,
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-            "corpora": "allDrives",
-        }
-        if token:
-            kwargs["pageToken"] = token
-        resp = store.service.files().list(**kwargs).execute()
-        for item in resp.get("files", []):
-            if item.get("mimeType") == FOLDER_MIME:
-                continue
-            match = DATE_RE.search(str(item.get("name") or ""))
-            if not match:
-                continue
-            try:
-                found.add(datetime.strptime(match.group(1), "%Y%m%d").date())
-            except ValueError:
-                continue
-        token = resp.get("nextPageToken")
-        if not token:
-            break
+    # Search canonical filenames globally only when the known archive
+    # subtrees/fallback folders did not yield any dates.
+    if not found:
+        token = None
+        while True:
+            kwargs = {
+                "q": "trashed = false and name contains 'BhavCopy_NSE_CM_0_0_0_'",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+                "corpora": "allDrives",
+            }
+            if token:
+                kwargs["pageToken"] = token
+            resp = store.service.files().list(**kwargs).execute()
+            for item in resp.get("files", []):
+                if item.get("mimeType") == FOLDER_MIME:
+                    continue
+                match = DATE_RE.search(str(item.get("name") or ""))
+                if not match:
+                    continue
+                try:
+                    found.add(datetime.strptime(match.group(1), "%Y%m%d").date())
+                except ValueError:
+                    continue
+            token = resp.get("nextPageToken")
+            if not token:
+                break
 
     return found
 
@@ -314,6 +310,23 @@ def main() -> None:
     if args.sync_drive:
         try:
             store = GoogleDriveStore()
+            root_meta = store.service.files().get(
+                fileId=store.root_id,
+                fields="id,name,mimeType,trashed,driveId",
+                supportsAllDrives=True,
+            ).execute()
+            print(
+                "Drive root:",
+                json.dumps(
+                    {
+                        "id": root_meta.get("id"),
+                        "name": root_meta.get("name"),
+                        "mimeType": root_meta.get("mimeType"),
+                        "driveId": root_meta.get("driveId"),
+                    },
+                    sort_keys=True,
+                ),
+            )
             remote_dates = _remote_bhavcopy_dates(store)
         except Exception as exc:
             raise SystemExit(
