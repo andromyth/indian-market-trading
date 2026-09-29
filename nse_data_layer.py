@@ -216,7 +216,7 @@ def normalize_equity_history(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     x["symbol"] = x["symbol"].astype(str).str.upper()
     if "date" not in x.columns:
         raise ValueError(f"NSE equity response has no date column: {list(x.columns)}")
-    x["date"] = pd.to_datetime(x["date"], errors="coerce", dayfirst=True)
+    x["date"] = pd.to_datetime(x["date"], errors="coerce", format="mixed", dayfirst=True)
     for c in ("open", "high", "low", "close", "ltp", "prev_close", "vwap", "volume", "traded_value", "num_trades", "delivery_qty", "delivery_pct"):
         if c in x.columns:
             x[c] = pd.to_numeric(x[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
@@ -351,7 +351,7 @@ def _normalize_udiff_common_bhavcopy(frame: pd.DataFrame, trade_date: date) -> p
     x = x.rename(columns=ren)
     if "date" not in x.columns:
         x["date"] = pd.Timestamp(trade_date)
-    x["date"] = pd.to_datetime(x["date"], errors="coerce", dayfirst=True)
+    x["date"] = pd.to_datetime(x["date"], errors="coerce", format="mixed", dayfirst=True)
     if x["date"].isna().all():
         x["date"] = pd.Timestamp(trade_date)
     if "symbol" not in x.columns:
