@@ -157,7 +157,12 @@ def _relative_or_absolute(path: Path) -> str:
 
 def gdrive_config() -> dict:
     """Resolve Google Drive configuration without failing when unconfigured."""
-    root_id = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+    # GitHub Actions uses GOOGLE_DRIVE_ROOT_ID, while Streamlit/local
+    # deployments historically use GDRIVE_ROOT_FOLDER_ID. Accept both.
+    root_id = (
+        os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+        or os.getenv("GOOGLE_DRIVE_ROOT_ID", "").strip()
+    )
     service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     try:
         import streamlit as st  # lazy: module also works outside Streamlit
