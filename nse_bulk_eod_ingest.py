@@ -222,6 +222,16 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
     # whose filenames do not contain the full BhavCopy prefix.
     resolved_paths: list[str] = []
     for idx, relative_path in enumerate(ARCHIVE_FOLDER_PATHS):
+        # raw/2026_expansion is a broad legacy tree. Only inspect it when
+        # the two known NSE archive locations produce no dates.
+        if idx == 2 and found:
+            print(
+                "Drive discovery: primary/legacy archive dates found; "
+                "skipping broad expansion tree.",
+                flush=True,
+            )
+            break
+
         folder_id = _find_folder_path(store, relative_path)
         if not folder_id:
             continue
@@ -236,16 +246,6 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
                 label=relative_path,
             )
         )
-
-        # Do not recursively scan the broad expansion tree when a primary or
-        # legacy NSE archive has already yielded dates.
-        if found and idx < 2:
-            print(
-                f"Drive discovery: dates found in {relative_path}; "
-                "skipping lower-priority archive tree(s).",
-                flush=True,
-            )
-            break
 
         if len(found) == before:
             print(
