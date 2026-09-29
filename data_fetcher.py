@@ -115,6 +115,51 @@ def _dhan_history(symbol: str, period: str, interval: str):
     return df
 
 
+def _normalize_historical_frame(df):
+    """Normalize provider-specific OHLC(V) shapes for all dashboard callers."""
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+    x = df.copy()
+    if isinstance(x.columns, pd.MultiIndex):
+        fields = {"open", "high", "low", "close", "adj close", "volume", "ltp", "vol"}
+        chosen = None
+        for level in range(x.columns.nlevels):
+            vals = {str(v).strip().lower() for v in x.columns.get_level_values(level)}
+            if vals & fields:
+                chosen = level
+                break
+        if chosen is not None:
+            x.columns = [str(v).strip() for v in x.columns.get_level_values(chosen)]
+    else:
+        x.columns = [str(c).strip() for c in x.columns]
+    aliases = {
+        "open":"Open", "high":"High", "low":"Low", "close":"Close",
+        "adj close":"Close", "adj_close":"Close", "ltp":"Close",
+        "volume":"Volume", "vol":"Volume",
+    }
+    ren={}
+    for c in x.columns:
+        k=str(c).strip().lower()
+        if k in aliases: ren[c]=aliases[k]
+    x=x.rename(columns=ren)
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c in x.columns:
+            v=x[c]
+            if isinstance(v,pd.DataFrame): v=v.iloc[:,0]
+            x[c]=pd.to_numeric(v,errors="coerce")
+    if "Close" not in x.columns and "Adj Close" in x.columns:
+        x["Close"]=pd.to_numeric(x["Adj Close"],errors="coerce")
+    if "Volume" not in x.columns:
+        x["Volume"]=float("nan")
+    idx=pd.to_datetime(x.index,errors="coerce")
+    x.index=idx
+    x=x[~x.index.isna()].sort_index()
+    required=["Open","High","Low","Close"]
+    if any(c not in x.columns for c in required):
+        return pd.DataFrame()
+    return x
+
+
 def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
     """NSE-first historical provider for NSE symbols; fallbacks are explicit."""
     is_nse = str(symbol).upper().endswith(".NS")
@@ -129,24 +174,24 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d"):
                 nse_df = nse_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
                 if "date" in nse_df.columns:
                     nse_df = nse_df.set_index("date")
-                return nse_df
+                return _normalize_historical_frame(nse_df)
         except Exception:
             pass
     if is_nse and interval.lower() in {"1m", "1min"} and fetch_intraday_1m_current is not None:
         try:
             nse_1m = fetch_intraday_1m_current(root, sync_drive=True)
             if not nse_1m.empty:
-                return nse_1m
+                return _normalize_historical_frame(nse_1m)
         except Exception:
             pass
     if _dhan_configured() and is_nse:
         try:
             df = _dhan_history(symbol, period, interval)
             if not df.empty:
-                return df
+                return _normalize_historical_frame(df)
         except Exception:
             pass
-    return yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    return _normalize_historical_frame(yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False))
 
 
 def get_intraday(symbol: str, interval: str = "1m"):
@@ -154,17 +199,17 @@ def get_intraday(symbol: str, interval: str = "1m"):
         try:
             nse_1m = fetch_intraday_1m_current(str(symbol).upper().replace(".NS", ""), sync_drive=True)
             if not nse_1m.empty:
-                return nse_1m
+                return _normalize_historical_frame(nse_1m)
         except Exception:
             pass
     if _dhan_configured() and str(symbol).upper().endswith(".NS"):
         try:
             df = _dhan_history(symbol, "5d", interval)
             if not df.empty:
-                return df
+                return _normalize_historical_frame(df)
         except Exception:
             pass
-    return yf.Ticker(symbol).history(period="5d", interval=interval, auto_adjust=False)
+    return _normalize_historical_frame(yf.Ticker(symbol).history(period="5d", interval=interval, auto_adjust=False))
 
 
 def get_latest_price(symbol: str) -> float | None:

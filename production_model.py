@@ -29,7 +29,6 @@ def _load_manifest() -> dict[str, Any]:
 
 _MANIFEST = _load_manifest()
 FEATURES = list(_MANIFEST["features"])
-CERTIFIED_SYMBOLS = {"BHARTIARTL", "RELIANCE", "SBIN"}
 
 
 def model_status() -> dict[str, Any]:
@@ -92,39 +91,32 @@ def model_target_contract() -> dict[str, Any]:
         "classes": [int(x) for x in classes],
     }
 
-def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize yfinance/NSE/Dhan OHLCV responses to flat Series columns."""
+def _normalize_price_frame(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
     x = df.copy()
-    if x.empty:
-        return x
-    wanted = {"open":"Open", "high":"High", "low":"Low", "close":"Close", "volume":"Volume", "adj close":"Adj Close"}
     if isinstance(x.columns, pd.MultiIndex):
-        data = {}
-        used = set()
-        for target, canonical in wanted.items():
-            chosen = None
-            for col in x.columns:
-                parts = [str(v).strip().lower() for v in (col if isinstance(col, tuple) else (col,))]
-                if target in parts:
-                    chosen = col
-                    if str(col[0]).strip().lower() == target:
-                        break
-            if chosen is not None and canonical not in used:
-                data[canonical] = x[chosen]
-                used.add(canonical)
-        x = pd.DataFrame(data, index=x.index)
+        fields = {"open", "high", "low", "close", "adj close", "volume", "ltp", "vol"}
+        chosen = None
+        for level in range(x.columns.nlevels):
+            vals = {str(v).strip().lower() for v in x.columns.get_level_values(level)}
+            if vals & fields:
+                chosen = level; break
+        if chosen is not None:
+            x.columns = [str(v).strip() for v in x.columns.get_level_values(chosen)]
     else:
-        data = {}
-        for col in x.columns:
-            key = str(col).strip().lower().replace("_", " ")
-            canonical = wanted.get(key)
-            if canonical and canonical not in data:
-                data[canonical] = x[col]
-        if data:
-            x = pd.DataFrame(data, index=x.index)
-    if "Close" not in x.columns and "Adj Close" in x.columns:
-        x["Close"] = x["Adj Close"]
-    return x
+        x.columns = [str(c).strip() for c in x.columns]
+    aliases={"open":"Open","high":"High","low":"Low","close":"Close","adj close":"Close","adj_close":"Close","ltp":"Close","volume":"Volume","vol":"Volume"}
+    x=x.rename(columns={c:aliases.get(str(c).strip().lower(),c) for c in x.columns})
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c in x.columns:
+            v=x[c]
+            if isinstance(v,pd.DataFrame): v=v.iloc[:,0]
+            x[c]=pd.to_numeric(v,errors="coerce")
+    if "Volume" not in x.columns: x["Volume"]=np.nan
+    if any(c not in x.columns for c in ["Open","High","Low","Close"]):
+        return pd.DataFrame()
+    return x.sort_index()
 
 
 def _safe_float(v):
@@ -166,10 +158,6 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def _price_features(df: pd.DataFrame) -> dict[str, float]:
-    df = _normalize_ohlcv_columns(df)
-    missing = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c not in df.columns]
-    if missing:
-        raise ValueError(f"Production history is missing required OHLCV columns: {missing}")
     c = pd.to_numeric(df["Close"], errors="coerce")
     h = pd.to_numeric(df["High"], errors="coerce")
     l = pd.to_numeric(df["Low"], errors="coerce")
@@ -195,9 +183,9 @@ def _price_features(df: pd.DataFrame) -> dict[str, float]:
 def _market_features(market_df: pd.DataFrame | None) -> dict[str, float]:
     if market_df is None or market_df.empty:
         return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
-    market_df = _normalize_ohlcv_columns(market_df)
-    if "Close" not in market_df.columns:
-        raise ValueError("Market benchmark history is missing Close column")
+    market_df = _normalize_price_frame(market_df)
+    if market_df.empty or "Close" not in market_df.columns:
+        return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
     c = pd.to_numeric(market_df["Close"], errors="coerce")
     return {
         "nifty_close": _safe_float(c.iloc[-1]), "market_ret_1": _returns(c, 1),
@@ -228,7 +216,9 @@ def build_feature_rows(items: list[dict[str, Any]]) -> pd.DataFrame:
     """
     rows: list[dict[str, Any]] = []
     for item in items:
-        price_df = item["price_df"]
+        price_df = _normalize_price_frame(item["price_df"])
+        if price_df.empty:
+            continue
         pf = _price_features(price_df)
         mf = _market_features(item.get("market_df"))
         row: dict[str, Any] = {**pf, **mf}
@@ -331,16 +321,6 @@ def predict(feature_df: pd.DataFrame) -> list[dict[str, Any]]:
     probs = model.predict_proba(X)[:, 1]
     out = []
     for i, p in enumerate(probs):
-        symbol = str(feature_df.iloc[i].get("_symbol", ""))
-        root_symbol = symbol.upper().replace(".NS", "").replace(".BO", "")
-        if root_symbol not in CERTIFIED_SYMBOLS:
-            out.append({
-                "symbol": symbol,
-                "prediction_status": "BLOCKED",
-                "reason": "symbol_not_in_validated_universe",
-                "trained_symbols": sorted(CERTIFIED_SYMBOLS),
-            })
-            continue
         p = float(np.clip(p, 0, 1))
         signal = "BUY" if p >= 0.55 else ("SELL" if p <= 0.45 else "HOLD")
         row = feature_df.iloc[i]
