@@ -24,7 +24,7 @@ from data_fetcher import (
 from delivery_model import supported_symbol, MANIFEST
 from autonomous_engine import delivery_prediction
 from fo_analysis import summarize as fo_summarize
-from nse_data_layer import fetch_equity_history
+from nse_data_layer import fetch_nse_bulk_symbol_history
 from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
 from triggers import announcement_to_news, event_risk_score, tag_news_items
 
@@ -41,7 +41,16 @@ def _is_nse_equity_trading_day(d) -> bool:
 def _nse_daily(symbol: str) -> pd.DataFrame:
     end = pd.Timestamp.now(tz=IST).date()
     start = end - pd.Timedelta(days=140)
-    df = fetch_equity_history(symbol, start, end, sync_drive=True)
+    # Use the existing official CM-UDiFF bulk EOD archive path. This avoids
+    # the security-wise historical endpoint, which may return no response in
+    # GitHub Actions even when the official daily archives are available.
+    df = fetch_nse_bulk_symbol_history(
+        symbol,
+        start,
+        end,
+        sync_drive=True,
+        download_missing=True,
+    )
     if df.empty:
         return pd.DataFrame()
     x = df.rename(
