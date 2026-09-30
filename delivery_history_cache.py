@@ -152,6 +152,76 @@ def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[
     return sorted(unique.values(), key=lambda x: _date_from_name(x["name"]) or date.min)
 
 
+def _remote_symbol_parquets(
+    store: GoogleDriveStore, symbols: list[str], start: date, end: date
+) -> dict[str, list[dict]]:
+    """Find already-synced per-symbol official NSE parquet chunks in Drive."""
+    out = {s.upper(): [] for s in symbols}
+    base = _find_folder(store, "production_data/nse_official/equity")
+    if not base:
+        return out
+
+    for symbol in out:
+        sfolder = store._find_child(base, symbol, FOLDER_MIME)
+        if not sfolder:
+            continue
+        token = None
+        while True:
+            kwargs = {
+                "q": f"'{sfolder['id']}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType,size)",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if token:
+                kwargs["pageToken"] = token
+            resp = store.service.files().list(**kwargs).execute()
+            for item in resp.get("files", []):
+                name = str(item.get("name", "")).lower()
+                if name.endswith(".parquet") and item.get("id"):
+                    out[symbol].append(item)
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+    return out
+
+
+def _load_remote_symbol_history(
+    store: GoogleDriveStore,
+    symbol: str,
+    files: list[dict],
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    frames = []
+    for item in files:
+        temp = CACHE_ROOT / f".{symbol}.{item['id']}.tmp"
+        try:
+            _download_file(store, item["id"], temp)
+            x = pd.read_parquet(temp)
+            if "date" not in x.columns:
+                continue
+            x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.date
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in x.columns:
+                    x[col] = pd.to_numeric(x[col], errors="coerce")
+            x = x[
+                x["date"].notna()
+                & (x["date"] >= start)
+                & (x["date"] <= end)
+            ].copy()
+            if not x.empty:
+                frames.append(x)
+        finally:
+            temp.unlink(missing_ok=True)
+    if not frames:
+        return pd.DataFrame()
+    x = pd.concat(frames, ignore_index=True)
+    return x.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
+
+
 def _filter_symbols(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
     if df is None or df.empty or "symbol" not in df.columns:
         return {}
@@ -193,6 +263,31 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
     folder_id = _find_folder(store, REMOTE_ROOT)
     results: dict[str, pd.DataFrame] = {}
     missing = []
+
+    # Prefer any already-synced official NSE security-wise parquet chunks.
+    # This is substantially cheaper than downloading dozens of daily bulk files.
+    remote_symbol_files = _remote_symbol_parquets(store, symbols, end - timedelta(days=180), end)
+    for symbol in symbols:
+        if symbol in remote_symbol_files and remote_symbol_files[symbol]:
+            frame = _load_remote_symbol_history(
+                store, symbol, remote_symbol_files[symbol], end - timedelta(days=180), end
+            )
+            if len(frame) >= min_rows:
+                local = CACHE_ROOT / f"{symbol}.parquet"
+                results[symbol] = _save_symbol(symbol, frame, store)
+        if symbol not in results:
+            local = CACHE_ROOT / f"{symbol}.parquet"
+            if not local.exists() and folder_id:
+                remote = _find_file_in_folder(store, folder_id, f"{symbol}.parquet")
+                if remote:
+                    _download_file(store, remote["id"], local)
+            if local.exists():
+                try:
+                    results[symbol] = pd.read_parquet(local)
+                except Exception:
+                    local.unlink(missing_ok=True)
+        if symbol not in results or len(results[symbol]) < min_rows:
+            missing.append(symbol)
 
     for symbol in symbols:
         local = CACHE_ROOT / f"{symbol}.parquet"
