@@ -53,7 +53,7 @@ def main() -> int:
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
     for r in pending:
         symbol = str(r["symbol"]).upper()
-        start = (pd.Timestamp(r["decision_timestamp"]).date() - pd.Timedelta(days=2)).date()
+        start = pd.Timestamp(r["decision_timestamp"]).date() - pd.Timedelta(days=2)
         # Fetch enough calendar time to cover seven NSE sessions, including holidays/weekends.
         by_symbol[symbol] = official_history(symbol, start, today)
 
