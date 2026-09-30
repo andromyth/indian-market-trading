@@ -312,8 +312,9 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
     if missing:
         if len(bulk_files) < min_rows:
             raise RuntimeError(
-                f"Drive contains only {len(bulk_files)} recent NSE bulk EOD files; "
-                f"{min_rows} are required for Delivery warmup."
+                "Insufficient Delivery history in persistent storage: "
+                f"only {len(bulk_files)} recent bulk EOD files were discoverable; "
+                f"{min_rows} sessions are required for Delivery warmup."
             )
         # Use the most recent min_rows trading-day files as the compact bootstrap.
         selected = bulk_files[-min_rows:]
