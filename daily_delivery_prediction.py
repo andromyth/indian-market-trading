@@ -25,6 +25,7 @@ from delivery_model import supported_symbol, MANIFEST
 from autonomous_engine import delivery_prediction
 from fo_analysis import summarize as fo_summarize
 from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
+from delivery_history_cache import ensure_delivery_history
 from triggers import announcement_to_news, event_risk_score, tag_news_items
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -37,22 +38,26 @@ def _is_nse_equity_trading_day(d) -> bool:
     )
 
 
-def _nse_daily(symbol: str) -> pd.DataFrame:
-    end = pd.Timestamp.now(tz=IST).date()
-    start = end - pd.Timedelta(days=140)
-    # Use the repository's bounded NSE-first history provider. It prefers
-    # cached official NSE bulk data and only falls through to the existing
-    # reference providers when the official endpoints are unavailable.
-    df = get_historical(f"{symbol}.NS", period="140d", interval="1d")
+def _nse_daily(symbol: str, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    df = histories.get(symbol.upper(), pd.DataFrame())
     if df.empty:
         return pd.DataFrame()
     x = df.copy()
-    x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+    x["Date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
     x = x.dropna(subset=["Date"]).set_index("Date").sort_index()
     return x
 
 
-def run_symbol(symbol: str, all_news: list[dict]) -> dict:
+def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFrame]) -> dict:
     root = symbol.replace(".NS", "").replace(".BO", "").upper()
     now = datetime.now(IST)
     expected_date = now.date()
@@ -63,7 +68,7 @@ def run_symbol(symbol: str, all_news: list[dict]) -> dict:
             "reason": "non_trading_day_no_new_delivery_prediction",
             "expected_date": expected_date.isoformat(),
         }
-    price_df = _nse_daily(root)
+    price_df = _nse_daily(root, histories)
     if price_df.empty or len(price_df) < 65:
         return {"symbol": root, "status": "BLOCKED", "reason": "insufficient_official_nse_daily_history"}
     latest_date = price_df.index[-1].date()
@@ -137,10 +142,11 @@ def main() -> int:
         raise SystemExit("No supported trained Delivery symbols in production manifest.")
 
     all_news = tag_news_items(get_news(max_items=100))
+    histories = ensure_delivery_history(trained, datetime.now(IST).date(), min_rows=65)
     rows = []
     for symbol in trained:
         try:
-            rows.append(run_symbol(symbol, all_news))
+            rows.append(run_symbol(symbol, all_news, histories))
         except Exception as exc:
             rows.append(
                 {
