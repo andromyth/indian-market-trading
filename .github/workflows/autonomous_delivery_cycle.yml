@@ -1,0 +1,39 @@
+name: Autonomous Delivery prediction and validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 14 * * 1-5'
+
+jobs:
+  delivery-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate autonomous Delivery predictions
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -eux
+          python -u daily_delivery_prediction.py
+
+      - name: Validate stored Delivery predictions D+1 through D+7
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -eux
+          python -u validate_prediction_ledger.py
