@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -14,7 +14,7 @@ from persistent_store import GoogleDriveStore
 BULK_PREFIX = "BhavCopy_NSE_CM_0_0_0_"
 CACHE_ROOT = Path(__file__).resolve().parent / "data" / "nse_official" / "delivery_history"
 REMOTE_ROOT = "production_data/nse_official/delivery_history"
-FILENAME_RE = re.compile(r"BhavCopy_NSE_CM_0_0_0_(20\d{6})_F_0000\\.parquet$", re.I)
+FILENAME_RE = re.compile(r"BhavCopy_NSE_CM_0_0_0_(20\d{6})_F_0000\.parquet$", re.I)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
@@ -23,7 +23,7 @@ def _date_from_name(name: str) -> date | None:
     if not m:
         return None
     try:
-        return pd.Timestamp(m.group(1)).date()
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
     except Exception:
         return None
 
@@ -71,8 +71,7 @@ def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[
         kwargs = {
             "q": (
                 "trashed = false and "
-                f"name contains '{BULK_PREFIX}' and "
-                "mimeType = 'application/octet-stream'"
+                f"name contains '{BULK_PREFIX}'"
             ),
             "spaces": "drive",
             "fields": "nextPageToken,files(id,name,mimeType,size)",
