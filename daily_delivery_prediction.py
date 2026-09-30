@@ -29,6 +29,13 @@ from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
 from triggers import announcement_to_news, event_risk_score, tag_news_items
 
 IST = ZoneInfo("Asia/Kolkata")
+MARKET_EOD_READY_TIME = time(16, 0)
+
+
+def _is_nse_equity_trading_day(d) -> bool:
+    return d.weekday() < 5 and d not in NSE_EQUITY_HOLIDAYS_BY_YEAR.get(
+        d.year, frozenset()
+    )
 
 
 def _nse_daily(symbol: str) -> pd.DataFrame:
