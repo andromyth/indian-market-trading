@@ -9,7 +9,6 @@ re-download the full archive.
 from __future__ import annotations
 
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -133,26 +132,57 @@ def _bootstrap(symbols: list[str], end: date, rows_needed: int) -> dict[str, pd.
     prior_end = end - timedelta(days=1)
     prior_dates = list(business_days(end - timedelta(days=370), prior_end))[-rows_needed:]
     if len(prior_dates) < rows_needed:
-        raise RuntimeError(f"Cannot identify {rows_needed} prior NSE trading sessions for Delivery bootstrap.")
+        raise RuntimeError(
+            f"Cannot identify {rows_needed} prior NSE trading sessions for Delivery bootstrap."
+        )
 
     collected = {s: [] for s in symbols}
+    failures: list[tuple[date, str]] = []
 
-    def load_one(d: date) -> pd.DataFrame:
-        return _day_frame(d)
-
-    with ThreadPoolExecutor(max_workers=min(8, len(prior_dates))) as pool:
-        futures = {pool.submit(load_one, d): d for d in prior_dates}
-        for future in as_completed(futures):
-            df = future.result()
-            for s, part in _symbol_parts(df, symbols).items():
+    # Deliberately sequential: fetch_nse_eod_bhavcopy() writes the shared local
+    # BULK_EOD_MANIFEST JSON, so concurrent downloads can corrupt it.
+    for idx, d in enumerate(prior_dates, start=1):
+        try:
+            df = _day_frame(d)
+            parts = _symbol_parts(df, symbols)
+            for s, part in parts.items():
                 collected[s].append(part)
+            print(
+                f"DELIVERY_BOOTSTRAP {idx}/{len(prior_dates)} {d.isoformat()} "
+                f"symbols={len(parts)}",
+                flush=True,
+            )
+        except Exception as exc:
+            failures.append((d, f"{type(exc).__name__}: {exc}"))
+            print(
+                f"DELIVERY_BOOTSTRAP_FAILED {d.isoformat()} "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
-    out = {}
+    out: dict[str, pd.DataFrame] = {}
     for s in symbols:
         frames = collected[s]
-        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        frame = frame.sort_values("date").drop_duplicates(["symbol", "date"], keep="last") if not frame.empty else frame
+        frame = (
+            pd.concat(frames, ignore_index=True)
+            if frames
+            else pd.DataFrame()
+        )
+        if not frame.empty:
+            frame = frame.sort_values("date").drop_duplicates(
+                ["symbol", "date"], keep="last"
+            )
         out[s] = frame
+
+    if any(len(out[s]) < rows_needed for s in symbols):
+        details = "; ".join(
+            f"{d.isoformat()}={err}" for d, err in failures[:8]
+        )
+        raise RuntimeError(
+            "Official NSE bootstrap completed with insufficient history: "
+            + ", ".join(f"{s}={len(out[s])} rows" for s in symbols)
+            + (f". Failed sessions: {details}" if details else "")
+        )
     return out
 
 
