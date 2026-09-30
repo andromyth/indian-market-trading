@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -65,22 +66,18 @@ def _download_file(store: GoogleDriveStore, file_id: str, path: Path) -> None:
 
 
 def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[dict]:
-    """Discover archived NSE bulk parquet files through the known Drive tree.
+    """Discover NSE bulk EOD parquet files with bounded Drive traversal.
 
-    The EOD ingest stores files under:
-    production_data/nse_official/bulk_eod/YYYY/MM/DD/<BhavCopy...parquet>
-    We traverse only the year/month/day folders needed for this window rather
-    than relying on a global filename query.
+    Lists each year/month/day folder once instead of issuing one lookup per
+    calendar date. This keeps the initial Delivery-history bootstrap bounded.
     """
     base = _find_folder(store, "production_data/nse_official/bulk_eod")
     if not base:
         return []
 
-    out: list[dict] = []
-
-    def list_children(parent_id: str) -> list[dict]:
+    def children(parent_id: str) -> list[dict]:
         token = None
-        items: list[dict] = []
+        out: list[dict] = []
         while True:
             kwargs = {
                 "q": f"'{parent_id}' in parents and trashed = false",
@@ -93,60 +90,45 @@ def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[
             if token:
                 kwargs["pageToken"] = token
             resp = store.service.files().list(**kwargs).execute()
-            items.extend(resp.get("files", []))
+            out.extend(resp.get("files", []))
             token = resp.get("nextPageToken")
             if not token:
-                return items
+                return out
 
-    years = sorted({d.year for d in pd.date_range(start, end, freq="D")})
-    for year in years:
-        yfolder = store._find_child(base, f"{year:04d}", FOLDER_MIME)
-        if not yfolder:
+    out: list[dict] = []
+    for yitem in children(base):
+        if yitem.get("mimeType") != FOLDER_MIME:
             continue
-        for month in range(1, 13):
-            month_start = date(year, month, 1)
-            if month_start > end or (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) < start:
-                continue
-            mfolder = store._find_child(yfolder["id"], f"{month:02d}", FOLDER_MIME)
-            if not mfolder:
-                continue
-            for day in range(1, 32):
-                try:
-                    d = date(year, month, day)
-                except ValueError:
-                    continue
-                if d < start or d > end:
-                    continue
-                dfolder = store._find_child(mfolder["id"], f"{day:02d}", FOLDER_MIME)
-                if not dfolder:
-                    continue
-                for item in list_children(dfolder["id"]):
-                    dname = _date_from_name(item.get("name", ""))
-                    if dname == d and str(item.get("name", "")).lower().endswith(".parquet"):
-                        out.append(item)
-
-    # Defensive fallback for archives whose date folder/file naming differs.
-    if not out:
-        parent_items = list_children(base)
-        for year_item in parent_items:
-            if year_item.get("mimeType") != FOLDER_MIME:
+        try:
+            year = int(yitem.get("name", ""))
+        except ValueError:
+            continue
+        if year < start.year or year > end.year:
+            continue
+        for mitem in children(yitem["id"]):
+            if mitem.get("mimeType") != FOLDER_MIME:
                 continue
             try:
-                year = int(year_item.get("name", ""))
+                month = int(mitem.get("name", ""))
             except ValueError:
                 continue
-            if year < start.year or year > end.year:
+            if not 1 <= month <= 12:
                 continue
-            for month_item in list_children(year_item["id"]):
-                if month_item.get("mimeType") != FOLDER_MIME:
+            for ditem in children(mitem["id"]):
+                if ditem.get("mimeType") != FOLDER_MIME:
                     continue
-                for day_item in list_children(month_item["id"]):
-                    if day_item.get("mimeType") != FOLDER_MIME:
-                        continue
-                    for item in list_children(day_item["id"]):
-                        dname = _date_from_name(item.get("name", ""))
-                        if dname and start <= dname <= end and str(item.get("name", "")).lower().endswith(".parquet"):
-                            out.append(item)
+                try:
+                    d = date(year, month, int(ditem.get("name", "")))
+                except (ValueError, TypeError):
+                    continue
+                if not (start <= d <= end):
+                    continue
+                for item in children(ditem["id"]):
+                    if (
+                        str(item.get("name", "")).lower().endswith(".parquet")
+                        and _date_from_name(item.get("name", "")) == d
+                    ):
+                        out.append(item)
 
     unique = {str(x["id"]): x for x in out}
     return sorted(unique.values(), key=lambda x: _date_from_name(x["name"]) or date.min)
@@ -319,16 +301,22 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
         # Use the most recent min_rows trading-day files as the compact bootstrap.
         selected = bulk_files[-min_rows:]
         collected = {s: [] for s in symbols}
-        for item in selected:
+
+        def load_one(item: dict) -> pd.DataFrame:
             temp = CACHE_ROOT / f".{item['name']}.tmp"
-            _download_file(store, item["id"], temp)
             try:
-                df = pd.read_parquet(temp)
+                _download_file(store, item["id"], temp)
+                return pd.read_parquet(temp)
+            finally:
+                temp.unlink(missing_ok=True)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(selected))) as pool:
+            futures = {pool.submit(load_one, item): item for item in selected}
+            for future in as_completed(futures):
+                df = future.result()
                 parts = _filter_symbols(df, symbols)
                 for s, part in parts.items():
                     collected[s].append(part)
-            finally:
-                temp.unlink(missing_ok=True)
         for s in missing:
             frames = collected.get(s, [])
             frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
