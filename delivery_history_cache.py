@@ -65,32 +65,91 @@ def _download_file(store: GoogleDriveStore, file_id: str, path: Path) -> None:
 
 
 def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[dict]:
-    token = None
+    """Discover archived NSE bulk parquet files through the known Drive tree.
+
+    The EOD ingest stores files under:
+    production_data/nse_official/bulk_eod/YYYY/MM/DD/<BhavCopy...parquet>
+    We traverse only the year/month/day folders needed for this window rather
+    than relying on a global filename query.
+    """
+    base = _find_folder(store, "production_data/nse_official/bulk_eod")
+    if not base:
+        return []
+
     out: list[dict] = []
-    while True:
-        kwargs = {
-            "q": (
-                "trashed = false and "
-                f"name contains '{BULK_PREFIX}'"
-            ),
-            "spaces": "drive",
-            "fields": "nextPageToken,files(id,name,mimeType,size)",
-            "pageSize": 1000,
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-            "corpora": "allDrives",
-        }
-        if token:
-            kwargs["pageToken"] = token
-        resp = store.service.files().list(**kwargs).execute()
-        for item in resp.get("files", []):
-            d = _date_from_name(item.get("name", ""))
-            if d and start <= d <= end:
-                out.append(item)
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    return sorted(out, key=lambda x: _date_from_name(x["name"]) or date.min)
+
+    def list_children(parent_id: str) -> list[dict]:
+        token = None
+        items: list[dict] = []
+        while True:
+            kwargs = {
+                "q": f"'{parent_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType,size)",
+                "pageSize": 500,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if token:
+                kwargs["pageToken"] = token
+            resp = store.service.files().list(**kwargs).execute()
+            items.extend(resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return items
+
+    years = sorted({d.year for d in pd.date_range(start, end, freq="D")})
+    for year in years:
+        yfolder = store._find_child(base, f"{year:04d}", FOLDER_MIME)
+        if not yfolder:
+            continue
+        for month in range(1, 13):
+            month_start = date(year, month, 1)
+            if month_start > end or (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) < start:
+                continue
+            mfolder = store._find_child(yfolder["id"], f"{month:02d}", FOLDER_MIME)
+            if not mfolder:
+                continue
+            for day in range(1, 32):
+                try:
+                    d = date(year, month, day)
+                except ValueError:
+                    continue
+                if d < start or d > end:
+                    continue
+                dfolder = store._find_child(mfolder["id"], f"{day:02d}", FOLDER_MIME)
+                if not dfolder:
+                    continue
+                for item in list_children(dfolder["id"]):
+                    dname = _date_from_name(item.get("name", ""))
+                    if dname == d and str(item.get("name", "")).lower().endswith(".parquet"):
+                        out.append(item)
+
+    # Defensive fallback for archives whose date folder/file naming differs.
+    if not out:
+        parent_items = list_children(base)
+        for year_item in parent_items:
+            if year_item.get("mimeType") != FOLDER_MIME:
+                continue
+            try:
+                year = int(year_item.get("name", ""))
+            except ValueError:
+                continue
+            if year < start.year or year > end.year:
+                continue
+            for month_item in list_children(year_item["id"]):
+                if month_item.get("mimeType") != FOLDER_MIME:
+                    continue
+                for day_item in list_children(month_item["id"]):
+                    if day_item.get("mimeType") != FOLDER_MIME:
+                        continue
+                    for item in list_children(day_item["id"]):
+                        dname = _date_from_name(item.get("name", ""))
+                        if dname and start <= dname <= end and str(item.get("name", "")).lower().endswith(".parquet"):
+                            out.append(item)
+
+    unique = {str(x["id"]): x for x in out}
+    return sorted(unique.values(), key=lambda x: _date_from_name(x["name"]) or date.min)
 
 
 def _filter_symbols(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
