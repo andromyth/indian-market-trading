@@ -177,7 +177,12 @@ def _manifest() -> dict[str, Any]:
 def _save_manifest(obj: dict[str, Any]) -> None:
     obj["updated_at"] = datetime.now(tz=IST).isoformat()
     _ensure_local()
-    MANIFEST.write_text(json.dumps(obj, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    tmp = MANIFEST.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(obj, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    tmp.replace(MANIFEST)
 
 
 def _drive_upload(local_path: Path, remote_path: str, mime: str = "application/octet-stream") -> dict[str, Any]:
@@ -452,7 +457,17 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
     if sync_drive:
         _drive_upload(zip_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{zip_path.name}", "application/zip")
         _drive_upload(parquet_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{parquet_path.name}", "application/octet-stream")
-    m = json.loads(BULK_EOD_MANIFEST.read_text()) if BULK_EOD_MANIFEST.exists() else {"version": "nse-cm-udiff-v1", "days": {}}
+    if BULK_EOD_MANIFEST.exists():
+        try:
+            m = json.loads(BULK_EOD_MANIFEST.read_text())
+            if not isinstance(m, dict):
+                raise ValueError("bulk EOD manifest is not a JSON object")
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A previously interrupted runner can leave a partial manifest.
+            # Reinitialize it from the files already present on disk.
+            m = {"version": "nse-cm-udiff-v1", "days": {}}
+    else:
+        m = {"version": "nse-cm-udiff-v1", "days": {}}
     m.setdefault("days", {})[key] = {
         "source": "NSE_OFFICIAL_UDIFF_BHAVCOPY", "url": url,
         "parquet": str(parquet_path), "rows": int(len(normalized)),
