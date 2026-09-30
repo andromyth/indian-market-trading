@@ -25,6 +25,7 @@ from delivery_model import supported_symbol, MANIFEST
 from autonomous_engine import delivery_prediction
 from fo_analysis import summarize as fo_summarize
 from nse_data_layer import fetch_equity_history
+from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
 from triggers import announcement_to_news, event_risk_score, tag_news_items
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -53,9 +54,28 @@ def _nse_daily(symbol: str) -> pd.DataFrame:
 
 def run_symbol(symbol: str, all_news: list[dict]) -> dict:
     root = symbol.replace(".NS", "").replace(".BO", "").upper()
+    now = datetime.now(IST)
+    expected_date = now.date()
+    if not _is_nse_equity_trading_day(expected_date):
+        return {
+            "symbol": root,
+            "status": "BLOCKED",
+            "reason": "non_trading_day_no_new_delivery_prediction",
+            "expected_date": expected_date.isoformat(),
+        }
     price_df = _nse_daily(root)
     if price_df.empty or len(price_df) < 65:
         return {"symbol": root, "status": "BLOCKED", "reason": "insufficient_official_nse_daily_history"}
+    latest_date = price_df.index[-1].date()
+    if now.time() < MARKET_EOD_READY_TIME or latest_date != expected_date:
+        return {
+            "symbol": root,
+            "status": "BLOCKED",
+            "reason": "official_nse_eod_not_ready_for_current_session",
+            "expected_date": expected_date.isoformat(),
+            "latest_official_date": latest_date.isoformat(),
+            "eod_ready_after_ist": MARKET_EOD_READY_TIME.strftime("%H:%M"),
+        }
 
     benchmark = benchmark_for_symbol(root)
     market_df = get_historical(benchmark, period="140d", interval="1d")
