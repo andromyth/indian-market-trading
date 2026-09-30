@@ -2,17 +2,19 @@
 
 The Streamlit container is treated as a cache, not as the system of record.
 1-minute observations are partitioned by IST trading date and mirrored to
-Google Drive when a Drive service-account configuration is available.
+Google Drive using OAuth when available, with the existing service-account
+configuration retained as a fallback.
 
 Configuration for Streamlit Cloud:
 
 [gdrive]
-root_folder_id = "<shared Google Drive folder ID>"
+root_folder_id = "<Google Drive root folder ID>"
 service_account_json = '''{...service-account-json...}'''
+oauth_token_json = '''{...authorized-user-token-json...}'''
 
-The Drive folder must be shared with the service-account email as Editor.
-Local execution may use GDRIVE_ROOT_FOLDER_ID and
-GOOGLE_SERVICE_ACCOUNT_JSON environment variables instead.
+GitHub Actions should provide GOOGLE_DRIVE_ROOT_ID and
+GOOGLE_OAUTH_TOKEN_JSON. The service-account variables remain supported as
+a fallback for existing deployments.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PERSIST_ROOT = BASE_DIR / "data" / "persistent_market_data"
 INTRADAY_ROOT = PERSIST_ROOT / "intraday_1m"
 MANIFEST_PATH = PERSIST_ROOT / "manifest.json"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _now_utc() -> str:
@@ -156,14 +159,19 @@ def _relative_or_absolute(path: Path) -> str:
 
 
 def gdrive_config() -> dict:
-    """Resolve Google Drive configuration without failing when unconfigured."""
-    # GitHub Actions uses GOOGLE_DRIVE_ROOT_ID, while Streamlit/local
-    # deployments historically use GDRIVE_ROOT_FOLDER_ID. Accept both.
+    """Resolve Google Drive configuration.
+
+    OAuth is preferred when GOOGLE_OAUTH_TOKEN_JSON is available because
+    the user's OAuth credentials use the user's own Drive storage quota.
+    The existing service-account configuration remains as a fallback.
+    """
     root_id = (
         os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
         or os.getenv("GOOGLE_DRIVE_ROOT_ID", "").strip()
     )
     service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    oauth_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+
     try:
         import streamlit as st  # lazy: module also works outside Streamlit
         if hasattr(st, "secrets"):
@@ -172,20 +180,95 @@ def gdrive_config() -> dict:
                 root_id = str(sec.get("root_folder_id", "")).strip()
             if not service_json:
                 service_json = str(sec.get("service_account_json", "")).strip()
+            if not oauth_json:
+                oauth_json = str(sec.get("oauth_token_json", "")).strip()
     except Exception:
         pass
-    if not root_id or not service_json:
-        return {"configured": False, "reason": "missing root_folder_id or service_account_json"}
+
+    if not root_id:
+        return {
+            "configured": False,
+            "reason": "missing root_folder_id",
+        }
+
+    # Prefer user's OAuth credentials.
+    if oauth_json:
+        try:
+            oauth_info = json.loads(oauth_json)
+        except Exception as exc:
+            return {
+                "configured": False,
+                "reason": f"invalid OAuth token JSON: {type(exc).__name__}",
+            }
+
+        if not isinstance(oauth_info, dict):
+            return {
+                "configured": False,
+                "reason": "OAuth token JSON is not an object",
+            }
+
+        if not oauth_info.get("refresh_token"):
+            return {
+                "configured": False,
+                "reason": "OAuth token JSON has no refresh_token",
+            }
+
+        return {
+            "configured": True,
+            "auth_method": "oauth",
+            "root_folder_id": root_id,
+            "oauth_token_info": oauth_info,
+        }
+
+    # Existing service-account fallback.
+    if not service_json:
+        return {
+            "configured": False,
+            "reason": "missing OAuth token JSON and service-account JSON",
+        }
+
     try:
         info = json.loads(service_json)
     except Exception as exc:
-        return {"configured": False, "reason": f"invalid service-account JSON: {type(exc).__name__}"}
+        return {
+            "configured": False,
+            "reason": f"invalid service-account JSON: {type(exc).__name__}",
+        }
+
     return {
         "configured": True,
+        "auth_method": "service_account",
         "root_folder_id": root_id,
         "service_account_info": info,
         "client_email": info.get("client_email"),
     }
+
+def _drive_credentials(cfg: dict):
+    """Build authenticated Drive credentials using OAuth first, then service account."""
+    if cfg.get("auth_method") == "oauth":
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+
+        credentials = Credentials.from_authorized_user_info(
+            cfg["oauth_token_info"],
+            scopes=DRIVE_SCOPES,
+        )
+
+        if not credentials.valid:
+            if not credentials.refresh_token:
+                raise RuntimeError(
+                    "OAuth credentials are invalid and have no refresh token"
+                )
+            credentials.refresh(Request())
+
+        return credentials
+
+    from google.oauth2 import service_account
+
+    return service_account.Credentials.from_service_account_info(
+        cfg["service_account_info"],
+        scopes=DRIVE_SCOPES,
+    )
 
 
 def drive_status() -> dict:
@@ -193,18 +276,22 @@ def drive_status() -> dict:
     if not cfg.get("configured"):
         return {"configured": False, "reason": cfg.get("reason"), "persistent_local_root": _relative_or_absolute(PERSIST_ROOT)}
     try:
-        from google.oauth2 import service_account
         from googleapiclient.discovery import build
-        credentials = service_account.Credentials.from_service_account_info(
-            cfg["service_account_info"], scopes=["https://www.googleapis.com/auth/drive"]
-        )
+
+        credentials = _drive_credentials(cfg)
         service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         meta = service.files().get(fileId=cfg["root_folder_id"], fields="id,name,mimeType,trashed").execute()
         if meta.get("trashed"):
             return {"configured": False, "reason": "configured root folder is in Trash"}
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             return {"configured": False, "reason": "configured root ID is not a folder"}
-        return {"configured": True, "root_folder_id": cfg["root_folder_id"], "client_email": cfg.get("client_email"), "root_name": meta.get("name")}
+        return {
+            "configured": True,
+            "root_folder_id": cfg["root_folder_id"],
+            "auth_method": cfg.get("auth_method"),
+            "client_email": cfg.get("client_email"),
+            "root_name": meta.get("name"),
+        }
     except Exception as exc:
         return {"configured": True, "reachable": False, "reason": f"Google Drive check failed: {type(exc).__name__}: {exc}", "client_email": cfg.get("client_email")}
 
@@ -215,15 +302,12 @@ class GoogleDriveStore:
         if not cfg.get("configured"):
             raise RuntimeError(cfg.get("reason", "Google Drive is not configured"))
         try:
-            from google.oauth2 import service_account
             from googleapiclient.discovery import build
             from googleapiclient.http import MediaFileUpload
         except Exception as exc:
             raise RuntimeError("Google Drive dependencies are not installed") from exc
         self.root_id = cfg["root_folder_id"]
-        self.credentials = service_account.Credentials.from_service_account_info(
-            cfg["service_account_info"], scopes=["https://www.googleapis.com/auth/drive"]
-        )
+        self.credentials = _drive_credentials(cfg)
         self.service = build("drive", "v3", credentials=self.credentials, cache_discovery=False)
         self.MediaFileUpload = MediaFileUpload
 
