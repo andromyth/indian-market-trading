@@ -384,6 +384,8 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
     request per security. The downloaded day is cached locally and can be
     mirrored to Google Drive when explicitly requested.
     """
+    global _last_nse_diagnostic
+
     d = pd.Timestamp(trade_date).date()
     key = d.strftime("%Y%m%d")
     out_dir = BULK_EOD_ROOT / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
