@@ -599,13 +599,28 @@ def main() -> None:
         "unresolved_dates": unresolved,
         "errors": errors,
     }
+    if errors:
+        run["run_status"] = "FAILED"
+    elif unresolved:
+        run["run_status"] = "SUCCESS_WITH_RETRY_PENDING"
+    else:
+        run["run_status"] = "SUCCESS"
+
     run["finished_at"] = _now_ist()
     _sync_manifest(store, run)
 
-    print("SUMMARY:", json.dumps(run["summary"], separators=(",", ":"), sort_keys=True))
-    # Keep the workflow non-green whenever a date remains unresolved, while
-    # distinguishing retryable archive misses from actual ingestion errors.
-    raise SystemExit(1 if (errors or run["summary"]["unresolved_dates"]) else 0)
+    print(
+        "SUMMARY:",
+        json.dumps(
+            {**run["summary"], "run_status": run["run_status"]},
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+    # A retryable archive miss (normally today's not-yet-published EOD file)
+    # is recorded and retried by the next run, but is not treated as a broken
+    # ingestion pipeline. Only hard ingestion/Drive errors fail the workflow.
+    raise SystemExit(1 if errors else 0)
 
 
 if __name__ == "__main__":
