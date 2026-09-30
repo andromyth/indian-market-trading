@@ -1,2 +1,6 @@
 # Runtime prediction ledger (persistent copy is mirrored to Google Drive)
 data/prediction_ledger/
+
+# Local Google OAuth credentials - never commit
+credentials.json
+token.json
