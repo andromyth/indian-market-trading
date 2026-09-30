@@ -24,6 +24,33 @@ from persistent_store import GoogleDriveStore
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_BOOTSTRAP_START = date(2026, 1, 1)
 DEFAULT_REPAIR_DAYS = 14
+
+# NSE's 2026 CM/equity trading-holiday calendar, sourced from NSE's
+# published 2026 equities holiday schedule. Weekends are handled separately.
+NSE_EQUITY_HOLIDAYS_BY_YEAR = {
+    2026: frozenset(
+        date.fromisoformat(x)
+        for x in (
+            "2026-01-15",
+            "2026-01-26",
+            "2026-03-03",
+            "2026-03-26",
+            "2026-03-31",
+            "2026-04-03",
+            "2026-04-14",
+            "2026-05-01",
+            "2026-05-28",
+            "2026-06-26",
+            "2026-09-14",
+            "2026-10-02",
+            "2026-10-20",
+            "2026-11-10",
+            "2026-11-24",
+            "2026-12-25",
+        )
+    )
+}
+
 DATE_RE = re.compile(r"(20\d{6})", re.I)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ARCHIVE_FOLDER_PATHS = (
@@ -41,9 +68,12 @@ LOCAL_SYNC_MANIFEST = (
 
 
 def business_days(start: date, end: date) -> Iterable[date]:
+    """Yield NSE CM equity trading days, excluding weekends and known holidays."""
+    holidays = NSE_EQUITY_HOLIDAYS_BY_YEAR.get(start.year, frozenset())
     d = start
     while d <= end:
-        if d.weekday() < 5:
+        year_holidays = NSE_EQUITY_HOLIDAYS_BY_YEAR.get(d.year, holidays if d.year == start.year else frozenset())
+        if d.weekday() < 5 and d not in year_holidays:
             yield d
         d += timedelta(days=1)
 
@@ -486,7 +516,13 @@ def main() -> None:
         end = date.fromisoformat(args.end)
         if end < start:
             raise SystemExit("--end cannot be before --start")
-        candidates = list(business_days(start, end))
+        candidate_days = list(business_days(start, end))
+        # Manual backfill is gap-filling when Drive is enabled. Do not
+        # re-download dates that have already been archived successfully.
+        if args.sync_drive:
+            candidates = [d for d in candidate_days if d not in remote_dates]
+        else:
+            candidates = candidate_days
         mode_reason = "MANUAL_BACKFILL"
         mode = "MANUAL"
 
