@@ -1,46 +1,37 @@
 #!/usr/bin/env python3
-"""Persistent Drive-backed daily history cache for the certified Delivery universe."""
+"""Persistent official NSE daily-history compiler for the Delivery engine.
+
+Google Drive stores the compact compiled history used by Delivery prediction.
+The first run bootstraps from official NSE CM-UDiFF daily EOD files. Later runs
+only add the newest trading day, so daily prediction does not rediscover or
+re-download the full archive.
+"""
 from __future__ import annotations
 
 import io
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
+from nse_bulk_eod_ingest import business_days
+from nse_data_layer import BULK_EOD_ROOT, fetch_nse_eod_bhavcopy
 from persistent_store import GoogleDriveStore
 
-BULK_PREFIX = "BhavCopy_NSE_CM_0_0_0_"
 CACHE_ROOT = Path(__file__).resolve().parent / "data" / "nse_official" / "delivery_history"
 REMOTE_ROOT = "production_data/nse_official/delivery_history"
-FILENAME_RE = re.compile(r"BhavCopy_NSE_CM_0_0_0_(20\d{6})_F_0000\.parquet$", re.I)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
-def _date_from_name(name: str) -> date | None:
-    m = FILENAME_RE.search(str(name))
-    if not m:
-        return None
-    try:
-        return datetime.strptime(m.group(1), "%Y%m%d").date()
-    except Exception:
-        return None
-
-
-def _find_folder(store: GoogleDriveStore, relative_path: str) -> str | None:
+def _find_file(store: GoogleDriveStore, symbol: str) -> dict | None:
     parent = store.root_id
-    for part in [p for p in relative_path.split("/") if p]:
+    for part in REMOTE_ROOT.split("/"):
         hit = store._find_child(parent, part, FOLDER_MIME)
         if not hit:
             return None
         parent = hit["id"]
-    return parent
-
-
-def _find_file_in_folder(store: GoogleDriveStore, folder_id: str, name: str) -> dict | None:
-    q = f"name = '{store._q(name)}' and '{folder_id}' in parents and trashed = false"
+    q = f"name = '{store._q(symbol)}.parquet' and '{parent}' in parents and trashed = false"
     files = store.service.files().list(
         q=q,
         spaces="drive",
@@ -52,7 +43,7 @@ def _find_file_in_folder(store: GoogleDriveStore, folder_id: str, name: str) -> 
     return files[0] if files else None
 
 
-def _download_file(store: GoogleDriveStore, file_id: str, path: Path) -> None:
+def _download(store: GoogleDriveStore, file_id: str, path: Path) -> None:
     from googleapiclient.http import MediaIoBaseDownload
 
     request = store.service.files().get_media(fileId=file_id)
@@ -65,146 +56,62 @@ def _download_file(store: GoogleDriveStore, file_id: str, path: Path) -> None:
     path.write_bytes(buf.getvalue())
 
 
-def _remote_bulk_files(store: GoogleDriveStore, start: date, end: date) -> list[dict]:
-    """Discover NSE bulk EOD parquet files with bounded Drive traversal.
-
-    Lists each year/month/day folder once instead of issuing one lookup per
-    calendar date. This keeps the initial Delivery-history bootstrap bounded.
-    """
-    base = _find_folder(store, "production_data/nse_official/bulk_eod")
-    if not base:
-        return []
-
-    def children(parent_id: str) -> list[dict]:
-        token = None
-        out: list[dict] = []
-        while True:
-            kwargs = {
-                "q": f"'{parent_id}' in parents and trashed = false",
-                "spaces": "drive",
-                "fields": "nextPageToken,files(id,name,mimeType,size)",
-                "pageSize": 500,
-                "includeItemsFromAllDrives": True,
-                "supportsAllDrives": True,
-            }
-            if token:
-                kwargs["pageToken"] = token
-            resp = store.service.files().list(**kwargs).execute()
-            out.extend(resp.get("files", []))
-            token = resp.get("nextPageToken")
-            if not token:
-                return out
-
-    out: list[dict] = []
-    for yitem in children(base):
-        if yitem.get("mimeType") != FOLDER_MIME:
-            continue
-        try:
-            year = int(yitem.get("name", ""))
-        except ValueError:
-            continue
-        if year < start.year or year > end.year:
-            continue
-        for mitem in children(yitem["id"]):
-            if mitem.get("mimeType") != FOLDER_MIME:
-                continue
-            try:
-                month = int(mitem.get("name", ""))
-            except ValueError:
-                continue
-            if not 1 <= month <= 12:
-                continue
-            for ditem in children(mitem["id"]):
-                if ditem.get("mimeType") != FOLDER_MIME:
-                    continue
-                try:
-                    d = date(year, month, int(ditem.get("name", "")))
-                except (ValueError, TypeError):
-                    continue
-                if not (start <= d <= end):
-                    continue
-                for item in children(ditem["id"]):
-                    if (
-                        str(item.get("name", "")).lower().endswith(".parquet")
-                        and _date_from_name(item.get("name", "")) == d
-                    ):
-                        out.append(item)
-
-    unique = {str(x["id"]): x for x in out}
-    return sorted(unique.values(), key=lambda x: _date_from_name(x["name"]) or date.min)
-
-
-def _remote_symbol_parquets(
-    store: GoogleDriveStore, symbols: list[str], start: date, end: date
-) -> dict[str, list[dict]]:
-    """Find already-synced per-symbol official NSE parquet chunks in Drive."""
-    out = {s.upper(): [] for s in symbols}
-    base = _find_folder(store, "production_data/nse_official/equity")
-    if not base:
-        return out
-
-    for symbol in out:
-        sfolder = store._find_child(base, symbol, FOLDER_MIME)
-        if not sfolder:
-            continue
-        token = None
-        while True:
-            kwargs = {
-                "q": f"'{sfolder['id']}' in parents and trashed = false",
-                "spaces": "drive",
-                "fields": "nextPageToken,files(id,name,mimeType,size)",
-                "pageSize": 100,
-                "includeItemsFromAllDrives": True,
-                "supportsAllDrives": True,
-            }
-            if token:
-                kwargs["pageToken"] = token
-            resp = store.service.files().list(**kwargs).execute()
-            for item in resp.get("files", []):
-                name = str(item.get("name", "")).lower()
-                if name.endswith(".parquet") and item.get("id"):
-                    out[symbol].append(item)
-            token = resp.get("nextPageToken")
-            if not token:
-                break
-    return out
-
-
-def _load_remote_symbol_history(
-    store: GoogleDriveStore,
-    symbol: str,
-    files: list[dict],
-    start: date,
-    end: date,
-) -> pd.DataFrame:
-    frames = []
-    for item in files:
-        temp = CACHE_ROOT / f".{symbol}.{item['id']}.tmp"
-        try:
-            _download_file(store, item["id"], temp)
-            x = pd.read_parquet(temp)
-            if "date" not in x.columns:
-                continue
-            x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.date
-            for col in ("open", "high", "low", "close", "volume"):
-                if col in x.columns:
-                    x[col] = pd.to_numeric(x[col], errors="coerce")
-            x = x[
-                x["date"].notna()
-                & (x["date"] >= start)
-                & (x["date"] <= end)
-            ].copy()
-            if not x.empty:
-                frames.append(x)
-        finally:
-            temp.unlink(missing_ok=True)
-    if not frames:
+def _load_compact(store: GoogleDriveStore, symbol: str) -> pd.DataFrame:
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = CACHE_ROOT / f"{symbol}.parquet"
+    if not path.exists():
+        remote = _find_file(store, symbol)
+        if remote:
+            _download(store, remote["id"], path)
+    if not path.exists():
         return pd.DataFrame()
-    x = pd.concat(frames, ignore_index=True)
-    return x.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
+    try:
+        x = pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
+    if "date" not in x.columns:
+        return pd.DataFrame()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    return x.dropna(subset=["symbol", "date", "open", "high", "low", "close"]).sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
 
 
-def _filter_symbols(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
+def _save_compact(store: GoogleDriveStore, symbol: str, frame: pd.DataFrame) -> pd.DataFrame:
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = CACHE_ROOT / f"{symbol}.parquet"
+    x = frame.copy()
+    x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+    x = x.dropna(subset=["symbol", "date", "open", "high", "low", "close"])
+    x = x.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
+    x.to_parquet(path, index=False)
+    store.upload_or_update(path, f"{REMOTE_ROOT}/{symbol}.parquet", mime_type="application/octet-stream")
+    return x
+
+
+def _local_bulk_file(d: date) -> Path:
+    return (
+        BULK_EOD_ROOT
+        / f"{d:%Y}"
+        / f"{d:%m}"
+        / f"{d:%d}"
+        / f"BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.parquet"
+    )
+
+
+def _day_frame(d: date) -> pd.DataFrame:
+    path = _local_bulk_file(d)
+    if path.exists() and path.stat().st_size > 0:
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            pass
+    return fetch_nse_eod_bhavcopy(d, sync_drive=False)
+
+
+def _symbol_parts(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
     if df is None or df.empty or "symbol" not in df.columns:
         return {}
     x = df.copy()
@@ -217,132 +124,77 @@ def _filter_symbols(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFr
             x[c] = pd.to_numeric(x[c], errors="coerce")
     x = x.dropna(subset=["symbol", "date", "open", "high", "low", "close"])
     return {
-        s: g.sort_values("date").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+        s: g.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
         for s, g in x.groupby("symbol", sort=False)
     }
 
 
-def _save_symbol(symbol: str, frame: pd.DataFrame, store: GoogleDriveStore) -> pd.DataFrame:
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    path = CACHE_ROOT / f"{symbol}.parquet"
-    frame = frame.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
-    frame.to_parquet(path, index=False)
-    store.upload_or_update(path, f"{REMOTE_ROOT}/{symbol}.parquet", mime_type="application/octet-stream")
-    return frame
+def _bootstrap(symbols: list[str], end: date, rows_needed: int) -> dict[str, pd.DataFrame]:
+    prior_end = end - timedelta(days=1)
+    prior_dates = list(business_days(end - timedelta(days=370), prior_end))[-rows_needed:]
+    if len(prior_dates) < rows_needed:
+        raise RuntimeError(f"Cannot identify {rows_needed} prior NSE trading sessions for Delivery bootstrap.")
+
+    collected = {s: [] for s in symbols}
+
+    def load_one(d: date) -> pd.DataFrame:
+        return _day_frame(d)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(prior_dates))) as pool:
+        futures = {pool.submit(load_one, d): d for d in prior_dates}
+        for future in as_completed(futures):
+            df = future.result()
+            for s, part in _symbol_parts(df, symbols).items():
+                collected[s].append(part)
+
+    out = {}
+    for s in symbols:
+        frames = collected[s]
+        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        frame = frame.sort_values("date").drop_duplicates(["symbol", "date"], keep="last") if not frame.empty else frame
+        out[s] = frame
+    return out
 
 
 def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -> dict[str, pd.DataFrame]:
-    """Load compact histories from Drive and update them with the newest official bulk EOD day.
-
-    On first use, bootstraps the compact cache from the most recent official
-    bulk EOD files already present in Drive. Subsequent runs download only the
-    compact symbol file plus any newer bulk day needed for the current session.
-    """
     symbols = [str(s).upper().replace(".NS", "").replace(".BO", "") for s in symbols]
     symbols = list(dict.fromkeys(symbols))
     store = GoogleDriveStore()
+    results = {s: _load_compact(store, s) for s in symbols}
 
-    folder_id = _find_folder(store, REMOTE_ROOT)
-    results: dict[str, pd.DataFrame] = {}
-    missing = []
-
-    # Prefer any already-synced official NSE security-wise parquet chunks.
-    # This is substantially cheaper than downloading dozens of daily bulk files.
-    remote_symbol_files = _remote_symbol_parquets(store, symbols, end - timedelta(days=180), end)
-    for symbol in symbols:
-        if symbol in remote_symbol_files and remote_symbol_files[symbol]:
-            frame = _load_remote_symbol_history(
-                store, symbol, remote_symbol_files[symbol], end - timedelta(days=180), end
-            )
-            if len(frame) >= min_rows:
-                local = CACHE_ROOT / f"{symbol}.parquet"
-                results[symbol] = _save_symbol(symbol, frame, store)
-        if symbol not in results:
-            local = CACHE_ROOT / f"{symbol}.parquet"
-            if not local.exists() and folder_id:
-                remote = _find_file_in_folder(store, folder_id, f"{symbol}.parquet")
-                if remote:
-                    _download_file(store, remote["id"], local)
-            if local.exists():
-                try:
-                    results[symbol] = pd.read_parquet(local)
-                except Exception:
-                    local.unlink(missing_ok=True)
-        if symbol not in results or len(results[symbol]) < min_rows:
-            missing.append(symbol)
-
-    for symbol in symbols:
-        local = CACHE_ROOT / f"{symbol}.parquet"
-        if not local.exists() and folder_id:
-            remote = _find_file_in_folder(store, folder_id, f"{symbol}.parquet")
-            if remote:
-                _download_file(store, remote["id"], local)
-        if local.exists():
-            try:
-                results[symbol] = pd.read_parquet(local)
-            except Exception:
-                local.unlink(missing_ok=True)
-        if symbol not in results or len(results[symbol]) < min_rows:
-            missing.append(symbol)
-
-    today_file = None
-    recent_start = end - timedelta(days=140)
-    bulk_files = _remote_bulk_files(store, recent_start, end)
-    if bulk_files:
-        today_file = bulk_files[-1] if _date_from_name(bulk_files[-1]["name"]) == end else None
-
-    if missing:
-        if len(bulk_files) < min_rows:
-            raise RuntimeError(
-                "Insufficient Delivery history in persistent storage: "
-                f"only {len(bulk_files)} recent bulk EOD files were discoverable; "
-                f"{min_rows} sessions are required for Delivery warmup."
-            )
-        # Use the most recent min_rows trading-day files as the compact bootstrap.
-        selected = bulk_files[-min_rows:]
-        collected = {s: [] for s in symbols}
-
-        def load_one(item: dict) -> pd.DataFrame:
-            temp = CACHE_ROOT / f".{item['name']}.tmp"
-            try:
-                _download_file(store, item["id"], temp)
-                return pd.read_parquet(temp)
-            finally:
-                temp.unlink(missing_ok=True)
-
-        with ThreadPoolExecutor(max_workers=min(8, len(selected))) as pool:
-            futures = {pool.submit(load_one, item): item for item in selected}
-            for future in as_completed(futures):
-                df = future.result()
-                parts = _filter_symbols(df, symbols)
-                for s, part in parts.items():
-                    collected[s].append(part)
-        for s in missing:
-            frames = collected.get(s, [])
-            frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            if frame.empty or len(frame) < min_rows:
+    need_bootstrap = [s for s, frame in results.items() if len(frame) < min_rows]
+    if need_bootstrap:
+        boot = _bootstrap(symbols, end, min_rows)
+        for s in need_bootstrap:
+            if len(boot.get(s, pd.DataFrame())) < min_rows:
                 raise RuntimeError(
-                    f"Insufficient official NSE EOD history in Drive for {s}: {len(frame)} rows"
+                    f"Official NSE bootstrap produced only {len(boot.get(s, pd.DataFrame()))} rows for {s}; "
+                    f"{min_rows} are required."
                 )
-            results[s] = _save_symbol(s, frame, store)
+            results[s] = _save_compact(store, s, boot[s])
 
-    # Add the newest official EOD bulk day if the compact cache is one session behind.
-    if today_file:
-        d = _date_from_name(today_file["name"])
-        for s in symbols:
-            current = results.get(s, pd.DataFrame())
-            latest = pd.to_datetime(current["date"], errors="coerce").max().date() if not current.empty else None
-            if latest == d:
-                continue
-            temp = CACHE_ROOT / f".{today_file['name']}.tmp"
-            _download_file(store, today_file["id"], temp)
-            try:
-                df = pd.read_parquet(temp)
-                parts = _filter_symbols(df, [s])
-                if parts:
-                    merged = pd.concat([current, parts[s]], ignore_index=True)
-                    results[s] = _save_symbol(s, merged, store)
-            finally:
-                temp.unlink(missing_ok=True)
+    # Daily compilation step: add today's official NSE EOD row to each compact history.
+    # If today's archive is not published yet, preserve the existing history and let
+    # the Delivery runner block rather than creating a stale prediction.
+    today_parts: dict[str, pd.DataFrame] = {}
+    try:
+        today_parts = _symbol_parts(_day_frame(end), symbols)
+    except Exception as exc:
+        print(
+            f"CURRENT_EOD_NOT_READY: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    for s in symbols:
+        current = results[s]
+        part = today_parts.get(s)
+        if part is not None and not part.empty:
+            results[s] = _save_compact(
+                store,
+                s,
+                pd.concat([current, part], ignore_index=True),
+            )
+        else:
+            print(f"COMPILED_HISTORY_NOT_UPDATED: {s} no current NSE EOD row", flush=True)
 
     return results
