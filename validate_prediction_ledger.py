@@ -10,17 +10,29 @@ from __future__ import annotations
 from datetime import date
 import pandas as pd
 
-from nse_data_layer import fetch_equity_history
+from delivery_history_cache import ensure_delivery_history
 from prediction_ledger import load_records, load_validation_records, save_validation_results
 from prediction_validation import ValidationConfig, validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
 
 
-def official_history(symbol: str, start: date, end: date) -> pd.DataFrame:
-    df = fetch_equity_history(symbol, start, end, sync_drive=True)
-    if df.empty:
+def official_history(symbol: str, today: date) -> pd.DataFrame:
+    """Use the persistent official NSE Delivery history as validation source."""
+    histories = ensure_delivery_history([symbol], today, min_rows=65)
+    frame = histories.get(str(symbol).upper(), pd.DataFrame())
+    if frame.empty:
         return pd.DataFrame()
-    x = df.rename(columns={"date": "Date", "close": "Close"}).copy()
+
+    x = frame.rename(
+        columns={
+            "date": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    ).copy()
     x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
     return x.dropna(subset=["Date"]).set_index("Date").sort_index()
 
@@ -51,11 +63,28 @@ def main() -> int:
 
     by_symbol: dict[str, pd.DataFrame] = {}
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    for r in pending:
-        symbol = str(r["symbol"]).upper()
-        start = pd.Timestamp(r["decision_timestamp"]).date() - pd.Timedelta(days=2)
-        # Fetch enough calendar time to cover seven NSE sessions, including holidays/weekends.
-        by_symbol[symbol] = official_history(symbol, start, today)
+    symbols = list(dict.fromkeys(str(r["symbol"]).upper() for r in pending))
+
+    print(
+        f"VALIDATION_HISTORY_SOURCE: persistent_compiled_nse symbols={len(symbols)} "
+        f"as_of={today.isoformat()}",
+        flush=True,
+    )
+
+    for symbol in symbols:
+        try:
+            by_symbol[symbol] = official_history(symbol, today)
+            print(
+                f"VALIDATION_HISTORY_READY: {symbol} rows={len(by_symbol[symbol])}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"VALIDATION_HISTORY_FAILED: {symbol} "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            by_symbol[symbol] = pd.DataFrame()
 
     def provider(symbol: str) -> pd.DataFrame:
         return by_symbol.get(symbol.upper(), pd.DataFrame())
