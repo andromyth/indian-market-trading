@@ -55,7 +55,7 @@ def _download(store: GoogleDriveStore, file_id: str, path: Path) -> None:
     path.write_bytes(buf.getvalue())
 
 
-def _load_compact(store: GoogleDriveStore, symbol: str) -> pd.DataFrame:
+def _load_compact(store: GoogleDriveStore, symbol: str, max_date: date) -> pd.DataFrame:
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     path = CACHE_ROOT / f"{symbol}.parquet"
     if not path.exists():
@@ -74,19 +74,39 @@ def _load_compact(store: GoogleDriveStore, symbol: str) -> pd.DataFrame:
     for c in ("open", "high", "low", "close", "volume"):
         if c in x.columns:
             x[c] = pd.to_numeric(x[c], errors="coerce")
-    return x.dropna(subset=["symbol", "date", "open", "high", "low", "close"]).sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
+    x = x.dropna(subset=["symbol", "date", "open", "high", "low", "close"])
+    before = len(x)
+    x = x[x["date"] <= pd.Timestamp(max_date)]
+    dropped = before - len(x)
+    if dropped:
+        print(
+            f"COMPILED_HISTORY_FUTURE_ROWS_DROPPED: {symbol} rows={dropped} "
+            f"max_allowed={max_date.isoformat()}",
+            flush=True,
+        )
+    return x.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
 
 
-def _save_compact(store: GoogleDriveStore, symbol: str, frame: pd.DataFrame) -> pd.DataFrame:
+def _save_compact(
+    store: GoogleDriveStore,
+    symbol: str,
+    frame: pd.DataFrame,
+    max_date: date,
+) -> pd.DataFrame:
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     path = CACHE_ROOT / f"{symbol}.parquet"
     x = frame.copy()
     x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
     x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
     x = x.dropna(subset=["symbol", "date", "open", "high", "low", "close"])
+    x = x[x["date"] <= pd.Timestamp(max_date)]
     x = x.sort_values("date").drop_duplicates(["symbol", "date"], keep="last")
     x.to_parquet(path, index=False)
-    store.upload_or_update(path, f"{REMOTE_ROOT}/{symbol}.parquet", mime_type="application/octet-stream")
+    store.upload_or_update(
+        path,
+        f"{REMOTE_ROOT}/{symbol}.parquet",
+        mime_type="application/octet-stream",
+    )
     return x
 
 
@@ -100,14 +120,45 @@ def _local_bulk_file(d: date) -> Path:
     )
 
 
+def _validate_day_frame(df: pd.DataFrame, expected_date: date, source: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "date" not in df.columns:
+        raise RuntimeError(
+            f"NSE EOD {source} has no date column for expected {expected_date.isoformat()}"
+        )
+    parsed = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    observed = sorted({ts.date() for ts in parsed.dropna()})
+    if not observed:
+        raise RuntimeError(
+            f"NSE EOD {source} has no valid trade dates for expected {expected_date.isoformat()}"
+        )
+    if any(x != expected_date for x in observed):
+        sample = ",".join(x.isoformat() for x in observed[:5])
+        raise RuntimeError(
+            f"NSE EOD date mismatch: expected {expected_date.isoformat()} "
+            f"but observed {sample}"
+        )
+    return df
+
+
 def _day_frame(d: date) -> pd.DataFrame:
     path = _local_bulk_file(d)
     if path.exists() and path.stat().st_size > 0:
         try:
-            return pd.read_parquet(path)
-        except Exception:
-            pass
-    return fetch_nse_eod_bhavcopy(d, sync_drive=False)
+            return _validate_day_frame(
+                pd.read_parquet(path),
+                d,
+                "local-cache",
+            )
+        except Exception as exc:
+            print(
+                f"LOCAL_EOD_CACHE_INVALID: {d.isoformat()} "
+                f"{type(exc).__name__}: {exc}; refreshing",
+                flush=True,
+            )
+    fresh = fetch_nse_eod_bhavcopy(d, sync_drive=False, force_refresh=True)
+    return _validate_day_frame(fresh, d, "NSE-fetch")
 
 
 def _symbol_parts(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
@@ -190,7 +241,7 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
     symbols = [str(s).upper().replace(".NS", "").replace(".BO", "") for s in symbols]
     symbols = list(dict.fromkeys(symbols))
     store = GoogleDriveStore()
-    results = {s: _load_compact(store, s) for s in symbols}
+    results = {s: _load_compact(store, s, end) for s in symbols}
 
     need_bootstrap = [s for s, frame in results.items() if len(frame) < min_rows]
     if need_bootstrap:
@@ -201,7 +252,7 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
                     f"Official NSE bootstrap produced only {len(boot.get(s, pd.DataFrame()))} rows for {s}; "
                     f"{min_rows} are required."
                 )
-            results[s] = _save_compact(store, s, boot[s])
+            results[s] = _save_compact(store, s, boot[s], end)
 
     # Daily compilation step: add today's official NSE EOD row to each compact history.
     # If today's archive is not published yet, preserve the existing history and let
@@ -223,6 +274,7 @@ def ensure_delivery_history(symbols: list[str], end: date, min_rows: int = 65) -
                 store,
                 s,
                 pd.concat([current, part], ignore_index=True),
+                end,
             )
         else:
             print(f"COMPILED_HISTORY_NOT_UPDATED: {s} no current NSE EOD row", flush=True)
