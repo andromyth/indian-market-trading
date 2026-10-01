@@ -135,6 +135,8 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
         "predicted_return": result.get("predicted_return_next_session"),
         "decision_timestamp": result.get("decision_timestamp"),
         "prediction_id": result.get("prediction_id"),
+        "prediction_ledger_status": result.get("prediction_ledger_status"),
+        "prediction_ledger_synced": result.get("prediction_ledger_synced"),
         "data_readiness_score": result.get("data_readiness_score"),
         "fno_available": bool(fo),
         "news_available": bool(matched),
