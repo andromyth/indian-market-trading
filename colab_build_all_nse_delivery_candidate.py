@@ -185,18 +185,26 @@ def build_panel(
     market_tables: dict[str, pd.DataFrame],
     trainable_symbols: list[str],
     min_history: int,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     rows: list[dict] = []
 
     trainable_set = set(trainable_symbols)
     selected = bulk[bulk["symbol"].isin(trainable_set)].copy()
 
-    for symbol, group in selected.groupby("symbol", sort=False):
+    symbol_groups = list(selected.groupby("symbol", sort=False))
+    total_symbols = len(symbol_groups)
+    if verbose:
+        print(f"[VERBOSE] Building panel: symbols={total_symbols:,}, min_history={min_history}", flush=True)
+
+    for symbol_idx, (symbol, group) in enumerate(symbol_groups, start=1):
         g = group.sort_values("date").reset_index(drop=True)
         benchmark = benchmark_for_symbol(symbol)
         market = market_tables.get(benchmark, pd.DataFrame())
 
         if len(g) < min_history + 1:
+            if verbose and (symbol_idx <= 10 or symbol_idx % 250 == 0):
+                print(f"[VERBOSE] {symbol_idx:,}/{total_symbols:,} {symbol}: skipped; rows={len(g):,}", flush=True)
             continue
 
         market_by_date = (
@@ -241,7 +249,17 @@ def build_panel(
             base["y_up"] = int(base["y_return"] > 0)
             rows.append(base)
 
-    return pd.DataFrame(rows)
+        if verbose and (symbol_idx <= 10 or symbol_idx % 250 == 0 or symbol_idx == total_symbols):
+            print(
+                f"[VERBOSE] {symbol_idx:,}/{total_symbols:,} {symbol}: "
+                f"source_rows={len(g):,}, panel_rows={len(rows):,}",
+                flush=True,
+            )
+
+    panel = pd.DataFrame(rows)
+    if verbose:
+        print(f"[VERBOSE] Panel complete: rows={len(panel):,}, columns={len(panel.columns)}", flush=True)
+    return panel
 
 
 def fit_models(panel: pd.DataFrame):
@@ -325,6 +343,7 @@ def main() -> int:
         default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_candidate_2026",
     )
     ap.add_argument("--min-history", type=int, default=60)
+    ap.add_argument("--verbose", action="store_true", help="Print detailed all-NSE training progress.")
     ap.add_argument(
         "--allow-missing-market-context",
         action="store_true",
@@ -336,7 +355,12 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    if args.verbose:
+        print(f"[VERBOSE] bulk_root={bulk_root}", flush=True)
+        print(f"[VERBOSE] out={out}", flush=True)
     bulk = load_bulk(bulk_root)
+    if args.verbose:
+        print(f"[VERBOSE] Loaded bulk rows={len(bulk):,} unique_symbols={bulk["symbol"].nunique() if not bulk.empty else 0:,}", flush=True)
     if bulk.empty:
         raise SystemExit(
             "No official NSE bulk EOD parquet files found. Run the automatic NSE EOD "
@@ -344,6 +368,8 @@ def main() -> int:
         )
 
     roster = training_roster(bulk, min_history=args.min_history)
+    if args.verbose:
+        print("[VERBOSE] NSE roster:", json.dumps({k: roster[k] for k in ("universe_symbol_count","symbols_with_bulk_history","trainable_symbol_count","excluded_symbol_count","minimum_history_sessions")}, indent=2), flush=True)
     trainable = roster["trainable_symbols"]
     if not trainable:
         raise SystemExit("NSE official roster contains no symbols with sufficient clean history.")
@@ -356,6 +382,8 @@ def main() -> int:
     market_status: dict[str, dict] = {}
 
     for benchmark in ("^NSEI", "^NSEBANK"):
+        if args.verbose:
+            print(f"[VERBOSE] Loading official NSE benchmark history: {benchmark}", flush=True)
         try:
             market_raw = fetch_index_history(
                 benchmark,
@@ -395,11 +423,17 @@ def main() -> int:
                 + json.dumps(failed, default=str)
             )
 
-    panel = build_panel(bulk, market_tables, trainable, args.min_history)
+    if args.verbose:
+        print("[VERBOSE] Starting feature-panel construction", flush=True)
+    panel = build_panel(bulk, market_tables, trainable, args.min_history, verbose=args.verbose)
     if panel.empty:
         raise SystemExit("No training rows could be built from the all-NSE roster.")
 
+    if args.verbose:
+        print("[VERBOSE] Fitting classifier and return regressor", flush=True)
     clf, reg, metrics = fit_models(panel)
+    if args.verbose:
+        print("[VERBOSE] Model fit complete", json.dumps(metrics, indent=2, default=str), flush=True)
 
     joblib.dump(clf, out / "deployment_all_nse_delivery_classifier_2026.joblib")
     joblib.dump(reg, out / "deployment_all_nse_delivery_regressor_2026.joblib")
