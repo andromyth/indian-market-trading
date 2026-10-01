@@ -380,46 +380,146 @@ def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.Da
 
 def fetch_index_history(index_symbol: str, start: date | datetime, end: date | datetime,
                         sync_drive: bool = False) -> pd.DataFrame:
-    """Fetch/cache one official NSE daily historical index series."""
+    """Fetch/cache official NSE daily index history with bounded date chunks.
+
+    NSE's public historical-index endpoint can return a silently truncated
+    window for a large date range. To avoid treating partial history as valid,
+    requests are split into short chunks and the combined result is coverage-
+    checked against the requested range. Existing full-range caches are reused
+    only when they cover both ends of the requested period.
+    """
     root = str(index_symbol).strip().upper()
     if root not in INDEX_HISTORY_NAMES:
         raise ValueError(f"Unsupported NSE benchmark: {index_symbol}")
 
     start_d = pd.Timestamp(start).date()
     end_d = pd.Timestamp(end).date()
+    if end_d < start_d:
+        raise ValueError("end date cannot be before start date")
+
     cache_dir = INDEX_NORMALIZED_ROOT / root.replace("^", "").replace("/", "_")
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{start_d:%Y%m%d}_{end_d:%Y%m%d}.parquet"
+
+    def _coverage_ok(frame: pd.DataFrame, requested_start: date, requested_end: date) -> bool:
+        if frame is None or frame.empty or "date" not in frame.columns:
+            return False
+        dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+        if dates.empty:
+            return False
+        first = dates.min().date()
+        last = dates.max().date()
+        # Allow weekends/holidays around the requested boundaries, but reject
+        # materially truncated history such as a one-month response to a
+        # one-year request.
+        start_slack = 10
+        end_slack = 10
+        if first > requested_start + timedelta(days=start_slack):
+            return False
+        if last < requested_end - timedelta(days=end_slack):
+            return False
+        span_days = max(1, (requested_end - requested_start).days)
+        if span_days >= 90:
+            expected_weekdays = int(span_days * 5 / 7)
+            if len(dates) < max(30, int(expected_weekdays * 0.50)):
+                return False
+        return True
+
     if cache_path.exists() and cache_path.stat().st_size > 0:
-        return pd.read_parquet(cache_path)
+        try:
+            cached = pd.read_parquet(cache_path)
+            if _coverage_ok(cached, start_d, end_d):
+                return cached
+        except Exception:
+            pass
 
-    params = {
-        "indexType": INDEX_HISTORY_NAMES[root],
-        "from": start_d.strftime("%d-%m-%Y"),
-        "to": end_d.strftime("%d-%m-%Y"),
-    }
-    response = _request(INDEX_HISTORY_ENDPOINT, params=params,
-                        accept="application/json,text/plain,*/*",
-                        retries=2, min_interval=0.75)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("NSE historical index response was not valid JSON") from exc
+    frames: list[pd.DataFrame] = []
+    cursor = start_d
+    chunk_days = 31
 
-    rows = payload.get("data", payload if isinstance(payload, list) else [])
-    normalized = _normalize_index_history(pd.DataFrame(rows), root)
-    if normalized.empty:
-        raise RuntimeError(
-            f"NSE historical index request returned no usable rows for {INDEX_HISTORY_NAMES[root]}"
+    while cursor <= end_d:
+        chunk_end = min(end_d, cursor + timedelta(days=chunk_days - 1))
+        params = {
+            "indexType": INDEX_HISTORY_NAMES[root],
+            "from": cursor.strftime("%d-%m-%Y"),
+            "to": chunk_end.strftime("%d-%m-%Y"),
+        }
+
+        response = _request(
+            INDEX_HISTORY_ENDPOINT,
+            params=params,
+            accept="application/json,text/plain,*/*",
+            retries=2,
+            min_interval=0.75,
         )
-    normalized.to_parquet(cache_path, index=False)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"NSE historical index response was not valid JSON for "
+                f"{INDEX_HISTORY_NAMES[root]} {cursor}..{chunk_end}"
+            ) from exc
+
+        rows = payload.get("data", payload if isinstance(payload, list) else [])
+        normalized = _normalize_index_history(pd.DataFrame(rows), root)
+
+        if normalized.empty:
+            raise RuntimeError(
+                f"NSE historical index request returned no usable rows for "
+                f"{INDEX_HISTORY_NAMES[root]} {cursor}..{chunk_end}"
+            )
+
+        # A chunk may legitimately begin/end on a weekend or holiday. Reject
+        # only material truncation inside the requested chunk.
+        chunk_dates = pd.to_datetime(normalized["date"], errors="coerce").dropna()
+        if chunk_dates.empty:
+            raise RuntimeError(
+                f"NSE historical index chunk contained no usable dates for "
+                f"{INDEX_HISTORY_NAMES[root]} {cursor}..{chunk_end}"
+            )
+        if chunk_dates.min().date() > cursor + timedelta(days=10):
+            raise RuntimeError(
+                f"NSE historical index chunk starts too late for "
+                f"{INDEX_HISTORY_NAMES[root]} {cursor}..{chunk_end}: "
+                f"{chunk_dates.min().date()}"
+            )
+        if chunk_dates.max().date() < chunk_end - timedelta(days=10):
+            raise RuntimeError(
+                f"NSE historical index chunk ends too early for "
+                f"{INDEX_HISTORY_NAMES[root]} {cursor}..{chunk_end}: "
+                f"{chunk_dates.max().date()}"
+            )
+
+        frames.append(normalized)
+        cursor = chunk_end + timedelta(days=1)
+
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    if not _coverage_ok(combined, start_d, end_d):
+        raise RuntimeError(
+            f"NSE historical index coverage incomplete for "
+            f"{INDEX_HISTORY_NAMES[root]}: "
+            f"requested={start_d}..{end_d}, "
+            f"actual={combined['date'].min().date()}..{combined['date'].max().date()}, "
+            f"rows={len(combined)}"
+        )
+
+    combined.to_parquet(cache_path, index=False)
+
     if sync_drive:
         _drive_upload(
             cache_path,
             f"production_data/nse_official/indices/{root.replace('^','')}/{cache_path.name}",
             "application/octet-stream",
         )
-    return normalized
+
+    return combined
 
 
 NSE_CM_UDIFF_URL_TEMPLATE = (

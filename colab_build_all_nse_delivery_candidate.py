@@ -374,10 +374,17 @@ def main() -> int:
                 columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
             )
             market_tables[benchmark] = market_feature_table(market_raw.rename(columns={"Close":"close"}) if "Close" in market_raw.columns else market_raw)
+            latest_market = market_tables[benchmark]["date"].max().date() if not market_tables[benchmark].empty else None
+            bulk_latest = pd.Timestamp(bulk["date"].max()).date()
+            if latest_market is None or latest_market < bulk_latest - pd.Timedelta(days=10):
+                raise RuntimeError(
+                    f"Official NSE benchmark history is stale for {benchmark}: "
+                    f"latest={latest_market}, bulk_latest={bulk_latest}"
+                )
             market_status[benchmark] = {
                 "status": "PASS",
                 "rows": int(len(market_tables[benchmark])),
-                "latest": str(market_tables[benchmark]["date"].max().date()) if not market_tables[benchmark].empty else None,
+                "latest": str(latest_market),
             }
         except Exception as exc:
             market_status[benchmark] = {
