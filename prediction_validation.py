@@ -120,8 +120,16 @@ def validate_ledger(records: list[dict[str, Any]], history_provider: Callable[[s
 def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
     if validation_df.empty:
         return {"status": "NO_DATA"}
+    if "validation_status" not in validation_df.columns:
+        return {"status": "NO_DATA"}
     x = validation_df[validation_df["validation_status"] == "VALIDATED"].copy()
-    x = x.sort_values("decision_timestamp").tail(7)
+    if x.empty:
+        return {"status": "NO_DATA"}
+    if "decision_timestamp" in x.columns:
+        x["decision_timestamp"] = pd.to_datetime(x["decision_timestamp"], errors="coerce")
+        x = x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").tail(7)
+    if x.empty:
+        return {"status": "NO_DATA"}
     matches = pd.to_numeric(x.get("direction_match_d1"), errors="coerce")
     valid_matches = matches.dropna()
     mae = pd.to_numeric(x.get("percentage_error_d1"), errors="coerce").abs().mean()
