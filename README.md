@@ -434,6 +434,25 @@ The new sidebar controls are:
 
 Dhan 1-minute downloads and current-year free 1-minute archive downloads are automatically partitioned into the persistent store. Historical replay reads the persistent store first.
 
+## All-NSE Delivery training policy
+
+Future next-session Delivery candidate training uses the current **official NSE
+securities-available-for-trading equity universe** as the training roster. The
+training job reads historical observations from the persistent official NSE
+CM-UDiFF bulk EOD archive and includes every roster symbol with sufficient clean
+history; symbols lacking enough history are reported as excluded rather than
+silently replaced by another data source.
+
+The candidate builder also restores official NSE NIFTY 50 / NIFTY BANK daily market
+context and creates the relative-return, market-RSI, mood-proxy and stress-proxy
+features point-in-time. News, F&O and fundamentals remain explicit missing inputs
+until timestamped point-in-time datasets are available.
+
+All-NSE candidate artifacts are written to a separate candidate directory and are
+**not automatically promoted** to production. Production continues to use the
+small certified artifact until the broader candidate has passed the required
+walk-forward and live D+1 validation gates.
+
 ## NSE-first data layer (v5)
 
 The production data policy is now **NSE-first**. The current NSE site exposes
