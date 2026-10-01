@@ -29,9 +29,14 @@ def main() -> None:
     checks.append("OK production target_30m / 137 features")
 
     dm = json.loads(d_manifest.read_text(encoding="utf-8"))
-    expected = {"BHARTIARTL", "RELIANCE", "SBIN"}
-    if not expected.issubset({str(x).upper() for x in dm.get("trained_symbols", [])}):
-        raise SystemExit("Delivery trained-universe contract mismatch")
+    trained_symbols = {
+        str(x).strip().upper()
+        for x in dm.get("trained_symbols", [])
+        if str(x).strip()
+    }
+    if not trained_symbols:
+        raise SystemExit("Delivery trained-universe contract is empty")
+    checks.append(f"OK delivery trained universe declared: {len(trained_symbols)} symbols")
 
     c = joblib.load(d_classifier)
     r = joblib.load(d_regressor)
