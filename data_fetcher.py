@@ -13,7 +13,14 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 try:
-    from nse_data_layer import fetch_equity_history, fetch_intraday_1m_current, fetch_quote, fetch_nse_bulk_symbol_history, nse_last_diagnostic
+    from nse_data_layer import (
+    fetch_equity_history,
+    fetch_intraday_1m_current,
+    fetch_quote,
+    fetch_nse_bulk_symbol_history,
+    fetch_index_history,
+    nse_last_diagnostic,
+)
 except Exception:
     fetch_equity_history = fetch_intraday_1m_current = fetch_quote = nse_last_diagnostic = None
 
@@ -331,6 +338,29 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_
     is_nse = str(symbol).upper().endswith(".NS")
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
     iv = str(interval).lower()
+
+    if str(symbol).upper() in {"^NSEI", "^NSEBANK"} and iv in {"1d", "d", "day", "daily"}:
+        days = _period_days(period)
+        end = dt.datetime.now(IST).date()
+        start = end - dt.timedelta(days=days)
+        # NSE is the authoritative benchmark source. Use its historical-index
+        # interface before any reference-provider fallback.
+        try:
+            index_df = fetch_index_history(symbol, start, end, sync_drive=True)
+            if not index_df.empty and len(index_df) >= 2:
+                return _normalize_historical_frame(
+                    index_df.rename(
+                        columns={
+                            "open": "Open",
+                            "high": "High",
+                            "low": "Low",
+                            "close": "Close",
+                            "volume": "Volume",
+                        }
+                    ).set_index("date")
+                )
+        except Exception:
+            pass
 
     if is_nse and iv in {"1d", "d", "day", "daily"}:
         days = _period_days(period)
