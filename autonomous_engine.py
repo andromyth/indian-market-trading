@@ -19,7 +19,12 @@ def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[s
         result["mode"] = "Delivery"
         result["prediction_horizon"] = "next_session"
         result["model_version"] = "2026.09-stage2"
-        append_prediction(result, sync_drive=sync_drive)
+        persisted = append_prediction(result, sync_drive=sync_drive)
+        result['prediction_id'] = persisted.get('prediction_id')
+        result['prediction_ledger_status'] = persisted.get('status')
+        result['prediction_ledger_synced'] = bool(persisted.get('synced'))
+        if persisted.get('sync_error'):
+            result['prediction_ledger_sync_error'] = persisted['sync_error']
     return result
 
 
