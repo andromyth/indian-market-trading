@@ -313,6 +313,132 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
 
 
 
+INDEX_HISTORY_ENDPOINT = "/api/historicalOR/indicesHistory"
+INDEX_HISTORY_NAMES = {
+    "^NSEI": "NIFTY 50",
+    "^NSEBANK": "NIFTY BANK",
+}
+INDEX_NORMALIZED_ROOT = NORMALIZED_ROOT / "indices"
+
+
+def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.DataFrame:
+    """Normalize NSE historical-index JSON into the dashboard OHLC schema."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    x = frame.copy()
+    x.columns = [str(c).strip() for c in x.columns]
+    aliases = {
+        "EOD_TIMESTAMP": "date",
+        "TIMESTAMP": "date",
+        "Date": "date",
+        "EOD_OPEN_INDEX_VAL": "open",
+        "EOD_HIGH_INDEX_VAL": "high",
+        "EOD_LOW_INDEX_VAL": "low",
+        "EOD_CLOSE_INDEX_VAL": "close",
+        "OPEN": "open",
+        "HIGH": "high",
+        "LOW": "low",
+        "CLOSE": "close",
+    }
+    x = x.rename(columns={c: aliases[c] for c in x.columns if c in aliases})
+    if "date" not in x.columns or any(c not in x.columns for c in ("open", "high", "low", "close")):
+        return pd.DataFrame()
+
+    raw_dates = x["date"].astype(str).str.strip()
+    parsed = pd.to_datetime(raw_dates, format="%d-%b-%Y", errors="coerce")
+    remaining = parsed.isna()
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y%m%d"):
+        if not remaining.any():
+            break
+        candidate = pd.to_datetime(raw_dates.loc[remaining], format=fmt, errors="coerce")
+        parsed.loc[remaining] = candidate
+        remaining = parsed.isna()
+    if remaining.any():
+        candidate = pd.to_datetime(x.loc[remaining, "date"], errors="coerce")
+        parsed.loc[remaining] = candidate
+
+    x["date"] = parsed
+    for c in ("open", "high", "low", "close"):
+        x[c] = pd.to_numeric(
+            x[c].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+    if "volume" not in x.columns:
+        x["volume"] = 0.0
+    else:
+        x["volume"] = pd.to_numeric(
+            x["volume"].astype(str).str.replace(",", "", regex=False),
+            errors="coerce"
+        )
+
+    x["symbol"] = str(requested_index).upper()
+    x["source"] = "NSE_OFFICIAL_INDEX_HISTORY"
+    x["provenance"] = "nseindia.com /api/historicalOR/indicesHistory"
+    x = x.dropna(subset=["date", "open", "high", "low", "close"])
+    return (
+        x[["symbol", "date", "open", "high", "low", "close", "volume", "source", "provenance"]]
+        .sort_values("date")
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def fetch_index_history(
+    index_symbol: str,
+    start: date | datetime,
+    end: date | datetime,
+    sync_drive: bool = False,
+) -> pd.DataFrame:
+    """Fetch and locally cache official NSE daily historical index data."""
+    root = str(index_symbol).strip().upper()
+    if root not in INDEX_HISTORY_NAMES:
+        raise ValueError(f"Unsupported NSE benchmark: {index_symbol}")
+
+    start_d = pd.Timestamp(start).date()
+    end_d = pd.Timestamp(end).date()
+    cache_dir = INDEX_NORMALIZED_ROOT / root.replace("^", "").replace("/", "_")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{start_d:%Y%m%d}_{end_d:%Y%m%d}.parquet"
+
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return pd.read_parquet(cache_path)
+
+    params = {
+        "indexType": INDEX_HISTORY_NAMES[root],
+        "from": start_d.strftime("%d-%m-%Y"),
+        "to": end_d.strftime("%d-%m-%Y"),
+    }
+    response = _request(
+        INDEX_HISTORY_ENDPOINT,
+        params=params,
+        accept="application/json,text/plain,*/*",
+        retries=2,
+        min_interval=0.75,
+    )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("NSE historical index response was not valid JSON") from exc
+
+    rows = payload.get("data", payload if isinstance(payload, list) else [])
+    frame = pd.DataFrame(rows)
+    normalized = _normalize_index_history(frame, root)
+    if normalized.empty:
+        raise RuntimeError(
+            f"NSE historical index request returned no usable rows for {INDEX_HISTORY_NAMES[root]}"
+        )
+
+    normalized.to_parquet(cache_path, index=False)
+    if sync_drive:
+        _drive_upload(
+            cache_path,
+            f"production_data/nse_official/indices/{root.replace('^', '')}/{cache_path.name}",
+            "application/octet-stream",
+        )
+    return normalized
+
+
 NSE_CM_UDIFF_URL_TEMPLATE = (
     "https://nsearchives.nseindia.com/content/cm/"
     "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
