@@ -39,38 +39,35 @@ def _ensure_local() -> None:
 
 
 def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
+    """Download a Drive file using the same OAuth/service-account resolver as the store."""
     try:
-        from persistent_store import gdrive_config
-        cfg = gdrive_config()
-        if not cfg.get("configured"):
-            return None
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseDownload
-        import io
-        credentials = service_account.Credentials.from_service_account_info(
-            cfg["service_account_info"], scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        from persistent_store import GoogleDriveStore
+
+        g = GoogleDriveStore()
         parts = remote_relative_path.strip("/").split("/")
-        parent = cfg["root_folder_id"]
+        parent = g.root_id
+
         for part in parts[:-1]:
-            q = f"name = '{part.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
-            found = service.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute().get("files", [])
+            found = g._find_child(parent, part)
             if not found:
                 return None
-            parent = found[0]["id"]
+            parent = found["id"]
+
         name = parts[-1]
-        q = f"name = '{name.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
-        found = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=10).execute().get("files", [])
+        found = g._find_child(parent, name)
         if not found:
             return None
-        request = service.files().get_media(fileId=found[0]["id"])
+
+        from googleapiclient.http import MediaIoBaseDownload
+        import io
+
+        request = g.service.files().get_media(fileId=found["id"])
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, request)
         done = False
         while not done:
             _, done = downloader.next_chunk()
+
         return buf.getvalue()
     except Exception:
         return None
