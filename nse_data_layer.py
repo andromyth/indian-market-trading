@@ -356,7 +356,41 @@ def _normalize_udiff_common_bhavcopy(frame: pd.DataFrame, trade_date: date) -> p
     x = x.rename(columns=ren)
     if "date" not in x.columns:
         x["date"] = pd.Timestamp(trade_date)
-    x["date"] = pd.to_datetime(x["date"], errors="coerce", format="mixed", dayfirst=True)
+
+    # NSE CM-UDiFF commonly supplies ISO dates such as YYYY-MM-DD.
+    # Do not parse these with dayfirst=True: that can silently transform
+    # 2026-07-01 into 2026-01-07 and similar month/day inversions.
+    raw_dates = x["date"].astype(str).str.strip()
+    parsed_dates = pd.to_datetime(
+        raw_dates,
+        format="%Y-%m-%d",
+        errors="coerce",
+    )
+
+    # Support the other date representations seen in NSE extracts without
+    # applying dayfirst parsing to already-ISO values.
+    remaining = parsed_dates.isna()
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%y", "%d/%b/%Y", "%Y%m%d"):
+        if not remaining.any():
+            break
+        candidate = pd.to_datetime(
+            raw_dates.loc[remaining],
+            format=fmt,
+            errors="coerce",
+        )
+        parsed_dates.loc[remaining] = candidate
+        remaining = parsed_dates.isna()
+
+    # Final fallback for datetime-like values that may already have been
+    # parsed by pandas before normalization.
+    if remaining.any():
+        candidate = pd.to_datetime(
+            x.loc[remaining, "date"],
+            errors="coerce",
+        )
+        parsed_dates.loc[remaining] = candidate
+
+    x["date"] = parsed_dates
     if x["date"].isna().all():
         x["date"] = pd.Timestamp(trade_date)
     if "symbol" not in x.columns:
