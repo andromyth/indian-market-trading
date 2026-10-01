@@ -72,6 +72,14 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
     if price_df.empty or len(price_df) < 65:
         return {"symbol": root, "status": "BLOCKED", "reason": "insufficient_official_nse_daily_history"}
     latest_date = price_df.index[-1].date()
+    if latest_date > expected_date:
+        return {
+            "symbol": root,
+            "status": "BLOCKED",
+            "reason": "official_nse_history_contains_future_date",
+            "expected_date": expected_date.isoformat(),
+            "latest_official_date": latest_date.isoformat(),
+        }
     if now.time() < MARKET_EOD_READY_TIME or latest_date != expected_date:
         return {
             "symbol": root,
