@@ -12,6 +12,9 @@ def main():
     ap.add_argument("--project", default="/content/indian-market-trading")
     ap.add_argument("--drive-root", default="/content/drive/MyDrive/Indian_Market_Research")
     ap.add_argument("--bulk-root", default=None, help="Canonical NSE bulk EOD archive.")
+    ap.add_argument("--refresh-fundamentals", action="store_true", help="Force a fresh NSE fundamentals catalog/XBRL pass.")
+    ap.add_argument("--retry-failed-fundamentals", action="store_true", help="Retry only filings previously cached as failed.")
+    ap.add_argument("--force-rebuild-candidate", action="store_true", help="Force panel/model regeneration even when inputs are unchanged.")
     a = ap.parse_args()
 
     def log(msg):
@@ -63,6 +66,12 @@ def main():
         sys.executable, "-u", "colab_build_all_nse_delivery_multifactor_candidate.py",
         "--bulk-root", str(bulk), "--out", str(out),
     ]
+    if args.refresh_fundamentals:
+        build_cmd.append("--refresh-fundamentals")
+    if args.retry_failed_fundamentals:
+        build_cmd.append("--retry-failed-fundamentals")
+    if args.force_rebuild_candidate:
+        build_cmd.append("--force-rebuild-candidate")
     subprocess.run(build_cmd, cwd=p, check=True, env=env)
 
     log("Step 2/2: validating candidate artifacts...")
