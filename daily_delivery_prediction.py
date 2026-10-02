@@ -21,7 +21,10 @@ from data_fetcher import (
     news_for_symbol,
     stock_news_keywords,
 )
-from delivery_model import supported_symbol, MANIFEST
+from all_nse_delivery_model import (
+    supported_symbol as all_nse_supported_symbol,
+    _load_manifest as load_all_nse_manifest,
+)
 from autonomous_engine import delivery_prediction
 from fo_analysis import summarize as fo_summarize
 from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
@@ -69,9 +72,16 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
             "expected_date": expected_date.isoformat(),
         }
     price_df = _nse_daily(root, histories)
-    if price_df.empty or len(price_df) < 65:
-        return {"symbol": root, "status": "BLOCKED", "reason": "insufficient_official_nse_daily_history"}
-    latest_date = price_df.index[-1].date()
+    if price_df.empty:
+        # PIT inference can still run because all_nse_delivery_model.py loads
+        # the persisted feature snapshot independently.
+        price_df = pd.DataFrame()
+
+    latest_date = (
+        price_df.index[-1].date()
+        if not price_df.empty
+        else expected_date
+    )
     if latest_date > expected_date:
         return {
             "symbol": root,
@@ -80,18 +90,25 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
             "expected_date": expected_date.isoformat(),
             "latest_official_date": latest_date.isoformat(),
         }
-    if now.time() < MARKET_EOD_READY_TIME or latest_date != expected_date:
+
+    if now.time() < MARKET_EOD_READY_TIME:
         return {
             "symbol": root,
             "status": "BLOCKED",
             "reason": "official_nse_eod_not_ready_for_current_session",
             "expected_date": expected_date.isoformat(),
-            "latest_official_date": latest_date.isoformat(),
             "eod_ready_after_ist": MARKET_EOD_READY_TIME.strftime("%H:%M"),
         }
 
     benchmark = benchmark_for_symbol(root)
-    market_df = get_historical(benchmark, period="140d", interval="1d")
+    try:
+        market_df = get_historical(
+            benchmark,
+            period="140d",
+            interval="1d",
+        )
+    except Exception:
+        market_df = pd.DataFrame()
     aliases = stock_news_keywords(root)
     matched = news_for_symbol(aliases, all_news)
 
@@ -146,13 +163,31 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
 
 
 def main() -> int:
-    trained = [str(x).upper() for x in MANIFEST.get("trained_symbols", [])]
-    trained = [x for x in trained if supported_symbol(x)]
+    # Scheduled Delivery uses the current ALL-NSE trainable roster,
+    # not the retired 3-stock Delivery manifest.
+    manifest = load_all_nse_manifest()
+    trained = [
+        str(x).upper()
+        for x in manifest.get(
+            "trainable_symbols",
+            [],
+        )
+    ]
+    trained = [
+        x
+        for x in trained
+        if all_nse_supported_symbol(x)
+    ]
+
     if not trained:
-        raise SystemExit("No supported trained Delivery symbols in production manifest.")
+        raise SystemExit(
+            "No supported symbols in the ALL-NSE Delivery manifest."
+        )
 
     all_news = tag_news_items(get_news(max_items=100))
-    histories = ensure_delivery_history(trained, datetime.now(IST).date(), min_rows=65)
+    # The ALL-NSE adapter prefers its persisted PIT snapshot. Do not
+    # pre-download 65+ daily bars for 2,372 symbols in the scheduled runner.
+    histories = {}
     rows = []
     for symbol in trained:
         try:
