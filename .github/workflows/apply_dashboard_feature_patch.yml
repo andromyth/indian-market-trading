@@ -1,0 +1,38 @@
+name: Apply dashboard feature patch
+
+on:
+  push:
+    paths:
+      - "tools/patch_dashboard_features.py"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply patch
+        run: python tools/patch_dashboard_features.py
+
+      - name: Commit app changes
+        run: |
+          if git diff --quiet -- app.py; then
+            echo "app.py already contains the dashboard feature patch"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git commit -m "Add prediction history and delivery price forecast"
+          git push
