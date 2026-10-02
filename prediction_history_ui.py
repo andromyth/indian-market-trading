@@ -1314,6 +1314,25 @@ def _historical_prediction(
         reg.predict(features)[0]
     )
 
+    historical_feature_count = int(
+        features.shape[1]
+    )
+
+    historical_non_missing_count = int(
+        features.notna()
+        .sum(axis=1)
+        .iloc[0]
+    )
+
+    historical_readiness = (
+        historical_non_missing_count
+        / float(
+            historical_feature_count
+        )
+        if historical_feature_count
+        else np.nan
+    )
+
     if (
         p_up >= BUY_P
         and expected_return > MIN_EXPECTED_RETURN
@@ -1396,13 +1415,9 @@ def _historical_prediction(
         "signal": signal,
         "p_up": p_up,
         "expected_return": expected_return,
-        "data_readiness": float(
-            features.notna().sum(axis=1).iloc[0]
-            / len(expected_features)
-        ),
-        "feature_count": len(
-            expected_features
-        ),
+        "data_readiness": historical_readiness,
+        "feature_count": historical_feature_count,
+        "non_missing_feature_count": historical_non_missing_count,
         "reference_close": float(
             reference["close"]
         ),
