@@ -253,13 +253,20 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
             "to": chunk_end.strftime("%d-%m-%Y"),
             "symbol": s,
             "type": "priceVolumeDeliverable",
+            # The security-wise historical NSE interface uses csv=true for
+            # the actual tabular download response. Without it, the endpoint
+            # can return HTTP 200 with a JSON response that is not a usable
+            # historical row set on hosted runtimes.
+            "csv": "true",
         }
-        # Current NSE deployments have been observed returning either JSON or
-        # CSV depending on the request. Try the current-series JSON contract
-        # first, then the CSV contract, and finally ALL-series variants.
+
+        # Prefer the explicit CSV contract, then retry without the csv hint
+        # as a compatibility fallback, and finally try ALL-series.
         request_variants = [
             {**base_params, "series": series},
             {**base_params, "series": "ALL"},
+            {k: v for k, v in base_params.items() if k != "csv"} | {"series": series},
+            {k: v for k, v in base_params.items() if k != "csv"} | {"series": "ALL"},
         ]
         r = None
         csv = pd.DataFrame()
@@ -268,12 +275,42 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
                 rr = _request(EQUITY_HISTORY_ENDPOINT, params=params,
                                accept="application/json,text/csv,application/csv,*/*", retries=1, min_interval=0.75)
                 ctype = (rr.headers.get("content-type") or "").lower()
-                if "json" in ctype or rr.text.lstrip().startswith(("{", "[")):
-                    payload = rr.json()
-                    rows = payload.get("data", payload if isinstance(payload, list) else [])
-                    csv = pd.DataFrame(rows)
-                else:
-                    csv = pd.read_csv(io.BytesIO(rr.content), thousands=",")
+                body = rr.text.lstrip()
+
+                # csv=true is the authoritative tabular contract for the
+                # security-wise historical report. Sniff the body as well as
+                # the content type because some NSE responses are served with
+                # a generic application/json content type despite being CSV.
+                looks_like_csv = (
+                    params.get("csv") == "true"
+                    or ("csv" in ctype)
+                    or (
+                        body
+                        and not body.startswith(("{", "["))
+                        and "," in body[:500]
+                    )
+                )
+
+                if looks_like_csv:
+                    try:
+                        csv = pd.read_csv(
+                            io.BytesIO(rr.content),
+                            thousands=",",
+                        )
+                    except Exception:
+                        csv = pd.DataFrame()
+
+                if csv.empty:
+                    try:
+                        payload = rr.json()
+                        rows = payload.get(
+                            "data",
+                            payload if isinstance(payload, list) else [],
+                        )
+                        csv = pd.DataFrame(rows)
+                    except Exception:
+                        csv = pd.DataFrame()
+
                 if not csv.empty:
                     r = rr
                     break
