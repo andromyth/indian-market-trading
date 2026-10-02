@@ -163,35 +163,191 @@ def _price_features(df: pd.DataFrame) -> dict[str, float]:
     l = pd.to_numeric(df["Low"], errors="coerce")
     o = pd.to_numeric(df["Open"], errors="coerce")
     v = pd.to_numeric(df["Volume"], errors="coerce")
-    close = _safe_float(c.iloc[-1]); open_ = _safe_float(o.iloc[-1])
-    high = _safe_float(h.iloc[-1]); low = _safe_float(l.iloc[-1]); vol = _safe_float(v.iloc[-1])
-    ma20 = _safe_float(c.rolling(20, min_periods=20).mean().iloc[-1])
-    ma50 = _safe_float(c.rolling(50, min_periods=50).mean().iloc[-1])
-    vma20 = _safe_float(v.rolling(20, min_periods=20).mean().iloc[-1])
+
+    close = _safe_float(c.iloc[-1])
+    open_ = _safe_float(o.iloc[-1])
+    high = _safe_float(h.iloc[-1])
+    low = _safe_float(l.iloc[-1])
+    vol = _safe_float(v.iloc[-1])
+
+    ma20 = _safe_float(
+        c.rolling(
+            20,
+            min_periods=20,
+        ).mean().iloc[-1]
+    )
+
+    ma50 = _safe_float(
+        c.rolling(
+            50,
+            min_periods=50,
+        ).mean().iloc[-1]
+    )
+
+    vma20 = _safe_float(
+        v.rolling(
+            20,
+            min_periods=20,
+        ).mean().iloc[-1]
+    )
+
+    market_vol20 = _safe_float(
+        c.pct_change()
+        .rolling(
+            20,
+            min_periods=20,
+        )
+        .std()
+        .iloc[-1]
+    )
+
     return {
-        "open": open_, "high": high, "low": low, "close": close, "volume": vol,
-        "ret_1": _returns(c, 1), "ret_3": _returns(c, 3), "ret_6": _returns(c, 6),
-        "ret_12": _returns(c, 12), "ret_24": _returns(c, 24), "rsi14": _rsi(c),
-        "atr14": _atr(df), "ma20_ratio": close / ma20 - 1 if np.isfinite(close) and np.isfinite(ma20) and ma20 else np.nan,
-        "ma50_ratio": close / ma50 - 1 if np.isfinite(close) and np.isfinite(ma50) and ma50 else np.nan,
-        "volume_ratio": vol / vma20 if np.isfinite(vol) and np.isfinite(vma20) and vma20 else np.nan,
-        "range_pct": (high - low) / close if np.isfinite(high) and np.isfinite(low) and np.isfinite(close) and close else np.nan,
-        "body_pct": (close - open_) / open_ if np.isfinite(close) and np.isfinite(open_) and open_ else np.nan,
+        "open": open_,
+        "high": high_,
+        "low": low_,
+        "close": close,
+        "volume": vol,
+        "volume_ma20": vma20,
+        "ret_1": _returns(c, 1),
+        "ret_3": _returns(c, 3),
+        "ret_6": _returns(c, 6),
+        "ret_12": _returns(c, 12),
+        "ret_24": _returns(c, 24),
+        "rsi14": _rsi(c),
+        "atr14": _atr(df),
+        "ma20_ratio": (
+            close / ma20 - 1
+            if np.isfinite(close)
+            and np.isfinite(ma20)
+            and ma20
+            else np.nan
+        ),
+        "ma50_ratio": (
+            close / ma50 - 1
+            if np.isfinite(close)
+            and np.isfinite(ma50)
+            and ma50
+            else np.nan
+        ),
+        "volume_ratio": (
+            vol / vma20
+            if np.isfinite(vol)
+            and np.isfinite(vma20)
+            and vma20
+            else np.nan
+        ),
+        "range_pct": (
+            (high - low) / close
+            if np.isfinite(high)
+            and np.isfinite(low)
+            and np.isfinite(close)
+            and close
+            else np.nan
+        ),
+        "body_pct": (
+            (close - open_) / open_
+            if np.isfinite(close)
+            and np.isfinite(open_)
+            and open_
+            else np.nan
+        ),
+        "market_vol_20": market_vol20,
     }
+
 
 
 def _market_features(market_df: pd.DataFrame | None) -> dict[str, float]:
-    if market_df is None or market_df.empty:
-        return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
-    market_df = _normalize_price_frame(market_df)
-    if market_df.empty or "Close" not in market_df.columns:
-        return {k: np.nan for k in ["nifty_close","market_ret_1","market_ret_3","market_ret_6","market_ret_12","market_rsi14"]}
-    c = pd.to_numeric(market_df["Close"], errors="coerce")
+    keys = [
+        "nifty_close",
+        "market_ret_1",
+        "market_ret_3",
+        "market_ret_6",
+        "market_ret_12",
+        "market_rsi14",
+        "market_vol_20",
+        "nifty_ma20_ratio",
+        "nifty_ma50_ratio",
+    ]
+
+    if (
+        market_df is None
+        or market_df.empty
+    ):
+        return {
+            key: np.nan
+            for key in keys
+        }
+
+    market_df = _normalize_price_frame(
+        market_df
+    )
+
+    if (
+        market_df.empty
+        or "Close" not in market_df.columns
+    ):
+        return {
+            key: np.nan
+            for key in keys
+        }
+
+    c = pd.to_numeric(
+        market_df["Close"],
+        errors="coerce",
+    )
+
+    ma20 = _safe_float(
+        c.rolling(
+            20,
+            min_periods=20,
+        ).mean().iloc[-1]
+    )
+
+    ma50 = _safe_float(
+        c.rolling(
+            50,
+            min_periods=50,
+        ).mean().iloc[-1]
+    )
+
+    vol20 = _safe_float(
+        c.pct_change()
+        .rolling(
+            20,
+            min_periods=20,
+        )
+        .std()
+        .iloc[-1]
+    )
+
+    close = _safe_float(
+        c.iloc[-1]
+    )
+
     return {
-        "nifty_close": _safe_float(c.iloc[-1]), "market_ret_1": _returns(c, 1),
-        "market_ret_3": _returns(c, 3), "market_ret_6": _returns(c, 6),
-        "market_ret_12": _returns(c, 12), "market_rsi14": _rsi(c),
+        "nifty_close": close,
+        "market_ret_1": _returns(c, 1),
+        "market_ret_3": _returns(c, 3),
+        "market_ret_6": _returns(c, 6),
+        "market_ret_12": _returns(c, 12),
+        "market_rsi14": _rsi(c),
+        "market_vol_20": vol20,
+        "nifty_ma20_ratio": (
+            close / ma20 - 1
+            if np.isfinite(close)
+            and np.isfinite(ma20)
+            and ma20
+            else np.nan
+        ),
+        "nifty_ma50_ratio": (
+            close / ma50 - 1
+            if np.isfinite(close)
+            and np.isfinite(ma50)
+            and ma50
+            else np.nan
+        ),
     }
+
 
 
 def _cross_sectional(rows: list[dict[str, Any]]) -> None:
