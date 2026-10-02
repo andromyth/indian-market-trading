@@ -517,6 +517,95 @@ def _score_model_pair(
     }
 
 
+def _augment_auxiliary_features(
+    symbol: str,
+    base_feature_row: pd.DataFrame,
+    stock_history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+    news_items: list[dict[str, Any]] | None,
+    announcements: list[dict[str, Any]] | None,
+    fno: dict[str, Any] | None,
+    event_risk: float = 0.0,
+) -> pd.DataFrame:
+    """Create the broad feature surface expected by older compatible models.
+
+    Reuses the repository's certified 137-feature builder so legacy GLOBAL and
+    deployment artifacts are checked against their real feature names rather
+    than being incorrectly rejected by the 59-feature Delivery surface.
+    """
+    try:
+        from production_model import (
+            build_feature_rows,
+        )
+
+        price = stock_history.copy()
+
+        if (
+            price is not None
+            and not price.empty
+        ):
+            if "date" in price.columns:
+                # Historical/EOD frames may be lower-case; the production
+                # normalizer handles the actual OHLC names.
+                pass
+
+        market = (
+            benchmark_history.copy()
+            if benchmark_history is not None
+            else pd.DataFrame()
+        )
+
+        item = {
+            "symbol": symbol,
+            "price_df": price,
+            "market_df": market,
+            "matched_news": news_items or [],
+            "announcements": announcements or [],
+            "event_risk": event_risk,
+            "fo": fno or {},
+        }
+
+        broad = build_feature_rows(
+            [item]
+        )
+
+        if broad is not None and not broad.empty:
+            broad = broad.drop(
+                columns=[
+                    c
+                    for c in (
+                        "_symbol",
+                        "_decision_ts",
+                    )
+                    if c in broad.columns
+                ],
+                errors="ignore",
+            )
+
+            # Base Delivery features take precedence for their exact names.
+            merged = pd.concat(
+                [
+                    broad.reset_index(drop=True),
+                    base_feature_row.reset_index(drop=True),
+                ],
+                axis=1,
+            )
+
+            merged = merged.loc[
+                :,
+                ~merged.columns.duplicated(
+                    keep="last"
+                ),
+            ]
+
+            return merged
+
+    except Exception:
+        pass
+
+    return base_feature_row.copy()
+
+
 def model_ensemble_direction(
     symbol: str,
     feature_row: pd.DataFrame,
@@ -914,19 +1003,6 @@ def enrich_delivery_prediction(
         fno
     )
 
-    ensemble = model_ensemble_direction(
-        symbol,
-        feature_row,
-        horizon="next_session",
-        fno_available=fno_available,
-    )
-
-    multi_horizon = multi_horizon_model_evidence(
-        symbol,
-        feature_row,
-        fno_available=fno_available,
-    )
-
     context = directional_context(
         symbol,
         as_of,
@@ -935,6 +1011,34 @@ def enrich_delivery_prediction(
         news_items=news_items,
         announcements=announcements,
         fno=fno,
+    )
+
+    auxiliary_feature_row = _augment_auxiliary_features(
+        symbol,
+        feature_row,
+        stock_history,
+        benchmark_history,
+        news_items,
+        announcements,
+        fno,
+        event_risk=_safe(
+            context.get(
+                "event_risk"
+            )
+        ),
+    )
+
+    ensemble = model_ensemble_direction(
+        symbol,
+        auxiliary_feature_row,
+        horizon="next_session",
+        fno_available=fno_available,
+    )
+
+    multi_horizon = multi_horizon_model_evidence(
+        symbol,
+        auxiliary_feature_row,
+        fno_available=fno_available,
     )
 
     base_p = _safe(
