@@ -3,28 +3,51 @@ from __future__ import annotations
 
 from typing import Any
 
-from delivery_model import build_feature_row, predict as predict_delivery
+from all_nse_delivery_model import predict_symbol as predict_all_nse_delivery
 from production_model import build_feature_rows, predict as predict_intraday
 from prediction_ledger import append_prediction
 
 
 def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
+    """Run the active ALL-NSE 59-feature Delivery candidate.
+
+    The model artifact remains in Google Drive and is verified against the
+    locked Step 5K hashes by all_nse_delivery_model.py. No retraining occurs.
+    """
     symbol = str(item["symbol"])
-    frame = build_feature_row(
-        item["price_df"], item.get("market_df"), news=item.get("news"),
-        event=item.get("event"), fno=item.get("fno"), fundamentals=item.get("fundamentals"),
+    result = predict_all_nse_delivery(
+        symbol,
+        item.get("decision_timestamp"),
     )
-    result = predict_delivery(frame, symbol, item.get("decision_timestamp"))
+
     if result.get("prediction_status") == "PASS":
         result["mode"] = "Delivery"
         result["prediction_horizon"] = "next_session"
-        result["model_version"] = "2026.09-stage2"
-        persisted = append_prediction(result, sync_drive=sync_drive)
-        result['prediction_id'] = persisted.get('prediction_id')
-        result['prediction_ledger_status'] = persisted.get('status')
-        result['prediction_ledger_synced'] = bool(persisted.get('synced'))
-        if persisted.get('sync_error'):
-            result['prediction_ledger_sync_error'] = persisted['sync_error']
+        result["model_version"] = result.get(
+            "model_version",
+            "2026-all-nse-delivery-candidate-5-market-context-fixed",
+        )
+
+        persisted = append_prediction(
+            result,
+            sync_drive=sync_drive,
+        )
+
+        result["prediction_id"] = persisted.get(
+            "prediction_id"
+        )
+        result["prediction_ledger_status"] = persisted.get(
+            "status"
+        )
+        result["prediction_ledger_synced"] = bool(
+            persisted.get("synced")
+        )
+
+        if persisted.get("sync_error"):
+            result["prediction_ledger_sync_error"] = (
+                persisted["sync_error"]
+            )
+
     return result
 
 
