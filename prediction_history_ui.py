@@ -34,6 +34,71 @@ def _clean_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
     x = frame.copy()
     x.columns = [str(c).strip().lower() for c in x.columns]
 
+    # Canonicalize official NSE field aliases used by persisted compact
+    # histories. The 59-feature model requires these exact names.
+    alias_map = {
+        "cop_deliv_qty": "delivery_qty",
+        "delivery_qty": "delivery_qty",
+        "delivery quantity": "delivery_qty",
+        "delivery_quantity": "delivery_qty",
+        "cop_deliv_perc": "delivery_pct",
+        "delivery %": "delivery_pct",
+        "delivery_percentage": "delivery_pct",
+        "delivery_percent": "delivery_pct",
+        "ttltradgvol": "volume",
+        "ch_tot_traded_qty": "volume",
+        "opnpric": "open",
+        "hghpric": "high",
+        "lwpric": "low",
+        "clspric": "close",
+        "ch_opening_price": "open",
+        "ch_trade_high_price": "high",
+        "ch_trade_low_price": "low",
+        "ch_closing_price": "close",
+    }
+
+    rename = {
+        col: alias_map[col]
+        for col in x.columns
+        if col in alias_map
+        and alias_map[col] != col
+    }
+
+    if rename:
+        x = x.rename(columns=rename)
+
+    if x.columns.duplicated().any():
+        # Prefer the first populated canonical column when an alias and a
+        # canonical field coexist.
+        for canonical in (
+            "delivery_qty",
+            "delivery_pct",
+            "volume",
+            "open",
+            "high",
+            "low",
+            "close",
+        ):
+            matches = [
+                col
+                for col in x.columns
+                if col == canonical
+            ]
+
+            if len(matches) > 1:
+                first = x.loc[:, canonical]
+                if isinstance(first, pd.DataFrame):
+                    x[canonical] = (
+                        first.bfill(axis=1).iloc[:, 0]
+                    )
+
+        x = x.loc[
+            :,
+            ~x.columns.duplicated(
+                keep="first"
+            ),
+        ].copy()
+
     if x.columns.duplicated().any():
         x = x.loc[:, ~x.columns.duplicated(keep="first")].copy()
 
@@ -45,7 +110,15 @@ def _clean_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
         errors="coerce",
     ).dt.normalize()
 
-    for col in ("open", "high", "low", "close", "volume", "delivery_qty", "delivery_pct"):
+    for col in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "delivery_qty",
+        "delivery_pct",
+    ):
         if col in x.columns:
             x[col] = pd.to_numeric(
                 x[col],
