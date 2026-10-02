@@ -665,6 +665,43 @@ def model_ensemble_direction(
     }
 
 
+def multi_horizon_model_evidence(
+    symbol: str,
+    feature_row: pd.DataFrame,
+    fno_available: bool = False,
+) -> dict[str, Any]:
+    """Score compatible auxiliary artifacts separately by prediction horizon.
+
+    Horizons are never averaged together: a 30m vote is not treated as a
+    next-session vote. The result is evidence for the directional engine and
+    retains each horizon's provenance.
+    """
+    horizons = [
+        "30m",
+        "60m",
+        "next_session",
+        "7d",
+    ]
+
+    out: dict[str, Any] = {}
+
+    for horizon in horizons:
+        try:
+            out[horizon] = model_ensemble_direction(
+                symbol,
+                feature_row,
+                horizon=horizon,
+                fno_available=fno_available,
+            )
+        except Exception as exc:
+            out[horizon] = {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    return out
+
+
 def directional_context(
     symbol: str,
     as_of: Any,
@@ -884,6 +921,12 @@ def enrich_delivery_prediction(
         fno_available=fno_available,
     )
 
+    multi_horizon = multi_horizon_model_evidence(
+        symbol,
+        feature_row,
+        fno_available=fno_available,
+    )
+
     context = directional_context(
         symbol,
         as_of,
@@ -911,6 +954,7 @@ def enrich_delivery_prediction(
     # testing establishes a safe fusion weight.
     out.update({
         "legacy_model_ensemble": ensemble,
+        "multi_horizon_model_evidence": multi_horizon,
         "directional_information_context": context,
         "base_model_direction": (
             "UP"
