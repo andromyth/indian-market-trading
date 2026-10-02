@@ -356,12 +356,34 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
         raise RuntimeError("ALL-NSE PIT fundamentals: no eligible NSE Integrated Filing records found")
 
     sig=_fundamental_build_signature(symbols,filings)
-    if not force_refresh and FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0 and FUND_BROAD_META.exists() and FUND_BROAD_META.stat().st_size>0:
+    if not force_refresh and FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0:
         try:
-            meta=json.loads(FUND_BROAD_META.read_text(encoding="utf-8"))
-            if _broad_meta_matches(meta,sig):
-                print(f"fundamentals build reused; rows={pd.read_parquet(FUND_BROAD).shape[0]:,}",flush=True)
+            meta=json.loads(FUND_BROAD_META.read_text(encoding="utf-8")) if FUND_BROAD_META.exists() else {}
+            if meta and _broad_meta_matches(meta,sig):
+                print(f"fundamentals build reused from manifest; rows={int(meta.get('rows',0)):,}",flush=True)
                 return {"path":str(FUND_BROAD),"rebuilt":False,"cached":True,"symbols":int(meta.get("symbols",0)),"rows":int(meta.get("rows",0))}
+            # One-time bootstrap for a broad file produced by the period-aware
+            # parser before the persistent build metadata existed. This prevents
+            # an immediate second full NSE/XBRL pass after a completed run.
+            if not meta:
+                old=pd.read_parquet(FUND_BROAD)
+                basis=old.get("fundamental_basis")
+                compatible = basis is not None and basis.astype(str).str.contains("period_aware",case=False,na=False).any()
+                if compatible and "symbol" in old.columns:
+                    boot={
+                        **sig,
+                        "rows":int(len(old)),
+                        "symbols":int(old["symbol"].map(normalize_symbol).nunique()),
+                        "bootstrapped_from_existing_broad":True,
+                    }
+                    FUND_BROAD_META.write_text(json.dumps(boot,indent=2,default=str),encoding="utf-8")
+                    print(
+                        f"fundamentals build metadata bootstrapped from existing broad file; "
+                        f"rows={len(old):,} symbols={old['symbol'].map(normalize_symbol).nunique():,}",
+                        flush=True,
+                    )
+                    return {"path":str(FUND_BROAD),"rebuilt":False,"cached":True,
+                            "symbols":int(boot["symbols"]),"rows":int(boot["rows"])}
         except Exception:
             pass
 
