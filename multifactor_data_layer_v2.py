@@ -19,7 +19,7 @@ FEATURES_59 = [
     "relative_ret_1","relative_ret_6","relative_ret_12","market_mood_proxy",
     "market_stress_proxy","news_available","event_available","event_high_impact",
     "fno_pcr","fno_oi_change","fno_iv_change","fno_available","fno_fut_close",
-    "fno_fut_return","fno_fut_oi","fundamental_revenue","fundamental_pat",
+    "fno_fut_basis","fno_fut_return","fno_fut_oi","fundamental_revenue","fundamental_pat",
     "fundamental_eps","fundamental_ebitda","fundamental_finance_cost",
     "fundamental_total_equity","fundamental_total_debt","fundamental_cash",
     "fund_revenue_growth","fund_pat_growth","fund_eps_growth",
@@ -33,9 +33,12 @@ GROUPS = {
     "market_context": FEATURES_59[21:30],
     "news": ["news_available"],
     "events": ["event_available","event_high_impact"],
-    "fno": FEATURES_59[33:40],
-    "fundamentals": FEATURES_59[40:],
+    "fno": FEATURES_59[33:41],
+    "fundamentals": FEATURES_59[41:],
 }
+if len(FEATURES_59) != 59:
+    raise RuntimeError(f"Feature contract must contain exactly 59 features; found {len(FEATURES_59)}")
+
 READINESS_COLUMNS = {
     "market_price":"ready_market_price",
     "market_context":"ready_market_context",
