@@ -56,6 +56,7 @@ from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
+from prediction_history_ui import render_delivery_forecast, render_prediction_history
 from nse_data_layer import fetch_equity_history as nse_fetch_equity_history, fetch_intraday_1m_current as nse_fetch_intraday_1m_current, fetch_corporate_actions as nse_fetch_corporate_actions, fetch_nse_equity_universe, nse_equity_symbols, nse_last_diagnostic
 from persistent_store import (
     drive_status as persistent_drive_status,
@@ -157,7 +158,7 @@ if _nse_symbol_count and _nse_symbol_col:
 st.caption(f"Active watchlist: {', '.join(symbols)} · Analysis refresh {int(st.session_state.get('watchlist_revision', 0))}")
 
 analysis_view = st.sidebar.radio(
-    "View", ["Live Dashboard", "Historical Replay"], index=0,
+    "View", ["Live Dashboard", "Historical Replay", "Prediction History"], index=0,
     help="Historical Replay reconstructs a past timestamp and compares the model/rule prediction with subsequent actual prices."
 )
 
@@ -419,6 +420,10 @@ if analysis_view == "Historical Replay":
     if "replay_ledger" in st.session_state and st.session_state["replay_ledger"]:
         with st.expander("Replay ledger from this session", expanded=False):
             st.dataframe(pd.DataFrame(st.session_state["replay_ledger"]), width="stretch", hide_index=True)
+    st.stop()
+
+if analysis_view == "Prediction History":
+    render_prediction_history()
     st.stop()
 
 style = st.sidebar.radio("Mode", ["Delivery", "Intraday"], index=0)
@@ -1471,6 +1476,9 @@ if style == "Delivery" and direct_delivery_results and not live_records:
                 width="stretch",
                 hide_index=True,
             )
+
+if style == "Delivery" and direct_delivery_results:
+    render_delivery_forecast(direct_delivery_results)
 
 for rec in live_records:
     symbol = rec["symbol"]
