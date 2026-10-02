@@ -161,11 +161,9 @@ def _relative_or_absolute(path: Path) -> str:
 def gdrive_config() -> dict:
     """Resolve Google Drive configuration from environment or Streamlit Secrets.
 
-    A root folder ID is preferred. When it is absent but valid Google Drive
-    credentials exist, the store can discover the configured research folder
-    by name (default: Indian_Market_Research). This is useful on Streamlit
-    Cloud, where secrets are not automatically exported as environment
-    variables.
+    Streamlit nested secrets may be represented by a mapping/AttrDict rather
+    than a plain Python dict, so configuration detection must not require
+    isinstance(section, dict).
     """
     root_id = (
         os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
@@ -182,57 +180,88 @@ def gdrive_config() -> dict:
 
     service_json = os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON",
-        ""
+        "",
     ).strip()
 
     oauth_json = os.getenv(
         "GOOGLE_OAUTH_TOKEN_JSON",
-        ""
+        "",
     ).strip()
+
+    secrets_seen = False
+    secret_names = []
 
     try:
         import streamlit as st
 
         if hasattr(st, "secrets"):
 
-            # Structured configuration.
+            # Record only key names. Never expose secret values.
+            try:
+                secret_names = [
+                    str(k)
+                    for k in st.secrets.keys()
+                ]
+                secrets_seen = True
+            except Exception:
+                pass
+
+            # Read structured sections without assuming plain dict.
             for section_name in (
                 "gdrive",
                 "google_drive",
                 "drive",
             ):
                 try:
-                    sec = st.secrets.get(
-                        section_name,
-                        {},
-                    )
-                except Exception:
-                    sec = {}
+                    if section_name not in st.secrets:
+                        continue
 
-                if not isinstance(sec, dict):
+                    sec = st.secrets[section_name]
+
+                    def sec_value(key):
+                        try:
+                            return str(
+                                sec[key]
+                            ).strip()
+                        except Exception:
+                            return ""
+
+                    value = sec_value(
+                        "root_folder_id"
+                    )
+                    if value and not root_id:
+                        root_id = value
+
+                    value = sec_value(
+                        "root_folder_name"
+                    )
+                    if value:
+                        root_name = value
+
+                    value = sec_value(
+                        "service_account_json"
+                    )
+                    if value and not service_json:
+                        service_json = value
+
+                    value = sec_value(
+                        "oauth_token_json"
+                    )
+                    if value and not oauth_json:
+                        oauth_json = value
+
+                except Exception:
                     continue
 
-                if not root_id:
-                    root_id = str(
-                        sec.get("root_folder_id", "")
+            # Also support top-level secrets used by previous deployments.
+            def top_secret(key):
+                try:
+                    return str(
+                        st.secrets[key]
                     ).strip()
+                except Exception:
+                    return ""
 
-                if not root_name:
-                    root_name = str(
-                        sec.get("root_folder_name", "")
-                    ).strip()
-
-                if not service_json:
-                    service_json = str(
-                        sec.get("service_account_json", "")
-                    ).strip()
-
-                if not oauth_json:
-                    oauth_json = str(
-                        sec.get("oauth_token_json", "")
-                    ).strip()
-
-            # Top-level legacy/current names.
             for key in (
                 "GOOGLE_DRIVE_ROOT_ID",
                 "GDRIVE_ROOT_FOLDER_ID",
@@ -241,31 +270,16 @@ def gdrive_config() -> dict:
                 "ROOT_FOLDER_ID",
             ):
                 if not root_id:
-                    try:
-                        root_id = str(
-                            st.secrets.get(
-                                key,
-                                "",
-                            )
-                        ).strip()
-                    except Exception:
-                        pass
+                    value = top_secret(key)
+                    if value:
+                        root_id = value
 
             for key in (
                 "GOOGLE_DRIVE_ROOT_FOLDER_NAME",
                 "DRIVE_ROOT_FOLDER_NAME",
                 "ROOT_FOLDER_NAME",
             ):
-                try:
-                    value = str(
-                        st.secrets.get(
-                            key,
-                            "",
-                        )
-                    ).strip()
-                except Exception:
-                    value = ""
-
+                value = top_secret(key)
                 if value:
                     root_name = value
                     break
@@ -275,42 +289,25 @@ def gdrive_config() -> dict:
                 "SERVICE_ACCOUNT_JSON",
             ):
                 if not service_json:
-                    try:
-                        service_json = str(
-                            st.secrets.get(
-                                key,
-                                "",
-                            )
-                        ).strip()
-                    except Exception:
-                        pass
+                    value = top_secret(key)
+                    if value:
+                        service_json = value
 
             for key in (
                 "GOOGLE_OAUTH_TOKEN_JSON",
                 "OAUTH_TOKEN_JSON",
             ):
                 if not oauth_json:
-                    try:
-                        oauth_json = str(
-                            st.secrets.get(
-                                key,
-                                "",
-                            )
-                        ).strip()
-                    except Exception:
-                        pass
+                    value = top_secret(key)
+                    if value:
+                        oauth_json = value
 
     except Exception:
         pass
 
-    if not root_id:
-        root_id = ""
-
     if oauth_json:
         try:
-            oauth_info = json.loads(
-                oauth_json
-            )
+            oauth_info = json.loads(oauth_json)
         except Exception as exc:
             return {
                 "configured": False,
@@ -318,25 +315,24 @@ def gdrive_config() -> dict:
                     f"invalid OAuth token JSON: "
                     f"{type(exc).__name__}"
                 ),
+                "secrets_detected": secrets_seen,
+                "secret_keys": secret_names,
             }
 
-        if not isinstance(
-            oauth_info,
-            dict,
-        ):
+        if not isinstance(oauth_info, dict):
             return {
                 "configured": False,
                 "reason": "OAuth token JSON is not an object",
+                "secrets_detected": secrets_seen,
+                "secret_keys": secret_names,
             }
 
-        if not oauth_info.get(
-            "refresh_token"
-        ):
+        if not oauth_info.get("refresh_token"):
             return {
                 "configured": False,
-                "reason": (
-                    "OAuth token JSON has no refresh_token"
-                ),
+                "reason": "OAuth token JSON has no refresh_token",
+                "secrets_detected": secrets_seen,
+                "secret_keys": secret_names,
             }
 
         return {
@@ -345,6 +341,8 @@ def gdrive_config() -> dict:
             "root_folder_id": root_id,
             "root_folder_name": root_name,
             "oauth_token_info": oauth_info,
+            "secrets_detected": secrets_seen,
+            "secret_keys": secret_names,
         }
 
     if not service_json:
@@ -354,12 +352,14 @@ def gdrive_config() -> dict:
                 "missing OAuth token JSON and "
                 "service-account JSON"
             ),
+            "secrets_detected": secrets_seen,
+            "secret_keys": secret_names,
+            "root_folder_id_present": bool(root_id),
+            "root_folder_name": root_name,
         }
 
     try:
-        info = json.loads(
-            service_json
-        )
+        info = json.loads(service_json)
     except Exception as exc:
         return {
             "configured": False,
@@ -367,6 +367,24 @@ def gdrive_config() -> dict:
                 f"invalid service-account JSON: "
                 f"{type(exc).__name__}"
             ),
+            "secrets_detected": secrets_seen,
+            "secret_keys": secret_names,
+        }
+
+    if not isinstance(info, dict):
+        return {
+            "configured": False,
+            "reason": "service-account JSON is not an object",
+            "secrets_detected": secrets_seen,
+            "secret_keys": secret_names,
+        }
+
+    if not info.get("client_email"):
+        return {
+            "configured": False,
+            "reason": "service-account JSON has no client_email",
+            "secrets_detected": secrets_seen,
+            "secret_keys": secret_names,
         }
 
     return {
@@ -375,9 +393,9 @@ def gdrive_config() -> dict:
         "root_folder_id": root_id,
         "root_folder_name": root_name,
         "service_account_info": info,
-        "client_email": info.get(
-            "client_email"
-        ),
+        "client_email": info.get("client_email"),
+        "secrets_detected": secrets_seen,
+        "secret_keys": secret_names,
     }
 
 
