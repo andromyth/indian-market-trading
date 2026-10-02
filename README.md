@@ -99,9 +99,12 @@ Open `http://localhost:8501`.
 ## Important interpretation note
 
 `BUY`, `SELL`, and `HOLD` are model classifications for decision support, not
-guarantees of return. Delivery's trained universe is currently limited to the
-validated symbols in the bundled delivery model. Unknown or unvalidated symbols
-are blocked rather than silently generalized. No order execution is implemented.
+guarantees of return. Delivery currently uses the ALL-NSE candidate roster:
+2,372 trainable symbols from the 2,593-stock official NSE equity universe, with
+a 60-session minimum-history gate. The candidate remains under prospective OOS
+monitoring and is not presented as a profitability guarantee. Symbols outside
+the trainable roster are blocked rather than silently generalized. No order
+execution is implemented.
 
 ## Next upgrade path
 
