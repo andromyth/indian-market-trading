@@ -159,141 +159,227 @@ def _relative_or_absolute(path: Path) -> str:
 
 
 def gdrive_config() -> dict:
-    """Resolve Google Drive configuration.
+    """Resolve Google Drive configuration from environment or Streamlit Secrets.
 
-    OAuth is preferred when GOOGLE_OAUTH_TOKEN_JSON is available because
-    the user's OAuth credentials use the user's own Drive storage quota.
-    The existing service-account configuration remains as a fallback.
+    A root folder ID is preferred. When it is absent but valid Google Drive
+    credentials exist, the store can discover the configured research folder
+    by name (default: Indian_Market_Research). This is useful on Streamlit
+    Cloud, where secrets are not automatically exported as environment
+    variables.
     """
     root_id = (
         os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
         or os.getenv("GOOGLE_DRIVE_ROOT_ID", "").strip()
+        or os.getenv("GOOGLE_DRIVE_ROOT_FOLDER_ID", "").strip()
+        or os.getenv("DRIVE_ROOT_FOLDER_ID", "").strip()
     )
-    service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    oauth_json = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+
+    root_name = (
+        os.getenv("GOOGLE_DRIVE_ROOT_FOLDER_NAME", "").strip()
+        or os.getenv("DRIVE_ROOT_FOLDER_NAME", "").strip()
+        or "Indian_Market_Research"
+    )
+
+    service_json = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        ""
+    ).strip()
+
+    oauth_json = os.getenv(
+        "GOOGLE_OAUTH_TOKEN_JSON",
+        ""
+    ).strip()
 
     try:
-        import streamlit as st  # lazy: module also works outside Streamlit
+        import streamlit as st
+
         if hasattr(st, "secrets"):
 
-            # Preferred structured configuration:
-            # [gdrive]
-            # root_folder_id = "..."
-            # service_account_json = "..."
-            # oauth_token_json = "..."
-            sec = st.secrets.get("gdrive", {})
-
-            if not root_id:
-                root_id = str(
-                    sec.get("root_folder_id", "")
-                ).strip()
-
-            if not service_json:
-                service_json = str(
-                    sec.get("service_account_json", "")
-                ).strip()
-
-            if not oauth_json:
-                oauth_json = str(
-                    sec.get("oauth_token_json", "")
-                ).strip()
-
-            # Also support the top-level Streamlit Secrets names already
-            # used by older deployments. Streamlit secrets are NOT guaranteed
-            # to appear in os.environ, so reading only os.getenv() can produce
-            # a false "missing root_folder_id" error.
-            if not root_id:
-                root_id = str(
-                    st.secrets.get(
-                        "GOOGLE_DRIVE_ROOT_ID",
-                        ""
+            # Structured configuration.
+            for section_name in (
+                "gdrive",
+                "google_drive",
+                "drive",
+            ):
+                try:
+                    sec = st.secrets.get(
+                        section_name,
+                        {},
                     )
-                ).strip()
+                except Exception:
+                    sec = {}
 
-            if not root_id:
-                root_id = str(
-                    st.secrets.get(
-                        "GDRIVE_ROOT_FOLDER_ID",
-                        ""
-                    )
-                ).strip()
+                if not isinstance(sec, dict):
+                    continue
 
-            if not service_json:
-                service_json = str(
-                    st.secrets.get(
-                        "GOOGLE_SERVICE_ACCOUNT_JSON",
-                        ""
-                    )
-                ).strip()
+                if not root_id:
+                    root_id = str(
+                        sec.get("root_folder_id", "")
+                    ).strip()
 
-            if not oauth_json:
-                oauth_json = str(
-                    st.secrets.get(
-                        "GOOGLE_OAUTH_TOKEN_JSON",
-                        ""
-                    )
-                ).strip()
+                if not root_name:
+                    root_name = str(
+                        sec.get("root_folder_name", "")
+                    ).strip()
+
+                if not service_json:
+                    service_json = str(
+                        sec.get("service_account_json", "")
+                    ).strip()
+
+                if not oauth_json:
+                    oauth_json = str(
+                        sec.get("oauth_token_json", "")
+                    ).strip()
+
+            # Top-level legacy/current names.
+            for key in (
+                "GOOGLE_DRIVE_ROOT_ID",
+                "GDRIVE_ROOT_FOLDER_ID",
+                "GOOGLE_DRIVE_ROOT_FOLDER_ID",
+                "DRIVE_ROOT_FOLDER_ID",
+                "ROOT_FOLDER_ID",
+            ):
+                if not root_id:
+                    try:
+                        root_id = str(
+                            st.secrets.get(
+                                key,
+                                "",
+                            )
+                        ).strip()
+                    except Exception:
+                        pass
+
+            for key in (
+                "GOOGLE_DRIVE_ROOT_FOLDER_NAME",
+                "DRIVE_ROOT_FOLDER_NAME",
+                "ROOT_FOLDER_NAME",
+            ):
+                try:
+                    value = str(
+                        st.secrets.get(
+                            key,
+                            "",
+                        )
+                    ).strip()
+                except Exception:
+                    value = ""
+
+                if value:
+                    root_name = value
+                    break
+
+            for key in (
+                "GOOGLE_SERVICE_ACCOUNT_JSON",
+                "SERVICE_ACCOUNT_JSON",
+            ):
+                if not service_json:
+                    try:
+                        service_json = str(
+                            st.secrets.get(
+                                key,
+                                "",
+                            )
+                        ).strip()
+                    except Exception:
+                        pass
+
+            for key in (
+                "GOOGLE_OAUTH_TOKEN_JSON",
+                "OAUTH_TOKEN_JSON",
+            ):
+                if not oauth_json:
+                    try:
+                        oauth_json = str(
+                            st.secrets.get(
+                                key,
+                                "",
+                            )
+                        ).strip()
+                    except Exception:
+                        pass
 
     except Exception:
         pass
 
     if not root_id:
-        return {
-            "configured": False,
-            "reason": "missing root_folder_id",
-        }
+        root_id = ""
 
-    # Prefer user's OAuth credentials.
     if oauth_json:
         try:
-            oauth_info = json.loads(oauth_json)
+            oauth_info = json.loads(
+                oauth_json
+            )
         except Exception as exc:
             return {
                 "configured": False,
-                "reason": f"invalid OAuth token JSON: {type(exc).__name__}",
+                "reason": (
+                    f"invalid OAuth token JSON: "
+                    f"{type(exc).__name__}"
+                ),
             }
 
-        if not isinstance(oauth_info, dict):
+        if not isinstance(
+            oauth_info,
+            dict,
+        ):
             return {
                 "configured": False,
                 "reason": "OAuth token JSON is not an object",
             }
 
-        if not oauth_info.get("refresh_token"):
+        if not oauth_info.get(
+            "refresh_token"
+        ):
             return {
                 "configured": False,
-                "reason": "OAuth token JSON has no refresh_token",
+                "reason": (
+                    "OAuth token JSON has no refresh_token"
+                ),
             }
 
         return {
             "configured": True,
             "auth_method": "oauth",
             "root_folder_id": root_id,
+            "root_folder_name": root_name,
             "oauth_token_info": oauth_info,
         }
 
-    # Existing service-account fallback.
     if not service_json:
         return {
             "configured": False,
-            "reason": "missing OAuth token JSON and service-account JSON",
+            "reason": (
+                "missing OAuth token JSON and "
+                "service-account JSON"
+            ),
         }
 
     try:
-        info = json.loads(service_json)
+        info = json.loads(
+            service_json
+        )
     except Exception as exc:
         return {
             "configured": False,
-            "reason": f"invalid service-account JSON: {type(exc).__name__}",
+            "reason": (
+                f"invalid service-account JSON: "
+                f"{type(exc).__name__}"
+            ),
         }
 
     return {
         "configured": True,
         "auth_method": "service_account",
         "root_folder_id": root_id,
+        "root_folder_name": root_name,
         "service_account_info": info,
-        "client_email": info.get("client_email"),
+        "client_email": info.get(
+            "client_email"
+        ),
     }
+
 
 def _drive_credentials(cfg: dict):
     """Build authenticated Drive credentials using OAuth first, then service account."""
@@ -331,21 +417,98 @@ def drive_status() -> dict:
         from googleapiclient.discovery import build
 
         credentials = _drive_credentials(cfg)
-        service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-        meta = service.files().get(fileId=cfg["root_folder_id"], fields="id,name,mimeType,trashed").execute()
+        service = build(
+            "drive",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+
+        root_id = str(
+            cfg.get("root_folder_id", "")
+        ).strip()
+
+        if not root_id:
+            root_id = _discover_drive_root_folder(
+                service,
+                cfg.get(
+                    "root_folder_name",
+                    "Indian_Market_Research",
+                ),
+            )
+
+        meta = service.files().get(
+            fileId=root_id,
+            fields="id,name,mimeType,trashed",
+        ).execute()
         if meta.get("trashed"):
             return {"configured": False, "reason": "configured root folder is in Trash"}
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             return {"configured": False, "reason": "configured root ID is not a folder"}
         return {
             "configured": True,
-            "root_folder_id": cfg["root_folder_id"],
+            "root_folder_id": root_id,
             "auth_method": cfg.get("auth_method"),
             "client_email": cfg.get("client_email"),
             "root_name": meta.get("name"),
         }
     except Exception as exc:
         return {"configured": True, "reachable": False, "reason": f"Google Drive check failed: {type(exc).__name__}: {exc}", "client_email": cfg.get("client_email")}
+
+
+def _discover_drive_root_folder(
+    service,
+    folder_name: str,
+) -> str:
+    """Discover an exact folder name in the connected Google Drive."""
+    name = str(
+        folder_name or "Indian_Market_Research"
+    ).strip()
+
+    if not name:
+        raise RuntimeError(
+            "Google Drive root folder name is empty."
+        )
+
+    q = (
+        f"name = '{name.replace(chr(39), chr(39) + chr(39))}' "
+        "and mimeType = "
+        "'application/vnd.google-apps.folder' "
+        "and trashed = false"
+    )
+
+    response = service.files().list(
+        q=q,
+        spaces="drive",
+        fields="files(id,name,mimeType,parents,driveId)",
+        pageSize=20,
+        orderBy="name",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+
+    matches = response.get(
+        "files",
+        [],
+    )
+
+    if not matches:
+        raise RuntimeError(
+            "Google Drive research folder was not found: "
+            f"{name!r}. Either share the folder with the configured "
+            "Google identity or provide its root_folder_id explicitly."
+        )
+
+    # Exact-name match; deterministic first item.
+    return str(
+        sorted(
+            matches,
+            key=lambda x: (
+                str(x.get("name", "")),
+                str(x.get("id", "")),
+            ),
+        )[0]["id"]
+    )
 
 
 class GoogleDriveStore:
@@ -358,9 +521,29 @@ class GoogleDriveStore:
             from googleapiclient.http import MediaFileUpload
         except Exception as exc:
             raise RuntimeError("Google Drive dependencies are not installed") from exc
-        self.root_id = cfg["root_folder_id"]
         self.credentials = _drive_credentials(cfg)
-        self.service = build("drive", "v3", credentials=self.credentials, cache_discovery=False)
+        self.service = build(
+            "drive",
+            "v3",
+            credentials=self.credentials,
+            cache_discovery=False,
+        )
+
+        configured_root = str(
+            cfg.get("root_folder_id", "")
+        ).strip()
+
+        if configured_root:
+            self.root_id = configured_root
+        else:
+            self.root_id = _discover_drive_root_folder(
+                self.service,
+                cfg.get(
+                    "root_folder_name",
+                    "Indian_Market_Research",
+                ),
+            )
+
         self.MediaFileUpload = MediaFileUpload
 
     @staticmethod
