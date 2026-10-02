@@ -1401,6 +1401,23 @@ def predict_symbol(
             .iloc[0]
         )
 
+        # Register compatible auxiliary model evidence without altering
+        # the locked ALL-NSE probability.
+        try:
+            from directional_ensemble import model_ensemble_direction
+
+            auxiliary_models = model_ensemble_direction(
+                root,
+                feature_frame,
+                horizon="next_session",
+                fno_available=False,
+            )
+        except Exception as exc:
+            auxiliary_models = {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         return {
             "symbol": root,
             "prediction_status": "PASS",
@@ -1446,6 +1463,17 @@ def predict_symbol(
                 "fno": "EXPLICITLY_MISSING_IN_SNAPSHOT",
                 "fundamentals": "EXPLICITLY_MISSING_IN_SNAPSHOT",
             },
+            "auxiliary_model_ensemble": auxiliary_models,
+            "auxiliary_model_consensus_p_up": (
+                auxiliary_models.get("consensus_p_up")
+                if isinstance(auxiliary_models, dict)
+                else None
+            ),
+            "auxiliary_model_consensus_direction": (
+                auxiliary_models.get("consensus_direction", "UNKNOWN")
+                if isinstance(auxiliary_models, dict)
+                else "UNKNOWN"
+            ),
             "universe_symbol_count": int(
                 manifest.get("universe_symbol_count", 2593)
             ),
