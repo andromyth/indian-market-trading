@@ -646,6 +646,12 @@ def _build_latest_features(
         "delivery_qty",
         "delivery_pct",
     ]:
+        if col not in x.columns:
+            # Historical compact files may omit delivery fields. Preserve that
+            # as explicit missing information so the trained model's imputation
+            # policy can handle it; never fabricate delivery values.
+            x[col] = np.nan
+
         x[col] = pd.to_numeric(
             x[col],
             errors="coerce",
