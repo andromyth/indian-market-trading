@@ -44,7 +44,7 @@ def main():
         [sys.executable,"build_all_nse_pit_fundamentals.py",
          "--bulk-root",str(bulk),"--out",str(fundamentals),
          "--from-date","01-01-2025","--to-date","30-09-2026",
-         "--page-size","100","--workers","8","--max-filings-per-symbol","6"],
+         "--page-size","100","--workers","8","--max-filings-per-symbol","5"],
         cwd=p,check=True
     )
     subprocess.run(
