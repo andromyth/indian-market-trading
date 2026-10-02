@@ -8,6 +8,7 @@ DERIVED estimates from the reference OHLC, the model expected return, and a
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -453,6 +454,821 @@ def _replay_benchmark_history(
     return frame, source
 
 
+def _drive_nse_bulk_history(
+    symbol: str,
+    end_date: pd.Timestamp,
+    min_sessions: int = 70,
+) -> pd.DataFrame:
+    """Read point-in-time stock history directly from the official NSE bulk-EOD archive.
+
+    This deliberately bypasses the live security-wise NSE endpoint. The archive
+    is the persistent exchange-data layer already used to build the ALL-NSE
+    candidate.
+    """
+    root = _root(symbol)
+    end_day = pd.Timestamp(end_date).normalize()
+
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+
+        production = store._find_child(
+            store.root_id,
+            "production_data",
+            "application/vnd.google-apps.folder",
+        )
+        if not production:
+            raise RuntimeError(
+                "Google Drive production_data folder not found."
+            )
+
+        nse = store._find_child(
+            production["id"],
+            "nse_official",
+            "application/vnd.google-apps.folder",
+        )
+        if not nse:
+            raise RuntimeError(
+                "Google Drive nse_official folder not found."
+            )
+
+        bulk = store._find_child(
+            nse["id"],
+            "bulk_eod",
+            "application/vnd.google-apps.folder",
+        )
+        if not bulk:
+            raise RuntimeError(
+                "Google Drive bulk_eod folder not found."
+            )
+
+        # The current official archive spans 2026. Discover month/day folders
+        # once per month, then read only the dated parquet files needed.
+        years = {}
+        page_token = None
+
+        while True:
+
+            kwargs = {
+                "q": (
+                    f"'{bulk['id']}' in parents "
+                    "and mimeType = "
+                    "'application/vnd.google-apps.folder' "
+                    "and trashed = false"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name)",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+
+            if page_token:
+                kwargs["pageToken"] = page_token
+
+            response = store.service.files().list(
+                **kwargs
+            ).execute()
+
+            for item in response.get("files", []):
+                years[str(item["name"])] = item["id"]
+
+            page_token = response.get(
+                "nextPageToken"
+            )
+
+            if not page_token:
+                break
+
+        available_days = []
+
+        local_dir = Path(
+            ".historical_bulk_cache"
+        ) / root
+        local_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # Scan all archive dates that can precede the requested date.
+        for year_name, year_id in years.items():
+
+            try:
+                year_num = int(year_name)
+            except Exception:
+                continue
+
+            if year_num > end_day.year:
+                continue
+
+            month_page = None
+            while True:
+
+                kwargs = {
+                    "q": (
+                        f"'{year_id}' in parents "
+                        "and mimeType = "
+                        "'application/vnd.google-apps.folder' "
+                        "and trashed = false"
+                    ),
+                    "spaces": "drive",
+                    "fields": "nextPageToken,files(id,name)",
+                    "pageSize": 100,
+                    "includeItemsFromAllDrives": True,
+                    "supportsAllDrives": True,
+                }
+
+                if month_page:
+                    kwargs["pageToken"] = month_page
+
+                response = store.service.files().list(
+                    **kwargs
+                ).execute()
+
+                for month_item in response.get("files", []):
+
+                    try:
+                        month_num = int(
+                            str(
+                                month_item["name"]
+                            )
+                        )
+                    except Exception:
+                        continue
+
+                    if year_num == end_day.year and month_num > end_day.month:
+                        continue
+
+                    day_page = None
+
+                    while True:
+
+                        day_kwargs = {
+                            "q": (
+                                f"'{month_item['id']}' in parents "
+                                "and mimeType = "
+                                "'application/vnd.google-apps.folder' "
+                                "and trashed = false"
+                            ),
+                            "spaces": "drive",
+                            "fields": "nextPageToken,files(id,name)",
+                            "pageSize": 100,
+                            "includeItemsFromAllDrives": True,
+                            "supportsAllDrives": True,
+                        }
+
+                        if day_page:
+                            day_kwargs[
+                                "pageToken"
+                            ] = day_page
+
+                        day_response = store.service.files().list(
+                            **day_kwargs
+                        ).execute()
+
+                        for day_item in day_response.get("files", []):
+
+                            try:
+                                day_num = int(
+                                    str(
+                                        day_item["name"]
+                                    )
+                                )
+                            except Exception:
+                                continue
+
+                            try:
+                                day = pd.Timestamp(
+                                    year_num,
+                                    month_num,
+                                    day_num,
+                                ).normalize()
+                            except Exception:
+                                continue
+
+                            if day > end_day:
+                                continue
+
+                            available_days.append(
+                                (
+                                    day,
+                                    day_item["id"],
+                                )
+                            )
+
+                        day_page = day_response.get(
+                            "nextPageToken"
+                        )
+
+                        if not day_page:
+                            break
+
+                month_page = response.get(
+                    "nextPageToken"
+                )
+
+                if not month_page:
+                    break
+
+        available_days = sorted(
+            set(available_days),
+            key=lambda x: x[0],
+        )
+
+        if not available_days:
+            raise RuntimeError(
+                f"No official NSE bulk-EOD sessions found through {end_day.date()}."
+            )
+
+        # Start from the latest date and accumulate until we have sufficient
+        # clean sessions for the 48/50-session features.
+        selected_days = list(
+            reversed(available_days)
+        )[: max(min_sessions + 20, 90)]
+
+        parts = []
+
+        for day, folder_id in selected_days:
+
+            if day > end_day:
+                continue
+
+            files_page = None
+            files = []
+
+            while True:
+
+                kwargs = {
+                    "q": (
+                        f"'{folder_id}' in parents "
+                        "and name contains '.parquet' "
+                        "and trashed = false"
+                    ),
+                    "spaces": "drive",
+                    "fields": "nextPageToken,files(id,name)",
+                    "pageSize": 100,
+                    "includeItemsFromAllDrives": True,
+                    "supportsAllDrives": True,
+                }
+
+                if files_page:
+                    kwargs["pageToken"] = files_page
+
+                response = store.service.files().list(
+                    **kwargs
+                ).execute()
+
+                files.extend(
+                    response.get(
+                        "files",
+                        [],
+                    )
+                )
+
+                files_page = response.get(
+                    "nextPageToken"
+                )
+
+                if not files_page:
+                    break
+
+            target = None
+
+            for item in files:
+
+                name = str(
+                    item.get("name", "")
+                )
+
+                if (
+                    "BhavCopy_NSE_CM_0_0_0_"
+                    in name
+                    and name.endswith(".parquet")
+                ):
+                    target = item
+                    break
+
+            if target is None:
+                continue
+
+            cache_file = (
+                local_dir
+                / f"{day:%Y%m%d}.parquet"
+            )
+
+            try:
+
+                if (
+                    not cache_file.exists()
+                    or cache_file.stat().st_size == 0
+                ):
+
+                    request = (
+                        store.service
+                        .files()
+                        .get_media(
+                            fileId=target["id"]
+                        )
+                    )
+
+                    temp = cache_file.with_suffix(
+                        ".tmp"
+                    )
+
+                    with temp.open("wb") as fh:
+
+                        downloader = MediaIoBaseDownload(
+                            fh,
+                            request,
+                        )
+
+                        done = False
+
+                        while not done:
+                            _, done = downloader.next_chunk()
+
+                    temp.replace(
+                        cache_file
+                    )
+
+                frame = pd.read_parquet(
+                    cache_file
+                )
+
+            except Exception:
+                continue
+
+            if frame is None or frame.empty:
+                continue
+
+            frame.columns = [
+                str(col).strip().lower()
+                for col in frame.columns
+            ]
+
+            symbol_col = next(
+                (
+                    col
+                    for col in (
+                        "symbol",
+                        "tckrsymb",
+                        "ch_symbol",
+                    )
+                    if col in frame.columns
+                ),
+                None,
+            )
+
+            if symbol_col is None:
+                continue
+
+            frame[symbol_col] = (
+                frame[symbol_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+
+            hit = frame[
+                frame[symbol_col].map(
+                    _root
+                ) == root
+            ].copy()
+
+            if hit.empty:
+                continue
+
+            if symbol_col != "symbol":
+                hit["symbol"] = hit[symbol_col]
+
+            date_col = next(
+                (
+                    col
+                    for col in (
+                        "date",
+                        "traddt",
+                        "trading_date",
+                    )
+                    if col in hit.columns
+                ),
+                None,
+            )
+
+            if date_col is None:
+                hit["date"] = day
+            else:
+                hit["date"] = pd.to_datetime(
+                    hit[date_col],
+                    errors="coerce",
+                ).dt.normalize()
+
+            def first_col(*names):
+                return next(
+                    (
+                        col
+                        for col in names
+                        if col in hit.columns
+                    ),
+                    None,
+                )
+
+            aliases = {
+                "open": first_col(
+                    "open",
+                    "opnpric",
+                    "ch_opening_price",
+                ),
+                "high": first_col(
+                    "high",
+                    "hghpric",
+                    "ch_trade_high_price",
+                ),
+                "low": first_col(
+                    "low",
+                    "lwpric",
+                    "ch_trade_low_price",
+                ),
+                "close": first_col(
+                    "close",
+                    "clspric",
+                    "ch_closing_price",
+                ),
+                "volume": first_col(
+                    "volume",
+                    "tt ltradgvol".replace(" ", ""),
+                    "ttltradgvol",
+                    "ch_tot_traded_qty",
+                ),
+                "delivery_qty": first_col(
+                    "delivery_qty",
+                    "cop_deliv_qty",
+                ),
+                "delivery_pct": first_col(
+                    "delivery_pct",
+                    "cop_deliv_perc",
+                ),
+            }
+
+            for target_col, source_col in aliases.items():
+                if target_col not in hit.columns:
+
+                    if source_col is not None:
+                        hit[target_col] = hit[source_col]
+
+                    else:
+                        hit[target_col] = np.nan
+
+                hit[target_col] = pd.to_numeric(
+                    hit[target_col].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce",
+                )
+
+            required = [
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+
+            hit = hit.dropna(
+                subset=required
+            )
+
+            if not hit.empty:
+                parts.append(
+                    hit[
+                        [
+                            "symbol",
+                            "date",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "volume",
+                            "delivery_qty",
+                            "delivery_pct",
+                        ]
+                    ]
+                )
+
+            if sum(len(x) for x in parts) >= min_sessions:
+                # Continue a little further only if the latest rows do not
+                # contain enough pre-reference history.
+                if len(
+                    pd.concat(
+                        parts,
+                        ignore_index=True,
+                    )["date"].unique()
+                ) >= min_sessions:
+                    break
+
+        if not parts:
+            raise RuntimeError(
+                f"No official NSE bulk-EOD rows found for {root} through {end_day.date()}."
+            )
+
+        out = (
+            pd.concat(
+                parts,
+                ignore_index=True,
+            )
+            .sort_values("date")
+            .drop_duplicates(
+                "date",
+                keep="last",
+            )
+            .reset_index(drop=True)
+        )
+
+        out = out[
+            out["date"] <= end_day
+        ].copy()
+
+        return out
+
+
+def _persisted_benchmark_daily(
+    symbol: str,
+    end_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, str]:
+    """Load a persisted official benchmark artifact for historical replay."""
+    root = _root(symbol)
+
+    benchmark = (
+        "^NSEBANK"
+        if root
+        in {
+            "HDFCBANK",
+            "ICICIBANK",
+            "SBIN",
+            "AXISBANK",
+            "KOTAKBANK",
+            "INDUSINDBK",
+            "BANKBARODA",
+            "PNB",
+        }
+        else "^NSEI"
+    )
+
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+
+        candidate_names = (
+            [
+                "NIFTYBANK-INDEX.parquet",
+                "NIFTY_BANK_CONTEXT_2026.parquet",
+                "EXPANSION_NIFTY_BANK_CONTEXT_2026.parquet",
+            ]
+            if benchmark == "^NSEBANK"
+            else [
+                "NIFTY50-INDEX.parquet",
+                "EXPANSION_NIFTY_CONTEXT_2026.parquet",
+                "STEP45_NIFTY_MARKET_CONTEXT_2026.parquet",
+            ]
+        )
+
+        # Exact-name Drive search; this searches the connected Drive and avoids
+        # hard-coding a folder layout for the benchmark artifact.
+        for name in candidate_names:
+
+            response = store.service.files().list(
+                q=(
+                    f"name = '{name}' "
+                    "and trashed = false"
+                ),
+                spaces="drive",
+                fields="files(id,name,mimeType,parents)",
+                pageSize=20,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+
+            items = response.get(
+                "files",
+                []
+            )
+
+            for item in items:
+
+                if item.get(
+                    "mimeType"
+                ) == "application/vnd.google-apps.folder":
+                    continue
+
+                local_dir = Path(
+                    ".benchmark_cache"
+                )
+                local_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                local_path = (
+                    local_dir
+                    / name
+                )
+
+                if (
+                    not local_path.exists()
+                    or local_path.stat().st_size == 0
+                ):
+
+                    request = (
+                        store.service
+                        .files()
+                        .get_media(
+                            fileId=item["id"]
+                        )
+                    )
+
+                    temp = local_path.with_suffix(
+                        ".tmp"
+                    )
+
+                    with temp.open("wb") as fh:
+
+                        downloader = MediaIoBaseDownload(
+                            fh,
+                            request,
+                        )
+
+                        done = False
+
+                        while not done:
+                            _, done = downloader.next_chunk()
+
+                    temp.replace(
+                        local_path
+                    )
+
+                frame = pd.read_parquet(
+                    local_path
+                )
+
+                if frame.empty:
+                    continue
+
+                frame.columns = [
+                    str(col).strip().lower()
+                    for col in frame.columns
+                ]
+
+                if "timestamp" in frame.columns:
+                    frame["date"] = pd.to_datetime(
+                        frame["timestamp"],
+                        errors="coerce",
+                    ).dt.normalize()
+                elif "date" in frame.columns:
+                    frame["date"] = pd.to_datetime(
+                        frame["date"],
+                        errors="coerce",
+                    ).dt.normalize()
+                else:
+                    continue
+
+                # Research context artifacts already contain the market-return
+                # fields. Preserve them when present.
+                if "market_ret_1" in frame.columns:
+                    for col in (
+                        "market_ret_1",
+                        "market_ret_3",
+                        "market_ret_6",
+                        "market_ret_12",
+                        "market_rsi14",
+                    ):
+                        if col not in frame.columns:
+                            frame[col] = np.nan
+
+                    frame["market_mood_proxy"] = frame[
+                        "market_ret_1"
+                    ]
+
+                    if "market_stress_proxy" not in frame.columns:
+                        frame["market_stress_proxy"] = (
+                            frame["market_ret_1"]
+                            .rolling(
+                                20,
+                                min_periods=5,
+                            )
+                            .std()
+                        )
+
+                else:
+
+                    close_col = (
+                        "nifty_close"
+                        if "nifty_close" in frame.columns
+                        else "close"
+                        if "close" in frame.columns
+                        else None
+                    )
+
+                    if close_col is None:
+                        continue
+
+                    frame[close_col] = pd.to_numeric(
+                        frame[close_col],
+                        errors="coerce",
+                    )
+
+                    close = frame[close_col]
+
+                    frame["market_ret_1"] = close.pct_change(1)
+                    frame["market_ret_3"] = close.pct_change(3)
+                    frame["market_ret_6"] = close.pct_change(6)
+                    frame["market_ret_12"] = close.pct_change(12)
+
+                    delta = close.diff()
+
+                    gain = (
+                        delta.clip(lower=0)
+                        .rolling(
+                            14,
+                            min_periods=14,
+                        )
+                        .mean()
+                    )
+
+                    loss = (
+                        (-delta.clip(upper=0))
+                        .rolling(
+                            14,
+                            min_periods=14,
+                        )
+                        .mean()
+                    )
+
+                    rs = gain / loss
+
+                    frame["market_rsi14"] = (
+                        100
+                        - 100 / (1 + rs)
+                    )
+
+                    frame["market_rsi14"] = frame[
+                        "market_rsi14"
+                    ].where(
+                        loss != 0,
+                        100.0,
+                    )
+
+                    frame["market_mood_proxy"] = frame[
+                        "market_ret_1"
+                    ]
+
+                    frame["market_stress_proxy"] = frame[
+                        "market_ret_1"
+                    ].rolling(
+                        20,
+                        min_periods=5,
+                    ).std()
+
+                frame = (
+                    frame[
+                        frame["date"]
+                        <= end_date.normalize()
+                    ]
+                    .sort_values("date")
+                    .groupby(
+                        "date",
+                        as_index=False,
+                    )
+                    .tail(1)
+                    .reset_index(drop=True)
+                )
+
+                if len(frame) >= 30:
+                    return (
+                        frame[
+                            [
+                                "date",
+                                "market_ret_1",
+                                "market_ret_3",
+                                "market_ret_6",
+                                "market_ret_12",
+                                "market_rsi14",
+                                "market_mood_proxy",
+                                "market_stress_proxy",
+                            ]
+                        ],
+                        benchmark + "_PERSISTED_OFFICIAL",
+                    )
+
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"No persisted official benchmark artifact available for {benchmark} "
+        f"through {end_date.date()}."
+    )
+
+
 def _historical_ml_vs_actual(
     symbol: str,
     prediction_date: pd.Timestamp,
@@ -460,80 +1276,108 @@ def _historical_ml_vs_actual(
 
     root = _root(symbol)
 
-    # Reconstruct only from information available through the selected
-    # historical NSE session. Existing PIT snapshots are used when available;
-    # otherwise the ALL-NSE model builds its fixed 59-feature row from the
-    # official historical archive.
-    decision_ts = pd.Timestamp(
-        prediction_date.date()
-    ).tz_localize(
-        "Asia/Kolkata"
-    ) + pd.Timedelta(
-        hours=15,
-        minutes=30,
-    )
-
-    benchmark_history, benchmark_source = _replay_benchmark_history(
+    history = _drive_nse_bulk_history(
         root,
-        prediction_date - pd.Timedelta(days=365),
         prediction_date,
+        min_sessions=70,
     )
 
-    prediction = all_nse_delivery_predict(
-        root,
-        decision_ts,
-        market_override=benchmark_history,
-    )
-
-    prediction["historical_replay_benchmark_source"] = benchmark_source
-
-    if prediction.get("prediction_status") != "PASS":
+    if history.empty:
         return {
             "symbol": root,
             "prediction_source": "HISTORICAL_ML_REPLAY",
-            "status": "PREDICTION_BLOCKED",
-            "prediction_reason": prediction.get(
-                "reason",
-                "Historical model replay did not produce a prediction.",
-            ),
+            "status": "HISTORICAL_NSE_DATA_UNAVAILABLE",
         }
 
+    # The selected date is a user-facing calendar date. Use the last official
+    # NSE session on/before it as the actual model reference session.
     ref_date = pd.Timestamp(
-        prediction.get(
-            "reference_session",
-            prediction_date.date(),
-        )
+        history["date"].iloc[-1]
     ).normalize()
 
-    df, ref, atr = _reference_row(
+    benchmark_history, benchmark_source = _persisted_benchmark_daily(
         root,
         ref_date,
     )
 
-    if ref is None or df.empty:
-        return {
-            "symbol": root,
-            "prediction_source": "HISTORICAL_ML_REPLAY",
-            "prediction_date": ref_date.date(),
-            "status": "REFERENCE_DATA_UNAVAILABLE",
-        }
+    from all_nse_delivery_model import (
+        _build_latest_features,
+        _load_models,
+    )
 
-    future = df[
-        df["date"] > ref_date
-    ].sort_values("date")
+    feature_frame = _build_latest_features(
+        history,
+        benchmark_history,
+    )
+
+    clf, reg, manifest = _load_models()
+
+    expected_features = list(
+        manifest["features"]
+    )
+
+    if list(feature_frame.columns) != expected_features:
+        raise RuntimeError(
+            "Historical replay feature order does not match the locked 59-feature model."
+        )
 
     p_up = float(
-        prediction.get(
-            "probability_up_next_session",
-            np.nan,
+        np.clip(
+            clf.predict_proba(
+                feature_frame
+            )[0, 1],
+            0.0,
+            1.0,
         )
     )
 
     expected = float(
-        prediction.get(
-            "predicted_return_next_session",
-            np.nan,
-        )
+        reg.predict(
+            feature_frame
+        )[0]
+    )
+
+    if (
+        p_up >= 0.55
+        and expected > 0
+    ):
+        signal = "BUY"
+    elif (
+        p_up <= 0.45
+        and expected < 0
+    ):
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+
+    df = history.copy()
+    future = df[
+        df["date"] > ref_date
+    ].sort_values("date")
+
+    # If the first history load ended exactly at ref_date, retrieve only the
+    # subsequent archive window needed for the actual comparison.
+    if future.empty:
+        try:
+            future_history = _drive_nse_bulk_history(
+                root,
+                ref_date + pd.Timedelta(days=15),
+                min_sessions=5,
+            )
+            future = future_history[
+                future_history["date"] > ref_date
+            ].sort_values("date")
+        except Exception:
+            future = pd.DataFrame()
+
+    ref = df[
+        df["date"] == ref_date
+    ].iloc[-1]
+
+    atr = _atr14(
+        df[
+            df["date"] <= ref_date
+        ]
     )
 
     path = _derived_price_path(
@@ -546,47 +1390,28 @@ def _historical_ml_vs_actual(
         "symbol": root,
         "prediction_date": ref_date.date(),
         "prediction_source": "HISTORICAL_ML_REPLAY",
-        "model_version": prediction.get(
-            "model_version"
+        "model_version": manifest.get(
+            "engine_version"
         ),
-        "benchmark_source": prediction.get(
-            "historical_replay_benchmark_source",
-            "UNKNOWN",
-        ),
-        "signal": prediction.get(
-            "signal"
-        ),
+        "benchmark_source": benchmark_source,
+        "signal": signal,
         "p_up": p_up,
         "expected_return": expected,
         "reference_close": float(
             ref["close"]
         ),
-        "predicted_open": path[
-            "predicted_open"
-        ],
-        "predicted_high": path[
-            "predicted_high"
-        ],
-        "predicted_low": path[
-            "predicted_low"
-        ],
-        "predicted_close": path[
-            "predicted_close"
-        ],
-        "purchase_price": path[
-            "purchase_price"
-        ],
-        "sale_price": path[
-            "sale_price"
-        ],
-        "stop_price": path[
-            "stop_price"
-        ],
+        "predicted_open": path["predicted_open"],
+        "predicted_high": path["predicted_high"],
+        "predicted_low": path["predicted_low"],
+        "predicted_close": path["predicted_close"],
+        "purchase_price": path["purchase_price"],
+        "sale_price": path["sale_price"],
+        "stop_price": path["stop_price"],
     }
 
     if future.empty:
         row["status"] = (
-            "Prediction available; next NSE session actual not available yet"
+            "Prediction available; next official NSE actual is unavailable"
         )
         return row
 
@@ -604,8 +1429,6 @@ def _historical_ml_vs_actual(
         "UP"
         if p_up >= 0.5
         else "DOWN"
-        if np.isfinite(p_up)
-        else "N/A"
     )
 
     actual_direction = (
@@ -619,13 +1442,13 @@ def _historical_ml_vs_actual(
     row.update({
         "actual_date": actual["date"].date(),
         "actual_open": float(
-            actual.get("open", np.nan)
+            actual["open"]
         ),
         "actual_high": float(
-            actual.get("high", np.nan)
+            actual["high"]
         ),
         "actual_low": float(
-            actual.get("low", np.nan)
+            actual["low"]
         ),
         "actual_close": float(
             actual["close"]
@@ -641,7 +1464,8 @@ def _historical_ml_vs_actual(
         "predicted_direction": predicted_direction,
         "actual_direction": actual_direction,
         "direction_match": (
-            predicted_direction == actual_direction
+            predicted_direction
+            == actual_direction
             if actual_direction != "FLAT"
             else None
         ),
@@ -856,17 +1680,17 @@ def render_prediction_history() -> None:
 
     selected = c1.date_input(
         "Prediction date",
-        value=min(
-            today,
-            pd.Timestamp("2018-01-01").date()
-            if today < pd.Timestamp("2018-01-01").date()
-            else today,
-        ),
+        value=today,
         min_value=pd.Timestamp(
-            "2018-01-01"
+            "2026-01-01"
         ).date(),
         max_value=today,
         format="DD-MM-YYYY",
+        help=(
+            "Historical replay uses the official NSE bulk-EOD archive "
+            "persisted in Google Drive and the matching persisted market-context "
+            "artifact. No live NSE API is used for the replay."
+        ),
     )
 
     stock_text = c2.text_input(
