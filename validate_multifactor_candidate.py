@@ -26,8 +26,10 @@ def main():
         for kind in ("classifier","regressor"):
             p=Path(item[kind])
             if not p.exists(): raise SystemExit(f"Missing {kind}: {p}")
-            model=joblib.load(p); imp=getattr(model,"named_steps",{}).get("imputer")
-            if imp is None or int(getattr(imp,"n_features_in_",0))!=59: raise SystemExit(f"{p}: expected 59 original features")
+            model=joblib.load(p); steps=getattr(model,"named_steps",{}) ; imp=steps.get("imputer") if hasattr(steps,"get") else None
+            learned=int(getattr(imp,"n_features_in_",0)) if imp is not None else 0
+            if not learned and imp is not None and getattr(imp,"statistics_",None) is not None: learned=int(len(imp.statistics_))
+            if learned!=59: raise SystemExit(f"{p}: expected 59 original features, found {learned}")
             report["artifacts"].setdefault(name,{})[kind+"_sha256"]=sha256(p)
     out=root/"CANDIDATE_VALIDATION_REPORT_2026.json"; out.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
     print(json.dumps(report,indent=2,default=str))
