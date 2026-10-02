@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--refresh-fundamentals", action="store_true", help="Force a fresh NSE fundamentals catalog/XBRL pass.")
     ap.add_argument("--retry-failed-fundamentals", action="store_true", help="Retry only filings previously cached as failed.")
     ap.add_argument("--force-rebuild-candidate", action="store_true", help="Force panel/model regeneration even when inputs are unchanged.")
+    ap.add_argument("--preflight", action="store_true", help="Check code contract and Drive caches without running the build.")
     a = ap.parse_args()
 
     def log(msg):
@@ -23,6 +24,22 @@ def main():
     log("COLAB MULTIFACTOR UPGRADE STARTING",)
     log(f"Project: {a.project}")
     log(f"Drive root: {a.drive_root}")
+    if a.preflight:
+        from multifactor_data_layer_v2 import FEATURES_59
+        if len(FEATURES_59) != 59:
+            raise SystemExit(f"PRECHECK FAILED: feature count={len(FEATURES_59)}")
+        builder_path = Path(a.project) / "colab_build_all_nse_delivery_multifactor_candidate.py"
+        builder_text = builder_path.read_text(encoding="utf-8")
+        required = [
+            "2026-all-nse-delivery-multifactor-59-candidate-v2",
+            "pit_fundamentals_filing_cache_2025_2026_v3",
+            "CANDIDATE_BUILD_META_2026.json",
+        ]
+        missing = [x for x in required if x not in builder_text]
+        if missing:
+            raise SystemExit("PRECHECK FAILED: stale builder; missing=" + ",".join(missing))
+        log("PRECHECK OK: feature contract=59; incremental-cache builder present.")
+        return 0
 
     try:
         from google.colab import drive
@@ -66,11 +83,11 @@ def main():
         sys.executable, "-u", "colab_build_all_nse_delivery_multifactor_candidate.py",
         "--bulk-root", str(bulk), "--out", str(out),
     ]
-    if args.refresh_fundamentals:
+    if a.refresh_fundamentals:
         build_cmd.append("--refresh-fundamentals")
-    if args.retry_failed_fundamentals:
+    if a.retry_failed_fundamentals:
         build_cmd.append("--retry-failed-fundamentals")
-    if args.force_rebuild_candidate:
+    if a.force_rebuild_candidate:
         build_cmd.append("--force-rebuild-candidate")
     subprocess.run(build_cmd, cwd=p, check=True, env=env)
 
