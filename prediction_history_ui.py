@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
 from datetime import timedelta
 from typing import Any
 
@@ -272,20 +273,26 @@ def _compact_symbol_history(symbol: str) -> pd.DataFrame:
     ttl=3600,
     show_spinner=False,
 )
-def _canonical_all_nse_daily() -> pd.DataFrame:
-    """Load the persisted all-NSE daily canonical parquet once per runtime.
+def _bulk_eod_drive_index() -> dict[str, str]:
+    """Index official NSE BhavCopy parquet files in Drive by filename.
 
-    This archive contains the official NSE daily OHLC/volume/delivery fields
-    used by the all-NSE candidate build. It is the correct historical source
-    for replay because it does not depend on per-symbol compact files.
+    The production archive is the dated:
+      production_data/nse_official/bulk_eod
+    collection. We build the filename→file-id index once per Streamlit
+    runtime instead of traversing year/month/day folders for every request.
     """
+    from persistent_store import GoogleDriveStore
+
     store = _drive_store()
 
-    parent = store.root_id
+    candidates = []
 
+    # First use the known production archive path.
+    parent = store.root_id
     for part in (
-        "processed",
-        "universe_expansion_2026_v4",
+        "production_data",
+        "nse_official",
+        "bulk_eod",
     ):
         folder = store._find_child(
             parent,
@@ -294,126 +301,413 @@ def _canonical_all_nse_daily() -> pd.DataFrame:
         )
 
         if not folder:
-            raise RuntimeError(
-                f"Google Drive folder not found: {part}"
-            )
+            parent = None
+            break
 
         parent = folder["id"]
 
-    item = store._find_child(
-        parent,
-        "EXPANSION_DAILY_NSE_CANONICAL_2026.parquet",
-        None,
-    )
+    if parent:
+        token = None
+        while True:
+            kwargs = {
+                "q": (
+                    f"'{parent}' in parents "
+                    "and trashed = false "
+                    "and name contains 'BhavCopy_NSE_CM_0_0_0_'"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
 
-    if not item:
-        raise RuntimeError(
-            "Persisted all-NSE canonical daily parquet was not found in Drive."
-        )
+            if token:
+                kwargs["pageToken"] = token
 
-    local_dir = Path(
-        ".canonical_history_cache"
-    )
-    local_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+            response = store.service.files().list(
+                **kwargs
+            ).execute()
 
-    local = (
-        local_dir
-        / "EXPANSION_DAILY_NSE_CANONICAL_2026.parquet"
-    )
-
-    if (
-        not local.exists()
-        or local.stat().st_size == 0
-    ):
-
-        from googleapiclient.http import MediaIoBaseDownload
-
-        request = (
-            store.service
-            .files()
-            .get_media(
-                fileId=item["id"]
-            )
-        )
-
-        temp = local.with_suffix(
-            ".tmp"
-        )
-
-        with temp.open("wb") as fh:
-
-            downloader = MediaIoBaseDownload(
-                fh,
-                request,
+            candidates.extend(
+                response.get(
+                    "files",
+                    [],
+                )
             )
 
-            done = False
+            token = response.get(
+                "nextPageToken"
+            )
 
-            while not done:
-                _, done = downloader.next_chunk()
+            if not token:
+                break
 
-        temp.replace(local)
+    # Fallback: global filename search if the configured folder layout differs.
+    if not candidates:
+        token = None
 
-    frame = pd.read_parquet(
-        local
-    )
+        while True:
+            kwargs = {
+                "q": (
+                    "trashed = false "
+                    "and name contains 'BhavCopy_NSE_CM_0_0_0_'"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+                "corpora": "allDrives",
+            }
 
-    if frame is None or frame.empty:
+            if token:
+                kwargs["pageToken"] = token
+
+            response = store.service.files().list(
+                **kwargs
+            ).execute()
+
+            candidates.extend(
+                response.get(
+                    "files",
+                    [],
+                )
+            )
+
+            token = response.get(
+                "nextPageToken"
+            )
+
+            if not token:
+                break
+
+    index = {}
+
+    for item in candidates:
+
+        if item.get(
+            "mimeType"
+        ) == "application/vnd.google-apps.folder":
+            continue
+
+        name = str(
+            item.get(
+                "name",
+                "",
+            )
+        ).strip()
+
+        file_id = str(
+            item.get(
+                "id",
+                "",
+            )
+        ).strip()
+
+        if (
+            name
+            and file_id
+            and name.endswith(".parquet")
+        ):
+            index[name] = file_id
+
+    if not index:
         raise RuntimeError(
-            "Persisted all-NSE canonical daily parquet is empty."
+            "No official NSE BhavCopy parquet files were found in the "
+            "configured Google Drive archive."
         )
 
-    return _clean_ohlc(frame)
+    return index
 
 
-def _historical_stock_history_from_drive(
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def _historical_symbol_bulk_history(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Efficient all-NSE historical stock slice from one canonical archive."""
-    frame = _canonical_all_nse_daily()
+    """Read only the requested symbol from official NSE BhavCopy files.
+
+    The Drive file index is created once. Only business-day BhavCopy files
+    whose dates fall inside the requested range are downloaded/read.
+    """
+    from googleapiclient.http import MediaIoBaseDownload
 
     root = _root(symbol)
 
-    if frame.empty:
-        return pd.DataFrame()
+    start_day = pd.Timestamp(start).normalize()
+    end_day = pd.Timestamp(end).normalize()
 
-    symbols = (
-        frame["symbol"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
+    index = _bulk_eod_drive_index()
+
+    # Select relevant dated BhavCopy files without walking Drive folders.
+    selected = []
+
+    for name, file_id in index.items():
+
+        match = re.search(
+            r"BhavCopy_NSE_CM_0_0_0_(20\d{6})",
+            name,
+        )
+
+        if not match:
+            continue
+
+        try:
+            day = pd.Timestamp(
+                match.group(1)
+            ).normalize()
+        except Exception:
+            continue
+
+        if (
+            start_day
+            <= day
+            <= end_day
+        ):
+            selected.append(
+                (
+                    day,
+                    name,
+                    file_id,
+                )
+            )
+
+    selected.sort(
+        key=lambda x: x[0]
     )
 
-    x = frame[
-        symbols == root
-    ].copy()
-
-    if x.empty:
+    if not selected:
         return pd.DataFrame()
 
-    start_day = pd.Timestamp(
-        start
-    ).normalize()
+    store = _drive_store()
 
-    end_day = pd.Timestamp(
-        end
-    ).normalize()
+    cache_dir = (
+        Path(".historical_bhavcopy_cache")
+        / root
+    )
+    cache_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    return x[
-        (x["date"] >= start_day)
-        & (x["date"] <= end_day)
-    ].sort_values(
-        "date"
-    ).drop_duplicates(
-        "date",
-        keep="last",
-    ).reset_index(
-        drop=True
+    pieces = []
+
+    for day, name, file_id in selected:
+
+        local = (
+            cache_dir
+            / name
+        )
+
+        try:
+
+            if (
+                not local.exists()
+                or local.stat().st_size == 0
+            ):
+
+                request = (
+                    store.service
+                    .files()
+                    .get_media(
+                        fileId=file_id
+                    )
+                )
+
+                temp = local.with_suffix(
+                    ".tmp"
+                )
+
+                with temp.open("wb") as fh:
+
+                    downloader = MediaIoBaseDownload(
+                        fh,
+                        request,
+                    )
+
+                    done = False
+
+                    while not done:
+                        _, done = downloader.next_chunk()
+
+                temp.replace(local)
+
+            raw = pd.read_parquet(
+                local
+            )
+
+            if raw is None or raw.empty:
+                continue
+
+            raw.columns = [
+                str(col).strip().lower()
+                for col in raw.columns
+            ]
+
+            if raw.columns.duplicated().any():
+                raw = raw.loc[
+                    :,
+                    ~raw.columns.duplicated(
+                        keep="first"
+                    ),
+                ].copy()
+
+            if "symbol" not in raw.columns:
+                continue
+
+            symbols = (
+                raw["symbol"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+
+            hit = raw[
+                symbols == root
+            ].copy()
+
+            if hit.empty:
+                continue
+
+            aliases = {
+                "date": (
+                    "date",
+                    "date1",
+                    "traddt",
+                    "trading_date",
+                ),
+                "open": (
+                    "open",
+                    "opnpric",
+                    "ch_opening_price",
+                ),
+                "high": (
+                    "high",
+                    "hghpric",
+                    "ch_trade_high_price",
+                ),
+                "low": (
+                    "low",
+                    "lwpric",
+                    "ch_trade_low_price",
+                ),
+                "close": (
+                    "close",
+                    "clspric",
+                    "ch_closing_price",
+                ),
+                "volume": (
+                    "volume",
+                    "ttltradgvol",
+                    "ch_tot_traded_qty",
+                ),
+                "delivery_qty": (
+                    "delivery_qty",
+                    "cop_deliv_qty",
+                ),
+                "delivery_pct": (
+                    "delivery_pct",
+                    "cop_deliv_perc",
+                ),
+            }
+
+            for target, names in aliases.items():
+
+                source = next(
+                    (
+                        col
+                        for col in names
+                        if col in hit.columns
+                    ),
+                    None,
+                )
+
+                if source is None:
+                    hit[target] = np.nan
+
+                elif source != target:
+                    hit[target] = hit[source]
+
+            hit["date"] = pd.to_datetime(
+                hit["date"],
+                errors="coerce",
+            ).dt.normalize()
+
+            for col in (
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "delivery_qty",
+                "delivery_pct",
+            ):
+                hit[col] = pd.to_numeric(
+                    hit[col],
+                    errors="coerce",
+                )
+
+            hit = hit.dropna(
+                subset=[
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            )
+
+            if not hit.empty:
+                pieces.append(
+                    hit[
+                        [
+                            "symbol",
+                            "date",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "volume",
+                            "delivery_qty",
+                            "delivery_pct",
+                        ]
+                    ]
+                )
+
+        except Exception:
+            continue
+
+    if not pieces:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(
+            pieces,
+            ignore_index=True,
+        )
+        .sort_values("date")
+        .drop_duplicates(
+            ["symbol", "date"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def _stock_history_from_drive(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    return _historical_symbol_bulk_history(
+        symbol,
+        start,
+        end,
     )
 
 
@@ -731,8 +1025,10 @@ def _historical_prediction(
 
     # Read the actual target row from the same cached compact history.
     # The target row is not passed into the feature builder.
-    all_history = _compact_symbol_history(
-        root
+    all_history = _historical_symbol_bulk_history(
+        root,
+        target_date,
+        target_date,
     )
 
     actual_rows = all_history[
