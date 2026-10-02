@@ -378,7 +378,7 @@ def _scope_allowed(
     root = _root(symbol)
 
     if scope == "GLOBAL_LEGACY":
-        return root in LEGACY_VALIDATED_SYMBOLS
+        return True
 
     if scope == "DEPLOYMENT_LEGACY":
         return root in LEGACY_VALIDATED_SYMBOLS
@@ -680,6 +680,9 @@ def _augment_auxiliary_features(
             "announcements": announcements or [],
             "event_risk": event_risk,
             "fo": fo_payload,
+            # Critical for historical replay: never let build_feature_rows
+            # substitute the current runtime clock for the historical cutoff.
+            "decision_ts": str(as_of),
         }
 
         broad = build_feature_rows(
@@ -1166,7 +1169,10 @@ def enrich_delivery_prediction(
 
     base_return = _safe(
         result.get(
-            "predicted_return_next_session"
+            "predicted_return_next_session",
+            result.get(
+                "expected_return"
+            ),
         )
     )
 
