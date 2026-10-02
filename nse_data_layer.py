@@ -343,10 +343,32 @@ def fetch_equity_history(symbol: str, start: date | datetime, end: date | dateti
             }
             _save_manifest(m)
         cursor = chunk_end + timedelta(days=1)
-    if not frames:
-        return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    return out.sort_values("date").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+    if frames:
+        out = pd.concat(frames, ignore_index=True)
+        return (
+            out.sort_values("date")
+            .drop_duplicates(["symbol", "date"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    # Direct NSE security-wise history can return an HTTP 200 JSON response
+    # without usable historical rows on hosted/cloud IPs. The project already
+    # maintains the same official NSE CM-UDiFF daily archive in Google Drive;
+    # use it as the persistent NSE-first fallback instead of jumping straight
+    # to a third-party provider.
+    try:
+        drive_history = fetch_nse_drive_bulk_symbol_history(
+            s,
+            start_d,
+            end_d,
+            max_calendar_days=240,
+        )
+        if not drive_history.empty:
+            return drive_history
+    except Exception:
+        pass
+
+    return pd.DataFrame()
 
 
 
@@ -755,6 +777,236 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
     }
     BULK_EOD_MANIFEST.write_text(json.dumps(m, indent=2, sort_keys=True, default=str))
     return normalized
+
+
+def _drive_bulk_file_index() -> dict[str, str]:
+    """Return a cached Google Drive index of official NSE bulk-EOD parquet files."""
+    cache = getattr(_drive_bulk_file_index, "_cache", None)
+    if cache is not None:
+        return cache
+
+    try:
+        from persistent_store import GoogleDriveStore
+
+        store = GoogleDriveStore()
+
+        files = {}
+        token = None
+
+        while True:
+            kwargs = {
+                "q": (
+                    "name contains 'BhavCopy_NSE_CM_0_0_0_' "
+                    "and name contains '.parquet' and trashed = false"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+
+            if token:
+                kwargs["pageToken"] = token
+
+            resp = store.service.files().list(**kwargs).execute()
+
+            for item in resp.get("files", []):
+                name = str(item.get("name", "")).strip()
+                file_id = str(item.get("id", "")).strip()
+                if name and file_id:
+                    files[name] = file_id
+
+            token = resp.get("nextPageToken")
+
+            if not token:
+                break
+
+        _drive_bulk_file_index._cache = files
+        return files
+
+    except Exception:
+        _drive_bulk_file_index._cache = {}
+        return {}
+
+
+def _drive_download_bulk_day(filename: str, destination: Path) -> bool:
+    """Download one official NSE bulk-EOD parquet from Google Drive."""
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        index = _drive_bulk_file_index()
+        file_id = index.get(filename)
+
+        if not file_id:
+            return False
+
+        store = GoogleDriveStore()
+
+        request = store.service.files().get_media(
+            fileId=file_id
+        )
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        temp = destination.with_suffix(
+            destination.suffix + ".tmp"
+        )
+
+        with temp.open("wb") as fh:
+            downloader = MediaIoBaseDownload(
+                fh,
+                request,
+            )
+
+            done = False
+
+            while not done:
+                _, done = downloader.next_chunk()
+
+        temp.replace(destination)
+        return True
+
+    except Exception:
+        return False
+
+
+def fetch_nse_drive_bulk_symbol_history(
+    symbol: str,
+    start: date | datetime,
+    end: date | datetime,
+    max_calendar_days: int = 240,
+) -> pd.DataFrame:
+    """Read official NSE bulk-EOD history from Google Drive when direct NSE
+    security-history HTTP is unavailable.
+
+    The Drive archive is the persistent official NSE source already populated
+    by the project's EOD ingestion workflow. Only the requested symbol is
+    retained from each day, and downloaded day files are cached locally.
+    """
+    s = root_symbol(symbol)
+
+    start_d = pd.Timestamp(start).date()
+    end_d = pd.Timestamp(end).date()
+
+    earliest = end_d - timedelta(
+        days=int(max_calendar_days)
+    )
+
+    if start_d < earliest:
+        start_d = earliest
+
+    days = pd.date_range(
+        start_d,
+        end_d,
+        freq="B",
+    )
+
+    if len(days) == 0:
+        return pd.DataFrame()
+
+    pieces = []
+
+    for day in days:
+
+        d = day.date()
+
+        filename = (
+            f"BhavCopy_NSE_CM_0_0_0_"
+            f"{d:%Y%m%d}_F_0000.parquet"
+        )
+
+        local_path = (
+            BULK_EOD_ROOT
+            / f"{d:%Y}"
+            / f"{d:%m}"
+            / f"{d:%d}"
+            / filename
+        )
+
+        try:
+            if local_path.exists() and local_path.stat().st_size > 0:
+                day_df = pd.read_parquet(
+                    local_path,
+                    columns=None,
+                )
+
+            else:
+                ok = _drive_download_bulk_day(
+                    filename,
+                    local_path,
+                )
+
+                if not ok:
+                    continue
+
+                day_df = pd.read_parquet(
+                    local_path,
+                    columns=None,
+                )
+
+            if day_df.empty:
+                continue
+
+            if "symbol" not in day_df.columns:
+                continue
+
+            part = day_df[
+                day_df["symbol"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                == s
+            ].copy()
+
+            if not part.empty:
+                pieces.append(part)
+
+        except Exception:
+            continue
+
+    if not pieces:
+        return pd.DataFrame()
+
+    out = pd.concat(
+        pieces,
+        ignore_index=True,
+    )
+
+    out["symbol"] = (
+        out["symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    out["date"] = pd.to_datetime(
+        out["date"],
+        errors="coerce",
+    ).dt.normalize()
+
+    return (
+        out
+        .dropna(
+            subset=[
+                "symbol",
+                "date",
+            ]
+        )
+        .sort_values("date")
+        .drop_duplicates(
+            [
+                "symbol",
+                "date",
+            ],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
 
 
 def fetch_nse_bulk_symbol_history(symbol: str, start: date | datetime, end: date | datetime,
