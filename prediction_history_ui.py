@@ -183,6 +183,7 @@ def _stock_history_from_drive(
     This historical-replay loader intentionally does not call fetch_equity_history
     or the live NSE transport layer.
     """
+    from pathlib import Path
     from persistent_store import GoogleDriveStore
     from googleapiclient.http import MediaIoBaseDownload
 
@@ -687,6 +688,7 @@ def _historical_prediction(
     inputs. The actual target-session OHLC is used only after prediction.
     """
 
+    from pathlib import Path
     from all_nse_delivery_model import (
         BUY_P,
         MIN_EXPECTED_RETURN,
