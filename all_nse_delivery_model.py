@@ -586,24 +586,7 @@ def _dedupe_dataframe_columns(
     if frame is None or frame.empty:
         return pd.DataFrame()
 
-    x = _dedupe_dataframe_columns(
-        frame
-    )
-
-    if x.empty:
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "market_ret_1",
-                "market_ret_3",
-                "market_ret_6",
-                "market_ret_12",
-                "market_rsi14",
-                "market_mood_proxy",
-                "market_stress_proxy",
-            ]
-        )
-
+    x = frame.copy()
 
     # Normalize labels first.
     x.columns = [
