@@ -13,7 +13,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
 from nse_data_layer import fetch_equity_history
 from prediction_ledger import load_records
@@ -139,18 +138,289 @@ def render_delivery_forecast(results: dict[str, dict[str, Any]]) -> None:
         st.dataframe(out, width="stretch", hide_index=True)
 
 
+def _load_persisted_market_context(
+    benchmark: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> tuple[pd.DataFrame, str]:
+    """Load previously persisted official NSE market context from Drive.
+
+    The research build already stores NIFTY context artifacts. Historical
+    replay should consume those artifacts rather than call a hosted market
+    endpoint that may return HTML/403 or otherwise fail.
+    """
+    benchmark = str(benchmark).strip().upper()
+
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+
+        # Candidate persisted artifacts created by the research pipeline.
+        artifact_names = [
+            (
+                "EXPANSION_NIFTY_CONTEXT_2026.parquet",
+                "processed/universe_expansion_2026_v4",
+            ),
+            (
+                "STEP45_NIFTY_MARKET_CONTEXT_2026.parquet",
+                "processed/universe_expansion_2026_v4",
+            ),
+            (
+                "NIFTY50-INDEX.parquet",
+                "raw/2026",
+            ),
+        ]
+
+        for filename, folder_path in artifact_names:
+
+            parent_id = store.root_id
+
+            for part in [
+                p
+                for p in folder_path.split("/")
+                if p
+            ]:
+
+                folder = store._find_child(
+                    parent_id,
+                    part,
+                    "application/vnd.google-apps.folder",
+                )
+
+                if not folder:
+                    parent_id = None
+                    break
+
+                parent_id = folder["id"]
+
+            if not parent_id:
+                continue
+
+            file_item = store._find_child(
+                parent_id,
+                filename,
+                None,
+            )
+
+            if not file_item:
+                continue
+
+            local_dir = Path(
+                ".market_context_cache"
+            )
+            local_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            local_path = (
+                local_dir / filename
+            )
+
+            if (
+                not local_path.exists()
+                or local_path.stat().st_size == 0
+            ):
+
+                request = (
+                    store.service
+                    .files()
+                    .get_media(
+                        fileId=file_item["id"]
+                    )
+                )
+
+                temp = local_path.with_suffix(
+                    ".tmp"
+                )
+
+                with temp.open("wb") as fh:
+
+                    downloader = MediaIoBaseDownload(
+                        fh,
+                        request,
+                    )
+
+                    done = False
+
+                    while not done:
+                        _, done = downloader.next_chunk()
+
+                temp.replace(
+                    local_path
+                )
+
+            frame = pd.read_parquet(
+                local_path
+            )
+
+            if frame.empty:
+                continue
+
+            x = frame.copy()
+
+            x.columns = [
+                str(col).strip().lower()
+                for col in x.columns
+            ]
+
+            # Handle the two research-artifact schemas:
+            # 1) timestamp + market_* fields
+            # 2) date + OHLC index values.
+            if "timestamp" in x.columns:
+                x["date"] = pd.to_datetime(
+                    x["timestamp"],
+                    errors="coerce",
+                ).dt.normalize()
+
+            elif "date" in x.columns:
+                x["date"] = pd.to_datetime(
+                    x["date"],
+                    errors="coerce",
+                ).dt.normalize()
+
+            else:
+                continue
+
+            if "market_ret_1" not in x.columns:
+                close_col = (
+                    "nifty_close"
+                    if "nifty_close" in x.columns
+                    else "close"
+                    if "close" in x.columns
+                    else None
+                )
+
+                if close_col is None:
+                    continue
+
+                cclose = pd.to_numeric(
+                    x[close_col],
+                    errors="coerce",
+                )
+
+                x["market_ret_1"] = (
+                    cclose.pct_change(1)
+                )
+                x["market_ret_3"] = (
+                    cclose.pct_change(3)
+                )
+                x["market_ret_6"] = (
+                    cclose.pct_change(6)
+                )
+                x["market_ret_12"] = (
+                    cclose.pct_change(12)
+                )
+
+                delta = cclose.diff()
+
+                gain = (
+                    delta.clip(lower=0)
+                    .rolling(
+                        14,
+                        min_periods=14,
+                    )
+                    .mean()
+                )
+
+                loss = (
+                    (-delta.clip(upper=0))
+                    .rolling(
+                        14,
+                        min_periods=14,
+                    )
+                    .mean()
+                )
+
+                rs = gain / loss
+
+                x["market_rsi14"] = (
+                    100
+                    - 100 / (1 + rs)
+                )
+
+                x["market_rsi14"] = x[
+                    "market_rsi14"
+                ].where(
+                    loss != 0,
+                    100.0,
+                )
+
+            for col in (
+                "market_ret_1",
+                "market_ret_3",
+                "market_ret_6",
+                "market_ret_12",
+                "market_rsi14",
+            ):
+                if col not in x.columns:
+                    x[col] = np.nan
+                x[col] = pd.to_numeric(
+                    x[col],
+                    errors="coerce",
+                )
+
+            x["market_mood_proxy"] = (
+                x["market_ret_1"]
+            )
+            x["market_stress_proxy"] = (
+                x["market_ret_1"]
+                .rolling(
+                    20,
+                    min_periods=5,
+                )
+                .std()
+            )
+
+            x = x[
+                (x["date"] >= start.normalize())
+                & (x["date"] <= end.normalize())
+            ].copy()
+
+            if x.empty:
+                continue
+
+            return (
+                x[
+                    [
+                        "date",
+                        "market_ret_1",
+                        "market_ret_3",
+                        "market_ret_6",
+                        "market_ret_12",
+                        "market_rsi14",
+                        "market_mood_proxy",
+                        "market_stress_proxy",
+                    ]
+                ]
+                .sort_values("date")
+                .drop_duplicates(
+                    "date",
+                    keep="last",
+                )
+                .reset_index(drop=True),
+                "PERSISTED_OFFICIAL_NSE_CONTEXT",
+            )
+
+    except Exception:
+        pass
+
+    return pd.DataFrame(), ""
+
+
 def _replay_benchmark_history(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> tuple[pd.DataFrame, str]:
 
-    """Load a benchmark series for retrospective replay.
+    """Load benchmark context for retrospective replay.
 
-    Official NSE index history is preferred. If the hosted NSE endpoint does
-    not return a usable response, use Yahoo Finance only as an explicitly
-    labeled retrospective reference fallback. This fallback is never used by
-    the prospective live PIT snapshot path.
+    Persisted official NSE research context is preferred. No fabricated index
+    values are generated. If that artifact is unavailable, the replay is
+    explicitly blocked rather than silently substituting an online provider.
     """
     benchmark = (
         "^NSEBANK"
@@ -168,190 +438,19 @@ def _replay_benchmark_history(
         else "^NSEI"
     )
 
-    # First try only the project's persisted official NSE benchmark archive.
-    # This avoids repeated hosted-IP calls to the NSE index endpoint during
-    # historical replay.
-    try:
-        from nse_data_layer import _drive_index_history
-
-        official = _drive_index_history(
-            benchmark,
-            start.date(),
-            end.date(),
-        )
-
-        if (
-            official is not None
-            and not official.empty
-        ):
-            return official, "OFFICIAL_NSE_PERSISTED"
-
-    except Exception:
-        pass
-
-    # Retrospective-only fallback. The table is explicitly labeled in the UI
-    # and is not written back into the official archive.
-    data = yf.download(
+    frame, source = _load_persisted_market_context(
         benchmark,
-        start=start.date(),
-        end=(end + pd.Timedelta(days=1)).date(),
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+        start,
+        end,
     )
 
-    if data is None or data.empty:
+    if frame.empty:
         raise RuntimeError(
-            f"No benchmark history available for retrospective replay: {benchmark}"
+            "Persisted official NSE market-context history is unavailable "
+            f"for retrospective replay of {benchmark}."
         )
 
-    x = data.copy()
-
-    if isinstance(
-        x.columns,
-        pd.MultiIndex,
-    ):
-        flattened = []
-        for col in x.columns:
-            if isinstance(col, tuple):
-                values = [
-                    str(v).strip().lower()
-                    for v in col
-                    if str(v).strip()
-                ]
-                flattened.append(
-                    values[0]
-                    if values
-                    else ""
-                )
-            else:
-                flattened.append(
-                    str(col).strip().lower()
-                )
-        x.columns = flattened
-    else:
-        x.columns = [
-            str(col).strip().lower()
-            for col in x.columns
-        ]
-
-    # A duplicate column label makes x["close"] a DataFrame rather than a
-    # Series, which causes pandas to raise:
-    # "arg must be a list, tuple, 1-d array, or Series".
-    if x.columns.duplicated().any():
-        x = x.loc[
-            :,
-            ~x.columns.duplicated(
-                keep="first"
-            ),
-        ].copy()
-
-    rename = {
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "adj close": "close",
-    }
-
-    x = x.rename(
-        columns=rename
-    )
-
-    if "date" not in x.columns:
-        x = x.reset_index()
-        x.columns = [
-            str(col).strip().lower()
-            for col in x.columns
-        ]
-
-        if x.columns.duplicated().any():
-            x = x.loc[
-                :,
-                ~x.columns.duplicated(
-                    keep="first"
-                ),
-            ].copy()
-
-    date_column = next(
-        (
-            col
-            for col in (
-                "date",
-                "datetime",
-            )
-            if col in x.columns
-        ),
-        None,
-    )
-
-    if date_column is None:
-        raise RuntimeError(
-            f"Yahoo benchmark response has no date column for {benchmark}."
-        )
-
-    x["date"] = pd.to_datetime(
-        x[date_column],
-        errors="coerce",
-    ).dt.normalize()
-
-    for col in (
-        "open",
-        "high",
-        "low",
-        "close",
-    ):
-        if col in x.columns:
-            x[col] = pd.to_numeric(
-                x[col],
-                errors="coerce",
-            )
-
-    required = [
-        "date",
-        "open",
-        "high",
-        "low",
-        "close",
-    ]
-
-    missing = [
-        col
-        for col in required
-        if col not in x.columns
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Yahoo benchmark missing fields for {benchmark}: {missing}"
-        )
-
-    x = x.dropna(
-        subset=required
-    )
-
-    x["symbol"] = benchmark
-    x = (
-        x[
-            [
-                "symbol",
-                "date",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        ]
-        .sort_values("date")
-        .drop_duplicates(
-            "date",
-            keep="last",
-        )
-        .reset_index(drop=True)
-    )
-
-    return x, "YAHOO_REFERENCE_FALLBACK"
+    return frame, source
 
 
 def _historical_ml_vs_actual(
