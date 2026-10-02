@@ -437,6 +437,258 @@ def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.Da
     )
 
 
+def _drive_index_history(
+    index_symbol: str,
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    """Read persisted official NSE benchmark parquet files from Google Drive."""
+    root = str(index_symbol).strip().upper()
+
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+
+        production = store._find_child(
+            store.root_id,
+            "production_data",
+            "application/vnd.google-apps.folder",
+        )
+        if not production:
+            return pd.DataFrame()
+
+        nse_official = store._find_child(
+            production["id"],
+            "nse_official",
+            "application/vnd.google-apps.folder",
+        )
+        if not nse_official:
+            return pd.DataFrame()
+
+        indices = store._find_child(
+            nse_official["id"],
+            "indices",
+            "application/vnd.google-apps.folder",
+        )
+        if not indices:
+            return pd.DataFrame()
+
+        folder_name = root.replace("^", "").replace("/", "_")
+
+        index_folder = store._find_child(
+            indices["id"],
+            folder_name,
+            "application/vnd.google-apps.folder",
+        )
+
+        if not index_folder:
+            return pd.DataFrame()
+
+        page_token = None
+        files = []
+
+        while True:
+
+            kwargs = {
+                "q": (
+                    f"'{index_folder['id']}' in parents "
+                    "and name contains '.parquet' "
+                    "and trashed = false"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name)",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+
+            if page_token:
+                kwargs["pageToken"] = page_token
+
+            response = store.service.files().list(
+                **kwargs
+            ).execute()
+
+            files.extend(
+                response.get(
+                    "files",
+                    [],
+                )
+            )
+
+            page_token = response.get(
+                "nextPageToken"
+            )
+
+            if not page_token:
+                break
+
+        if not files:
+            return pd.DataFrame()
+
+        local_root = (
+            NORMALIZED_ROOT
+            / "indices"
+            / folder_name
+        )
+
+        parts = []
+
+        for item in files:
+
+            file_id = str(
+                item.get("id", "")
+            ).strip()
+
+            name = str(
+                item.get("name", "")
+            ).strip()
+
+            if not file_id or not name:
+                continue
+
+            local_path = (
+                local_root
+                / name
+            )
+
+            try:
+
+                if (
+                    not local_path.exists()
+                    or local_path.stat().st_size == 0
+                ):
+
+                    local_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+
+                    request = (
+                        store.service.files()
+                        .get_media(
+                            fileId=file_id
+                        )
+                    )
+
+                    temp = local_path.with_suffix(
+                        ".tmp"
+                    )
+
+                    with temp.open("wb") as fh:
+
+                        downloader = MediaIoBaseDownload(
+                            fh,
+                            request,
+                        )
+
+                        done = False
+
+                        while not done:
+                            _, done = downloader.next_chunk()
+
+                    temp.replace(
+                        local_path
+                    )
+
+                frame = pd.read_parquet(
+                    local_path
+                )
+
+                normalized = _normalize_index_history(
+                    frame,
+                    root,
+                )
+
+                if normalized.empty:
+                    # Some persisted files may already be normalized but carry
+                    # a different column spelling. Try the frame directly.
+                    frame = frame.copy()
+                    frame.columns = [
+                        str(col).strip().lower()
+                        for col in frame.columns
+                    ]
+
+                    if all(
+                        col in frame.columns
+                        for col in (
+                            "date",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                        )
+                    ):
+                        for col in (
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                        ):
+                            frame[col] = pd.to_numeric(
+                                frame[col],
+                                errors="coerce",
+                            )
+
+                        frame["date"] = pd.to_datetime(
+                            frame["date"],
+                            errors="coerce",
+                        ).dt.normalize()
+
+                        frame["symbol"] = root
+                        normalized = frame
+
+                if normalized.empty:
+                    continue
+
+                normalized["date"] = pd.to_datetime(
+                    normalized["date"],
+                    errors="coerce",
+                ).dt.normalize()
+
+                normalized = normalized.dropna(
+                    subset=["date"]
+                )
+
+                normalized = normalized[
+                    (normalized["date"] >= pd.Timestamp(start))
+                    & (normalized["date"] <= pd.Timestamp(end))
+                ]
+
+                if not normalized.empty:
+                    parts.append(
+                        normalized
+                    )
+
+            except Exception:
+                continue
+
+        if not parts:
+            return pd.DataFrame()
+
+        out = pd.concat(
+            parts,
+            ignore_index=True,
+        )
+
+        out["symbol"] = root
+
+        return (
+            out
+            .sort_values("date")
+            .drop_duplicates(
+                ["symbol", "date"],
+                keep="last",
+            )
+            .reset_index(drop=True)
+        )
+
+    except Exception:
+        return pd.DataFrame()
+
+
 def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end: date | datetime,
                         sync_drive: bool = False) -> pd.DataFrame:
     """Fetch/cache official NSE daily index history with bounded date chunks.
