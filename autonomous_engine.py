@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from all_nse_delivery_model import predict_symbol as predict_all_nse_delivery
+from all_nse_delivery_model import (
+    predict_symbol as predict_all_nse_delivery,
+    _build_latest_features as build_all_nse_features,
+)
+from directional_ensemble import enrich_delivery_prediction
 from production_model import build_feature_rows, predict as predict_intraday
 from prediction_ledger import append_prediction
 
@@ -21,6 +25,53 @@ def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[s
     )
 
     if result.get("prediction_status") == "PASS":
+
+        # Add compatible auxiliary-model and multi-source directional evidence
+        # before persisting the prediction. The locked ALL-NSE model remains
+        # the primary trained output.
+        try:
+            price_df = item.get("price_df")
+            market_df = item.get("market_df")
+
+            if (
+                price_df is not None
+                and not price_df.empty
+            ):
+
+                feature_frame = build_all_nse_features(
+                    price_df,
+                    market_df,
+                )
+
+                result = enrich_delivery_prediction(
+                    result,
+                    symbol,
+                    feature_frame,
+                    price_df,
+                    market_df,
+                    item.get(
+                        "decision_timestamp"
+                    ),
+                    news_items=item.get(
+                        "matched_news",
+                        [],
+                    ),
+                    announcements=item.get(
+                        "announcements",
+                        [],
+                    ),
+                    fno=item.get(
+                        "fo",
+                        {},
+                    ),
+                )
+
+        except Exception as exc:
+            result["ensemble_context_status"] = "ERROR"
+            result["ensemble_context_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
         result["mode"] = "Delivery"
         result["prediction_horizon"] = "next_session"
         result["model_version"] = result.get(
