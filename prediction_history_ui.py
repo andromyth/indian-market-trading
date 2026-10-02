@@ -11,6 +11,7 @@ model, prediction ledger, or prospective OOS baseline.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 
 from datetime import timedelta
