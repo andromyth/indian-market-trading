@@ -738,19 +738,21 @@ def _stock_history_from_drive(
     ttl=3600,
     show_spinner=False,
 )
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
 def _benchmark_history(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> tuple[pd.DataFrame, str]:
-    """Use the model's official NSE benchmark lineage for historical replay."""
-
-    from all_nse_delivery_model import _official_market_history
+    """Read persisted official NSE index history first; Yahoo is fallback only."""
 
     root = _root(symbol)
 
     benchmark = (
-        "^NSEBANK"
+        "NSEBANK"
         if root
         in {
             "HDFCBANK",
@@ -761,20 +763,269 @@ def _benchmark_history(
             "INDUSINDBK",
             "BANKBARODA",
             "PNB",
+            "FEDERALBNK",
+            "IDFCFIRSTB",
         }
-        else "^NSEI"
+        else "NSEI"
     )
 
-    start_day = pd.Timestamp(start).normalize()
-    end_day = pd.Timestamp(end).normalize()
+    start_day = pd.Timestamp(
+        start
+    ).normalize()
 
+    end_day = pd.Timestamp(
+        end
+    ).normalize()
+
+    # Preferred source: persistent Drive research index archive.
     try:
-        official = _official_market_history(
+        from persistent_store import GoogleDriveStore
+
+        store = _drive_store()
+
+        # The historical research archive uses:
+        #   processed/universe_expansion_2026_v4/indices/NSEI/*.parquet
+        #   processed/universe_expansion_2026_v4/indices/NSEBANK/*.parquet
+        parent = store.root_id
+
+        for part in (
+            "processed",
+            "universe_expansion_2026_v4",
+            "indices",
             benchmark,
+        ):
+            folder = store._find_child(
+                parent,
+                part,
+                "application/vnd.google-apps.folder",
+            )
+
+            if not folder:
+                raise RuntimeError(
+                    f"Persistent NSE index folder missing: {part}"
+                )
+
+            parent = folder["id"]
+
+        files = []
+
+        token = None
+
+        while True:
+
+            kwargs = {
+                "q": (
+                    f"'{parent}' in parents "
+                    "and trashed = false"
+                ),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+
+            if token:
+                kwargs["pageToken"] = token
+
+            response = store.service.files().list(
+                **kwargs
+            ).execute()
+
+            files.extend(
+                response.get(
+                    "files",
+                    [],
+                )
+            )
+
+            token = response.get(
+                "nextPageToken"
+            )
+
+            if not token:
+                break
+
+        selected = [
+            item
+            for item in files
+            if str(
+                item.get("name", "")
+            ).lower().endswith(
+                ".parquet"
+            )
+        ]
+
+        if selected:
+
+            local_dir = (
+                Path(".historical_index_cache")
+                / benchmark
+            )
+            local_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            frames = []
+
+            from googleapiclient.http import MediaIoBaseDownload
+
+            for item in selected:
+
+                name = str(
+                    item.get(
+                        "name",
+                        "",
+                    )
+                )
+
+                local = (
+                    local_dir
+                    / name
+                )
+
+                if (
+                    not local.exists()
+                    or local.stat().st_size == 0
+                ):
+
+                    request = (
+                        store.service
+                        .files()
+                        .get_media(
+                            fileId=item["id"]
+                        )
+                    )
+
+                    temp = local.with_suffix(
+                        ".tmp"
+                    )
+
+                    with temp.open("wb") as fh:
+
+                        downloader = MediaIoBaseDownload(
+                            fh,
+                            request,
+                        )
+
+                        done = False
+
+                        while not done:
+                            _, done = downloader.next_chunk()
+
+                    temp.replace(local)
+
+                frame = pd.read_parquet(
+                    local
+                )
+
+                if (
+                    frame is not None
+                    and not frame.empty
+                ):
+                    frames.append(frame)
+
+            if frames:
+
+                x = pd.concat(
+                    frames,
+                    ignore_index=True,
+                )
+
+                x.columns = [
+                    str(col).strip().lower()
+                    for col in x.columns
+                ]
+
+                date_col = next(
+                    (
+                        col
+                        for col in (
+                            "date",
+                            "date1",
+                            "datetime",
+                        )
+                        if col in x.columns
+                    ),
+                    None,
+                )
+
+                close_col = next(
+                    (
+                        col
+                        for col in (
+                            "close",
+                            "clspric",
+                        )
+                        if col in x.columns
+                    ),
+                    None,
+                )
+
+                if (
+                    date_col
+                    and close_col
+                ):
+
+                    x["date"] = pd.to_datetime(
+                        x[date_col],
+                        errors="coerce",
+                    ).dt.normalize()
+
+                    x["close"] = pd.to_numeric(
+                        x[close_col],
+                        errors="coerce",
+                    )
+
+                    x = (
+                        x[
+                            (x["date"] >= start_day)
+                            & (x["date"] <= end_day)
+                        ]
+                        .dropna(
+                            subset=[
+                                "date",
+                                "close",
+                            ]
+                        )
+                        .sort_values("date")
+                        .drop_duplicates(
+                            "date",
+                            keep="last",
+                        )
+                        .reset_index(drop=True)
+                    )
+
+                    if not x.empty:
+                        return (
+                            x[
+                                [
+                                    "date",
+                                    "close",
+                                ]
+                            ],
+                            "OFFICIAL_NSE_PERSISTED",
+                        )
+
+    except Exception:
+        pass
+
+    # Secondary official source: the model's existing NSE index helper.
+    try:
+        from all_nse_delivery_model import (
+            _official_market_history,
+        )
+
+        official = _official_market_history(
+            "^" + benchmark,
             str(end_day.date()),
         )
 
-        if official is not None and not official.empty:
+        if (
+            official is not None
+            and not official.empty
+        ):
 
             x = official.copy()
 
@@ -796,44 +1047,48 @@ def _benchmark_history(
                     errors="coerce",
                 )
 
-                x = x[
-                    (x["date"] >= start_day)
-                    & (x["date"] <= end_day)
-                ].dropna(
-                    subset=[
-                        "date",
-                        "close",
+                x = (
+                    x[
+                        (x["date"] >= start_day)
+                        & (x["date"] <= end_day)
                     ]
+                    .dropna(
+                        subset=[
+                            "date",
+                            "close",
+                        ]
+                    )
+                    .sort_values("date")
+                    .drop_duplicates(
+                        "date",
+                        keep="last",
+                    )
+                    .reset_index(drop=True)
                 )
 
                 if not x.empty:
-
                     return (
                         x[
                             [
                                 "date",
                                 "close",
                             ]
-                        ]
-                        .sort_values("date")
-                        .drop_duplicates(
-                            "date",
-                            keep="last",
-                        )
-                        .reset_index(drop=True),
-                        "OFFICIAL_NSE",
+                        ],
+                        "OFFICIAL_NSE_HELPER",
                     )
 
     except Exception:
         pass
 
-    # Explicit fallback only. This preserves the historical feature test when
-    # the official benchmark archive cannot be reached, but provenance is clear.
+    # Explicit third-party fallback.
     try:
         data = yf.download(
-            benchmark,
+            "^" + benchmark,
             start=start_day.date(),
-            end=(end_day + pd.Timedelta(days=1)).date(),
+            end=(
+                end_day
+                + pd.Timedelta(days=1)
+            ).date(),
             interval="1d",
             auto_adjust=False,
             progress=False,
@@ -842,7 +1097,7 @@ def _benchmark_history(
 
         if data is None or data.empty:
             raise RuntimeError(
-                f"No fallback benchmark rows for {benchmark}."
+                f"No Yahoo benchmark rows for {benchmark}."
             )
 
         x = data.copy()
@@ -851,25 +1106,19 @@ def _benchmark_history(
             x.columns,
             pd.MultiIndex,
         ):
-
-            flattened = []
-
-            for col in x.columns:
-
-                values = [
-                    str(v).strip().lower()
-                    for v in col
-                    if str(v).strip()
-                ]
-
-                flattened.append(
-                    values[0]
-                    if values
-                    else ""
-                )
-
-            x.columns = flattened
-
+            x.columns = [
+                str(
+                    next(
+                        (
+                            v
+                            for v in col
+                            if str(v).strip()
+                        ),
+                        "",
+                    )
+                ).strip().lower()
+                for col in x.columns
+            ]
         else:
             x.columns = [
                 str(col).strip().lower()
@@ -904,7 +1153,7 @@ def _benchmark_history(
 
         if date_col is None or "close" not in x.columns:
             raise RuntimeError(
-                f"Fallback benchmark lacks date/close for {benchmark}."
+                f"Yahoo benchmark lacks date/close for {benchmark}."
             )
 
         x["date"] = pd.to_datetime(
@@ -917,19 +1166,28 @@ def _benchmark_history(
             errors="coerce",
         )
 
-        x = x[
-            (x["date"] >= start_day)
-            & (x["date"] <= end_day)
-        ].dropna(
-            subset=[
-                "date",
-                "close",
+        x = (
+            x[
+                (x["date"] >= start_day)
+                & (x["date"] <= end_day)
             ]
+            .dropna(
+                subset=[
+                    "date",
+                    "close",
+                ]
+            )
+            .sort_values("date")
+            .drop_duplicates(
+                "date",
+                keep="last",
+            )
+            .reset_index(drop=True)
         )
 
         if x.empty:
             raise RuntimeError(
-                f"Fallback benchmark has no usable rows for {benchmark}."
+                f"Yahoo benchmark has no usable rows for {benchmark}."
             )
 
         return (
@@ -938,13 +1196,7 @@ def _benchmark_history(
                     "date",
                     "close",
                 ]
-            ]
-            .sort_values("date")
-            .drop_duplicates(
-                "date",
-                keep="last",
-            )
-            .reset_index(drop=True),
+            ],
             "YAHOO_RETROSPECTIVE_FALLBACK",
         )
 
@@ -1650,21 +1902,48 @@ def render_prediction_history() -> None:
             ),
         )
 
+        readiness_fraction = (
+            row.get(
+                "non_missing_feature_count"
+            ),
+            row.get(
+                "feature_count",
+            ),
+        )
+
+        if all(
+            isinstance(
+                value,
+                (int, float, np.integer, np.floating),
+            )
+            and np.isfinite(
+                float(value)
+            )
+            for value in readiness_fraction
+        ):
+            readiness_text = (
+                f"{int(readiness_fraction[0])}/"
+                f"{int(readiness_fraction[1])} "
+                f"({float(readiness_fraction[0]) / float(readiness_fraction[1]):.1%})"
+            )
+        else:
+            readiness_text = "—"
+
         m2.metric(
             "Data readiness",
-            (
-                f"{float(row['data_readiness']):.0%}"
-                if "data_readiness" in row
-                and np.isfinite(
-                    float(row["data_readiness"])
-                )
-                else "—"
-            ),
+            readiness_text,
         )
 
         m3.metric(
             "Model",
             "ALL-NSE 59-feature",
+        )
+
+        st.info(
+            "Data readiness is shown as usable features / total model features. "
+            "It is not the number of model features. Missing optional news, "
+            "F&O or fundamental inputs are reported separately and are never "
+            "replaced with fabricated values."
         )
 
         st.markdown(
