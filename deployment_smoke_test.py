@@ -46,12 +46,14 @@ def main() -> None:
         raise SystemExit("Delivery model feature count is not 53")
     checks.append("OK delivery classifier/regressor / 53 features / classes [0,1]")
 
+    import all_nse_delivery_model  # noqa: F401
     import delivery_model  # noqa: F401
     import prediction_ledger  # noqa: F401
     import prediction_validation  # noqa: F401
     import model_health  # noqa: F401
     import autonomous_engine  # noqa: F401
-    checks.append("OK new runtime modules import")
+    checks.append("OK all-NSE Delivery runtime module imports")
+    checks.append("OK legacy Delivery module remains importable for compatibility")
 
     print("DEPLOYMENT SMOKE TEST: PASS")
     for c in checks:
