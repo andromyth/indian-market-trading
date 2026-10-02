@@ -162,31 +162,80 @@ def merge_optional(panel):
         if layer.empty: audit[kind]={"exists":False,"rows":0}; continue
         out=merge_pit_layer(out,layer,cols,kind)
         audit[kind]={"exists":True,"rows":int(len(layer)),"symbols":int(layer["symbol"].nunique())}
-    fp=BASE/"corporate/fundamentals_v2/PIT_FUNDAMENTALS_STRICT_2025_2026.parquet"
-    if fp.exists():
-        f=pd.read_parquet(fp); f["symbol"]=f["symbol"].map(normalize_symbol); f["fundamental_available_at"]=pd.to_datetime(f["fundamental_available_at"],errors="coerce",utc=True)
-        f=f.dropna(subset=["symbol","fundamental_available_at"]).sort_values(["symbol","fundamental_available_at"])
-        vals=[c for c in FEATURES_59 if c.startswith("fundamental_") or c.startswith("fund_")]
+    # Broad ALL-NSE PIT fundamentals. Strict three-stock legacy source is fallback only.
+    candidates=[
+        BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet",
+        BASE/"corporate/fundamentals_v2/PIT_FUNDAMENTALS_STRICT_2025_2026.parquet",
+    ]
+    fp=next((p for p in candidates if p.exists() and p.stat().st_size>0),None)
+    if fp is not None:
+        f=pd.read_parquet(fp)
+        f["symbol"]=f["symbol"].map(normalize_symbol)
+        f["fundamental_available_at"]=pd.to_datetime(
+            f["fundamental_available_at"],errors="coerce",utc=True
+        )
+        f["period_end"]=pd.to_datetime(
+            f.get("period_end"),errors="coerce",utc=True
+        ).dt.normalize() if "period_end" in f.columns else pd.NaT
+        f=f.dropna(subset=["symbol","fundamental_available_at"]).sort_values(
+            ["symbol","fundamental_available_at"]
+        )
+        vals=[
+            "fundamental_revenue","fundamental_pat","fundamental_eps",
+            "fundamental_ebitda","fundamental_finance_cost",
+            "fundamental_total_equity","fundamental_total_debt","fundamental_cash",
+            "fund_revenue_growth","fund_pat_growth","fund_eps_growth",
+            "fund_ebitda_growth","fund_pat_margin","fund_debt_to_equity",
+            "fund_cash_to_debt",
+        ]
         pieces=[]
         for sym,lp in out.groupby("symbol",sort=False):
             rp=f[f["symbol"].eq(sym)]
             if rp.empty:
                 pieces.append(lp)
                 continue
-            cols=["fundamental_available_at"]+[c for c in vals if c in rp.columns]
+            cols=["fundamental_available_at"]+[x for x in vals if x in rp.columns]
+            rp=rp[cols].drop_duplicates(["fundamental_available_at"],keep="last")
             m=pd.merge_asof(
                 lp.sort_values("decision_timestamp"),
-                rp[cols].sort_values("fundamental_available_at"),
+                rp.sort_values("fundamental_available_at"),
                 left_on="decision_timestamp",
                 right_on="fundamental_available_at",
                 direction="backward",
                 allow_exact_matches=True,
             )
             pieces.append(m)
-        if pieces: out=pd.concat(pieces,ignore_index=True)
-        audit["fundamentals"]={"exists":True,"rows":int(len(f)),"symbols":int(f["symbol"].nunique())}
+        if pieces:
+            out=pd.concat(pieces,ignore_index=True)
+        # Fundamental readiness is based on the existence of an as-of filing,
+        # not on every optional accounting field being present.
+        fa=pd.to_datetime(out.get("fundamental_available_at"),errors="coerce",utc=True)
+        valid=fa.notna() & fa.le(out["decision_timestamp"])
+        out["fundamentals_available"]=valid.astype("Int8")
+        out["fundamental_age_days"]=np.nan
+        out.loc[valid,"fundamental_age_days"]=(
+            out.loc[valid,"decision_timestamp"]-fa.loc[valid]
+        ).dt.total_seconds()/86400.0
+        out["fundamental_stale_90d"]=pd.Series(
+            np.where(valid,(out["fundamental_age_days"]>90).astype(float),np.nan),
+            index=out.index,dtype="float64"
+        )
+        out["fundamental_stale_180d"]=pd.Series(
+            np.where(valid,(out["fundamental_age_days"]>180).astype(float),np.nan),
+            index=out.index,dtype="float64"
+        )
+        audit["fundamentals"]={
+            "exists":True,
+            "path":str(fp),
+            "rows":int(len(f)),
+            "symbols":int(f["symbol"].nunique()),
+        }
     else:
         audit["fundamentals"]={"exists":False,"rows":0}
+        out["fundamentals_available"]=pd.Series(np.zeros(len(out),dtype="Int8"),index=out.index)
+        out["fundamental_age_days"]=np.nan
+        out["fundamental_stale_90d"]=np.nan
+        out["fundamental_stale_180d"]=np.nan
     return attach_readiness_flags(out),audit
 
 def add_targets(panel,steps,name):
