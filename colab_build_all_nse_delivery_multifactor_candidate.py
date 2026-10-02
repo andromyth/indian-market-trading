@@ -162,12 +162,10 @@ def merge_optional(panel):
         if layer.empty: audit[kind]={"exists":False,"rows":0}; continue
         out=merge_pit_layer(out,layer,cols,kind)
         audit[kind]={"exists":True,"rows":int(len(layer)),"symbols":int(layer["symbol"].nunique())}
-    # Broad ALL-NSE PIT fundamentals. Strict three-stock legacy source is fallback only.
-    candidates=[
-        BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet",
-        BASE/"corporate/fundamentals_v2/PIT_FUNDAMENTALS_STRICT_2025_2026.parquet",
-    ]
-    fp=next((p for p in candidates if p.exists() and p.stat().st_size>0),None)
+    # ONLY the broad ALL-NSE PIT fundamentals layer is accepted here.
+    # Never silently fall back to the legacy three-stock pilot.
+    fp=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+    fp=fp if fp.exists() and fp.stat().st_size>0 else None
     if fp is not None:
         f=pd.read_parquet(fp)
         f["symbol"]=f["symbol"].map(normalize_symbol)
