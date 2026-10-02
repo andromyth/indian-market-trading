@@ -68,39 +68,31 @@ def _clean_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
         x = x.rename(columns=rename)
 
     if x.columns.duplicated().any():
-        # Prefer the first populated canonical column when an alias and a
-        # canonical field coexist.
-        for canonical in (
-            "delivery_qty",
-            "delivery_pct",
-            "volume",
-            "open",
-            "high",
-            "low",
-            "close",
-        ):
-            matches = [
-                col
-                for col in x.columns
-                if col == canonical
+        # Merge duplicate canonical/alias columns deterministically by taking
+        # the first non-null value in each row, then keep one column.
+        deduped = pd.DataFrame(
+            index=x.index
+        )
+
+        for column in dict.fromkeys(x.columns):
+            block = x.loc[
+                :,
+                x.columns == column,
             ]
 
-            if len(matches) > 1:
-                first = x.loc[:, canonical]
-                if isinstance(first, pd.DataFrame):
-                    x[canonical] = (
-                        first.bfill(axis=1).iloc[:, 0]
-                    )
+            if isinstance(
+                block,
+                pd.Series,
+            ):
+                deduped[column] = block
+            else:
+                deduped[column] = (
+                    block
+                    .bfill(axis=1)
+                    .iloc[:, 0]
+                )
 
-        x = x.loc[
-            :,
-            ~x.columns.duplicated(
-                keep="first"
-            ),
-        ].copy()
-
-    if x.columns.duplicated().any():
-        x = x.loc[:, ~x.columns.duplicated(keep="first")].copy()
+        x = deduped
 
     if "date" not in x.columns:
         return pd.DataFrame()
