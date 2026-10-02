@@ -849,11 +849,74 @@ def cached_delivery_validation():
     records = [r for r in load_records() if str(r.get("mode", "")).lower() == "delivery"][-100:]
     if not records:
         return pd.DataFrame(), {"status": "NO_DATA"}, {"status": "NO_DATA", "retraining_candidate": False}
+
     histories = {}
+
     def provider(symbol):
-        if symbol not in histories:
-            histories[symbol] = load_history(symbol, "45d", "1d")
-        return histories[symbol]
+        root = normalize_symbol(symbol).replace(".NS", "").replace(".BO", "").upper()
+
+        if root not in histories:
+            end = pd.Timestamp.now(tz="Asia/Kolkata").date()
+            start = end - pd.Timedelta(days=90)
+
+            try:
+                x = nse_fetch_equity_history(
+                    root,
+                    start,
+                    end,
+                    sync_drive=True,
+                )
+
+                if x is None or x.empty:
+                    histories[root] = pd.DataFrame()
+                else:
+                    x = x.copy()
+                    x["date"] = pd.to_datetime(
+                        x["date"],
+                        errors="coerce",
+                    ).dt.normalize()
+
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col in x.columns:
+                            x[col] = pd.to_numeric(
+                                x[col],
+                                errors="coerce",
+                            )
+
+                    x = x.dropna(
+                        subset=[
+                            "date",
+                            "close",
+                        ]
+                    )
+
+                    x = (
+                        x.sort_values("date")
+                        .drop_duplicates("date", keep="last")
+                        .set_index("date")
+                    )
+
+                    x = x.rename(
+                        columns={
+                            "open": "Open",
+                            "high": "High",
+                            "low": "Low",
+                            "close": "Close",
+                            "volume": "Volume",
+                        }
+                    )
+
+                    histories[root] = x
+
+            except Exception as exc:
+                histories[root] = pd.DataFrame()
+                st.warning(
+                    f"{root}: official NSE validation history unavailable "
+                    f"({type(exc).__name__}: {exc})"
+                )
+
+        return histories[root]
+
     validated = validate_ledger(records, provider)
     if not validated.empty:
         save_validation_results(validated.to_dict("records"), sync_drive=True)
