@@ -1490,6 +1490,104 @@ for rec in live_records:
     t_score = rec["t_score"]
     m_score = rec["m_score"]
 
+    # The legacy technical/chart frame can legitimately be empty even when
+    # the dedicated ALL-NSE Delivery model has produced a valid prediction.
+    # Never let that optional UI context crash or suppress the ML result.
+    if df is None or df.empty or "Close" not in df.columns:
+
+        if style == "Delivery":
+
+            dlv = (
+                direct_delivery_results.get(symbol)
+                or delivery_results.get(symbol)
+            )
+
+            st.markdown(
+                f"## {symbol}"
+            )
+
+            st.markdown(
+                "### Live ALL-NSE Delivery ML — next-session signal"
+            )
+
+            if dlv and dlv.get("prediction_status") == "PASS":
+
+                d1, d2, d3, d4, d5 = st.columns(5)
+
+                d1.metric(
+                    "Delivery Signal",
+                    dlv.get("signal", "HOLD"),
+                )
+
+                d2.metric(
+                    "P(up) next session",
+                    f"{dlv.get('probability_up_next_session', np.nan):.1%}",
+                )
+
+                d3.metric(
+                    "Expected move",
+                    f"{dlv.get('predicted_return_next_session', np.nan):+.2%}",
+                )
+
+                d4.metric(
+                    "Confidence",
+                    dlv.get("confidence", "UNKNOWN"),
+                )
+
+                d5.metric(
+                    "Model inputs",
+                    str(dlv.get("feature_count", 59)),
+                )
+
+                st.write({
+                    "model_version":
+                        dlv.get("model_version"),
+                    "reference_session":
+                        dlv.get("reference_session"),
+                    "feature_source":
+                        dlv.get("feature_source"),
+                    "PIT_snapshot_date":
+                        dlv.get("pit_snapshot_date"),
+                    "data_readiness":
+                        dlv.get("data_readiness_score"),
+                    "non_missing_features":
+                        f"{dlv.get('non_missing_feature_count', 0)}/{dlv.get('feature_count', 59)}",
+                    "trainable_NSE_symbols":
+                        dlv.get("trainable_symbol_count"),
+                    "NSE_universe_symbols":
+                        dlv.get("universe_symbol_count"),
+                })
+
+                st.info(
+                    "The live ALL-NSE Delivery prediction is valid. "
+                    "The optional legacy technical/chart context was unavailable "
+                    "for this request and was skipped."
+                )
+
+            elif dlv and dlv.get("prediction_status") == "BLOCKED":
+
+                st.error(
+                    f"Delivery prediction blocked: "
+                    f"{dlv.get('reason', 'unknown')}"
+                )
+
+            else:
+
+                st.warning(
+                    "Delivery ML prediction is unavailable for this symbol."
+                )
+
+        else:
+
+            st.warning(
+                "The technical history needed for the legacy dashboard "
+                "context is unavailable for this symbol."
+            )
+
+        # Never execute df.iloc[-1], technical_components(), line_chart(),
+        # or the legacy backtest blocks on an empty frame.
+        continue
+
     label, combined = combined_signal(
         t_score, live_news_score, m_score, event_risk,
         tech_weight, news_weight, market_weight,
