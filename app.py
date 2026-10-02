@@ -47,7 +47,6 @@ from free_data import (
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
-from all_nse_delivery_model import universe_status as all_nse_delivery_universe_status
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -69,12 +68,12 @@ st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
 st.caption(
     "Multi-factor decision-support dashboard for NSE/BSE cash equity with F&O context. "
-    "Signals are not guarantees and no orders are placed. Delivery uses the certified next-session model; Intraday uses the certified 30-minute production model."
+    "Signals are not guarantees and no orders are placed. Delivery uses the active all-NSE 59-feature candidate; Intraday uses the certified 30-minute production model."
 )
 
 st.info(
-    "Production ML is connected for supported Delivery and Intraday workflows. "
-    "Delivery uses the certified next-session classifier/regressor; Intraday uses the certified 30-minute production model. "
+    "Production ML is connected for Delivery and Intraday workflows. "
+    "Delivery uses the active all-NSE 59-feature classifier/regressor candidate; Intraday uses the certified 30-minute production model. "
     "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
     "No orders are placed."
 )
@@ -86,6 +85,7 @@ with st.expander("Step 52 PIT walk-forward audit", expanded=False):
     st.dataframe(pd.DataFrame(STEP52_AUDIT), width="stretch", hide_index=True)
     st.caption(
         "The Step 52 model has not been connected to live signals. Its out-of-sample results do not establish a tradable edge. "
+        "The active Delivery live path is the separate 59-feature all-NSE candidate and remains under prospective OOS monitoring. "
         "No order execution is available in this dashboard."
     )
 
