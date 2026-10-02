@@ -1252,6 +1252,7 @@ def _official_market_history(
 def predict_symbol(
     symbol: str,
     decision_timestamp: Any = None,
+    market_override: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
 
     root = _normalize_symbol(
@@ -1487,10 +1488,18 @@ def predict_symbol(
         root
     )
 
-    market = _official_market_history(
-        benchmark,
-        str(latest_date.date()),
-    )
+    if (
+        market_override is not None
+        and not market_override.empty
+    ):
+        market = market_override.copy()
+        market_source = "INJECTED_REPLAY_BENCHMARK"
+    else:
+        market = _official_market_history(
+            benchmark,
+            str(latest_date.date()),
+        )
+        market_source = "OFFICIAL_NSE"
 
     feature_frame = _build_latest_features(
         history,
@@ -1627,6 +1636,7 @@ def predict_symbol(
         "reference_session": str(
             latest_date.date()
         ),
+        "market_context_source": market_source,
         "probability_up_next_session": p_up,
         "probability_down_next_session": 1.0 - p_up,
         "predicted_return_next_session": expected_return,
