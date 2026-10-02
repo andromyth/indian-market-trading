@@ -47,6 +47,7 @@ from free_data import (
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
+from all_nse_delivery_model import universe_status as all_nse_delivery_universe_status
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -994,7 +995,7 @@ for rec in live_records:
     pct_change = (latest_close - previous_close) / previous_close * 100 if previous_close else 0.0
 
     primary = delivery_results.get(symbol) if style == "Delivery" else production_results.get(symbol)
-    primary_signal = primary.get("signal") if primary else label
+    primary_signal = primary.get("signal") if primary else "UNAVAILABLE"
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Primary Signal", primary_signal)
     c2.metric("Last", f"₹{latest_close:,.2f}", f"bar {pct_change:+.2f}%")
@@ -1019,7 +1020,7 @@ for rec in live_records:
             st.warning("Production ML prediction unavailable for this symbol; the rule-based context remains available.")
     else:
         dlv = delivery_results.get(symbol)
-        st.markdown("### Production ML — next-session delivery signal")
+        st.markdown("### Live ALL-NSE Delivery ML — next-session signal")
         if dlv and dlv.get("prediction_status") == "PASS":
             d1, d2, d3, d4, d5 = st.columns(5)
             d1.metric("Delivery Signal", dlv["signal"])
@@ -1027,10 +1028,21 @@ for rec in live_records:
             d3.metric("Expected move", f"{dlv['predicted_return_next_session']:+.2%}")
             d4.metric("Confidence", dlv["confidence"])
             d5.metric("Model inputs", f"{dlv['feature_count']}")
-            st.caption("Next-session delivery model · 53-feature contract · prediction stored automatically for actual-vs-predicted validation.")
+            st.caption(
+    "LIVE ALL-NSE Delivery candidate · 59-feature point-in-time NSE contract · "
+    "2,372 trainable stocks from the 2,593-stock official NSE equity universe. "
+    "Prediction is stored automatically for actual-vs-predicted validation."
+)
         elif dlv and dlv.get("prediction_status") == "BLOCKED":
-            st.error(f"Delivery prediction blocked: {dlv.get("reason", "unknown")}")
-            st.caption(f"Validated delivery universe: {', '.join(dlv.get('trained_symbols', []))}")
+            st.error(
+                f"Delivery prediction blocked: {dlv.get('reason', 'unknown')}"
+            )
+            st.caption(
+                f"ALL-NSE Delivery roster: "
+                f"{int(dlv.get('trainable_symbol_count', 0)):,} trainable / "
+                f"{int(dlv.get('universe_symbol_count', 0)):,} NSE universe "
+                f"with a {int(dlv.get('minimum_history_sessions', 60))}-session minimum-history gate."
+            )
         else:
             st.warning("Delivery production prediction unavailable for this symbol.")
 
