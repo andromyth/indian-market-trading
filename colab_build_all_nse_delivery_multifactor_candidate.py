@@ -21,8 +21,13 @@ DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_
 DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_candidate_2026"
 BASE=Path("/content/drive/MyDrive/Indian_Market_Research")
 
+FUND_PARSER_VERSION="2026-10-02-period-context-v3"
+FUND_CATALOG_CACHE=BASE/"corporate/nse_integrated_filing_catalog_2025_2026.json"
 FUND_BROAD=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+FUND_BROAD_META=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.meta.json"
+FUND_FILING_CACHE=BASE/"corporate/pit_fundamentals_filing_cache_2025_2026_v3.parquet"
 FUND_CACHE=BASE/"corporate/xbrl_cache/all_nse_2025_2026"
+CANDIDATE_META_NAME="CANDIDATE_BUILD_META_2026.json"
 NSE_HOME="https://www.nseindia.com/"
 NSE_IF_API="https://www.nseindia.com/api/integrated-filing-results"
 FUND_FIELDS={
@@ -67,22 +72,61 @@ def _fn(x):
         return float(t)
     except Exception: return np.nan
 def _fl(tag): return str(tag).split("}",1)[-1].split(":",1)[-1]
-def _catalog_all():
+def _catalog_all(force_refresh=False):
+    from datetime import datetime, timezone
+    if not force_refresh and FUND_CATALOG_CACHE.exists() and FUND_CATALOG_CACHE.stat().st_size>0:
+        try:
+            cached=json.loads(FUND_CATALOG_CACHE.read_text(encoding="utf-8"))
+            meta=cached.get("meta",{})
+            same_window=meta.get("from_date")=="01-01-2025" and meta.get("to_date")=="30-09-2026"
+            fetched=datetime.fromisoformat(meta["fetched_at"]).replace(tzinfo=timezone.utc) if meta.get("fetched_at") else None
+            fresh=fetched is not None and (datetime.now(timezone.utc)-fetched).total_seconds() < 24*3600
+            if same_window and fresh and isinstance(cached.get("data"),list):
+                print(f"fundamental catalog cache reused rows={len(cached['data']):,}", flush=True)
+                return cached["data"]
+        except Exception:
+            pass
+
     s=_fund_session(); out=[]; size=500
     for page in range(1,401):
         params={"type":"Integrated Filing- Financials","index":"equities","from_date":"01-01-2025","to_date":"30-09-2026","page":page,"size":size}
         last=None
         for attempt in range(3):
             try:
-                rr=s.get(NSE_IF_API,params=params,timeout=30); rr.raise_for_status(); payload=rr.json(); batch=payload.get("data",[]) if isinstance(payload,dict) else payload; last=None; break
-            except Exception as exc: last=exc; time.sleep(1.0*(attempt+1))
-        if last: raise last
-        if not batch: break
+                rr=s.get(NSE_IF_API,params=params,timeout=30)
+                rr.raise_for_status()
+                payload=rr.json()
+                batch=payload.get("data",[]) if isinstance(payload,dict) else payload
+                last=None
+                break
+            except Exception as exc:
+                last=exc
+                time.sleep(1.0*(attempt+1))
+        if last:
+            raise last
+        if not batch:
+            break
         out.extend(batch)
-        if page%20==0: print(f"fundamental catalog pages={page} rows={len(out):,}")
-        if len(batch)<size: break
-    print(f"fundamental catalog rows={len(out):,}")
+        if page%20==0:
+            print(f"fundamental catalog pages={page} rows={len(out):,}", flush=True)
+        if len(batch)<size:
+            break
+
+    FUND_CATALOG_CACHE.parent.mkdir(parents=True,exist_ok=True)
+    from datetime import datetime, timezone
+    FUND_CATALOG_CACHE.write_text(json.dumps({
+        "meta":{
+            "cache_version":"1",
+            "from_date":"01-01-2025",
+            "to_date":"30-09-2026",
+            "fetched_at":datetime.now(timezone.utc).isoformat(),
+            "rows":len(out),
+        },
+        "data":out,
+    },default=str),encoding="utf-8")
+    print(f"fundamental catalog rows={len(out):,}", flush=True)
     return out
+
 def _fund_filings(catalog,symbols,max_each=4):
     rows=[]
     for r in catalog:
@@ -228,33 +272,176 @@ def _fund_parse(f):
         if not any(np.isfinite(v) for v in vals.values()):
             return None
         return {**f,**vals,"fundamental_source":"NSE_XBRL_PIT","fundamental_basis":"Integrated_Filing_period_aware_OneD_OneI_fallback"}
-def _ensure_broad_fundamentals(symbols):
-    if FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0:
+def _funding_key(f):
+    raw="|".join([
+        str(f.get("symbol","")),
+        str(pd.Timestamp(f.get("period_end")).date()) if pd.notna(f.get("period_end")) else "",
+        str(pd.Timestamp(f.get("fundamental_available_at")).isoformat()) if pd.notna(f.get("fundamental_available_at")) else "",
+        str(f.get("xbrl_url","")),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _hash_strings(values):
+    h=hashlib.sha256()
+    for v in sorted(str(x) for x in values):
+        h.update(v.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+def _fund_target_hash(symbols):
+    return _hash_strings(symbols)
+
+def _load_filing_cache():
+    if not FUND_FILING_CACHE.exists() or FUND_FILING_CACHE.stat().st_size==0:
+        return pd.DataFrame()
+    try:
+        x=pd.read_parquet(FUND_FILING_CACHE)
+        if "parser_version" not in x.columns:
+            return pd.DataFrame()
+        x=x[x["parser_version"].eq(FUND_PARSER_VERSION)].copy()
+        return x
+    except Exception:
+        return pd.DataFrame()
+
+def _save_filing_cache(cache):
+    FUND_FILING_CACHE.parent.mkdir(parents=True,exist_ok=True)
+    cache.to_parquet(FUND_FILING_CACHE,index=False)
+
+def _parse_one_cached(f):
+    key=_funding_key(f)
+    r=_fund_parse(f)
+    if r is None:
+        return {**f,"filing_key":key,"parser_version":FUND_PARSER_VERSION,"parse_status":"failed"}
+    return {**r,"filing_key":key,"parser_version":FUND_PARSER_VERSION,"parse_status":"parsed"}
+
+def _fundamental_build_signature(symbols,filings):
+    return {
+        "parser_version":FUND_PARSER_VERSION,
+        "target_symbols_hash":_fund_target_hash(symbols),
+        "target_symbol_count":len(symbols),
+        "selected_filing_keys_hash":_hash_strings([_funding_key(f) for f in filings]),
+        "selected_filing_count":len(filings),
+    }
+
+def _broad_meta_matches(meta,sig):
+    return all(meta.get(k)==v for k,v in sig.items())
+
+def _bootstrap_cache_from_broad(filing_cache):
+    if not FUND_BROAD.exists() or FUND_BROAD.stat().st_size==0:
+        return filing_cache
+    try:
+        old=pd.read_parquet(FUND_BROAD)
+        if old.empty or "symbol" not in old.columns:
+            return filing_cache
+        basis=old.get("fundamental_basis")
+        if basis is None or not basis.astype(str).str.contains("period_aware",case=False,na=False).any():
+            return filing_cache
+        if "xbrl_url" not in old.columns or "period_end" not in old.columns or "fundamental_available_at" not in old.columns:
+            return filing_cache
+        rows=[]
+        for r in old.to_dict("records"):
+            f={k:r.get(k) for k in ("symbol","period_end","fundamental_available_at","xbrl_url","consolidated")}
+            rows.append({**r,"filing_key":_funding_key(f),"parser_version":FUND_PARSER_VERSION,"parse_status":"parsed"})
+        boot=pd.DataFrame(rows)
+        if filing_cache.empty:
+            return boot
+        return pd.concat([filing_cache,boot],ignore_index=True).drop_duplicates("filing_key",keep="last")
+    except Exception:
+        return filing_cache
+
+def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
+    catalog=_catalog_all(force_refresh=force_refresh)
+    filings=_fund_filings(catalog,set(symbols),max_each=4)
+    if not filings:
+        raise RuntimeError("ALL-NSE PIT fundamentals: no eligible NSE Integrated Filing records found")
+
+    sig=_fundamental_build_signature(symbols,filings)
+    if not force_refresh and FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0 and FUND_BROAD_META.exists() and FUND_BROAD_META.stat().st_size>0:
         try:
-            q=pd.read_parquet(FUND_BROAD); cov=q["symbol"].map(normalize_symbol).nunique() if "symbol" in q else 0
-            if cov>=max(100,int(len(symbols)*0.8)): return {"path":str(FUND_BROAD),"rows":len(q),"symbols":cov,"rebuilt":False}
-        except Exception: pass
-    print(f"Building broad PIT fundamentals for {len(symbols):,} trainable symbols...")
-    cat=_catalog_all(); filings=_fund_filings(cat,set(symbols),max_each=4)
-    parsed=[]
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        futs=[ex.submit(_fund_parse,f) for f in filings]
-        for i,fut in enumerate(as_completed(futs),1):
-            r=fut.result()
-            if r: parsed.append(r)
-            if i%500==0: print(f"fundamentals XBRL={i:,}/{len(filings):,} parsed={len(parsed):,}")
-    if not parsed: raise RuntimeError("ALL-NSE PIT fundamentals: no XBRL filings could be parsed")
-    d=pd.DataFrame(parsed); d["symbol"]=d["symbol"].map(normalize_symbol); d["period_end"]=pd.to_datetime(d["period_end"],utc=True).dt.normalize(); d["fundamental_available_at"]=pd.to_datetime(d["fundamental_available_at"],utc=True)
-    for c in FUND_FIELDS: d[c]=pd.to_numeric(d[c],errors="coerce")
+            meta=json.loads(FUND_BROAD_META.read_text(encoding="utf-8"))
+            if _broad_meta_matches(meta,sig):
+                print(f"fundamentals build reused; rows={pd.read_parquet(FUND_BROAD).shape[0]:,}",flush=True)
+                return {"path":str(FUND_BROAD),"rebuilt":False,"cached":True,"symbols":int(meta.get("symbols",0)),"rows":int(meta.get("rows",0))}
+        except Exception:
+            pass
+
+    filing_cache=_bootstrap_cache_from_broad(_load_filing_cache())
+    cached_keys=set(filing_cache["filing_key"].astype(str)) if not filing_cache.empty else set()
+    selected_by_key={_funding_key(f):f for f in filings}
+    missing=[f for k,f in selected_by_key.items() if k not in cached_keys]
+    failed_cached=set()
+    if not filing_cache.empty and "parse_status" in filing_cache.columns:
+        failed_cached=set(filing_cache.loc[filing_cache["parse_status"].eq("failed"),"filing_key"].astype(str))
+    if retry_failed:
+        missing.extend(selected_by_key[k] for k in failed_cached if k in selected_by_key and k not in {_funding_key(x) for x in missing})
+
+    print(
+        f"fundamentals cache: selected={len(filings):,} "
+        f"cached={len(filings)-len(missing):,} "
+        f"to_process={len(missing):,} "
+        f"failed_cached={len(failed_cached):,}",
+        flush=True,
+    )
+
+    new_rows=[]
+    if missing:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futs=[ex.submit(_parse_one_cached,f) for f in missing]
+            for i,fut in enumerate(as_completed(futs),1):
+                new_rows.append(fut.result())
+                if i%500==0:
+                    parsed_now=sum(r.get("parse_status")=="parsed" for r in new_rows)
+                    print(f"fundamentals parse={i:,}/{len(missing):,} new_parsed={parsed_now:,}",flush=True)
+
+    if new_rows:
+        filing_cache=pd.concat([filing_cache,pd.DataFrame(new_rows)],ignore_index=True)
+    if not filing_cache.empty:
+        filing_cache=filing_cache.drop_duplicates("filing_key",keep="last")
+        _save_filing_cache(filing_cache)
+
+    selected_keys=set(selected_by_key)
+    usable=filing_cache[
+        filing_cache["filing_key"].astype(str).isin(selected_keys) &
+        filing_cache["parse_status"].eq("parsed")
+    ].copy()
+    if usable.empty:
+        raise RuntimeError("ALL-NSE PIT fundamentals: selected filings have no parsed records")
+
+    d=pd.DataFrame(usable).drop(columns=["filing_key","parser_version","parse_status"],errors="ignore")
+    d["symbol"]=d["symbol"].map(normalize_symbol)
+    d["period_end"]=pd.to_datetime(d["period_end"],utc=True).dt.normalize()
+    d["fundamental_available_at"]=pd.to_datetime(d["fundamental_available_at"],utc=True)
+    for c in FUND_FIELDS:
+        if c in d.columns:
+            d[c]=pd.to_numeric(d[c],errors="coerce")
     d=d.sort_values(["symbol","period_end","fundamental_available_at"]).drop_duplicates(["symbol","period_end"],keep="last")
     pieces=[]
     for sym,g in d.groupby("symbol",sort=False):
         g=g.sort_values("period_end").copy()
-        for base,growth in (("fundamental_revenue","fund_revenue_growth"),("fundamental_pat","fund_pat_growth"),("fundamental_eps","fund_eps_growth"),("fundamental_ebitda","fund_ebitda_growth")): g[growth]=g[base].pct_change(fill_method=None)
-        g["fund_pat_margin"]=g["fundamental_pat"]/g["fundamental_revenue"].replace(0,np.nan); g["fund_debt_to_equity"]=g["fundamental_total_debt"]/g["fundamental_total_equity"].replace(0,np.nan); g["fund_cash_to_debt"]=g["fundamental_cash"]/g["fundamental_total_debt"].replace(0,np.nan); pieces.append(g)
-    d=pd.concat(pieces,ignore_index=True).replace([np.inf,-np.inf],np.nan); FUND_BROAD.parent.mkdir(parents=True,exist_ok=True); d.to_parquet(FUND_BROAD,index=False)
-    report={"path":str(FUND_BROAD),"rows":len(d),"symbols":int(d["symbol"].nunique()),"target_symbols":len(symbols),"symbol_coverage_pct":round(100*d["symbol"].nunique()/len(symbols),3) if symbols else 0.0,"filings_selected":len(filings),"filings_parsed":len(parsed),"feature_coverage_pct":{c:round(100*d[c].notna().mean(),3) for c in FUND_FIELDS}}
-    FUND_BROAD.with_suffix(".json").write_text(json.dumps(report,indent=2),encoding="utf-8"); print(json.dumps(report,indent=2)); return report
+        for base,growth in (("fundamental_revenue","fund_revenue_growth"),("fundamental_pat","fund_pat_growth"),("fundamental_eps","fund_eps_growth"),("fundamental_ebitda","fund_ebitda_growth")):
+            g[growth]=g[base].pct_change(fill_method=None)
+        g["fund_pat_margin"]=g["fundamental_pat"]/g["fundamental_revenue"].replace(0,np.nan)
+        g["fund_debt_to_equity"]=g["fundamental_total_debt"]/g["fundamental_total_equity"].replace(0,np.nan)
+        g["fund_cash_to_debt"]=g["fundamental_cash"]/g["fundamental_total_debt"].replace(0,np.nan)
+        pieces.append(g)
+    d=pd.concat(pieces,ignore_index=True).replace([np.inf,-np.inf],np.nan)
+    FUND_BROAD.parent.mkdir(parents=True,exist_ok=True)
+    d.to_parquet(FUND_BROAD,index=False)
+    report={
+        "path":str(FUND_BROAD),
+        "rows":len(d),
+        "symbols":int(d["symbol"].nunique()),
+        "target_symbols":len(symbols),
+        "symbol_coverage_pct":round(100*d["symbol"].nunique()/len(symbols),3) if symbols else 0.0,
+        "filings_selected":len(filings),
+        "filings_parsed":int((filing_cache["filing_key"].astype(str).isin(selected_keys) & filing_cache["parse_status"].eq("parsed")).sum()),
+        "filings_failed_cached":int((filing_cache["filing_key"].astype(str).isin(selected_keys) & filing_cache["parse_status"].eq("failed")).sum()),
+        "feature_coverage_pct":{c:round(100*d[c].notna().mean(),3) for c in FUND_FIELDS if c in d.columns},
+        **sig,
+    }
+    FUND_BROAD_META.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
+    print(json.dumps(report,indent=2,default=str),flush=True)
+    return report
 
 if len(FEATURES_59) != 59:
     raise RuntimeError(f"Feature contract must contain exactly 59 features; found {len(FEATURES_59)}")
@@ -508,30 +695,161 @@ def fit_models(frame,horizon):
         raise RuntimeError(f"{horizon}: finite training set is insufficient after non-finite-value cleanup")
     clf=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("scale",StandardScaler(with_mean=False)),("model",LogisticRegression(C=.5,class_weight="balanced",solver="lbfgs",max_iter=2500,random_state=42))])
     reg=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("model",HistGradientBoostingRegressor(max_iter=180,learning_rate=.04,max_leaf_nodes=19,l2_regularization=2.0,random_state=42))])
-    clf.fit(Xtr,tr[f"target_up_{horizon}"].astype(int)); reg.fit(Xtr,tr[f"target_return_{horizon}"].astype(float))
+    clf.fit(Xtr,tr[f"target_up_{horizon}"].astype(int))
+    reg.fit(Xtr,tr[f"target_return_{horizon}"].astype(float))
+    for fitted in (clf,reg):
+        imp=fitted.named_steps.get("imputer")
+        learned=int(getattr(imp,"n_features_in_",0)) if imp is not None else 0
+        if not learned and imp is not None and getattr(imp,"statistics_",None) is not None:
+            learned=int(len(imp.statistics_))
+        if learned!=len(FEATURES_59):
+            raise RuntimeError(f"{horizon}: fitted model contract has {learned} original features; expected {len(FEATURES_59)}")
     p=clf.predict_proba(Xte)[:,1]; pr=reg.predict(Xte); y=te[f"target_up_{horizon}"].to_numpy()
     return clf,reg,{"train_rows":int(len(tr)),"holdout_rows":int(len(te)),"holdout_accuracy":float(np.mean((p>=.5)==y)),"mean_abs_return_error":float(np.mean(np.abs(pr-te[f"target_return_{horizon}"].to_numpy()))),"holdout_mean_readiness_pct":float(te["data_readiness_score"].mean()*100)}
 
+def _candidate_input_signature(bulk_root,bulk,trainable,fund_report):
+    optional=[
+        BASE/"processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
+        BASE/"processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+        BASE/"processed/pit_replay/FNO_PIT_REPLAY_2026.parquet",
+        BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet",
+    ]
+    sig={
+        "engine_version":"2026-all-nse-delivery-multifactor-59-candidate-v2",
+        "feature_contract_hash":hashlib.sha256(json.dumps(FEATURES_59,separators=(",",":")).encode()).hexdigest(),
+        "feature_count":len(FEATURES_59),
+        "bulk_root":str(bulk_root),
+        "bulk_rows":int(len(bulk)),
+        "bulk_symbols":int(bulk["symbol"].nunique()),
+        "bulk_min_date":str(pd.Timestamp(bulk["date"].min()).date()),
+        "bulk_max_date":str(pd.Timestamp(bulk["date"].max()).date()),
+        "trainable_hash":_fund_target_hash(trainable),
+        "fundamental_meta_hash":sha256(FUND_BROAD_META) if FUND_BROAD_META.exists() else "",
+    }
+    for p in optional[:-1]:
+        sig[str(p)]=({"exists":True,"size":p.stat().st_size,"mtime_ns":p.stat().st_mtime_ns} if p.exists() else {"exists":False})
+    return sig
+
+def _candidate_artifacts_complete(out):
+    mp=out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+    if not mp.exists() or mp.stat().st_size==0:
+        return False
+    try:
+        m=json.loads(mp.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if m.get("promotion_status")!="CANDIDATE_ONLY" or m.get("features")!=FEATURES_59:
+        return False
+    for item in m.get("artifacts",{}).values():
+        if not isinstance(item,dict) or item.get("status")!="CANDIDATE_READY":
+            return False
+        for k in ("classifier","regressor"):
+            if not Path(item[k]).exists():
+                return False
+    return True
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--bulk-root",default=DEFAULT_BULK); ap.add_argument("--out",default=DEFAULT_OUT); ap.add_argument("--min-history",type=int,default=60); args=ap.parse_args()
-    out=Path(args.out); out.mkdir(parents=True,exist_ok=True); bulk=load_bulk(Path(args.bulk_root))
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--bulk-root",default=DEFAULT_BULK)
+    ap.add_argument("--out",default=DEFAULT_OUT)
+    ap.add_argument("--min-history",type=int,default=60)
+    ap.add_argument("--refresh-fundamentals",action="store_true")
+    ap.add_argument("--retry-failed-fundamentals",action="store_true")
+    ap.add_argument("--force-rebuild-candidate",action="store_true")
+    args=ap.parse_args()
+
+    out=Path(args.out)
+    out.mkdir(parents=True,exist_ok=True)
+    bulk_root=Path(args.bulk_root)
+    bulk=load_bulk(bulk_root)
     roster=training_roster(bulk,min_history=args.min_history)
     trainable=list(roster["trainable_symbols"])
-    _ensure_broad_fundamentals(trainable)
-    universe={"universe_source":roster.get("universe_source"),"universe_as_of":roster.get("universe_as_of"),"universe_symbol_count":int(roster["universe_symbol_count"]),"symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),"trainable_symbol_count":int(roster["trainable_symbol_count"]),"excluded_symbol_count":int(roster["excluded_symbol_count"]),"minimum_history_sessions":int(roster["minimum_history_sessions"])}
+
+    fund_report=_ensure_broad_fundamentals(
+        trainable,
+        force_refresh=args.refresh_fundamentals,
+        retry_failed=args.retry_failed_fundamentals,
+    )
+
+    universe={
+        "universe_source":roster.get("universe_source"),
+        "universe_as_of":roster.get("universe_as_of"),
+        "universe_symbol_count":int(roster["universe_symbol_count"]),
+        "symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),
+        "trainable_symbol_count":int(roster["trainable_symbol_count"]),
+        "excluded_symbol_count":int(roster["excluded_symbol_count"]),
+        "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+    }
+
+    input_sig=_candidate_input_signature(bulk_root,bulk,trainable,fund_report)
+    candidate_meta=out/CANDIDATE_META_NAME
+    if not args.force_rebuild_candidate and not args.refresh_fundamentals and candidate_meta.exists() and _candidate_artifacts_complete(out):
+        try:
+            old=json.loads(candidate_meta.read_text(encoding="utf-8"))
+            if old.get("input_signature")==input_sig:
+                print("CANDIDATE BUILD REUSED; inputs and feature contract unchanged.",flush=True)
+                return
+        except Exception:
+            pass
+
     panel,audit=merge_optional(make_panel(bulk,trainable))
-    (out/"DATA_READINESS_REPORT_2026.json").write_text(json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},indent=2,default=str),encoding="utf-8")
+    (out/"DATA_READINESS_REPORT_2026.json").write_text(
+        json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},
+                   indent=2,default=str),
+        encoding="utf-8",
+    )
     panel.to_parquet(out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet",index=False)
+
     artifacts={}
     for horizon,steps in (("next_session",1),("3d",3),("5d",5),("7d",7)):
+        cp=out/f"deployment_all_nse_{horizon}_multifactor59_classifier_2026.joblib"
+        rp=out/f"deployment_all_nse_{horizon}_multifactor59_regressor_2026.joblib"
         try:
-            d=add_targets(panel,steps,horizon); clf,reg,metrics=fit_models(d,horizon)
-            cp=out/f"deployment_all_nse_{horizon}_multifactor59_classifier_2026.joblib"; rp=out/f"deployment_all_nse_{horizon}_multifactor59_regressor_2026.joblib"
-            joblib.dump(clf,cp); joblib.dump(reg,rp)
-            artifacts[horizon]={"status":"CANDIDATE_READY","classifier":str(cp),"regressor":str(rp),"classifier_sha256":sha256(cp),"regressor_sha256":sha256(rp),"metrics":metrics}
-        except Exception as exc: artifacts[horizon]={"status":"BLOCKED","reason":f"{type(exc).__name__}: {exc}"}
-    manifest={"engine_version":"2026-all-nse-delivery-multifactor-59-candidate","promotion_status":"CANDIDATE_ONLY","universe":universe,"feature_count":59,"features":FEATURES_59,"artifacts":artifacts,"data_readiness_path":str(out/"DATA_READINESS_REPORT_2026.json"),"pit_policy":"Only observations at or before decision_timestamp are eligible. Missing information is not fabricated.","no_auto_orders":True}
-    (out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json").write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
-    print(json.dumps(manifest,indent=2,default=str))
+            d=add_targets(panel,steps,horizon)
+            clf,reg,metrics=fit_models(d,horizon)
+            # Save only after the 59-input contract has been checked.
+            joblib.dump(clf,cp)
+            joblib.dump(reg,rp)
+            artifacts[horizon]={
+                "status":"CANDIDATE_READY",
+                "classifier":str(cp),
+                "regressor":str(rp),
+                "classifier_sha256":sha256(cp),
+                "regressor_sha256":sha256(rp),
+                "metrics":metrics,
+            }
+        except Exception as exc:
+            if cp.exists():
+                cp.unlink()
+            if rp.exists():
+                rp.unlink()
+            artifacts[horizon]={
+                "status":"BLOCKED",
+                "reason":f"{type(exc).__name__}: {exc}",
+            }
 
-if __name__=="__main__": main()
+    manifest={
+        "engine_version":"2026-all-nse-delivery-multifactor-59-candidate-v2",
+        "promotion_status":"CANDIDATE_ONLY",
+        "universe":universe,
+        "feature_count":len(FEATURES_59),
+        "features":FEATURES_59,
+        "feature_contract_hash":input_sig["feature_contract_hash"],
+        "artifacts":artifacts,
+        "data_readiness_path":str(out/"DATA_READINESS_REPORT_2026.json"),
+        "pit_policy":"Only observations at or before decision_timestamp are eligible. Missing information is not fabricated.",
+        "no_auto_orders":True,
+    }
+    (out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json").write_text(
+        json.dumps(manifest,indent=2,default=str),
+        encoding="utf-8",
+    )
+    candidate_meta.write_text(json.dumps({
+        "input_signature":input_sig,
+        "manifest_path":str(out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"),
+        "fundamentals_report":fund_report,
+    },indent=2,default=str),encoding="utf-8")
+    print(json.dumps(manifest,indent=2,default=str),flush=True)
+
+if __name__=="__main__":
+    main()
