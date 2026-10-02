@@ -74,7 +74,33 @@ def load_bulk(root: Path) -> pd.DataFrame:
     x = pd.concat(frames, ignore_index=True)
     x["symbol"] = x["symbol"].astype(str).str.strip().str.upper()
     x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
-    for col in ["open","high","low","close","volume"]:
+    rename = {}
+    alias_map = {
+        "opnpric": "open",
+        "hghpric": "high",
+        "lwpric": "low",
+        "clspric": "close",
+        "ttltradgvol": "volume",
+        "ch_tot_traded_qty": "volume",
+        "cop_deliv_qty": "delivery_qty",
+        "cop_deliv_perc": "delivery_pct",
+    }
+    for col in x.columns:
+        key = str(col).strip().lower()
+        if key in alias_map:
+            rename[col] = alias_map[key]
+    if rename:
+        x = x.rename(columns=rename)
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "delivery_qty",
+        "delivery_pct",
+    ]:
         if col not in x.columns:
             x[col] = np.nan
         x[col] = pd.to_numeric(x[col], errors="coerce")
@@ -120,18 +146,58 @@ def _ret(s: pd.Series, n: int) -> float:
 
 
 def stock_feature_row(hist: pd.DataFrame) -> dict[str, float]:
-    c = hist["close"]
-    h = hist["high"]
-    l = hist["low"]
-    o = hist["open"]
-    v = hist["volume"]
+    c = pd.to_numeric(hist["close"], errors="coerce")
+    h = pd.to_numeric(hist["high"], errors="coerce")
+    l = pd.to_numeric(hist["low"], errors="coerce")
+    o = pd.to_numeric(hist["open"], errors="coerce")
+    v = pd.to_numeric(hist["volume"], errors="coerce")
+    dp = pd.to_numeric(
+        hist.get("delivery_pct", pd.Series(np.nan, index=hist.index)),
+        errors="coerce",
+    )
+    dq = pd.to_numeric(
+        hist.get("delivery_qty", pd.Series(np.nan, index=hist.index)),
+        errors="coerce",
+    )
 
     last = float(c.iloc[-1])
     last_open = float(o.iloc[-1])
-    ma20 = float(c.rolling(20).mean().iloc[-1]) if len(c) >= 20 else np.nan
-    ma50 = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else np.nan
-    vma20 = float(v.rolling(20).mean().iloc[-1]) if len(v) >= 20 else np.nan
-    vstdev20 = float(v.rolling(20).std().iloc[-1]) if len(v) >= 20 else np.nan
+
+    ma20 = (
+        float(c.rolling(20).mean().iloc[-1])
+        if len(c) >= 20 else np.nan
+    )
+    ma50 = (
+        float(c.rolling(50).mean().iloc[-1])
+        if len(c) >= 50 else np.nan
+    )
+    vma20 = (
+        float(v.rolling(20).mean().iloc[-1])
+        if len(v) >= 20 else np.nan
+    )
+    vstdev20 = (
+        float(v.rolling(20).std().iloc[-1])
+        if len(v) >= 20 else np.nan
+    )
+
+    dp_prev = float(dp.iloc[-2]) if len(dp) >= 2 else np.nan
+    dp_ma20 = (
+        float(dp.rolling(20, min_periods=10).mean().iloc[-1])
+        if len(dp) >= 10 else np.nan
+    )
+    dp_std20 = (
+        float(dp.rolling(20, min_periods=10).std().iloc[-1])
+        if len(dp) >= 10 else np.nan
+    )
+    dq_last = float(dq.iloc[-1]) if len(dq) else np.nan
+    dq_ma20 = (
+        float(dq.rolling(20, min_periods=10).mean().iloc[-1])
+        if len(dq) >= 10 else np.nan
+    )
+    dq_std20 = (
+        float(dq.rolling(20, min_periods=10).std().iloc[-1])
+        if len(dq) >= 10 else np.nan
+    )
 
     return {
         "ret_1": _ret(c, 1),
@@ -145,7 +211,40 @@ def stock_feature_row(hist: pd.DataFrame) -> dict[str, float]:
         "ma20_ratio": last / ma20 - 1.0 if np.isfinite(ma20) and ma20 else np.nan,
         "ma50_ratio": last / ma50 - 1.0 if np.isfinite(ma50) and ma50 else np.nan,
         "volume_ratio": float(v.iloc[-1] / vma20) if np.isfinite(vma20) and vma20 else np.nan,
-        "volume_z20": float((v.iloc[-1] - vma20) / vstdev20) if np.isfinite(vma20) and np.isfinite(vstdev20) and vstdev20 else np.nan,
+        "volume_z20": (
+            float((v.iloc[-1] - vma20) / vstdev20)
+            if np.isfinite(vma20) and np.isfinite(vstdev20) and vstdev20
+            else np.nan
+        ),
+        "delivery_pct": float(dp.iloc[-1]) if len(dp) else np.nan,
+        "delivery_pct_change_1": (
+            float(dp.iloc[-1] - dp_prev)
+            if len(dp) and np.isfinite(dp.iloc[-1]) and np.isfinite(dp_prev)
+            else np.nan
+        ),
+        "delivery_pct_ratio20": (
+            float(dp.iloc[-1] / dp_ma20)
+            if len(dp) and np.isfinite(dp.iloc[-1])
+            and np.isfinite(dp_ma20) and dp_ma20
+            else np.nan
+        ),
+        "delivery_pct_z20": (
+            float((dp.iloc[-1] - dp_ma20) / dp_std20)
+            if len(dp) and np.isfinite(dp.iloc[-1])
+            and np.isfinite(dp_ma20) and np.isfinite(dp_std20) and dp_std20
+            else np.nan
+        ),
+        "delivery_qty_ratio20": (
+            float(dq_last / dq_ma20)
+            if np.isfinite(dq_last) and np.isfinite(dq_ma20) and dq_ma20
+            else np.nan
+        ),
+        "delivery_qty_z20": (
+            float((dq_last - dq_ma20) / dq_std20)
+            if np.isfinite(dq_last) and np.isfinite(dq_ma20)
+            and np.isfinite(dq_std20) and dq_std20
+            else np.nan
+        ),
         "range_pct": float((h.iloc[-1] - l.iloc[-1]) / last) if last else np.nan,
         "body_pct": float((last - last_open) / last_open) if last_open else np.nan,
         "up_bar": 1.0 if last > last_open else 0.0,
