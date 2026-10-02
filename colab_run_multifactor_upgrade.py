@@ -39,14 +39,6 @@ def main():
         )
 
     out=d/"models/all_nse_delivery_multifactor_candidate_2026"
-    fundamentals= d/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
-    subprocess.run(
-        [sys.executable,"build_all_nse_pit_fundamentals.py",
-         "--bulk-root",str(bulk),"--out",str(fundamentals),
-         "--from-date","01-01-2025","--to-date","30-09-2026",
-         "--page-size","100","--workers","8","--max-filings-per-symbol","5"],
-        cwd=p,check=True
-    )
     subprocess.run(
         [sys.executable,"colab_build_all_nse_delivery_multifactor_candidate.py",
          "--bulk-root",str(bulk),"--out",str(out)],
