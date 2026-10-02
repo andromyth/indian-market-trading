@@ -296,11 +296,36 @@ def _keyword_bias(text: str) -> float:
 
 
 def news_metrics(news_items: list[dict], now: datetime | None = None) -> dict:
-    """Recency/impact-weighted news score plus trigger and freshness metrics."""
-    if not news_items:
-        return {"score": 0.0, "impact": 0.0, "count": 0, "high_impact": 0, "fresh_hours": None}
+    """Recency/impact-weighted news score plus trigger and freshness metrics.
 
-    now = now or datetime.now(timezone.utc)
+    All timestamps are normalized to timezone-aware UTC before subtraction so
+    historical and live news with mixed naive/aware timestamp representations
+    cannot crash the directional engine.
+    """
+    if not news_items:
+        return {
+            "score": 0.0,
+            "impact": 0.0,
+            "count": 0,
+            "high_impact": 0,
+            "fresh_hours": None,
+        }
+
+    now_dt = now or datetime.now(timezone.utc)
+
+    try:
+        now_ts = pd.Timestamp(now_dt)
+
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.tz_localize("UTC")
+        else:
+            now_ts = now_ts.tz_convert("UTC")
+
+    except Exception:
+        now_ts = pd.Timestamp.now(
+            tz="UTC"
+        )
+
     weighted_sum = 0.0
     weights = 0.0
     impact_sum = 0.0
@@ -308,47 +333,205 @@ def news_metrics(news_items: list[dict], now: datetime | None = None) -> dict:
     high_impact = 0
 
     for item in news_items:
-        title = item.get("title", "")
-        summary = item.get("summary", "")
-        text = f"{title} {summary}".strip()
-        if _analyzer is not None:
-            sent = _analyzer.polarity_scores(title)["compound"]
-        else:
-            words = set(title.lower().replace(",", " ").replace(".", " ").split())
-            pos = sum(1 for w in _FALLBACK_POSITIVE if w in title.lower() or w in words)
-            neg = sum(1 for w in _FALLBACK_NEGATIVE if w in title.lower() or w in words)
-            sent = max(-1.0, min(1.0, (pos - neg) / max(2.0, pos + neg)))
-        kw = _keyword_bias(text)
-        base = 0.65 * sent + 0.35 * kw
 
-        tags = item.get("tags", [])
-        impact = 1.75 if item.get("high_impact") else 1.0
+        title = item.get(
+            "title",
+            "",
+        )
+
+        summary = item.get(
+            "summary",
+            "",
+        )
+
+        text = (
+            f"{title} {summary}"
+        ).strip()
+
+        if _analyzer is not None:
+            sent = _analyzer.polarity_scores(
+                title
+            )["compound"]
+
+        else:
+            words = set(
+                title.lower()
+                .replace(",", " ")
+                .replace(".", " ")
+                .split()
+            )
+
+            pos = sum(
+                1
+                for w in _FALLBACK_POSITIVE
+                if w in title.lower()
+                or w in words
+            )
+
+            neg = sum(
+                1
+                for w in _FALLBACK_NEGATIVE
+                if w in title.lower()
+                or w in words
+            )
+
+            sent = max(
+                -1.0,
+                min(
+                    1.0,
+                    (pos - neg)
+                    / max(
+                        2.0,
+                        pos + neg,
+                    ),
+                ),
+            )
+
+        kw = _keyword_bias(
+            text
+        )
+
+        base = (
+            0.65 * sent
+            + 0.35 * kw
+        )
+
+        tags = item.get(
+            "tags",
+            [],
+        )
+
+        impact = (
+            1.75
+            if item.get(
+                "high_impact"
+            )
+            else 1.0
+        )
+
         if tags and len(tags) >= 2:
             impact = 2.0
-        published = _parse_published(item.get("published"))
+
+        published = _parse_published(
+            item.get(
+                "published"
+            )
+        )
+
         age_hours = 48.0
+
         if published is not None:
-            age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
-            if freshest is None or age_hours < freshest:
+
+            try:
+                published_ts = pd.Timestamp(
+                    published
+                )
+
+                if published_ts.tzinfo is None:
+                    published_ts = published_ts.tz_localize(
+                        "UTC"
+                    )
+
+                else:
+                    published_ts = published_ts.tz_convert(
+                        "UTC"
+                    )
+
+                age_hours = max(
+                    0.0,
+                    (
+                        now_ts
+                        - published_ts
+                    ).total_seconds()
+                    / 3600.0,
+                )
+
+            except Exception:
+                age_hours = 48.0
+
+            if (
+                freshest is None
+                or age_hours < freshest
+            ):
                 freshest = age_hours
-        recency = math.exp(-age_hours / 24.0)
-        w = impact * max(0.12, recency)
 
-        weighted_sum += base * w
+        recency = math.exp(
+            -age_hours / 24.0
+        )
+
+        w = (
+            impact
+            * max(
+                0.12,
+                recency,
+            )
+        )
+
+        weighted_sum += (
+            base * w
+        )
+
         weights += w
-        impact_sum += 1.0 if item.get("high_impact") else 0.0
-        high_impact += 1 if item.get("high_impact") else 0
 
-    score = weighted_sum / weights if weights else 0.0
-    impact_score = min(1.0, impact_sum / max(3.0, len(news_items) * 0.5))
+        impact_sum += (
+            1.0
+            if item.get(
+                "high_impact"
+            )
+            else 0.0
+        )
+
+        high_impact += (
+            1
+            if item.get(
+                "high_impact"
+            )
+            else 0
+        )
+
+    score = (
+        weighted_sum / weights
+        if weights
+        else 0.0
+    )
+
+    impact_score = min(
+        1.0,
+        impact_sum
+        / max(
+            3.0,
+            len(news_items) * 0.5,
+        ),
+    )
+
     return {
-        "score": round(max(-1.0, min(1.0, score)), 4),
-        "impact": round(impact_score, 4),
-        "count": len(news_items),
+        "score": round(
+            max(
+                -1.0,
+                min(
+                    1.0,
+                    score,
+                ),
+            ),
+            4,
+        ),
+        "impact": round(
+            impact_score,
+            4,
+        ),
+        "count": len(
+            news_items
+        ),
         "high_impact": high_impact,
-        "fresh_hours": round(freshest, 1) if freshest is not None else None,
+        "fresh_hours": (
+            round(
+                freshest,
+                1,
+            )
+            if freshest is not None
+            else None
+        ),
     }
-
 
 def sentiment_score(news_items: list[dict]) -> float:
     return news_metrics(news_items)["score"]
