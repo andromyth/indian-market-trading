@@ -175,13 +175,65 @@ def gdrive_config() -> dict:
     try:
         import streamlit as st  # lazy: module also works outside Streamlit
         if hasattr(st, "secrets"):
+
+            # Preferred structured configuration:
+            # [gdrive]
+            # root_folder_id = "..."
+            # service_account_json = "..."
+            # oauth_token_json = "..."
             sec = st.secrets.get("gdrive", {})
+
             if not root_id:
-                root_id = str(sec.get("root_folder_id", "")).strip()
+                root_id = str(
+                    sec.get("root_folder_id", "")
+                ).strip()
+
             if not service_json:
-                service_json = str(sec.get("service_account_json", "")).strip()
+                service_json = str(
+                    sec.get("service_account_json", "")
+                ).strip()
+
             if not oauth_json:
-                oauth_json = str(sec.get("oauth_token_json", "")).strip()
+                oauth_json = str(
+                    sec.get("oauth_token_json", "")
+                ).strip()
+
+            # Also support the top-level Streamlit Secrets names already
+            # used by older deployments. Streamlit secrets are NOT guaranteed
+            # to appear in os.environ, so reading only os.getenv() can produce
+            # a false "missing root_folder_id" error.
+            if not root_id:
+                root_id = str(
+                    st.secrets.get(
+                        "GOOGLE_DRIVE_ROOT_ID",
+                        ""
+                    )
+                ).strip()
+
+            if not root_id:
+                root_id = str(
+                    st.secrets.get(
+                        "GDRIVE_ROOT_FOLDER_ID",
+                        ""
+                    )
+                ).strip()
+
+            if not service_json:
+                service_json = str(
+                    st.secrets.get(
+                        "GOOGLE_SERVICE_ACCOUNT_JSON",
+                        ""
+                    )
+                ).strip()
+
+            if not oauth_json:
+                oauth_json = str(
+                    st.secrets.get(
+                        "GOOGLE_OAUTH_TOKEN_JSON",
+                        ""
+                    )
+                ).strip()
+
     except Exception:
         pass
 
