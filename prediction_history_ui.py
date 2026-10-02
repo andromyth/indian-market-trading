@@ -369,6 +369,12 @@ def _historical_prediction(
     symbol: str,
     selected_date: pd.Timestamp,
 ) -> dict[str, Any]:
+    """Replay a historical prediction using data strictly before target date.
+
+    The selected date is the target NSE session. No stock, benchmark, or other
+    feature information from the target session is allowed into the model
+    inputs. The actual target-session OHLC is used only after prediction.
+    """
 
     from all_nse_delivery_model import (
         BUY_P,
@@ -380,42 +386,54 @@ def _historical_prediction(
 
     root = _root(symbol)
 
-    end_date = selected_date.normalize()
-
-    start_date = (
-        end_date - pd.Timedelta(days=365)
-    )
-
-    # Pull the complete stock history needed to construct the 59-feature row.
-    stock = _stock_history_from_drive(
-        root,
-        start_date,
-        end_date + pd.Timedelta(days=7),
-    )
-
-    if stock.empty:
-        raise RuntimeError(
-            f"Official NSE bulk-EOD history unavailable for {root} "
-            f"through {end_date.date()}."
-        )
-
-    reference_rows = stock[
-        stock["date"] <= end_date
-    ].sort_values("date")
-
-    if reference_rows.empty:
-        raise RuntimeError(
-            f"No official NSE reference session exists on/before "
-            f"{end_date.date()} for {root}."
-        )
-
-    reference = reference_rows.iloc[-1]
-    reference_date = pd.Timestamp(
-        reference["date"]
+    target_date = pd.Timestamp(
+        selected_date
     ).normalize()
 
+    # Strict causal boundary: model inputs stop on the previous calendar day.
+    # The NSE archive naturally resolves this to the previous trading session.
+    input_end = (
+        target_date
+        - pd.Timedelta(days=1)
+    ).normalize()
+
+    history_start = (
+        input_end
+        - pd.Timedelta(days=365)
+    )
+
+    # Load enough history through the day before the target session.
+    stock_input = _stock_history_from_drive(
+        root,
+        history_start,
+        input_end,
+    )
+
+    if stock_input.empty:
+        raise RuntimeError(
+            f"Official NSE bulk-EOD history unavailable for {root} "
+            f"through {input_end.date()}."
+        )
+
+    input_rows = stock_input[
+        stock_input["date"] <= input_end
+    ].sort_values("date")
+
+    if input_rows.empty:
+        raise RuntimeError(
+            f"No model input session exists before target date "
+            f"{target_date.date()} for {root}."
+        )
+
+    reference_date = pd.Timestamp(
+        input_rows["date"].iloc[-1]
+    ).normalize()
+
+    # Benchmark also stops at the reference session. The target session is
+    # deliberately excluded to prevent look-ahead leakage.
     benchmark_start = (
-        reference_date - pd.Timedelta(days=365)
+        reference_date
+        - pd.Timedelta(days=365)
     )
 
     benchmark, benchmark_source = _benchmark_history(
@@ -424,11 +442,8 @@ def _historical_prediction(
         reference_date,
     )
 
-    # Build exactly the locked 59-feature model input.
     features = _build_latest_features(
-        stock[
-            stock["date"] <= reference_date
-        ].copy(),
+        input_rows,
         benchmark,
     )
 
@@ -469,16 +484,23 @@ def _historical_prediction(
     else:
         signal = "HOLD"
 
-    # Compare with the first official NSE session after the reference session.
-    actuals = stock[
-        stock["date"] > reference_date
+    # Actual target-session data is deliberately loaded separately, after the
+    # prediction has been generated.
+    future = _stock_history_from_drive(
+        root,
+        target_date,
+        target_date,
+    )
+
+    actual_rows = future[
+        future["date"] == target_date
     ].sort_values("date")
 
-    atr = _atr14(
-        stock[
-            stock["date"] <= reference_date
-        ]
-    )
+    reference = input_rows[
+        input_rows["date"] == reference_date
+    ].iloc[-1]
+
+    atr = _atr14(input_rows)
 
     path = _price_path(
         reference,
@@ -488,7 +510,8 @@ def _historical_prediction(
 
     result = {
         "symbol": root,
-        "prediction_date": reference_date.date(),
+        "prediction_date": target_date.date(),
+        "input_through_date": reference_date.date(),
         "prediction_source": "HISTORICAL_ML_REPLAY",
         "model_version": manifest.get(
             "engine_version",
@@ -497,6 +520,13 @@ def _historical_prediction(
         "signal": signal,
         "p_up": p_up,
         "expected_return": expected_return,
+        "data_readiness": float(
+            features.notna().sum(axis=1).iloc[0]
+            / len(expected_features)
+        ),
+        "feature_count": len(
+            expected_features
+        ),
         "reference_close": float(
             reference["close"]
         ),
@@ -507,27 +537,22 @@ def _historical_prediction(
         "purchase_price": path["purchase_price"],
         "sale_price": path["sale_price"],
         "stop_price": path["stop_price"],
-        "feature_count": len(
-            expected_features
-        ),
-        "data_readiness": float(
-            features.notna().sum(axis=1).iloc[0]
-            / len(expected_features)
-        ),
     }
 
-    if actuals.empty:
+    if actual_rows.empty:
         result["status"] = (
-            "Prediction available; next official NSE session "
-            "is not present in the loaded archive."
+            "Prediction generated from data through the previous session, "
+            "but target-session actual is unavailable."
         )
         return result
 
-    actual = actuals.iloc[0]
+    actual = actual_rows.iloc[0]
 
     actual_return = (
         float(
-            actual["close"] / reference["close"] - 1.0
+            actual["close"]
+            / reference["close"]
+            - 1.0
         )
         if float(reference["close"]) != 0
         else np.nan
@@ -738,10 +763,10 @@ def render_prediction_history() -> None:
     st.caption(
         "Select any historical date and NSE stock. "
         "For dates without a stored live prediction, the app reconstructs "
-        "the current 59-feature ALL-NSE model from point-in-time official "
-        "NSE bulk-EOD stock history, then compares the result with the next "
-        "official NSE session. Historical replay is retrospective analysis, "
-        "not prospective OOS validation."
+        "the current 59-feature ALL-NSE model using data only through the "
+        "previous NSE session, then compares that prediction with the selected "
+        "target session. Historical replay is retrospective analysis, not "
+        "prospective OOS validation."
     )
 
     today = pd.Timestamp.now(
@@ -751,7 +776,7 @@ def render_prediction_history() -> None:
     c1, c2 = st.columns(2)
 
     selected = c1.date_input(
-        "Prediction date",
+        "Prediction target date",
         value=today,
         min_value=pd.Timestamp(
             "2026-01-01"
@@ -814,6 +839,14 @@ def render_prediction_history() -> None:
             "Limit historical replay to 10 stocks at a time."
         )
         return
+
+    st.info(
+        f"Historical replay is causal: the model uses data only through "
+        f"{(pd.Timestamp(selected) - pd.Timedelta(days=1)).strftime('%d-%m-%Y')} "
+        f"(previous calendar day; the actual previous NSE trading session is "
+        f"resolved from the archive). The selected date "
+        f"{pd.Timestamp(selected).strftime('%d-%m-%Y')} is the prediction target."
+    )
 
     rows = []
 
