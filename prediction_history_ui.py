@@ -164,10 +164,50 @@ def render_prediction_history() -> None:
             continue
     dates = sorted(set(dated), reverse=True)
     if not dates:
-        st.info("The prediction ledger contains Delivery records but no usable reference dates.")
+        st.info(
+            "The prediction ledger contains Delivery records but no usable reference dates."
+        )
         return
 
-    selected = st.selectbox("Prediction date", dates, format_func=lambda d: d.strftime("%d-%m-%Y"))
+    earliest_prediction_date = min(dates)
+    latest_prediction_date = max(dates)
+    today = pd.Timestamp.now(
+        tz="Asia/Kolkata"
+    ).date()
+
+    # Use a real calendar instead of a selectbox limited to dates that already
+    # exist in the ledger. A user can inspect any valid historical date; when
+    # no stored prediction exists for that date, we report that explicitly.
+    default_date = min(
+        max(
+            latest_prediction_date,
+            earliest_prediction_date,
+        ),
+        today,
+    )
+
+    selected = st.date_input(
+        "Prediction date",
+        value=default_date,
+        min_value=earliest_prediction_date,
+        max_value=today,
+        format="DD-MM-YYYY",
+        help=(
+            "Choose the date on which an ALL-NSE Delivery prediction was made. "
+            "Dates with no stored prediction are allowed and will be reported "
+            "as unavailable rather than reconstructed or fabricated."
+        ),
+    )
+
+    if selected not in dates:
+        st.info(
+            f"No stored ALL-NSE Delivery prediction exists for "
+            f"{selected.strftime('%d-%m-%Y')}. "
+            f"Currently stored prediction dates run through "
+            f"{latest_prediction_date.strftime('%d-%m-%Y')}."
+        )
+        return
+
     selected_records = []
     for r in records:
         raw = r.get("reference_session") or str(r.get("decision_timestamp", ""))[:10]
