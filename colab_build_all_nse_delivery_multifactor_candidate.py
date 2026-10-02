@@ -127,10 +127,18 @@ def market_context_tables(bulk) -> dict[str, pd.DataFrame]:
 
 
 def make_panel(bulk, symbols):
-    ctxs = market_context_tables(bulk)
+    # Normalize the bulk symbol column before filtering. The training roster
+    # is built on normalized symbols; filtering against raw symbol text can
+    # silently collapse the panel when archive symbols carry series/suffix
+    # variants such as '-EQ'.
+    work = bulk.copy()
+    work["_symbol_norm"] = work["symbol"].map(normalize_symbol)
+    ctxs = market_context_tables(work)
     parts = []
     for sym in symbols:
-        z = add_features(bulk[bulk["symbol"].eq(sym)].copy())
+        z = add_features(work[work["_symbol_norm"].eq(sym)].drop(columns=["_symbol_norm"]).copy())
+        if z.empty:
+            continue
         benchmark = benchmark_for_symbol(sym)
         ctx = ctxs.get(benchmark)
         if ctx is None or ctx.empty:
