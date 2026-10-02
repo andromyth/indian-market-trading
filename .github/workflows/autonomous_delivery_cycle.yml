@@ -2,8 +2,6 @@ name: Autonomous Delivery prediction and validation
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '15 14 * * 1-5'
 
 jobs:
   delivery-cycle:
@@ -36,15 +34,10 @@ jobs:
           print(f"Google Drive auth method: {status.get('auth_method')}")
           PY
 
-      - name: Generate autonomous Delivery predictions
-        env:
-          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
-          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
-        run: |
-          set -eux
-          python -u daily_delivery_prediction.py
+      # Legacy scheduled 3-stock Delivery generation is disabled.
+      # The live Streamlit application now produces ALL-NSE 59-feature Delivery
+      # predictions on demand, preventing legacy and ALL-NSE records from being
+      # mixed in the persistent production ledger.
 
       - name: Validate stored Delivery predictions D+1 through D+7
         env:
