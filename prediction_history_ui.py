@@ -733,175 +733,225 @@ def _stock_history_from_drive(
         & (frame["date"] <= end_day)
     ].copy()
 
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
 def _benchmark_history(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> tuple[pd.DataFrame, str]:
+    """Use the model's official NSE benchmark lineage for historical replay."""
 
-    """Load retrospective benchmark data without calling NSE's blocked index API."""
-
-    bank_symbols = {
-        "HDFCBANK",
-        "ICICIBANK",
-        "SBIN",
-        "AXISBANK",
-        "KOTAKBANK",
-        "INDUSINDBK",
-        "BANKBARODA",
-        "PNB",
-    }
+    from all_nse_delivery_model import _official_market_history
 
     root = _root(symbol)
 
     benchmark = (
         "^NSEBANK"
-        if root in bank_symbols
+        if root
+        in {
+            "HDFCBANK",
+            "ICICIBANK",
+            "SBIN",
+            "AXISBANK",
+            "KOTAKBANK",
+            "INDUSINDBK",
+            "BANKBARODA",
+            "PNB",
+        }
         else "^NSEI"
     )
 
-    # Use Yahoo only for retrospective replay. It is explicitly labelled in
-    # the result and is never used by the live PIT prediction path.
-    data = yf.download(
-        benchmark,
-        start=start.date(),
-        end=(end + pd.Timedelta(days=1)).date(),
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    start_day = pd.Timestamp(start).normalize()
+    end_day = pd.Timestamp(end).normalize()
 
-    if data is None or data.empty:
-        raise RuntimeError(
-            f"No retrospective benchmark data available for {benchmark}."
+    try:
+        official = _official_market_history(
+            benchmark,
+            str(end_day.date()),
         )
 
-    x = data.copy()
+        if official is not None and not official.empty:
 
-    if isinstance(
-        x.columns,
-        pd.MultiIndex,
-    ):
-        flattened = []
+            x = official.copy()
 
-        for col in x.columns:
-            parts = [
-                str(part).strip().lower()
-                for part in col
-                if str(part).strip()
+            x.columns = [
+                str(col).strip().lower()
+                for col in x.columns
             ]
 
-            flattened.append(
-                parts[0]
-                if parts
-                else ""
+            if "date" in x.columns:
+                x["date"] = pd.to_datetime(
+                    x["date"],
+                    errors="coerce",
+                ).dt.normalize()
+
+            if "close" in x.columns:
+
+                x["close"] = pd.to_numeric(
+                    x["close"],
+                    errors="coerce",
+                )
+
+                x = x[
+                    (x["date"] >= start_day)
+                    & (x["date"] <= end_day)
+                ].dropna(
+                    subset=[
+                        "date",
+                        "close",
+                    ]
+                )
+
+                if not x.empty:
+
+                    return (
+                        x[
+                            [
+                                "date",
+                                "close",
+                            ]
+                        ]
+                        .sort_values("date")
+                        .drop_duplicates(
+                            "date",
+                            keep="last",
+                        )
+                        .reset_index(drop=True),
+                        "OFFICIAL_NSE",
+                    )
+
+    except Exception:
+        pass
+
+    # Explicit fallback only. This preserves the historical feature test when
+    # the official benchmark archive cannot be reached, but provenance is clear.
+    try:
+        data = yf.download(
+            benchmark,
+            start=start_day.date(),
+            end=(end_day + pd.Timedelta(days=1)).date(),
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+
+        if data is None or data.empty:
+            raise RuntimeError(
+                f"No fallback benchmark rows for {benchmark}."
             )
 
-        x.columns = flattened
+        x = data.copy()
 
-    else:
+        if isinstance(
+            x.columns,
+            pd.MultiIndex,
+        ):
+
+            flattened = []
+
+            for col in x.columns:
+
+                values = [
+                    str(v).strip().lower()
+                    for v in col
+                    if str(v).strip()
+                ]
+
+                flattened.append(
+                    values[0]
+                    if values
+                    else ""
+                )
+
+            x.columns = flattened
+
+        else:
+            x.columns = [
+                str(col).strip().lower()
+                for col in x.columns
+            ]
+
+        x = x.loc[
+            :,
+            ~x.columns.duplicated(
+                keep="first"
+            ),
+        ].copy()
+
+        x = x.reset_index()
+
         x.columns = [
             str(col).strip().lower()
             for col in x.columns
         ]
 
-    if x.columns.duplicated().any():
-        x = x.loc[
-            :,
-            ~x.columns.duplicated(
-                keep="first"
+        date_col = next(
+            (
+                col
+                for col in (
+                    "date",
+                    "datetime",
+                )
+                if col in x.columns
             ),
-        ].copy()
-
-    x = x.reset_index()
-    x.columns = [
-        str(col).strip().lower()
-        for col in x.columns
-    ]
-
-    if x.columns.duplicated().any():
-        x = x.loc[
-            :,
-            ~x.columns.duplicated(
-                keep="first"
-            ),
-        ].copy()
-
-    date_col = next(
-        (
-            col
-            for col in ("date", "datetime")
-            if col in x.columns
-        ),
-        None,
-    )
-
-    if date_col is None:
-        raise RuntimeError(
-            f"Retrospective benchmark has no date column for {benchmark}."
+            None,
         )
 
-    x["date"] = pd.to_datetime(
-        x[date_col],
-        errors="coerce",
-    ).dt.normalize()
-
-    for col in (
-        "open",
-        "high",
-        "low",
-        "close",
-    ):
-        if col not in x.columns:
+        if date_col is None or "close" not in x.columns:
             raise RuntimeError(
-                f"Retrospective benchmark missing {col} for {benchmark}."
+                f"Fallback benchmark lacks date/close for {benchmark}."
             )
 
-        x[col] = pd.to_numeric(
-            x[col],
+        x["date"] = pd.to_datetime(
+            x[date_col],
+            errors="coerce",
+        ).dt.normalize()
+
+        x["close"] = pd.to_numeric(
+            x["close"],
             errors="coerce",
         )
 
-    x = (
-        x.dropna(
+        x = x[
+            (x["date"] >= start_day)
+            & (x["date"] <= end_day)
+        ].dropna(
             subset=[
                 "date",
-                "open",
-                "high",
-                "low",
                 "close",
             ]
         )
-        .sort_values("date")
-        .drop_duplicates(
-            "date",
-            keep="last",
-        )
-        .reset_index(drop=True)
-    )
 
-    if x.empty:
-        raise RuntimeError(
-            f"Retrospective benchmark has no usable rows for {benchmark}."
-        )
+        if x.empty:
+            raise RuntimeError(
+                f"Fallback benchmark has no usable rows for {benchmark}."
+            )
 
-    x["symbol"] = benchmark
-
-    return (
-        x[
-            [
-                "symbol",
+        return (
+            x[
+                [
+                    "date",
+                    "close",
+                ]
+            ]
+            .sort_values("date")
+            .drop_duplicates(
                 "date",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        ],
-        "YAHOO_RETROSPECTIVE_REFERENCE",
-    )
+                keep="last",
+            )
+            .reset_index(drop=True),
+            "YAHOO_RETROSPECTIVE_FALLBACK",
+        )
 
+    except Exception as exc:
+        raise RuntimeError(
+            f"No benchmark history available for {benchmark}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 def _historical_prediction(
     symbol: str,
