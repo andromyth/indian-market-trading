@@ -60,35 +60,36 @@ def _nse_daily(symbol: str, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return x
 
 
-def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFrame]) -> dict:
-    root = symbol.replace(".NS", "").replace(".BO", "").upper()
+def run_symbol(
+    symbol: str,
+    all_news: list[dict],
+    histories: dict[str, pd.DataFrame],
+) -> dict:
+    """Run one ALL-NSE next-session prediction from the persisted PIT layer.
+
+    The scheduled job deliberately avoids per-symbol remote history, news and
+    option-chain fan-out across 2,372 stocks. Those sources are attached by the
+    interactive engine when available; the scheduled base prediction uses the
+    same persisted PIT feature snapshot as the live model.
+    """
+    root = (
+        symbol
+        .replace(".NS", "")
+        .replace(".BO", "")
+        .upper()
+    )
+
     now = datetime.now(IST)
     expected_date = now.date()
-    if not _is_nse_equity_trading_day(expected_date):
+
+    if not _is_nse_equity_trading_day(
+        expected_date
+    ):
         return {
             "symbol": root,
             "status": "BLOCKED",
             "reason": "non_trading_day_no_new_delivery_prediction",
             "expected_date": expected_date.isoformat(),
-        }
-    price_df = _nse_daily(root, histories)
-    if price_df.empty:
-        # PIT inference can still run because all_nse_delivery_model.py loads
-        # the persisted feature snapshot independently.
-        price_df = pd.DataFrame()
-
-    latest_date = (
-        price_df.index[-1].date()
-        if not price_df.empty
-        else expected_date
-    )
-    if latest_date > expected_date:
-        return {
-            "symbol": root,
-            "status": "BLOCKED",
-            "reason": "official_nse_history_contains_future_date",
-            "expected_date": expected_date.isoformat(),
-            "latest_official_date": latest_date.isoformat(),
         }
 
     if now.time() < MARKET_EOD_READY_TIME:
@@ -100,65 +101,62 @@ def run_symbol(symbol: str, all_news: list[dict], histories: dict[str, pd.DataFr
             "eod_ready_after_ist": MARKET_EOD_READY_TIME.strftime("%H:%M"),
         }
 
-    benchmark = benchmark_for_symbol(root)
-    try:
-        market_df = get_historical(
-            benchmark,
-            period="140d",
-            interval="1d",
-        )
-    except Exception:
-        market_df = pd.DataFrame()
-    aliases = stock_news_keywords(root)
-    matched = news_for_symbol(aliases, all_news)
+    decision_timestamp = datetime.combine(
+        expected_date,
+        time(15, 30),
+        tzinfo=IST,
+    )
 
-    raw_ann = get_corporate_announcements(root)
-    announcements = []
-    for item in raw_ann[:10]:
-        if not isinstance(item, dict):
-            continue
-        announcements.append(
-            {
-                "subject": item.get("subject") or item.get("desc") or item.get("attchmntText") or "Corporate announcement",
-                "date": item.get("an_dt") or item.get("date") or item.get("sort_date") or "",
-                "link": item.get("attchmntFile") or item.get("link") or "",
-            }
-        )
-
-    raw_chain = get_option_chain(root, is_index=False)
-    fo = fo_summarize(raw_chain) if raw_chain else {}
-
-    item = {
-        "symbol": root,
-        "price_df": price_df,
-        "market_df": market_df,
-        "news": {"available": 1.0 if matched else 0.0},
-        "event": {
-            "available": 1.0 if announcements else 0.0,
-            "high_impact": 1.0 if announcements else 0.0,
+    result = delivery_prediction(
+        {
+            "symbol": root,
+            "decision_timestamp": decision_timestamp,
         },
-        "fno": {**fo, "available": 1.0 if fo else 0.0},
-        "decision_timestamp": str(
-            datetime.combine(price_df.index[-1].date(), time(15, 30), tzinfo=IST)
-        ),
-    }
-    result = delivery_prediction(item, sync_drive=True)
+        sync_drive=True,
+    )
+
     return {
         "symbol": root,
-        "status": result.get("prediction_status", "ERROR"),
-        "signal": result.get("signal"),
-        "confidence": result.get("confidence"),
-        "probability_up": result.get("probability_up_next_session"),
-        "predicted_return": result.get("predicted_return_next_session"),
-        "decision_timestamp": result.get("decision_timestamp"),
-        "prediction_id": result.get("prediction_id"),
-        "prediction_ledger_status": result.get("prediction_ledger_status"),
-        "prediction_ledger_synced": result.get("prediction_ledger_synced"),
-        "data_readiness_score": result.get("data_readiness_score"),
-        "fno_available": bool(fo),
-        "news_available": bool(matched),
-        "announcements_available": bool(announcements),
-        "reason": result.get("reason"),
+        "status": result.get(
+            "prediction_status",
+            "ERROR",
+        ),
+        "signal": result.get(
+            "signal"
+        ),
+        "confidence": result.get(
+            "confidence"
+        ),
+        "probability_up": result.get(
+            "probability_up_next_session"
+        ),
+        "predicted_return": result.get(
+            "predicted_return_next_session"
+        ),
+        "decision_timestamp": result.get(
+            "decision_timestamp"
+        ),
+        "prediction_id": result.get(
+            "prediction_id"
+        ),
+        "prediction_ledger_status": result.get(
+            "prediction_ledger_status"
+        ),
+        "prediction_ledger_synced": result.get(
+            "prediction_ledger_synced"
+        ),
+        "data_readiness_score": result.get(
+            "data_readiness_score"
+        ),
+        "auxiliary_model_consensus_p_up": result.get(
+            "auxiliary_model_consensus_p_up"
+        ),
+        "auxiliary_model_consensus_direction": result.get(
+            "auxiliary_model_consensus_direction"
+        ),
+        "reason": result.get(
+            "reason"
+        ),
     }
 
 
