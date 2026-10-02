@@ -247,29 +247,124 @@ def historical_news(symbol: str, when: pd.Timestamp) -> list[dict]:
     return out
 
 
-def historical_announcements(symbol: str, when: pd.Timestamp) -> list[dict]:
-    """Best-effort filter of NSE announcement data when the endpoint exposes the date."""
+def historical_announcements(
+    symbol: str,
+    when: pd.Timestamp,
+    lookback_days: int = 7,
+) -> list[dict]:
+    """Return recent stock announcements known by the historical cutoff.
+
+    Only announcements whose available date is on/before the cutoff and no
+    older than the requested lookback window are retained. This prevents a
+    cumulative announcement archive from becoming a misleading single event
+    signal while preserving point-in-time causality.
+    """
     try:
         from data_fetcher import get_corporate_announcements
-        raw = get_corporate_announcements(normalize_root_symbol(symbol))
+
+        raw = get_corporate_announcements(
+            normalize_root_symbol(symbol)
+        )
+
     except Exception:
         return []
-    cutoff_date = _date_only(when).date()
+
+    cutoff = pd.Timestamp(
+        when
+    )
+
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize(
+            "Asia/Kolkata"
+        )
+    else:
+        cutoff = cutoff.tz_convert(
+            "Asia/Kolkata"
+        )
+
+    window_start = (
+        cutoff
+        - pd.Timedelta(
+            days=max(
+                1,
+                int(lookback_days),
+            )
+        )
+    )
+
     out = []
+    seen = set()
+
     for item in raw or []:
-        text_date = item.get("an_dt") or item.get("date") or item.get("sort_date") or ""
+
+        text_date = (
+            item.get("an_dt")
+            or item.get("date")
+            or item.get("sort_date")
+            or ""
+        )
+
         try:
-            d = pd.Timestamp(text_date).date()
+            d = pd.Timestamp(
+                text_date
+            )
+
+            if d.tzinfo is None:
+                d = d.tz_localize(
+                    "Asia/Kolkata"
+                )
+            else:
+                d = d.tz_convert(
+                    "Asia/Kolkata"
+                )
+
         except Exception:
             continue
-        if d <= cutoff_date:
-            out.append({
-                "subject": item.get("subject") or item.get("desc") or item.get("attchmntText") or "Corporate announcement",
-                "date": text_date,
-                "link": item.get("attchmntFile") or item.get("link") or "",
-            })
-    return out
 
+        if (
+            d > cutoff
+            or d < window_start
+        ):
+            continue
+
+        key = (
+            str(
+                item.get("subject")
+                or item.get("desc")
+                or item.get("attchmntText")
+                or ""
+            ).strip().lower(),
+            d.isoformat(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        out.append({
+            "subject": (
+                item.get("subject")
+                or item.get("desc")
+                or item.get("attchmntText")
+                or "Corporate announcement"
+            ),
+            "date": text_date,
+            "link": (
+                item.get("attchmntFile")
+                or item.get("link")
+                or ""
+            ),
+        })
+
+    out.sort(
+        key=lambda x: str(
+            x.get("date", "")
+        ),
+        reverse=True,
+    )
+
+    return out[:50]
 
 def _entry_exit_metrics(df: pd.DataFrame, decision_ts: pd.Timestamp, mode: str, horizon: int) -> dict:
     """Calculate reference/target/stop from information available at decision time."""
