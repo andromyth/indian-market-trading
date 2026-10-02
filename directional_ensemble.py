@@ -1324,6 +1324,15 @@ def enrich_delivery_prediction(
         else np.nan
     )
     out["predicted_return_next_session"] = integrated_return
+    out["confidence"] = (
+        "HIGH"
+        if np.isfinite(integrated_p)
+        and abs(integrated_p - 0.5) >= 0.25
+        else "MEDIUM"
+        if np.isfinite(integrated_p)
+        and abs(integrated_p - 0.5) >= 0.12
+        else "LOW"
+    )
 
     out.update({
         "legacy_model_ensemble": ensemble,
