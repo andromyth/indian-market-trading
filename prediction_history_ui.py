@@ -266,6 +266,155 @@ def _compact_symbol_history(symbol: str) -> pd.DataFrame:
     return _clean_ohlc(frame)
 
 
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def _canonical_all_nse_daily() -> pd.DataFrame:
+    """Load the persisted all-NSE daily canonical parquet once per runtime.
+
+    This archive contains the official NSE daily OHLC/volume/delivery fields
+    used by the all-NSE candidate build. It is the correct historical source
+    for replay because it does not depend on per-symbol compact files.
+    """
+    store = _drive_store()
+
+    parent = store.root_id
+
+    for part in (
+        "processed",
+        "universe_expansion_2026_v4",
+    ):
+        folder = store._find_child(
+            parent,
+            part,
+            "application/vnd.google-apps.folder",
+        )
+
+        if not folder:
+            raise RuntimeError(
+                f"Google Drive folder not found: {part}"
+            )
+
+        parent = folder["id"]
+
+    item = store._find_child(
+        parent,
+        "EXPANSION_DAILY_NSE_CANONICAL_2026.parquet",
+        None,
+    )
+
+    if not item:
+        raise RuntimeError(
+            "Persisted all-NSE canonical daily parquet was not found in Drive."
+        )
+
+    local_dir = Path(
+        ".canonical_history_cache"
+    )
+    local_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    local = (
+        local_dir
+        / "EXPANSION_DAILY_NSE_CANONICAL_2026.parquet"
+    )
+
+    if (
+        not local.exists()
+        or local.stat().st_size == 0
+    ):
+
+        from googleapiclient.http import MediaIoBaseDownload
+
+        request = (
+            store.service
+            .files()
+            .get_media(
+                fileId=item["id"]
+            )
+        )
+
+        temp = local.with_suffix(
+            ".tmp"
+        )
+
+        with temp.open("wb") as fh:
+
+            downloader = MediaIoBaseDownload(
+                fh,
+                request,
+            )
+
+            done = False
+
+            while not done:
+                _, done = downloader.next_chunk()
+
+        temp.replace(local)
+
+    frame = pd.read_parquet(
+        local
+    )
+
+    if frame is None or frame.empty:
+        raise RuntimeError(
+            "Persisted all-NSE canonical daily parquet is empty."
+        )
+
+    return _clean_ohlc(frame)
+
+
+def _historical_stock_history_from_drive(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Efficient all-NSE historical stock slice from one canonical archive."""
+    frame = _canonical_all_nse_daily()
+
+    root = _root(symbol)
+
+    if frame.empty:
+        return pd.DataFrame()
+
+    symbols = (
+        frame["symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    x = frame[
+        symbols == root
+    ].copy()
+
+    if x.empty:
+        return pd.DataFrame()
+
+    start_day = pd.Timestamp(
+        start
+    ).normalize()
+
+    end_day = pd.Timestamp(
+        end
+    ).normalize()
+
+    return x[
+        (x["date"] >= start_day)
+        & (x["date"] <= end_day)
+    ].sort_values(
+        "date"
+    ).drop_duplicates(
+        "date",
+        keep="last",
+    ).reset_index(
+        drop=True
+    )
+
+
 def _stock_history_from_drive(
     symbol: str,
     start: pd.Timestamp,
@@ -497,7 +646,7 @@ def _historical_prediction(
         - pd.Timedelta(days=130)
     )
     # Load enough history through the day before the target session.
-    stock_input = _stock_history_from_drive(
+    stock_input = _historical_stock_history_from_drive(
         root,
         history_start,
         input_end,
