@@ -21,6 +21,10 @@ def main():
     m=json.loads(mp.read_text(encoding="utf-8"))
     if m.get("promotion_status")!="CANDIDATE_ONLY": raise SystemExit("Refusing non-candidate bundle")
     if m.get("features")!=FEATURES_59: raise SystemExit("59-feature contract mismatch")
+    expected_hash=hashlib.sha256(json.dumps(FEATURES_59,separators=(",",":")).encode()).hexdigest()
+    manifest_hash=m.get("feature_contract_hash")
+    if manifest_hash is not None and manifest_hash!=expected_hash:
+        raise SystemExit("59-feature contract hash mismatch")
     report={"engine_version":m.get("engine_version"),"promotion_status":m.get("promotion_status"),"universe":m.get("universe"),"artifacts":{}}
     for name,item in m.get("artifacts",{}).items():
         report["artifacts"][name]=item
