@@ -168,21 +168,23 @@ def _replay_benchmark_history(
         else "^NSEI"
     )
 
+    # First try only the project's persisted official NSE benchmark archive.
+    # This avoids repeated hosted-IP calls to the NSE index endpoint during
+    # historical replay.
     try:
-        from nse_data_layer import fetch_index_history
+        from nse_data_layer import _drive_index_history
 
-        official = fetch_index_history(
+        official = _drive_index_history(
             benchmark,
             start.date(),
             end.date(),
-            sync_drive=True,
         )
 
         if (
             official is not None
             and not official.empty
         ):
-            return official, "OFFICIAL_NSE"
+            return official, "OFFICIAL_NSE_PERSISTED"
 
     except Exception:
         pass
