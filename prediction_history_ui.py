@@ -178,21 +178,332 @@ def _stock_history_from_drive(
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
+    """Load official NSE bulk-EOD rows directly from the persisted Drive archive.
 
-    from nse_data_layer import (
-        fetch_nse_drive_bulk_symbol_history,
-    )
+    This historical-replay loader intentionally does not call fetch_equity_history
+    or the live NSE transport layer.
+    """
+    from persistent_store import GoogleDriveStore
+    from googleapiclient.http import MediaIoBaseDownload
 
     root = _root(symbol)
+    start_day = pd.Timestamp(start).normalize()
+    end_day = pd.Timestamp(end).normalize()
 
-    frame = fetch_nse_drive_bulk_symbol_history(
-        root,
-        start.date(),
-        end.date(),
-        max_calendar_days=420,
+    store = GoogleDriveStore()
+
+    # Find the persisted bulk-EOD root.
+    parent = store.root_id
+
+    for part in (
+        "production_data",
+        "nse_official",
+        "bulk_eod",
+    ):
+        folder = store._find_child(
+            parent,
+            part,
+            "application/vnd.google-apps.folder",
+        )
+
+        if not folder:
+            raise RuntimeError(
+                f"Google Drive archive folder not found: {part}"
+            )
+
+        parent = folder["id"]
+
+    pieces = []
+
+    # The ALL-NSE archive is daily and organized as YYYY/MM/DD folders.
+    for year in range(
+        start_day.year,
+        end_day.year + 1,
+    ):
+
+        year_folder = store._find_child(
+            parent,
+            f"{year:04d}",
+            "application/vnd.google-apps.folder",
+        )
+
+        if not year_folder:
+            continue
+
+        month_first = (
+            start_day.month
+            if year == start_day.year
+            else 1
+        )
+
+        month_last = (
+            end_day.month
+            if year == end_day.year
+            else 12
+        )
+
+        for month in range(
+            month_first,
+            month_last + 1,
+        ):
+
+            month_folder = store._find_child(
+                year_folder["id"],
+                f"{month:02d}",
+                "application/vnd.google-apps.folder",
+            )
+
+            if not month_folder:
+                continue
+
+            days = pd.date_range(
+                max(
+                    start_day,
+                    pd.Timestamp(
+                        year,
+                        month,
+                        1,
+                    ),
+                ),
+                min(
+                    end_day,
+                    (
+                        pd.Timestamp(
+                            year,
+                            month,
+                            1,
+                        )
+                        + pd.offsets.MonthEnd(1)
+                    ),
+                ),
+                freq="D",
+            )
+
+            for day in days:
+
+                day_folder = store._find_child(
+                    month_folder["id"],
+                    f"{day.day:02d}",
+                    "application/vnd.google-apps.folder",
+                )
+
+                if not day_folder:
+                    continue
+
+                filename = (
+                    f"BhavCopy_NSE_CM_0_0_0_"
+                    f"{day:%Y%m%d}_F_0000.parquet"
+                )
+
+                item = store._find_child(
+                    day_folder["id"],
+                    filename,
+                    None,
+                )
+
+                if not item:
+                    continue
+
+                cache_dir = (
+                    Path(".historical_bulk_cache")
+                    / root
+                )
+
+                cache_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                cache_file = (
+                    cache_dir
+                    / filename
+                )
+
+                try:
+
+                    if (
+                        not cache_file.exists()
+                        or cache_file.stat().st_size == 0
+                    ):
+
+                        request = (
+                            store.service
+                            .files()
+                            .get_media(
+                                fileId=item["id"]
+                            )
+                        )
+
+                        temp = cache_file.with_suffix(
+                            ".tmp"
+                        )
+
+                        with temp.open("wb") as fh:
+
+                            downloader = MediaIoBaseDownload(
+                                fh,
+                                request,
+                            )
+
+                            done = False
+
+                            while not done:
+                                _, done = downloader.next_chunk()
+
+                        temp.replace(
+                            cache_file
+                        )
+
+                    frame = pd.read_parquet(
+                        cache_file
+                    )
+
+                except Exception:
+                    continue
+
+                if frame is None or frame.empty:
+                    continue
+
+                frame.columns = [
+                    str(col).strip().lower()
+                    for col in frame.columns
+                ]
+
+                if frame.columns.duplicated().any():
+                    frame = frame.loc[
+                        :,
+                        ~frame.columns.duplicated(
+                            keep="first"
+                        ),
+                    ].copy()
+
+                if "symbol" not in frame.columns:
+                    continue
+
+                symbols = (
+                    frame["symbol"]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                )
+
+                hit = frame[
+                    symbols == root
+                ].copy()
+
+                if hit.empty:
+                    continue
+
+                if "date" not in hit.columns:
+                    hit["date"] = day
+
+                hit["date"] = pd.to_datetime(
+                    hit["date"],
+                    errors="coerce",
+                ).dt.normalize()
+
+                # Normalize the official UDiFF field names used by the archive.
+                aliases = {
+                    "open": (
+                        "open",
+                        "opnpric",
+                        "ch_opening_price",
+                    ),
+                    "high": (
+                        "high",
+                        "hghpric",
+                        "ch_trade_high_price",
+                    ),
+                    "low": (
+                        "low",
+                        "lwpric",
+                        "ch_trade_low_price",
+                    ),
+                    "close": (
+                        "close",
+                        "clspric",
+                        "ch_closing_price",
+                    ),
+                    "volume": (
+                        "volume",
+                        "ttltradgvol",
+                        "ch_tot_traded_qty",
+                    ),
+                    "delivery_qty": (
+                        "delivery_qty",
+                        "cop_deliv_qty",
+                    ),
+                    "delivery_pct": (
+                        "delivery_pct",
+                        "cop_deliv_perc",
+                    ),
+                }
+
+                for target, names in aliases.items():
+                    source = next(
+                        (
+                            name
+                            for name in names
+                            if name in hit.columns
+                        ),
+                        None,
+                    )
+
+                    if source is None:
+                        hit[target] = np.nan
+
+                    elif target != source:
+                        hit[target] = hit[source]
+
+                    hit[target] = pd.to_numeric(
+                        hit[target],
+                        errors="coerce",
+                    )
+
+                hit = hit.dropna(
+                    subset=[
+                        "date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                    ]
+                )
+
+                if not hit.empty:
+                    pieces.append(
+                        hit[
+                            [
+                                "symbol",
+                                "date",
+                                "open",
+                                "high",
+                                "low",
+                                "close",
+                                "volume",
+                                "delivery_qty",
+                                "delivery_pct",
+                            ]
+                        ]
+                    )
+
+    if not pieces:
+        return pd.DataFrame()
+
+    out = (
+        pd.concat(
+            pieces,
+            ignore_index=True,
+        )
+        .sort_values("date")
+        .drop_duplicates(
+            "date",
+            keep="last",
+        )
+        .reset_index(drop=True)
     )
 
-    return _clean_ohlc(frame)
+    return out
 
 
 def _benchmark_history(
