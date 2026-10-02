@@ -44,7 +44,22 @@ def _fund_session():
         _fund_local.s=s
     return s
 def _fd(x):
-    return pd.to_datetime(x,errors="coerce",utc=True,dayfirst=True) if x is not None else pd.NaT
+    if x is None:
+        return pd.NaT
+    if isinstance(x, pd.Timestamp):
+        return x.tz_localize("UTC") if x.tzinfo is None else x.tz_convert("UTC")
+    s=str(x).strip()
+    if not s:
+        return pd.NaT
+    for fmt in ("%Y-%m-%d %H:%M:%S","%d-%m-%Y %H:%M:%S","%Y-%m-%d","%d-%m-%Y"):
+        try:
+            return pd.Timestamp(pd.to_datetime(s,format=fmt,utc=True))
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s,errors="coerce",utc=True,dayfirst=True)
+    except Exception:
+        return pd.NaT
 def _fn(x):
     try:
         t=str(x).strip().replace(",","")
@@ -164,15 +179,13 @@ def _fund_parse(f):
         for diff_days,duration,cid in duration_ids:
             if facts.get(cid):
                 q=facts[cid]
-                if diff_days <= 3:
-                    break
-                # keep the closest available context when no exact period exists
+                break
+
         bs={}
         for diff_days,cid in sorted(instant_ids):
             if facts.get(cid):
                 bs=facts[cid]
-                if diff_days <= 3:
-                    break
+                break
 
         def pick(d,names):
             for n in names:
@@ -392,9 +405,12 @@ def merge_optional(panel):
     # Derived F&O basis is PIT-safe because fno_fut_close is already merged
     # with the same backward-as-of F&O timestamp contract.
     if "fno_fut_basis" not in out.columns:
-        fut=pd.to_numeric(out.get("fno_fut_close"),errors="coerce")
-        spot=pd.to_numeric(out.get("close"),errors="coerce")
-        out["fno_fut_basis"]=(fut/spot.replace(0,np.nan))-1.0
+        if "fno_fut_close" in out.columns:
+            fut=pd.to_numeric(out["fno_fut_close"],errors="coerce")
+            spot=pd.to_numeric(out["close"],errors="coerce")
+            out["fno_fut_basis"]=(fut/spot.replace(0,np.nan))-1.0
+        else:
+            out["fno_fut_basis"]=np.nan
 
     # ONLY the broad ALL-NSE PIT fundamentals layer is accepted here.
     # Never silently fall back to the legacy three-stock pilot.
