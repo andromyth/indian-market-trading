@@ -463,7 +463,7 @@ def main():
     ap.add_argument("--to-date", default="30-09-2026")
     ap.add_argument("--page-size", type=int, default=100)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--max-filings-per-symbol", type=int, default=6)
+    ap.add_argument("--max-filings-per-symbol", type=int, default=5)
     args = ap.parse_args()
 
     from colab_build_all_nse_delivery_multifactor_candidate import load_bulk
