@@ -28,9 +28,9 @@ All values can be changed from the sidebar.
 
 ### 3. Production ML delivery + intraday routing
 
-The dashboard now routes Delivery mode to the existing certified `next_session`
-classifier/regressor and Intraday mode to the certified `target_30m` production
-model. A signal is displayed directly after a stock is searched. Unknown symbols
+The dashboard now routes Delivery mode to the live ALL-NSE 59-feature
+classifier/regressor candidate and Intraday mode to the certified `target_30m`
+production model. A signal is displayed directly after a stock is searched. Unknown symbols
 are blocked instead of receiving an unvalidated score.
 
 ### 4. Continuous seven-prediction validation
