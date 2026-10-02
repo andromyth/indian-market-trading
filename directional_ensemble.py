@@ -423,15 +423,15 @@ def _score_model_pair(
         if col not in feature_row.columns
     ]
 
-    if missing_contract:
-        return {
-            "status": "SKIP",
-            "model": classifier_item["name"],
-            "reason": "feature_contract_not_covered",
-            "missing_features": missing_contract,
-        }
+    X = feature_row.copy()
 
-    X = feature_row[
+    for col in missing_contract:
+        # Missing source data stays explicitly missing. The saved sklearn
+        # pipeline is allowed to impute it only if its fitted preprocessing
+        # can accept NaN values.
+        X[col] = np.nan
+
+    X = X[
         required
     ].apply(
         pd.to_numeric,
@@ -443,7 +443,33 @@ def _score_model_pair(
             "status": "SKIP",
             "model": classifier_item["name"],
             "reason": "all_required_inputs_missing",
+            "missing_features": missing_contract,
         }
+
+    if missing_contract:
+        try:
+            named = getattr(
+                clf,
+                "named_steps",
+                {},
+            )
+            imputer = named.get("imputer")
+
+            if imputer is None:
+                return {
+                    "status": "SKIP",
+                    "model": classifier_item["name"],
+                    "reason": "missing_features_without_fitted_imputer",
+                    "missing_features": missing_contract,
+                }
+
+        except Exception:
+            return {
+                "status": "SKIP",
+                "model": classifier_item["name"],
+                "reason": "missing_features_imputer_check_failed",
+                "missing_features": missing_contract,
+            }
 
     try:
         p_up = _safe(
@@ -1163,7 +1189,10 @@ def enrich_delivery_prediction(
 
     base_p = _safe(
         result.get(
-            "probability_up_next_session"
+            "probability_up_next_session",
+            result.get(
+                "p_up"
+            ),
         )
     )
 
