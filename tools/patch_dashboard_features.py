@@ -35,3 +35,5 @@ if render_marker not in text:
 
 APP.write_text(text, encoding="utf-8")
 print("dashboard feature patch applied")
+
+# Trigger the workflow once after it was installed; the patch itself is idempotent.
