@@ -1,0 +1,18 @@
+name: Engine syntax smoke test
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile changed engine modules
+        run: |
+          python -m py_compile             app.py             autonomous_engine.py             all_nse_delivery_model.py             directional_ensemble.py             prediction_history_ui.py             daily_delivery_prediction.py             colab_build_all_nse_delivery_candidate.py
