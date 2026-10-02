@@ -13,6 +13,8 @@ def sha256(path):
     return h.hexdigest()
 
 def main():
+    if len(FEATURES_59) != 59:
+        raise SystemExit(f"Repository feature contract is not 59 features: found {len(FEATURES_59)}")
     ap=argparse.ArgumentParser(); ap.add_argument("--model-dir",default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_candidate_2026"); a=ap.parse_args()
     root=Path(a.model_dir); mp=root/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
     if not mp.exists(): raise SystemExit(f"Missing manifest: {mp}")
@@ -28,8 +30,13 @@ def main():
             if not p.exists(): raise SystemExit(f"Missing {kind}: {p}")
             model=joblib.load(p); steps=getattr(model,"named_steps",{}) ; imp=steps.get("imputer") if hasattr(steps,"get") else None
             learned=int(getattr(imp,"n_features_in_",0)) if imp is not None else 0
-            if not learned and imp is not None and getattr(imp,"statistics_",None) is not None: learned=int(len(imp.statistics_))
-            if learned!=59: raise SystemExit(f"{p}: expected 59 original features, found {learned}")
+            if not learned and imp is not None and getattr(imp,"statistics_",None) is not None:
+                learned=int(len(imp.statistics_))
+            if learned!=59:
+                raise SystemExit(f"{p}: expected 59 original features, found {learned}")
+            names=getattr(model,"feature_names_in_",None)
+            if names is not None and list(names)!=FEATURES_59:
+                raise SystemExit(f"{p}: learned feature-name contract does not match FEATURES_59")
             report["artifacts"].setdefault(name,{})[kind+"_sha256"]=sha256(p)
     out=root/"CANDIDATE_VALIDATION_REPORT_2026.json"; out.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
     print(json.dumps(report,indent=2,default=str))
