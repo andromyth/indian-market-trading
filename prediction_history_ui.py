@@ -617,7 +617,6 @@ def _historical_prediction(
     inputs. The actual target-session OHLC is used only after prediction.
     """
 
-    from pathlib import Path
     from all_nse_delivery_model import (
         BUY_P,
         MIN_EXPECTED_RETURN,
