@@ -402,9 +402,9 @@ def _load_seed() -> pd.DataFrame:
             df["fundamental_available_at"], errors="coerce", utc=True
         )
         if "period_end" not in df.columns:
-            if "trade_date" in df.columns:
+            if "fundamental_period_end" in df.columns:
                 df["period_end"] = pd.to_datetime(
-                    df["trade_date"], errors="coerce", utc=True
+                    df["fundamental_period_end"], errors="coerce", utc=True
                 ).dt.normalize()
             else:
                 continue
