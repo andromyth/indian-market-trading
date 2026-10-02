@@ -1037,6 +1037,157 @@ def _build_latest_features(
 
 
 @lru_cache(maxsize=128)
+def _latest_drive_pit_features(as_of_date: date) -> tuple[pd.DataFrame, str | None]:
+    """Load the latest persisted ALL-NSE Delivery PIT snapshot on/before date."""
+    cache_dir = CACHE_ROOT / "pit"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+
+        features_folder = store._find_child(
+            store.root_id,
+            "features",
+            "application/vnd.google-apps.folder",
+        )
+        if not features_folder:
+            return pd.DataFrame(), None
+
+        daily_folder = store._find_child(
+            features_folder["id"],
+            "daily",
+            "application/vnd.google-apps.folder",
+        )
+        if not daily_folder:
+            return pd.DataFrame(), None
+
+        resp = store.service.files().list(
+            q=(
+                f"'{daily_folder['id']}' in parents "
+                "and name contains 'DELIVERY_PIT_FEATURES_' "
+                "and trashed = false"
+            ),
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=100,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+
+        candidates = []
+
+        for item in resp.get("files", []):
+            name = str(item.get("name", ""))
+            m = re.search(
+                r"DELIVERY_PIT_FEATURES_(20\d{2}-\d{2}-\d{2})\.parquet$",
+                name,
+            )
+            if not m:
+                continue
+
+            try:
+                d = pd.Timestamp(m.group(1)).date()
+            except Exception:
+                continue
+
+            if d <= as_of_date:
+                candidates.append((d, item["id"], name))
+
+        if not candidates:
+            return pd.DataFrame(), None
+
+        target_date, file_id, name = max(
+            candidates,
+            key=lambda x: x[0],
+        )
+
+        local = cache_dir / name
+
+        if not local.exists() or local.stat().st_size == 0:
+            request = store.service.files().get_media(fileId=file_id)
+            temp = local.with_suffix(".tmp")
+
+            with temp.open("wb") as fh:
+                downloader = MediaIoBaseDownload(
+                    fh,
+                    request,
+                )
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+
+            temp.replace(local)
+
+        frame = pd.read_parquet(local)
+
+        if frame.empty:
+            return pd.DataFrame(), str(target_date)
+
+        return frame, str(target_date)
+
+    except Exception:
+        return pd.DataFrame(), None
+
+
+def _pit_row_for_symbol(
+    symbol: str,
+    as_of_date: date,
+) -> tuple[pd.DataFrame, str | None]:
+
+    frame, snapshot_date = _latest_drive_pit_features(
+        as_of_date
+    )
+
+    if frame.empty or "symbol" not in frame.columns:
+        return pd.DataFrame(), snapshot_date
+
+    x = frame.copy()
+
+    x["symbol"] = (
+        x["symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    hit = x[
+        x["symbol"] == _normalize_symbol(symbol)
+    ].copy()
+
+    if hit.empty:
+        return pd.DataFrame(), snapshot_date
+
+    for date_col in (
+        "date",
+        "prediction_date",
+        "as_of_date",
+        "feature_date",
+    ):
+        if date_col in hit.columns:
+            parsed = pd.to_datetime(
+                hit[date_col],
+                errors="coerce",
+            ).dt.normalize()
+
+            hit["_pit_date"] = parsed
+
+            hit = hit[
+                hit["_pit_date"] <= pd.Timestamp(as_of_date)
+            ]
+
+            if not hit.empty:
+                hit = hit.sort_values(
+                    "_pit_date"
+                ).tail(1)
+
+            break
+
+    return hit, snapshot_date
+
+
 def _official_history(
     symbol: str,
     end_iso: str,
@@ -1124,6 +1275,157 @@ def predict_symbol(
             ],
         }
 
+    # Prefer the exact persisted PIT feature snapshot from the candidate
+    # builder. This avoids feature-definition drift between Colab and Streamlit.
+    now_ist = (
+        pd.Timestamp.now(
+            tz="Asia/Kolkata"
+        )
+    )
+
+    if decision_timestamp is not None:
+        try:
+            ts0 = pd.Timestamp(
+                decision_timestamp
+            )
+            if ts0.tzinfo is None:
+                ts0 = ts0.tz_localize(
+                    "Asia/Kolkata"
+                )
+            now_ist = ts0.tz_convert(
+                "Asia/Kolkata"
+            )
+        except Exception:
+            pass
+
+    pit_row, pit_date = _pit_row_for_symbol(
+        root,
+        now_ist.date(),
+    )
+
+    clf, reg, manifest = _load_models()
+    expected_features = list(
+        manifest["features"]
+    )
+
+    if not pit_row.empty:
+
+        feature_frame = pd.DataFrame([
+            {
+                col: (
+                    pit_row.iloc[0][col]
+                    if col in pit_row.columns
+                    else np.nan
+                )
+                for col in expected_features
+            }
+        ]).apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+
+        if list(feature_frame.columns) != expected_features:
+            raise RuntimeError(
+                "Persisted PIT feature order does not match the "
+                "locked 59-feature model contract."
+            )
+
+        p_up = float(
+            np.clip(
+                clf.predict_proba(
+                    feature_frame
+                )[0, 1],
+                0.0,
+                1.0,
+            )
+        )
+
+        expected_return = float(
+            reg.predict(
+                feature_frame
+            )[0]
+        )
+
+        if (
+            p_up >= BUY_P
+            and expected_return > MIN_EXPECTED_RETURN
+        ):
+            signal = "BUY"
+        elif (
+            p_up <= SELL_P
+            and expected_return < -MIN_EXPECTED_RETURN
+        ):
+            signal = "SELL"
+        else:
+            signal = "HOLD"
+
+        non_missing = int(
+            feature_frame.notna()
+            .sum(axis=1)
+            .iloc[0]
+        )
+
+        return {
+            "symbol": root,
+            "prediction_status": "PASS",
+            "mode": "Delivery",
+            "prediction_horizon": "next_session",
+            "model_version": EXPECTED_ENGINE_VERSION,
+            "model_family": manifest.get(
+                "model_family",
+                "logistic_regression + hgb_return_regressor",
+            ),
+            "engine_version": manifest.get(
+                "engine_version"
+            ),
+            "decision_timestamp": (
+                f"{pit_date}T15:30:00+05:30"
+                if pit_date
+                else now_ist.isoformat()
+            ),
+            "reference_session": pit_date,
+            "probability_up_next_session": p_up,
+            "probability_down_next_session": 1.0 - p_up,
+            "predicted_return_next_session": expected_return,
+            "signal": signal,
+            "confidence": (
+                "HIGH"
+                if abs(p_up - 0.5) >= 0.25
+                else "MEDIUM"
+                if abs(p_up - 0.5) >= 0.12
+                else "LOW"
+            ),
+            "feature_count": len(expected_features),
+            "non_missing_feature_count": non_missing,
+            "feature_non_missing_fraction": (
+                non_missing / float(len(expected_features))
+            ),
+            "data_readiness_score": (
+                non_missing / float(len(expected_features))
+            ),
+            "feature_source": "PERSISTED_PIT_SNAPSHOT",
+            "pit_snapshot_date": pit_date,
+            "optional_information_status": {
+                "news": "EXPLICITLY_MISSING_IN_SNAPSHOT",
+                "fno": "EXPLICITLY_MISSING_IN_SNAPSHOT",
+                "fundamentals": "EXPLICITLY_MISSING_IN_SNAPSHOT",
+            },
+            "universe_symbol_count": int(
+                manifest.get("universe_symbol_count", 2593)
+            ),
+            "trainable_symbol_count": int(
+                manifest.get("trainable_symbol_count", 2372)
+            ),
+            "excluded_symbol_count": int(
+                manifest.get("excluded_symbol_count", 221)
+            ),
+            "minimum_history_sessions": int(
+                manifest.get("minimum_history_sessions", 60)
+            ),
+        }
+
+    # Fallback: build the current feature row from official NSE history when
+    # no persisted PIT snapshot is available.
     # Use the latest completed official NSE session available.
     now_ist = (
         pd.Timestamp.now(
