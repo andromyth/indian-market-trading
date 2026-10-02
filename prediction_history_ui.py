@@ -212,15 +212,40 @@ def _replay_benchmark_history(
         x.columns,
         pd.MultiIndex,
     ):
-        x.columns = [
-            str(a).strip().lower()
-            for a, _ in x.columns
-        ]
+        flattened = []
+        for col in x.columns:
+            if isinstance(col, tuple):
+                values = [
+                    str(v).strip().lower()
+                    for v in col
+                    if str(v).strip()
+                ]
+                flattened.append(
+                    values[0]
+                    if values
+                    else ""
+                )
+            else:
+                flattened.append(
+                    str(col).strip().lower()
+                )
+        x.columns = flattened
     else:
         x.columns = [
-            str(c).strip().lower()
-            for c in x.columns
+            str(col).strip().lower()
+            for col in x.columns
         ]
+
+    # A duplicate column label makes x["close"] a DataFrame rather than a
+    # Series, which causes pandas to raise:
+    # "arg must be a list, tuple, 1-d array, or Series".
+    if x.columns.duplicated().any():
+        x = x.loc[
+            :,
+            ~x.columns.duplicated(
+                keep="first"
+            ),
+        ].copy()
 
     rename = {
         "open": "open",
@@ -237,9 +262,17 @@ def _replay_benchmark_history(
     if "date" not in x.columns:
         x = x.reset_index()
         x.columns = [
-            str(c).strip().lower()
-            for c in x.columns
+            str(col).strip().lower()
+            for col in x.columns
         ]
+
+        if x.columns.duplicated().any():
+            x = x.loc[
+                :,
+                ~x.columns.duplicated(
+                    keep="first"
+                ),
+            ].copy()
 
     date_column = next(
         (
