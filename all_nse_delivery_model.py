@@ -1404,7 +1404,10 @@ def predict_symbol(
         # Register compatible auxiliary model evidence without altering
         # the locked ALL-NSE probability.
         try:
-            from directional_ensemble import model_ensemble_direction
+            from directional_ensemble import (
+                model_ensemble_direction,
+                multi_horizon_model_evidence,
+            )
 
             auxiliary_models = model_ensemble_direction(
                 root,
@@ -1412,8 +1415,19 @@ def predict_symbol(
                 horizon="next_session",
                 fno_available=False,
             )
+
+            auxiliary_horizons = multi_horizon_model_evidence(
+                root,
+                feature_frame,
+                fno_available=False,
+            )
+
         except Exception as exc:
             auxiliary_models = {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            auxiliary_horizons = {
                 "status": "ERROR",
                 "error": f"{type(exc).__name__}: {exc}",
             }
@@ -1464,6 +1478,7 @@ def predict_symbol(
                 "fundamentals": "EXPLICITLY_MISSING_IN_SNAPSHOT",
             },
             "auxiliary_model_ensemble": auxiliary_models,
+            "auxiliary_multi_horizon_evidence": auxiliary_horizons,
             "auxiliary_model_consensus_p_up": (
                 auxiliary_models.get("consensus_p_up")
                 if isinstance(auxiliary_models, dict)
@@ -1618,7 +1633,10 @@ def predict_symbol(
     )
 
     try:
-        from directional_ensemble import model_ensemble_direction
+        from directional_ensemble import (
+            model_ensemble_direction,
+            multi_horizon_model_evidence,
+        )
 
         auxiliary_models = model_ensemble_direction(
             root,
@@ -1626,8 +1644,19 @@ def predict_symbol(
             horizon="next_session",
             fno_available=False,
         )
+
+        auxiliary_horizons = multi_horizon_model_evidence(
+            root,
+            feature_frame,
+            fno_available=False,
+        )
+
     except Exception as exc:
         auxiliary_models = {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        auxiliary_horizons = {
             "status": "ERROR",
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -1734,6 +1763,7 @@ def predict_symbol(
             core_readiness
         ),
         "auxiliary_model_ensemble": auxiliary_models,
+        "auxiliary_multi_horizon_evidence": auxiliary_horizons,
         "auxiliary_model_consensus_p_up": (
             auxiliary_models.get("consensus_p_up")
             if isinstance(auxiliary_models, dict)
