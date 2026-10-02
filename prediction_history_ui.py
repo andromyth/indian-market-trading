@@ -942,7 +942,7 @@ def _historical_prediction(
         - pd.Timedelta(days=130)
     )
     # Load enough history through the day before the target session.
-    stock_input = _historical_stock_history_from_drive(
+    stock_input = _historical_symbol_bulk_history(
         root,
         history_start,
         input_end,
