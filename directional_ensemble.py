@@ -943,13 +943,153 @@ def enrich_delivery_prediction(
         )
     )
 
+    base_return = _safe(
+        result.get(
+            "predicted_return_next_session"
+        )
+    )
+
     ensemble_p = _safe(
         ensemble.get(
             "consensus_p_up"
         )
     )
 
-    # The current locked ALL-NSE output remains authoritative. The new evidence
+    context_score = _safe(
+        context.get(
+            "context_score"
+        )
+    )
+
+    context_p = (
+        (context_score + 1.0) / 2.0
+        if np.isfinite(context_score)
+        else np.nan
+    )
+
+    # Provisional multi-source next-session decision score.
+    #
+    # The locked ALL-NSE model remains the strongest component. Compatible
+    # next-session auxiliary models receive secondary weight. Independent
+    # directional context receives a smaller weight. Cross-horizon models are
+    # never blended into this next-session probability.
+    fusion_parts = []
+
+    if np.isfinite(base_p):
+        fusion_parts.append(
+            (
+                0.60
+                if np.isfinite(ensemble_p)
+                else 0.80,
+                base_p,
+            )
+        )
+
+    if np.isfinite(ensemble_p):
+        fusion_parts.append(
+            (
+                0.25,
+                ensemble_p,
+            )
+        )
+
+    if np.isfinite(context_p):
+        fusion_parts.append(
+            (
+                0.15
+                if np.isfinite(ensemble_p)
+                else 0.20,
+                context_p,
+            )
+        )
+
+    weight_total = sum(
+        weight
+        for weight, _
+        in fusion_parts
+    )
+
+    integrated_p = (
+        sum(
+            weight * probability
+            for weight, probability
+            in fusion_parts
+        )
+        / weight_total
+        if weight_total
+        else np.nan
+    )
+
+    auxiliary_expected = np.nan
+
+    vote_returns = []
+
+    for vote in ensemble.get(
+        "votes",
+        [],
+    ):
+        value = _safe(
+            vote.get(
+                "expected_return"
+            )
+        )
+
+        if np.isfinite(value):
+            vote_returns.append(
+                value
+            )
+
+    if vote_returns:
+        auxiliary_expected = float(
+            np.mean(
+                vote_returns
+            )
+        )
+
+    if (
+        np.isfinite(base_return)
+        and np.isfinite(
+            auxiliary_expected
+        )
+    ):
+        integrated_return = (
+            0.75 * base_return
+            + 0.25 * auxiliary_expected
+        )
+
+    else:
+        integrated_return = base_return
+
+    if (
+        np.isfinite(integrated_p)
+        and integrated_p >= 0.60
+        and np.isfinite(integrated_return)
+        and integrated_return > 0.0015
+    ):
+        integrated_signal = "BUY"
+
+    elif (
+        np.isfinite(integrated_p)
+        and integrated_p <= 0.40
+        and np.isfinite(integrated_return)
+        and integrated_return < -0.0015
+    ):
+        integrated_signal = "SELL"
+
+    else:
+        integrated_signal = "HOLD"
+
+    base_signal = result.get(
+        "signal",
+        "UNKNOWN",
+    )
+
+    # Preserve the exact model output, then expose the integrated engine
+    # decision through the existing signal field. The decision is explicitly
+    # marked provisional until prospective OOS validation proves the fusion.
+    out_signal = integrated_signal
+
+    # The current locked ALL-NSE output remains preserved in base_model_* fields.
     # is deliberately exposed as a separate consensus until prospective OOS
     # testing establishes a safe fusion weight.
     out.update({
@@ -962,6 +1102,17 @@ def enrich_delivery_prediction(
             else "DOWN"
             if np.isfinite(base_p)
             else "UNKNOWN"
+        ),
+        "base_model_signal": base_signal,
+        "base_model_expected_return": base_return,
+        "integrated_probability_up_next_session": integrated_p,
+        "integrated_expected_return_next_session": integrated_return,
+        "integrated_signal": out_signal,
+        "decision_engine_version": (
+            "multi_model_context_v1_provisional"
+        ),
+        "decision_engine_validation_status": (
+            "NOT_YET_PROSPECTIVE_VALIDATED"
         ),
         "ensemble_context_direction": (
             context.get(
