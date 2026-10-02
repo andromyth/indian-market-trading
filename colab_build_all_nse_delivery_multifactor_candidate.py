@@ -11,6 +11,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from delivery_training_universe import benchmark_for_symbol
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
 DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
@@ -74,20 +75,100 @@ def add_features(x):
     z["delivery_qty_ratio20"]=dq/dq.rolling(20).mean(); z["delivery_qty_z20"]=(dq-dq.rolling(20).mean())/dq.rolling(20).std()
     return z
 
-def market_context(bulk):
-    d=bulk.groupby("date",as_index=False)["close"].mean().sort_values("date"); c=d["close"]; out=d[["date"]].copy()
-    for n in (1,3,6,12): out[f"market_ret_{n}"]=c.pct_change(n)
-    out["market_rsi14"]=rsi(c,14); out["market_mood_proxy"]=out["market_ret_1"]; out["market_stress_proxy"]=c.pct_change().rolling(20).std()
+def _official_market_context(index_symbol: str) -> pd.DataFrame:
+    """Load persisted official NSE benchmark history and derive market features.
+
+    NSE NIFTY 50 / NIFTY BANK are the canonical market-context sources.
+    We never substitute a cross-sectional mean of constituent stocks because
+    that would make the benchmark endogenous to the training panel.
+    """
+    folder = str(index_symbol).upper().replace("^", "").replace("/", "_")
+    roots = [
+        BASE / "production_data/nse_official/indices" / folder,
+        BASE / "processed/universe_expansion_2026_v4/indices" / folder,
+    ]
+    files = []
+    for root in roots:
+        if root.exists():
+            files.extend(sorted(root.rglob("*.parquet")))
+            files.extend(sorted(root.rglob("*.csv")))
+    if not files:
+        raise FileNotFoundError(
+            f"Persisted official NSE index history not found for {index_symbol}. "
+            f"Checked: {', '.join(str(r) for r in roots)}"
+        )
+
+    parts = []
+    for path in files:
+        try:
+            x = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
+        except Exception:
+            continue
+        if x.empty:
+            continue
+        ren = {}
+        for col in x.columns:
+            lc = str(col).strip().lower()
+            aliases = {
+                "timestamp": "date", "eod_timestamp": "date", "trade_date": "date",
+                "open": "open", "high": "high", "low": "low", "close": "close",
+                "eod_close_index_val": "close",
+                "eod_open_index_val": "open", "eod_high_index_val": "high",
+                "eod_low_index_val": "low",
+            }
+            if lc in aliases:
+                ren[col] = aliases[lc]
+        x = x.rename(columns=ren)
+        if not {"date", "close"}.issubset(x.columns):
+            continue
+        x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = x.dropna(subset=["date", "close"])
+        parts.append(x[["date", "close"]])
+
+    if not parts:
+        raise RuntimeError(f"No readable persisted official NSE history for {index_symbol}")
+
+    x = (
+        pd.concat(parts, ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+    c0 = x["close"]
+    d = c0.diff()
+    gain = d.clip(lower=0).rolling(14, min_periods=14).mean()
+    loss = (-d.clip(upper=0)).rolling(14, min_periods=14).mean()
+    rsi14 = (100.0 - 100.0 / (1.0 + gain / loss.replace(0, np.nan))).where(loss.ne(0), 100.0)
+    out = pd.DataFrame({"date": x["date"]})
+    for n in (1, 3, 6, 12):
+        out[f"market_ret_{n}"] = c0.pct_change(n)
+    out["market_rsi14"] = rsi14
+    out["market_mood_proxy"] = out["market_ret_1"]
+    out["market_stress_proxy"] = c0.pct_change().rolling(20, min_periods=20).std()
     return out
 
-def make_panel(bulk,symbols):
-    ctx=market_context(bulk); parts=[]
+def market_context_tables() -> dict[str, pd.DataFrame]:
+    return {
+        "^NSEI": _official_market_context("^NSEI"),
+        "^NSEBANK": _official_market_context("^NSEBANK"),
+    }
+
+def make_panel(bulk, symbols):
+    ctxs = market_context_tables()
+    parts = []
     for sym in symbols:
-        z=add_features(bulk[bulk["symbol"].eq(sym)].copy()).merge(ctx,on="date",how="left")
-        for n in (1,6,12): z[f"relative_ret_{n}"]=z[f"ret_{n}"]-z[f"market_ret_{n}"]
-        z["decision_timestamp"]=z["date"]+pd.Timedelta(hours=15,minutes=30)
+        z = add_features(bulk[bulk["symbol"].eq(sym)].copy())
+        benchmark = benchmark_for_symbol(sym)
+        ctx = ctxs.get(benchmark)
+        if ctx is None or ctx.empty:
+            raise RuntimeError(f"Missing official NSE benchmark context for {sym}: {benchmark}")
+        z = z.merge(ctx, on="date", how="left")
+        for n in (1, 6, 12):
+            z[f"relative_ret_{n}"] = z[f"ret_{n}"] - z[f"market_ret_{n}"]
+        z["decision_timestamp"] = z["date"] + pd.Timedelta(hours=15, minutes=30)
         parts.append(z)
-    return pd.concat(parts,ignore_index=True).sort_values(["symbol","decision_timestamp"]).reset_index(drop=True)
+    return pd.concat(parts, ignore_index=True).sort_values(["symbol", "decision_timestamp"]).reset_index(drop=True)
 
 def merge_optional(panel):
     out=panel.copy(); audit={}
