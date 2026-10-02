@@ -362,7 +362,40 @@ if analysis_view == "Historical Replay":
                         m1.metric("ML Signal", ml["signal"])
                         m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
                         m3.metric("Model confidence", ml["confidence"])
-                        m4.metric("Data readiness", f"{ml['data_readiness_score']:.0%}")
+                        readiness_count = int(
+                            ml.get(
+                                "non_missing_feature_count",
+                                round(
+                                    float(
+                                        ml.get(
+                                            "data_readiness_score",
+                                            0.0,
+                                        )
+                                    )
+                                    * int(
+                                        ml.get(
+                                            "feature_count",
+                                            59,
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                        readiness_total = int(
+                            ml.get(
+                                "feature_count",
+                                59,
+                            )
+                        )
+                        m4.metric(
+                            "Data readiness",
+                            (
+                                f"{readiness_count}/{readiness_total} "
+                                f"({readiness_count / readiness_total:.1%})"
+                                if readiness_total > 0
+                                else "—"
+                            ),
+                        )
                         if float(ml.get("data_readiness_score", 0.0)) < 0.70:
                             st.warning("DATA-LIMITED REPLAY: the certified model produced a 30-minute probability, but fewer than 70% of the required information groups were historically available. Treat the model probability as model output, not as full-data trading confidence.")
                         r1,r2,r3,r4 = st.columns(4)
