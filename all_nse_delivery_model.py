@@ -1617,6 +1617,21 @@ def predict_symbol(
         .iloc[0]
     )
 
+    try:
+        from directional_ensemble import model_ensemble_direction
+
+        auxiliary_models = model_ensemble_direction(
+            root,
+            feature_frame,
+            horizon="next_session",
+            fno_available=False,
+        )
+    except Exception as exc:
+        auxiliary_models = {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
     feature_count = int(
         len(expected_features)
     )
@@ -1717,6 +1732,17 @@ def predict_symbol(
         ),
         "data_readiness_score": float(
             core_readiness
+        ),
+        "auxiliary_model_ensemble": auxiliary_models,
+        "auxiliary_model_consensus_p_up": (
+            auxiliary_models.get("consensus_p_up")
+            if isinstance(auxiliary_models, dict)
+            else None
+        ),
+        "auxiliary_model_consensus_direction": (
+            auxiliary_models.get("consensus_direction", "UNKNOWN")
+            if isinstance(auxiliary_models, dict)
+            else "UNKNOWN"
         ),
         "optional_information_status": {
             "news": "UNAVAILABLE_TO_TRAINED_CONTRACT",
