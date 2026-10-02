@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Build ALL-NSE 59-feature multi-factor Delivery candidates in Colab."""
 from __future__ import annotations
-import argparse, hashlib, json
+import argparse, hashlib, json, threading, time, xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import requests
 import joblib
 import numpy as np
 import pandas as pd
@@ -18,6 +20,140 @@ from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_
 DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
 DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_candidate_2026"
 BASE=Path("/content/drive/MyDrive/Indian_Market_Research")
+
+FUND_BROAD=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+FUND_CACHE=BASE/"corporate/xbrl_cache/all_nse_2025_2026"
+NSE_HOME="https://www.nseindia.com/"
+NSE_IF_API="https://www.nseindia.com/api/integrated-filing-results"
+FUND_FIELDS={
+ "fundamental_revenue":("RevenueFromOperations","RevenueFromOperationsNetOfExciseDuty","InterestEarned","GrossPremiumIncome","GrossPremiumsWritten"),
+ "fundamental_pat":("ProfitLossForPeriod","ProfitLossForThePeriod","ProfitLossAfterTax","ProfitLossAfterTaxesMinorityInterestAndShareOfProfitLossOfAssociates","ProfitLossFromOrdinaryActivitiesAfterTax","ProfitLossAfterTaxAndExtraordinaryItems","ProfitLossAfterTaxBeforeExtraordinaryItems"),
+ "fundamental_eps":("BasicAndDilutedEPSAfterExtraordinaryItemsNetOfTaxExpenseForThePeriodNotToBeAnnualized","BasicEarningsPerShare","DilutedEarningsPerShare","EarningsPerShareBasic","EarningsPerShareDiluted"),
+ "fundamental_finance_cost":("FinanceCosts","FinanceCost"),
+ "fundamental_total_equity":("TotalEquity","Equity","EquityAttributableToOwnersOfParent","OtherEquity","Capital","ReservesAndSurplus"),
+ "fundamental_total_debt":("TotalDebt","Debt","Borrowings"),
+ "fundamental_cash":("CashAndCashEquivalents","CashAndBankBalances","CashAndBank"),
+}
+_fund_local=threading.local()
+def _fund_session():
+    s=getattr(_fund_local,"s",None)
+    if s is None:
+        s=requests.Session(); s.headers.update({"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/134 Safari/537.36","Accept":"application/json,text/plain,*/*","Accept-Language":"en-GB,en-US;q=0.9,en;q=0.8","Referer":"https://www.nseindia.com/companies-listing/corporate-integrated-filing","X-Requested-With":"XMLHttpRequest"})
+        try: s.get(NSE_HOME,timeout=15)
+        except Exception: pass
+        _fund_local.s=s
+    return s
+def _fd(x):
+    return pd.to_datetime(x,errors="coerce",utc=True,dayfirst=True) if x is not None else pd.NaT
+def _fn(x):
+    try:
+        t=str(x).strip().replace(",","")
+        if t.startswith("(") and t.endswith(")"): t="-"+t[1:-1]
+        return float(t)
+    except Exception: return np.nan
+def _fl(tag): return str(tag).split("}",1)[-1].split(":",1)[-1]
+def _catalog_all():
+    s=_fund_session(); out=[]; size=500
+    for page in range(1,401):
+        params={"type":"Integrated Filing- Financials","index":"equities","from_date":"01-01-2025","to_date":"30-09-2026","page":page,"size":size}
+        last=None
+        for attempt in range(3):
+            try:
+                rr=s.get(NSE_IF_API,params=params,timeout=30); rr.raise_for_status(); payload=rr.json(); batch=payload.get("data",[]) if isinstance(payload,dict) else payload; last=None; break
+            except Exception as exc: last=exc; time.sleep(1.0*(attempt+1))
+        if last: raise last
+        if not batch: break
+        out.extend(batch)
+        if page%20==0: print(f"fundamental catalog pages={page} rows={len(out):,}")
+        if len(batch)<size: break
+    print(f"fundamental catalog rows={len(out):,}")
+    return out
+def _fund_filings(catalog,symbols,max_each=4):
+    rows=[]
+    for r in catalog:
+        if str(r.get("type","")).strip().lower()!="integrated filing- financials": continue
+        sym=normalize_symbol(r.get("symbol","")); url=str(r.get("xbrl") or "").strip(); pe=_fd(r.get("qe_Date")); av=_fd(r.get("broadcast_Date")); con=str(r.get("consolidated","")).strip().lower()=="consolidated"
+        if sym in symbols and url and pd.notna(pe) and pd.notna(av): rows.append({"symbol":sym,"period_end":pe.normalize(),"fundamental_available_at":av,"xbrl_url":url,"consolidated":con})
+    if not rows: return []
+    d=pd.DataFrame(rows); chosen=[]
+    for (sym,pe),g in d.groupby(["symbol","period_end"],sort=False):
+        g=g.sort_values(["consolidated","fundamental_available_at"],ascending=[False,False]); chosen.append(g.iloc[0].to_dict())
+    d=pd.DataFrame(chosen).sort_values(["symbol","period_end","fundamental_available_at"])
+    return d.groupby("symbol",sort=False,group_keys=False).tail(max_each).to_dict("records")
+def _fund_cache(url):
+    import hashlib
+    return FUND_CACHE/(hashlib.sha256(url.encode()).hexdigest()[:24]+".xbrl")
+def _fund_xml(f):
+    cp=_fund_cache(f["xbrl_url"]); cp.parent.mkdir(parents=True,exist_ok=True)
+    if cp.exists() and cp.stat().st_size: return cp.read_bytes()
+    s=_fund_session()
+    for attempt in range(3):
+        try:
+            rr=s.get(f["xbrl_url"],headers={"Accept":"*/*","Referer":NSE_HOME},timeout=30); rr.raise_for_status(); cp.write_bytes(rr.content); return rr.content
+        except Exception:
+            time.sleep(1.0*(attempt+1))
+    return b""
+def _fund_parse(f):
+    try:
+        root=ET.fromstring(_fund_xml(f)); xbrli="http://www.xbrl.org/2003/instance"; meta={}
+        for ctx in root.findall(f"{{{xbrli}}}context"):
+            cid=ctx.get("id"); per=ctx.find(f"{{{xbrli}}}period"); start=end=inst=pd.NaT
+            if per is not None:
+                for e in per:
+                    n=_fl(e.tag).lower()
+                    if n=="startdate": start=_fd(e.text)
+                    elif n=="enddate": end=_fd(e.text)
+                    elif n=="instant": inst=_fd(e.text)
+            dim=any(_fl(e.tag) in ("explicitMember","typedMember") for e in ctx.iter()); meta[cid]=(start,end,inst,dim)
+        facts={}
+        for e in root.iter():
+            cid=e.get("contextRef"); m=meta.get(cid)
+            if not cid or e.text is None or (m and m[3]): continue
+            v=_fn(e.text)
+            if np.isfinite(v): facts.setdefault(cid,{})[_fl(e.tag)]=v
+        q=facts.get("OneD",{}); bs=facts.get("OneI",{})
+        def pick(d,names):
+            for n in names:
+                if n in d and np.isfinite(d[n]): return float(d[n])
+            return np.nan
+        rev=pick(q,FUND_FIELDS["fundamental_revenue"]); pat=pick(q,FUND_FIELDS["fundamental_pat"]); eps=pick(q,FUND_FIELDS["fundamental_eps"]); fin=pick(q,FUND_FIELDS["fundamental_finance_cost"])
+        eq=pick(bs,("TotalEquity","Equity","EquityAttributableToOwnersOfParent","OtherEquity"))
+        if not np.isfinite(eq):
+            cap=pick(bs,("Capital","EquityShareCapital")); res=pick(bs,("ReservesAndSurplus","OtherEquity")); eq=(cap+res) if np.isfinite(cap) and np.isfinite(res) else np.nan
+        cash=pick(bs,FUND_FIELDS["fundamental_cash"]); debt=pick(bs,("TotalDebt","Debt","Borrowings")); cur=pick(bs,("BorrowingsCurrent",)); non=pick(bs,("BorrowingsNoncurrent",))
+        if np.isfinite(cur) or np.isfinite(non): debt=sum(v for v in (cur,non) if np.isfinite(v))
+        pbt=pick(q,("ProfitBeforeTax","ProfitLossFromOrdinaryActivitiesBeforeTax")); dep=pick(q,("DepreciationDepletionAndAmortisationExpense","DepreciationAndAmortisationExpense","Depreciation")); ebitda=(pbt+(fin if np.isfinite(fin) else 0)+(dep if np.isfinite(dep) else 0)) if np.isfinite(pbt) else np.nan
+        vals={"fundamental_revenue":rev,"fundamental_pat":pat,"fundamental_eps":eps,"fundamental_ebitda":ebitda,"fundamental_finance_cost":fin,"fundamental_total_equity":eq,"fundamental_total_debt":debt,"fundamental_cash":cash}
+        if not any(np.isfinite(v) for v in vals.values()): return None
+        return {**f,**vals,"fundamental_source":"NSE_XBRL_PIT","fundamental_basis":"Integrated_Filing_OneD_OneI"}
+    except Exception: return None
+def _ensure_broad_fundamentals(symbols):
+    if FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0:
+        try:
+            q=pd.read_parquet(FUND_BROAD); cov=q["symbol"].map(normalize_symbol).nunique() if "symbol" in q else 0
+            if cov>=max(100,int(len(symbols)*0.8)): return {"path":str(FUND_BROAD),"rows":len(q),"symbols":cov,"rebuilt":False}
+        except Exception: pass
+    print(f"Building broad PIT fundamentals for {len(symbols):,} trainable symbols...")
+    cat=_catalog_all(); filings=_fund_filings(cat,set(symbols),max_each=4)
+    parsed=[]
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futs=[ex.submit(_fund_parse,f) for f in filings]
+        for i,fut in enumerate(as_completed(futs),1):
+            r=fut.result()
+            if r: parsed.append(r)
+            if i%500==0: print(f"fundamentals XBRL={i:,}/{len(filings):,} parsed={len(parsed):,}")
+    if not parsed: raise RuntimeError("ALL-NSE PIT fundamentals: no XBRL filings could be parsed")
+    d=pd.DataFrame(parsed); d["symbol"]=d["symbol"].map(normalize_symbol); d["period_end"]=pd.to_datetime(d["period_end"],utc=True).dt.normalize(); d["fundamental_available_at"]=pd.to_datetime(d["fundamental_available_at"],utc=True)
+    for c in FUND_FIELDS: d[c]=pd.to_numeric(d[c],errors="coerce")
+    d=d.sort_values(["symbol","period_end","fundamental_available_at"]).drop_duplicates(["symbol","period_end"],keep="last")
+    pieces=[]
+    for sym,g in d.groupby("symbol",sort=False):
+        g=g.sort_values("period_end").copy()
+        for base,growth in (("fundamental_revenue","fund_revenue_growth"),("fundamental_pat","fund_pat_growth"),("fundamental_eps","fund_eps_growth"),("fundamental_ebitda","fund_ebitda_growth")): g[growth]=g[base].pct_change(fill_method=None)
+        g["fund_pat_margin"]=g["fundamental_pat"]/g["fundamental_revenue"].replace(0,np.nan); g["fund_debt_to_equity"]=g["fundamental_total_debt"]/g["fundamental_total_equity"].replace(0,np.nan); g["fund_cash_to_debt"]=g["fundamental_cash"]/g["fundamental_total_debt"].replace(0,np.nan); pieces.append(g)
+    d=pd.concat(pieces,ignore_index=True).replace([np.inf,-np.inf],np.nan); FUND_BROAD.parent.mkdir(parents=True,exist_ok=True); d.to_parquet(FUND_BROAD,index=False)
+    report={"path":str(FUND_BROAD),"rows":len(d),"symbols":int(d["symbol"].nunique()),"target_symbols":len(symbols),"symbol_coverage_pct":round(100*d["symbol"].nunique()/len(symbols),3) if symbols else 0.0,"filings_selected":len(filings),"filings_parsed":len(parsed),"feature_coverage_pct":{c:round(100*d[c].notna().mean(),3) for c in FUND_FIELDS}}
+    FUND_BROAD.with_suffix(".json").write_text(json.dumps(report,indent=2),encoding="utf-8"); print(json.dumps(report,indent=2)); return report
 
 def sha256(path: Path)->str:
     h=hashlib.sha256()
@@ -267,6 +403,7 @@ def main():
     out=Path(args.out); out.mkdir(parents=True,exist_ok=True); bulk=load_bulk(Path(args.bulk_root))
     roster=training_roster(bulk,min_history=args.min_history)
     trainable=list(roster["trainable_symbols"])
+    _ensure_broad_fundamentals(trainable)
     universe={"universe_source":roster.get("universe_source"),"universe_as_of":roster.get("universe_as_of"),"universe_symbol_count":int(roster["universe_symbol_count"]),"symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),"trainable_symbol_count":int(roster["trainable_symbol_count"]),"excluded_symbol_count":int(roster["excluded_symbol_count"]),"minimum_history_sessions":int(roster["minimum_history_sessions"])}
     panel,audit=merge_optional(make_panel(bulk,trainable))
     (out/"DATA_READINESS_REPORT_2026.json").write_text(json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},indent=2,default=str),encoding="utf-8")
