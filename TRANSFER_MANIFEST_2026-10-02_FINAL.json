@@ -1,0 +1,14 @@
+{
+  "transfer_id": "multifactor-readiness-v2-final-2026-10-02",
+  "required_branch": "multifactor-readiness-v2-final",
+  "required_feature_count": 59,
+  "required_feature": "fno_fut_basis",
+  "builder_version_marker": "2026-all-nse-delivery-multifactor-59-candidate-v2",
+  "persistent_filing_cache": "corporate/pit_fundamentals_filing_cache_2025_2026_v3.parquet",
+  "candidate_cache_markers": [
+    "CANDIDATE_BUILD_META_2026.json",
+    "candidate_input_signature"
+  ],
+  "runner_preflight_required": true,
+  "production_model_change": false
+}
