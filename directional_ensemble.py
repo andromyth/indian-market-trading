@@ -552,6 +552,7 @@ def _augment_auxiliary_features(
     announcements: list[dict[str, Any]] | None,
     fno: dict[str, Any] | None,
     event_risk: float = 0.0,
+    as_of: Any | None = None,
 ) -> pd.DataFrame:
     """Create the broad feature surface expected by older compatible models.
 
@@ -716,6 +717,143 @@ def _augment_auxiliary_features(
         )
 
         if broad is not None and not broad.empty:
+
+            # Populate contract names that are deterministic transformations
+            # of data already present in this causal feature row.
+            if "peer_ret_12" not in broad.columns:
+                if "relative_ret_12" in broad.columns:
+                    broad["peer_ret_12"] = broad[
+                        "relative_ret_12"
+                    ]
+                else:
+                    broad["peer_ret_12"] = np.nan
+
+            if "market_mood_score" not in broad.columns:
+                broad["market_mood_score"] = _safe(
+                    event_risk
+                )
+
+            if "news_mood_score" not in broad.columns:
+                broad["news_mood_score"] = pd.to_numeric(
+                    broad.get(
+                        "news_sentiment_24h",
+                        np.nan,
+                    ),
+                    errors="coerce",
+                )
+
+            if "core_market_ready" not in broad.columns:
+                broad["core_market_ready"] = pd.to_numeric(
+                    broad.get(
+                        "price_market_ready",
+                        np.nan,
+                    ),
+                    errors="coerce",
+                )
+
+            if "news_ready" not in broad.columns:
+                broad["news_ready"] = pd.to_numeric(
+                    broad.get(
+                        "ready_news",
+                        broad.get(
+                            "news_available",
+                            0.0,
+                        ),
+                    ),
+                    errors="coerce",
+                )
+
+            if "event_ready" not in broad.columns:
+                broad["event_ready"] = pd.to_numeric(
+                    broad.get(
+                        "ready_events",
+                        broad.get(
+                            "event_available",
+                            0.0,
+                        ),
+                    ),
+                    errors="coerce",
+                )
+
+            if "fno_ready" not in broad.columns:
+                broad["fno_ready"] = pd.to_numeric(
+                    broad.get(
+                        "ready_fno",
+                        broad.get(
+                            "fno_available",
+                            0.0,
+                        ),
+                    ),
+                    errors="coerce",
+                )
+
+            if "event_age_minutes" not in broad.columns:
+                event_age = np.nan
+
+                if announcements:
+                    ages = []
+
+                    for announcement in announcements:
+
+                        value = (
+                            announcement.get(
+                                "date"
+                            )
+                            or announcement.get(
+                                "an_dt"
+                            )
+                            or announcement.get(
+                                "sort_date"
+                            )
+                        )
+
+                        try:
+                            event_ts = pd.Timestamp(
+                                value
+                            )
+
+                            cutoff_ts = pd.Timestamp(
+                                as_of
+                            )
+
+                            if event_ts.tzinfo is None:
+                                event_ts = event_ts.tz_localize(
+                                    "Asia/Kolkata"
+                                )
+                            else:
+                                event_ts = event_ts.tz_convert(
+                                    "Asia/Kolkata"
+                                )
+
+                            if cutoff_ts.tzinfo is None:
+                                cutoff_ts = cutoff_ts.tz_localize(
+                                    "Asia/Kolkata"
+                                )
+                            else:
+                                cutoff_ts = cutoff_ts.tz_convert(
+                                    "Asia/Kolkata"
+                                )
+
+                            age = (
+                                cutoff_ts
+                                - event_ts
+                            ).total_seconds() / 60.0
+
+                            if np.isfinite(age) and age >= 0:
+                                ages.append(
+                                    age
+                                )
+
+                        except Exception:
+                            continue
+
+                    if ages:
+                        event_age = float(
+                            min(ages)
+                        )
+
+                broad["event_age_minutes"] = event_age
+
             broad = broad.drop(
                 columns=[
                     c
@@ -1172,6 +1310,7 @@ def enrich_delivery_prediction(
                 "event_risk"
             )
         ),
+        as_of=as_of,
     )
 
     ensemble = model_ensemble_direction(
