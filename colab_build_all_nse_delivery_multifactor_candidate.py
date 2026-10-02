@@ -94,39 +94,127 @@ def _fund_xml(f):
             time.sleep(1.0*(attempt+1))
     return b""
 def _fund_parse(f):
+    """Parse the primary dimension-free PIT financial contexts from an NSE XBRL filing.
+
+    Older versions assumed context IDs named OneD/OneI. NSE filings are not
+    contractually required to use those IDs, so select duration/instant
+    contexts by their periods and the filing period end instead.
+    """
     try:
-        root=ET.fromstring(_fund_xml(f)); xbrli="http://www.xbrl.org/2003/instance"; meta={}
+        raw = _fund_xml(f)
+        if not raw:
+            return None
+        root=ET.fromstring(raw)
+        xbrli="http://www.xbrl.org/2003/instance"
+        meta={}
+        contexts=[]
+        target_end=pd.Timestamp(f["period_end"]).tz_convert("UTC") if pd.Timestamp(f["period_end"]).tzinfo else pd.Timestamp(f["period_end"],tz="UTC")
+
         for ctx in root.findall(f"{{{xbrli}}}context"):
-            cid=ctx.get("id"); per=ctx.find(f"{{{xbrli}}}period"); start=end=inst=pd.NaT
+            cid=ctx.get("id")
+            if not cid:
+                continue
+            per=ctx.find(f"{{{xbrli}}}period")
+            start_ts=end_ts=inst_ts=pd.NaT
             if per is not None:
                 for e in per:
                     n=_fl(e.tag).lower()
-                    if n=="startdate": start=_fd(e.text)
-                    elif n=="enddate": end=_fd(e.text)
-                    elif n=="instant": inst=_fd(e.text)
-            dim=any(_fl(e.tag) in ("explicitMember","typedMember") for e in ctx.iter()); meta[cid]=(start,end,inst,dim)
+                    if n=="startdate":
+                        start_ts=_fd(e.text)
+                    elif n=="enddate":
+                        end_ts=_fd(e.text)
+                    elif n=="instant":
+                        inst_ts=_fd(e.text)
+            dim=any(_fl(e.tag) in ("explicitmember","typedmember") for e in ctx.iter())
+            duration_days=np.nan
+            if pd.notna(start_ts) and pd.notna(end_ts):
+                duration_days=(end_ts-start_ts).total_seconds()/86400.0
+            meta[cid]={"start":start_ts,"end":end_ts,"instant":inst_ts,"dim":dim,"duration_days":duration_days}
+            contexts.append(cid)
+
         facts={}
         for e in root.iter():
-            cid=e.get("contextRef"); m=meta.get(cid)
-            if not cid or e.text is None or (m and m[3]): continue
+            cid=e.get("contextRef")
+            m=meta.get(cid)
+            if not cid or e.text is None or m is None or m["dim"]:
+                continue
             v=_fn(e.text)
-            if np.isfinite(v): facts.setdefault(cid,{})[_fl(e.tag)]=v
-        q=facts.get("OneD",{}); bs=facts.get("OneI",{})
+            if np.isfinite(v):
+                facts.setdefault(cid,{})[_fl(e.tag)]=v
+
+        duration_ids=[]
+        instant_ids=[]
+        for cid,m in meta.items():
+            end=m["end"]
+            if pd.notna(end) and pd.notna(target_end):
+                diff_days=abs((end-target_end).total_seconds()/86400.0)
+            else:
+                diff_days=1e9
+            if pd.notna(m["start"]) and pd.notna(m["end"]) and m["duration_days"] > 0:
+                duration_ids.append((diff_days,m["duration_days"],cid))
+            elif pd.notna(m["instant"]):
+                inst_diff=abs((m["instant"]-target_end).total_seconds()/86400.0) if pd.notna(target_end) else 1e9
+                instant_ids.append((inst_diff,cid))
+
+        # For income/flow fields prefer the shortest clean duration ending on the
+        # filing period (normally the quarter) with non-empty facts. If there is
+        # no exact-period context, use the closest period-end duration.
+        duration_ids.sort(key=lambda x:(x[0],x[1]))
+        q={}
+        for diff_days,duration,cid in duration_ids:
+            if facts.get(cid):
+                q=facts[cid]
+                if diff_days <= 3:
+                    break
+                # keep the closest available context when no exact period exists
+        bs={}
+        for diff_days,cid in sorted(instant_ids):
+            if facts.get(cid):
+                bs=facts[cid]
+                if diff_days <= 3:
+                    break
+
         def pick(d,names):
             for n in names:
-                if n in d and np.isfinite(d[n]): return float(d[n])
+                if n in d and np.isfinite(d[n]):
+                    return float(d[n])
             return np.nan
-        rev=pick(q,FUND_FIELDS["fundamental_revenue"]); pat=pick(q,FUND_FIELDS["fundamental_pat"]); eps=pick(q,FUND_FIELDS["fundamental_eps"]); fin=pick(q,FUND_FIELDS["fundamental_finance_cost"])
+
+        rev=pick(q,FUND_FIELDS["fundamental_revenue"])
+        pat=pick(q,FUND_FIELDS["fundamental_pat"])
+        eps=pick(q,FUND_FIELDS["fundamental_eps"])
+        fin=pick(q,FUND_FIELDS["fundamental_finance_cost"])
+
         eq=pick(bs,("TotalEquity","Equity","EquityAttributableToOwnersOfParent","OtherEquity"))
         if not np.isfinite(eq):
-            cap=pick(bs,("Capital","EquityShareCapital")); res=pick(bs,("ReservesAndSurplus","OtherEquity")); eq=(cap+res) if np.isfinite(cap) and np.isfinite(res) else np.nan
-        cash=pick(bs,FUND_FIELDS["fundamental_cash"]); debt=pick(bs,("TotalDebt","Debt","Borrowings")); cur=pick(bs,("BorrowingsCurrent",)); non=pick(bs,("BorrowingsNoncurrent",))
-        if np.isfinite(cur) or np.isfinite(non): debt=sum(v for v in (cur,non) if np.isfinite(v))
-        pbt=pick(q,("ProfitBeforeTax","ProfitLossFromOrdinaryActivitiesBeforeTax")); dep=pick(q,("DepreciationDepletionAndAmortisationExpense","DepreciationAndAmortisationExpense","Depreciation")); ebitda=(pbt+(fin if np.isfinite(fin) else 0)+(dep if np.isfinite(dep) else 0)) if np.isfinite(pbt) else np.nan
-        vals={"fundamental_revenue":rev,"fundamental_pat":pat,"fundamental_eps":eps,"fundamental_ebitda":ebitda,"fundamental_finance_cost":fin,"fundamental_total_equity":eq,"fundamental_total_debt":debt,"fundamental_cash":cash}
-        if not any(np.isfinite(v) for v in vals.values()): return None
-        return {**f,**vals,"fundamental_source":"NSE_XBRL_PIT","fundamental_basis":"Integrated_Filing_OneD_OneI"}
-    except Exception: return None
+            cap=pick(bs,("Capital","EquityShareCapital"))
+            res=pick(bs,("ReservesAndSurplus","OtherEquity"))
+            eq=(cap+res) if np.isfinite(cap) and np.isfinite(res) else np.nan
+
+        cash=pick(bs,FUND_FIELDS["fundamental_cash"])
+        debt=pick(bs,("TotalDebt","Debt","Borrowings"))
+        cur=pick(bs,("BorrowingsCurrent",))
+        non=pick(bs,("BorrowingsNoncurrent",))
+        if np.isfinite(cur) or np.isfinite(non):
+            debt=sum(v for v in (cur,non) if np.isfinite(v))
+
+        pbt=pick(q,("ProfitBeforeTax","ProfitLossFromOrdinaryActivitiesBeforeTax"))
+        dep=pick(q,("DepreciationDepletionAndAmortisationExpense","DepreciationAndAmortisationExpense","Depreciation"))
+        ebitda=(pbt+(fin if np.isfinite(fin) else 0)+(dep if np.isfinite(dep) else 0)) if np.isfinite(pbt) else np.nan
+
+        vals={
+            "fundamental_revenue":rev,
+            "fundamental_pat":pat,
+            "fundamental_eps":eps,
+            "fundamental_ebitda":ebitda,
+            "fundamental_finance_cost":fin,
+            "fundamental_total_equity":eq,
+            "fundamental_total_debt":debt,
+            "fundamental_cash":cash,
+        }
+        if not any(np.isfinite(v) for v in vals.values()):
+            return None
+        return {**f,**vals,"fundamental_source":"NSE_XBRL_PIT","fundamental_basis":"Integrated_Filing_period_aware_OneD_OneI_fallback"}
 def _ensure_broad_fundamentals(symbols):
     if FUND_BROAD.exists() and FUND_BROAD.stat().st_size>0:
         try:
@@ -154,6 +242,9 @@ def _ensure_broad_fundamentals(symbols):
     d=pd.concat(pieces,ignore_index=True).replace([np.inf,-np.inf],np.nan); FUND_BROAD.parent.mkdir(parents=True,exist_ok=True); d.to_parquet(FUND_BROAD,index=False)
     report={"path":str(FUND_BROAD),"rows":len(d),"symbols":int(d["symbol"].nunique()),"target_symbols":len(symbols),"symbol_coverage_pct":round(100*d["symbol"].nunique()/len(symbols),3) if symbols else 0.0,"filings_selected":len(filings),"filings_parsed":len(parsed),"feature_coverage_pct":{c:round(100*d[c].notna().mean(),3) for c in FUND_FIELDS}}
     FUND_BROAD.with_suffix(".json").write_text(json.dumps(report,indent=2),encoding="utf-8"); print(json.dumps(report,indent=2)); return report
+
+if len(FEATURES_59) != 59:
+    raise RuntimeError(f"Feature contract must contain exactly 59 features; found {len(FEATURES_59)}")
 
 def sha256(path: Path)->str:
     h=hashlib.sha256()
@@ -298,6 +389,13 @@ def merge_optional(panel):
         if layer.empty: audit[kind]={"exists":False,"rows":0}; continue
         out=merge_pit_layer(out,layer,cols,kind)
         audit[kind]={"exists":True,"rows":int(len(layer)),"symbols":int(layer["symbol"].nunique())}
+    # Derived F&O basis is PIT-safe because fno_fut_close is already merged
+    # with the same backward-as-of F&O timestamp contract.
+    if "fno_fut_basis" not in out.columns:
+        fut=pd.to_numeric(out.get("fno_fut_close"),errors="coerce")
+        spot=pd.to_numeric(out.get("close"),errors="coerce")
+        out["fno_fut_basis"]=(fut/spot.replace(0,np.nan))-1.0
+
     # ONLY the broad ALL-NSE PIT fundamentals layer is accepted here.
     # Never silently fall back to the legacy three-stock pilot.
     fp=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
