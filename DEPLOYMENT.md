@@ -39,26 +39,25 @@ The replay ledger can be exported to CSV from the dashboard for later prediction
 
 NSE official primary layer + Colab model builder added.
 
-## Continuous validation + Delivery ML release (2026-09-29)
+## Live ALL-NSE Delivery release (2026-10-02)
 
-The current application release adds the existing next-session Delivery
-classifier/regressor without retraining it, plus a persistent prediction ledger,
-a validation ledger, a rolling seven-completed-prediction scorecard, and a model-
-health flag. Delivery predictions are recorded automatically when a supported
-stock is searched in Delivery mode.
+The live Delivery path now uses the existing ALL-NSE 59-feature candidate
+artifacts stored in Google Drive. The candidate manifest covers the official NSE
+equity universe and currently has 2,372 trainable symbols out of 2,593 universe
+symbols, using a 60-session minimum-history gate.
 
-The current validated Delivery universe remains the three symbols declared in
-`production_delivery_model/PREDICTION_ENGINE_MANIFEST_V2_2026.json`. Unknown
-symbols are blocked rather than silently generalized.
+The live Delivery adapter verifies the locked Step 5K manifest/model hashes,
+builds the exact 59-feature contract from official NSE EOD data, uses official
+NSE market context, keeps unavailable optional information explicitly missing,
+returns BUY/SELL/HOLD for trainable symbols, and records successful predictions
+in the existing persistent prediction ledger.
 
-New runtime files:
-- `delivery_model.py`
-- `autonomous_engine.py`
-- `prediction_ledger.py`
-- `prediction_validation.py`
-- `model_health.py`
-- `production_delivery_model/` (small delivery model artifacts)
+The ALL-NSE Delivery model remains a monitored candidate under prospective OOS
+validation; its live connection does not claim validated profitability.
 
-Historical datasets remain outside GitHub and should remain in Google Drive.
-Run `python deployment_smoke_test.py` before deployment. No order-placement code
-is added by this release.
+Intraday remains on the certified target_30m 137-feature production model.
+No order-placement code is present.
+
+Historical data and candidate artifacts remain in Google Drive; secrets must
+remain in Streamlit Secrets and never in GitHub.
+Run python deployment_smoke_test.py before deployment.
