@@ -47,7 +47,7 @@ from free_data import (
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
-from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status
+from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
 from directional_ensemble import enrich_delivery_prediction
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
@@ -1301,44 +1301,95 @@ if style == "Intraday" and live_records:
 if style == "Delivery" and live_records:
     try:
         for r in live_records:
-            company_root = r["symbol"].replace(".NS", "").replace(".BO", "")
+            company_root = (
+                r["symbol"]
+                .replace(".NS", "")
+                .replace(".BO", "")
+            )
+
             item = {
                 "symbol": company_root,
                 "price_df": r["raw_df"],
                 "market_df": r["market_df"],
-                "news": {"available": 1.0 if r.get("matched_news") else 0.0},
-                "event": {
-                    "available": 1.0 if r.get("announcements") else 0.0,
-                    "high_impact": 1.0 if r.get("announcements") else 0.0,
+                "news": {
+                    "available": (
+                        1.0
+                        if r.get("matched_news")
+                        else 0.0
+                    ),
                 },
-                "fno": {**(r.get("fo") or {}), "available": 1.0 if r.get("fo") else 0.0},
-                "decision_timestamp": str(r["raw_df"].index[-1]),
+                "event": {
+                    "available": (
+                        1.0
+                        if r.get("announcements")
+                        else 0.0
+                    ),
+                    "high_impact": (
+                        1.0
+                        if r.get("announcements")
+                        else 0.0
+                    ),
+                },
+                "fno": {
+                    **(r.get("fo") or {}),
+                    "available": (
+                        1.0
+                        if r.get("fo")
+                        else 0.0
+                    ),
+                },
+                "decision_timestamp": str(
+                    r["raw_df"].index[-1]
+                ),
             }
-            result = delivery_prediction(item, sync_drive=True)
-            delivery_results[r["symbol"]] = result
-        cached_delivery_validation.clear()
-    except Exception as exc:
-        # Enrich the already-produced ALL-NSE prediction with gated
-        # legacy-model votes and point-in-time information evidence.
-        # This does not replace the locked model's primary signal.
-        for rec in live_records:
-            symbol_key = rec["symbol"]
-            base_result = direct_delivery_results.get(symbol_key)
-            if not base_result or base_result.get("prediction_status") != "PASS":
+
+            result = delivery_prediction(
+                item,
+                sync_drive=True,
+            )
+
+            delivery_results[
+                r["symbol"]
+            ] = result
+
+        # Existing primary prediction is retained. Add the gated model/context
+        # diagnostics after successful inference so they can never mask a
+        # primary prediction failure.
+        for r in live_records:
+            symbol_key = r["symbol"]
+            base_result = (
+                direct_delivery_results.get(
+                    symbol_key
+                )
+                or delivery_results.get(
+                    symbol_key
+                )
+            )
+
+            if not base_result:
+                continue
+
+            if base_result.get(
+                "prediction_status"
+            ) != "PASS":
                 continue
 
             try:
-                hist = rec["raw_df"].copy()
-                if hasattr(hist.index, "name"):
-                    hist = hist.reset_index()
-                elif "date" not in hist.columns:
+                hist = r["raw_df"].copy()
+
+                if "date" not in hist.columns:
                     hist = hist.reset_index()
 
-                market = rec.get("market_df")
+                market = r.get(
+                    "market_df"
+                )
+
                 if market is None:
                     market = pd.DataFrame()
+
                 else:
                     market = market.copy()
+
                     if "date" not in market.columns:
                         market = market.reset_index()
 
@@ -1347,7 +1398,7 @@ if style == "Delivery" and live_records:
                     market,
                 )
 
-                direct_delivery_results[symbol_key] = enrich_delivery_prediction(
+                enriched = enrich_delivery_prediction(
                     base_result,
                     symbol_key,
                     feature_row,
@@ -1355,30 +1406,57 @@ if style == "Delivery" and live_records:
                     market,
                     base_result.get(
                         "decision_timestamp"
-                    ) or rec["raw_df"].index[-1],
-                    news_items=[
-                        *tag_news_items(
-                            rec.get("matched_news", [])
-                        ),
-                    ],
-                    announcements=rec.get(
+                    )
+                    or r["raw_df"].index[-1],
+                    news_items=tag_news_items(
+                        r.get(
+                            "matched_news",
+                            [],
+                        )
+                    ),
+                    announcements=r.get(
                         "announcements",
                         [],
                     ),
-                    fno=rec.get(
+                    fno=r.get(
                         "fo",
                         {},
                     ),
                 )
 
+                if direct_delivery_results.get(
+                    symbol_key
+                ):
+                    direct_delivery_results[
+                        symbol_key
+                    ] = enriched
+
+                if delivery_results.get(
+                    symbol_key
+                ):
+                    delivery_results[
+                        symbol_key
+                    ] = enriched
+
             except Exception as enrich_exc:
-                base_result["ensemble_context_status"] = "ERROR"
-                base_result["ensemble_context_error"] = (
-                    f"{type(enrich_exc).__name__}: {enrich_exc}"
+                base_result[
+                    "ensemble_context_status"
+                ] = "ERROR"
+                base_result[
+                    "ensemble_context_error"
+                ] = (
+                    f"{type(enrich_exc).__name__}: "
+                    f"{enrich_exc}"
                 )
 
-        st.error(f"Delivery ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
-        delivery_results = {}
+        cached_delivery_validation.clear()
+
+    except Exception as exc:
+        st.error(
+            "Delivery ML engine could not produce a live prediction: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
 
 if style == "Delivery" and direct_delivery_runtime is not None:
     with st.expander("ALL-NSE Delivery runtime diagnostic", expanded=True):
