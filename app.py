@@ -928,60 +928,297 @@ def cached_delivery_validation():
 live_records = []
 data_diagnostics = []
 revision = int(st.session_state.get("watchlist_revision", 0))
+
+# Delivery ML uses the official NSE daily layer directly. The generic
+# dashboard history provider must not block Delivery inference.
 for symbol in symbols:
-    raw_df = load_history(symbol, period, interval, revision)
+
+    raw_df = pd.DataFrame()
+    company_root = (
+        symbol.replace(".NS", "")
+        .replace(".BO", "")
+        .upper()
+    )
+
+    if style == "Delivery" and symbol.endswith(".NS"):
+        try:
+            end_date = pd.Timestamp.now(
+                tz="Asia/Kolkata"
+            ).date()
+
+            start_date = (
+                end_date
+                - pd.Timedelta(days=420)
+            )
+
+            official = nse_fetch_equity_history(
+                company_root,
+                start_date,
+                end_date,
+                sync_drive=True,
+            )
+
+            if official is not None and not official.empty:
+                raw_df = official.copy()
+
+        except Exception as exc:
+            data_diagnostics.append({
+                "symbol": symbol,
+                "status": "NSE_OFFICIAL_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+
+    # Fallback is allowed for obtaining the UI chart/context only. The
+    # all-NSE Delivery model itself independently verifies and fetches its
+    # official NSE history.
     if raw_df.empty:
-        data_diagnostics.append({"symbol": symbol, "status": "NO_DATA", "reason": "No usable history returned by NSE/persistent/Dhan/Yahoo providers."})
+        try:
+            if style == "Delivery":
+                fallback = get_historical(
+                    symbol,
+                    "420d",
+                    "1d",
+                    force_refresh=True,
+                )
+            else:
+                fallback = load_history(
+                    symbol,
+                    period,
+                    interval,
+                    revision,
+                )
+
+            if fallback is not None and not fallback.empty:
+                raw_df = fallback.copy()
+
+        except Exception:
+            raw_df = pd.DataFrame()
+
+    if raw_df.empty:
+        if not any(
+            x.get("symbol") == symbol
+            for x in data_diagnostics
+        ):
+            data_diagnostics.append({
+                "symbol": symbol,
+                "status": "NO_DATA",
+                "reason": "No usable official NSE or fallback history.",
+            })
         continue
+
+    # Canonicalize the EOD frame for the existing dashboard components.
+    if "date" in raw_df.columns:
+        raw_df["date"] = pd.to_datetime(
+            raw_df["date"],
+            errors="coerce",
+        ).dt.normalize()
+
+        raw_df = (
+            raw_df
+            .dropna(subset=["date"])
+            .sort_values("date")
+            .drop_duplicates("date", keep="last")
+            .set_index("date")
+        )
+
+        for col in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]:
+            if col in raw_df.columns:
+                raw_df[col] = pd.to_numeric(
+                    raw_df[col],
+                    errors="coerce",
+                )
+
+    raw_df = raw_df.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+
+    if "Volume" not in raw_df.columns:
+        raw_df["Volume"] = np.nan
+
+    raw_df = raw_df.sort_index()
+
     if len(raw_df) < slow + 15:
-        data_diagnostics.append({"symbol": symbol, "status": "INSUFFICIENT_HISTORY", "rows": int(len(raw_df)), "required": int(slow + 15)})
+        data_diagnostics.append({
+            "symbol": symbol,
+            "status": "INSUFFICIENT_HISTORY",
+            "rows": int(len(raw_df)),
+            "required": int(slow + 15),
+        })
         continue
-    company_root = symbol.replace(".NS", "").replace(".BO", "")
+
     benchmark_symbol = benchmark_for_symbol(symbol)
-    market_df = load_benchmark(benchmark_symbol, period, interval, revision)
+
     try:
-        df = add_indicators(raw_df, fast=fast, slow=slow)
-    except ValueError as exc:
-        # A provider returning a malformed/partial history must not crash the whole dashboard.
-        st.warning(f"{symbol}: market history could not be normalized for technical indicators ({exc}).")
+        market_df = load_benchmark(
+            benchmark_symbol,
+            period,
+            interval,
+            revision,
+        )
+    except Exception:
+        market_df = pd.DataFrame()
+
+    try:
+        df = add_indicators(
+            raw_df,
+            fast=fast,
+            slow=slow,
+        )
+    except Exception:
         df = pd.DataFrame()
+
     try:
-        mkt_df = add_indicators(market_df, fast=fast, slow=slow) if not market_df.empty else market_df
-    except ValueError:
+        mkt_df = (
+            add_indicators(
+                market_df,
+                fast=fast,
+                slow=slow,
+            )
+            if not market_df.empty
+            else market_df
+        )
+    except Exception:
         mkt_df = pd.DataFrame()
+
     aliases = stock_news_keywords(symbol)
-    matched_news = news_for_symbol(aliases, news_items)
-    news_stat = news_metrics(matched_news)
-    news_perception_label, news_freshness = news_perception(news_stat)
-    announcements_raw = load_announcements(company_root)
+    matched_news = news_for_symbol(
+        aliases,
+        news_items,
+    )
+
+    news_stat = news_metrics(
+        matched_news
+    )
+
+    news_perception_label, news_freshness = (
+        news_perception(news_stat)
+    )
+
+    try:
+        announcements_raw = load_announcements(
+            company_root
+        )
+    except Exception:
+        announcements_raw = []
+
     announcements = []
+
     for item in announcements_raw[:5]:
         if not isinstance(item, dict):
             continue
+
         announcements.append({
-            "subject": item.get("subject") or item.get("desc") or item.get("attchmntText") or "Corporate announcement",
-            "date": item.get("an_dt") or item.get("date") or item.get("sort_date") or "",
-            "link": item.get("attchmntFile") or item.get("link") or "",
+            "subject":
+                item.get("subject")
+                or item.get("desc")
+                or item.get("attchmntText")
+                or "Corporate announcement",
+
+            "date":
+                item.get("an_dt")
+                or item.get("date")
+                or item.get("sort_date")
+                or "",
+
+            "link":
+                item.get("attchmntFile")
+                or item.get("link")
+                or "",
         })
-    event_items = announcement_to_news(announcements)
-    all_event_news = matched_news + event_items
-    event_risk = event_risk_score(matched_news, announcements)
-    live_news_score = news_metrics(all_event_news)["score"] if all_event_news else 0.0
+
+    event_items = announcement_to_news(
+        announcements
+    )
+
+    all_event_news = (
+        matched_news
+        + event_items
+    )
+
+    event_risk = event_risk_score(
+        matched_news,
+        announcements,
+    )
+
+    live_news_score = (
+        news_metrics(all_event_news)["score"]
+        if all_event_news
+        else 0.0
+    )
+
     if company_root in INDEX_SYMBOLS:
         fo_symbol, is_index = company_root, True
     else:
         fo_symbol, is_index = company_root, False
-    raw_chain = load_option_chain(fo_symbol, is_index)
-    fo = fo_summarize(raw_chain) if raw_chain else {}
+
+    try:
+        raw_chain = load_option_chain(
+            fo_symbol,
+            is_index,
+        )
+        fo = (
+            fo_summarize(raw_chain)
+            if raw_chain
+            else {}
+        )
+    except Exception:
+        fo = {}
+
+    try:
+        t_score = (
+            technical_score(
+                df,
+                fast=fast,
+                slow=slow,
+            )
+            if not df.empty
+            else 0.0
+        )
+    except Exception:
+        t_score = 0.0
+
+    try:
+        m_score = (
+            market_regime_score(
+                mkt_df,
+                fast=fast,
+                slow=slow,
+            )
+            if not mkt_df.empty
+            else 0.0
+        )
+    except Exception:
+        m_score = 0.0
+
     live_records.append({
-        "symbol": symbol, "raw_df": raw_df, "df": df, "market_df": market_df,
-        "mkt_df": mkt_df, "benchmark_symbol": benchmark_symbol,
-        "matched_news": matched_news, "news_stat": news_stat,
-        "news_perception_label": news_perception_label, "news_freshness": news_freshness,
-        "announcements": announcements, "event_risk": event_risk,
-        "live_news_score": live_news_score, "fo": fo,
-        "t_score": technical_score(df, fast=fast, slow=slow),
-        "m_score": market_regime_score(mkt_df, fast=fast, slow=slow) if not mkt_df.empty else 0.0,
+        "symbol": symbol,
+        "raw_df": raw_df,
+        "df": df,
+        "market_df": market_df,
+        "mkt_df": mkt_df,
+        "benchmark_symbol": benchmark_symbol,
+        "matched_news": matched_news,
+        "news_stat": news_stat,
+        "news_perception_label": news_perception_label,
+        "news_freshness": news_freshness,
+        "announcements": announcements,
+        "event_risk": event_risk,
+        "live_news_score": live_news_score,
+        "fo": fo,
+        "t_score": t_score,
+        "m_score": m_score,
     })
 
 production_results = {}
