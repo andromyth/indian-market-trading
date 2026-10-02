@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 from nse_data_layer import fetch_equity_history
 from prediction_ledger import load_records
@@ -138,6 +139,186 @@ def render_delivery_forecast(results: dict[str, dict[str, Any]]) -> None:
         st.dataframe(out, width="stretch", hide_index=True)
 
 
+def _replay_benchmark_history(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> tuple[pd.DataFrame, str]:
+
+    """Load a benchmark series for retrospective replay.
+
+    Official NSE index history is preferred. If the hosted NSE endpoint does
+    not return a usable response, use Yahoo Finance only as an explicitly
+    labeled retrospective reference fallback. This fallback is never used by
+    the prospective live PIT snapshot path.
+    """
+    benchmark = (
+        "^NSEBANK"
+        if _root(symbol)
+        in {
+            "HDFCBANK",
+            "ICICIBANK",
+            "SBIN",
+            "AXISBANK",
+            "KOTAKBANK",
+            "INDUSINDBK",
+            "BANKBARODA",
+            "PNB",
+        }
+        else "^NSEI"
+    )
+
+    try:
+        from nse_data_layer import fetch_index_history
+
+        official = fetch_index_history(
+            benchmark,
+            start.date(),
+            end.date(),
+            sync_drive=True,
+        )
+
+        if (
+            official is not None
+            and not official.empty
+        ):
+            return official, "OFFICIAL_NSE"
+
+    except Exception:
+        pass
+
+    # Retrospective-only fallback. The table is explicitly labeled in the UI
+    # and is not written back into the official archive.
+    data = yf.download(
+        benchmark,
+        start=start.date(),
+        end=(end + pd.Timedelta(days=1)).date(),
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+
+    if data is None or data.empty:
+        raise RuntimeError(
+            f"No benchmark history available for retrospective replay: {benchmark}"
+        )
+
+    x = data.copy()
+
+    if isinstance(
+        x.columns,
+        pd.MultiIndex,
+    ):
+        x.columns = [
+            str(a).strip().lower()
+            for a, _ in x.columns
+        ]
+    else:
+        x.columns = [
+            str(c).strip().lower()
+            for c in x.columns
+        ]
+
+    rename = {
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "adj close": "close",
+    }
+
+    x = x.rename(
+        columns=rename
+    )
+
+    if "date" not in x.columns:
+        x = x.reset_index()
+        x.columns = [
+            str(c).strip().lower()
+            for c in x.columns
+        ]
+
+    date_column = next(
+        (
+            col
+            for col in (
+                "date",
+                "datetime",
+            )
+            if col in x.columns
+        ),
+        None,
+    )
+
+    if date_column is None:
+        raise RuntimeError(
+            f"Yahoo benchmark response has no date column for {benchmark}."
+        )
+
+    x["date"] = pd.to_datetime(
+        x[date_column],
+        errors="coerce",
+    ).dt.normalize()
+
+    for col in (
+        "open",
+        "high",
+        "low",
+        "close",
+    ):
+        if col in x.columns:
+            x[col] = pd.to_numeric(
+                x[col],
+                errors="coerce",
+            )
+
+    required = [
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    missing = [
+        col
+        for col in required
+        if col not in x.columns
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"Yahoo benchmark missing fields for {benchmark}: {missing}"
+        )
+
+    x = x.dropna(
+        subset=required
+    )
+
+    x["symbol"] = benchmark
+    x = (
+        x[
+            [
+                "symbol",
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        ]
+        .sort_values("date")
+        .drop_duplicates(
+            "date",
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    return x, "YAHOO_REFERENCE_FALLBACK"
+
+
 def _historical_ml_vs_actual(
     symbol: str,
     prediction_date: pd.Timestamp,
@@ -158,10 +339,19 @@ def _historical_ml_vs_actual(
         minutes=30,
     )
 
+    benchmark_history, benchmark_source = _replay_benchmark_history(
+        root,
+        prediction_date - pd.Timedelta(days=365),
+        prediction_date,
+    )
+
     prediction = all_nse_delivery_predict(
         root,
         decision_ts,
+        market_override=benchmark_history,
     )
+
+    prediction["historical_replay_benchmark_source"] = benchmark_source
 
     if prediction.get("prediction_status") != "PASS":
         return {
@@ -224,6 +414,10 @@ def _historical_ml_vs_actual(
         "prediction_source": "HISTORICAL_ML_REPLAY",
         "model_version": prediction.get(
             "model_version"
+        ),
+        "benchmark_source": prediction.get(
+            "historical_replay_benchmark_source",
+            "UNKNOWN",
         ),
         "signal": prediction.get(
             "signal"
@@ -746,6 +940,7 @@ def render_prediction_history() -> None:
         "actual_date",
         "prediction_source",
         "model_version",
+        "benchmark_source",
         "signal",
         "p_up",
         "expected_return",
