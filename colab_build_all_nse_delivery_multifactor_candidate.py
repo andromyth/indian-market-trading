@@ -191,14 +191,24 @@ def merge_optional(panel):
 
 def add_targets(panel,steps,name):
     x=panel.sort_values(["symbol","decision_timestamp"]).copy()
-    x[f"target_return_{name}"]=x.groupby("symbol")["close"].shift(-steps)/x["close"]-1.0
+    with np.errstate(divide="ignore",invalid="ignore",over="ignore"):
+        x[f"target_return_{name}"]=x.groupby("symbol")["close"].shift(-steps)/x["close"]-1.0
+    x[f"target_return_{name}"]=x[f"target_return_{name}"].replace([np.inf,-np.inf],np.nan)
     x[f"target_up_{name}"]=(x[f"target_return_{name}"]>0).astype(int)
     return x.dropna(subset=[f"target_return_{name}"])
 
 def fit_models(frame,horizon):
     cutoff=frame["decision_timestamp"].max()-pd.Timedelta(days=60); tr=frame[frame["decision_timestamp"]<cutoff]; te=frame[frame["decision_timestamp"]>=cutoff]
     if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique()<2: raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
-    Xtr=tr[FEATURES_59].apply(pd.to_numeric,errors="coerce"); Xte=te[FEATURES_59].apply(pd.to_numeric,errors="coerce")
+    Xtr=tr[FEATURES_59].apply(pd.to_numeric,errors="coerce").replace([np.inf,-np.inf],np.nan)
+    Xte=te[FEATURES_59].apply(pd.to_numeric,errors="coerce").replace([np.inf,-np.inf],np.nan)
+    yreg=tr[f"target_return_{horizon}"].replace([np.inf,-np.inf],np.nan)
+    good=yreg.notna()
+    Xtr=Xtr.loc[good]
+    yreg=yreg.loc[good]
+    yclf=tr.loc[good,f"target_up_{horizon}"].astype(int)
+    if Xtr.empty or yclf.nunique()<2:
+        raise RuntimeError(f"{horizon}: finite training set is insufficient after non-finite-value cleanup")
     clf=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("scale",StandardScaler(with_mean=False)),("model",LogisticRegression(C=.5,class_weight="balanced",solver="lbfgs",max_iter=2500,random_state=42))])
     reg=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("model",HistGradientBoostingRegressor(max_iter=180,learning_rate=.04,max_leaf_nodes=19,l2_regularization=2.0,random_state=42))])
     clf.fit(Xtr,tr[f"target_up_{horizon}"].astype(int)); reg.fit(Xtr,tr[f"target_return_{horizon}"].astype(float))
