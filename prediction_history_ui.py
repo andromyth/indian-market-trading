@@ -177,313 +177,51 @@ def _price_path(
     ttl=3600,
     show_spinner=False,
 )
+@st.cache_resource(ttl=3600)
+def _drive_store():
+    from persistent_store import GoogleDriveStore
+    return GoogleDriveStore()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _compact_symbol_history(symbol: str) -> pd.DataFrame:
+    from delivery_history_cache import _load_compact
+
+    root = _root(symbol)
+
+    frame = _load_compact(
+        _drive_store(),
+        root,
+        pd.Timestamp("2099-12-31").date(),
+    )
+
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    return _clean_ohlc(frame)
+
+
 def _stock_history_from_drive(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Load one symbol's official NSE history efficiently.
-
-    Preferred source:
-      Drive persistent compact per-symbol Delivery history.
-
-    Fallback:
-      Direct official NSE bulk-EOD archive.
-
-    The compact-history path is intentionally used first because the project
-    already maintains it specifically to avoid rediscovering/re-downloading
-    the full daily NSE archive for every Delivery request.
-    """
-    from delivery_history_cache import (
-        _load_compact,
-    )
-    from persistent_store import GoogleDriveStore
-
-    root = _root(symbol)
-
-    start_day = pd.Timestamp(
-        start
-    ).normalize()
-
-    end_day = pd.Timestamp(
-        end
-    ).normalize()
-
-    store = GoogleDriveStore()
-
-    try:
-        compact = _load_compact(
-            store,
-            root,
-            end_day.date(),
-        )
-
-        if (
-            compact is not None
-            and not compact.empty
-        ):
-            cleaned = _clean_ohlc(
-                compact
-            )
-
-            if not cleaned.empty:
-
-                cleaned = cleaned[
-                    (
-                        cleaned["date"]
-                        >= start_day
-                    )
-                    & (
-                        cleaned["date"]
-                        <= end_day
-                    )
-                ].copy()
-
-                if not cleaned.empty:
-                    return cleaned
-
-    except Exception:
-        pass
-
-    # Compact history not available: use the persisted official daily archive.
-    # This fallback is kept correct but is deliberately not the normal path.
-    from pathlib import Path
-    from googleapiclient.http import MediaIoBaseDownload
-    from nse_data_layer import (
-        _drive_bulk_file_index,
+    """Return a filtered view of cached compact official NSE history."""
+    frame = _compact_symbol_history(
+        _root(symbol)
     )
 
-    index = _drive_bulk_file_index()
-
-    if not index:
-        raise RuntimeError(
-            f"Official NSE Drive archive index unavailable for {root}."
-        )
-
-    pieces = []
-
-    for day in pd.date_range(
-        start_day,
-        end_day,
-        freq="D",
-    ):
-
-        filename = (
-            f"BhavCopy_NSE_CM_0_0_0_"
-            f"{day:%Y%m%d}_F_0000.parquet"
-        )
-
-        file_id = index.get(
-            filename
-        )
-
-        if not file_id:
-            continue
-
-        cache_dir = (
-            Path(".historical_bulk_cache")
-            / root
-        )
-
-        cache_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        cache_file = (
-            cache_dir
-            / filename
-        )
-
-        try:
-
-            if (
-                not cache_file.exists()
-                or cache_file.stat().st_size == 0
-            ):
-
-                request = (
-                    store.service
-                    .files()
-                    .get_media(
-                        fileId=file_id
-                    )
-                )
-
-                temp = cache_file.with_suffix(
-                    ".tmp"
-                )
-
-                with temp.open("wb") as fh:
-
-                    downloader = MediaIoBaseDownload(
-                        fh,
-                        request,
-                    )
-
-                    done = False
-
-                    while not done:
-                        _, done = downloader.next_chunk()
-
-                temp.replace(
-                    cache_file
-                )
-
-            frame = pd.read_parquet(
-                cache_file
-            )
-
-            if frame is None or frame.empty:
-                continue
-
-            frame.columns = [
-                str(col).strip().lower()
-                for col in frame.columns
-            ]
-
-            if frame.columns.duplicated().any():
-                frame = frame.loc[
-                    :,
-                    ~frame.columns.duplicated(
-                        keep="first"
-                    ),
-                ].copy()
-
-            if "symbol" not in frame.columns:
-                continue
-
-            mask = (
-                frame["symbol"]
-                .astype(str)
-                .str.strip()
-                .str.upper()
-                == root
-            )
-
-            hit = frame[
-                mask
-            ].copy()
-
-            if hit.empty:
-                continue
-
-            if "date" not in hit.columns:
-                hit["date"] = day
-
-            hit["date"] = pd.to_datetime(
-                hit["date"],
-                errors="coerce",
-            ).dt.normalize()
-
-            aliases = {
-                "open": (
-                    "open",
-                    "opnpric",
-                    "ch_opening_price",
-                ),
-                "high": (
-                    "high",
-                    "hghpric",
-                    "ch_trade_high_price",
-                ),
-                "low": (
-                    "low",
-                    "lwpric",
-                    "ch_trade_low_price",
-                ),
-                "close": (
-                    "close",
-                    "clspric",
-                    "ch_closing_price",
-                ),
-                "volume": (
-                    "volume",
-                    "ttltradgvol",
-                    "ch_tot_traded_qty",
-                ),
-                "delivery_qty": (
-                    "delivery_qty",
-                    "cop_deliv_qty",
-                ),
-                "delivery_pct": (
-                    "delivery_pct",
-                    "cop_deliv_perc",
-                ),
-            }
-
-            for target, names in aliases.items():
-
-                source = next(
-                    (
-                        name
-                        for name in names
-                        if name in hit.columns
-                    ),
-                    None,
-                )
-
-                if source is None:
-                    hit[target] = np.nan
-
-                elif target != source:
-                    hit[target] = hit[source]
-
-                hit[target] = pd.to_numeric(
-                    hit[target],
-                    errors="coerce",
-                )
-
-            hit = hit.dropna(
-                subset=[
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            )
-
-            if not hit.empty:
-                pieces.append(
-                    hit[
-                        [
-                            "symbol",
-                            "date",
-                            "open",
-                            "high",
-                            "low",
-                            "close",
-                            "volume",
-                            "delivery_qty",
-                            "delivery_pct",
-                        ]
-                    ]
-                )
-
-        except Exception:
-            continue
-
-    if not pieces:
+    if frame.empty:
         return pd.DataFrame()
 
-    return (
-        pd.concat(
-            pieces,
-            ignore_index=True,
-        )
-        .sort_values("date")
-        .drop_duplicates(
-            "date",
-            keep="last",
-        )
-        .reset_index(drop=True)
-    )
+    start_day = pd.Timestamp(start).normalize()
+    end_day = pd.Timestamp(end).normalize()
 
+    return frame[
+        (frame["date"] >= start_day)
+        & (frame["date"] <= end_day)
+    ].copy()
 
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def _benchmark_history(
     symbol: str,
     start: pd.Timestamp,
@@ -687,11 +425,12 @@ def _historical_prediction(
         - pd.Timedelta(days=1)
     ).normalize()
 
+    # The model's longest rolling windows are far shorter than one year.
+    # ~130 calendar days provides ample prior NSE sessions while keeping replay fast.
     history_start = (
         input_end
-        - pd.Timedelta(days=365)
+        - pd.Timedelta(days=130)
     )
-
     # Load enough history through the day before the target session.
     stock_input = _stock_history_from_drive(
         root,
@@ -721,11 +460,12 @@ def _historical_prediction(
 
     # Benchmark also stops at the reference session. The target session is
     # deliberately excluded to prevent look-ahead leakage.
+    # Market context only needs enough sessions for 12-session returns
+    # and the 20-session stress statistic.
     benchmark_start = (
         reference_date
-        - pd.Timedelta(days=365)
+        - pd.Timedelta(days=130)
     )
-
     benchmark, benchmark_source = _benchmark_history(
         root,
         benchmark_start,
@@ -774,16 +514,14 @@ def _historical_prediction(
     else:
         signal = "HOLD"
 
-    # Actual target-session data is deliberately loaded separately, after the
-    # prediction has been generated.
-    future = _stock_history_from_drive(
-        root,
-        target_date,
-        target_date,
+    # Read the actual target row from the same cached compact history.
+    # The target row is not passed into the feature builder.
+    all_history = _compact_symbol_history(
+        root
     )
 
-    actual_rows = future[
-        future["date"] == target_date
+    actual_rows = all_history[
+        all_history["date"] == target_date
     ].sort_values("date")
 
     reference = input_rows[
@@ -1170,146 +908,321 @@ def render_prediction_history() -> None:
 
     out = pd.DataFrame(rows)
 
-    st.markdown(
-        "### Prediction vs actual"
-    )
+    st.markdown("### Result")
 
-    if "actual_return" in out.columns:
+    def _money(value):
+        if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+            return f"₹{float(value):,.2f}"
+        return "—"
 
-        valid = out[
-            out["actual_return"].notna()
-        ]
+    def _pct(value):
+        if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+            return f"{float(value):+.2%}"
+        return "—"
 
-        if not valid.empty:
+    for _, row in out.iterrows():
 
-            m1, m2, m3 = st.columns(3)
+        st.markdown(
+            f"## {row.get('symbol', '')}"
+        )
 
-            m1.metric(
-                "Predictions",
-                len(out),
-            )
-
-            m2.metric(
-                "Actuals available",
-                len(valid),
-            )
-
-            matches = valid[
-                "direction_match"
-            ].dropna()
-
-            m3.metric(
-                "Direction matches",
-                (
-                    f"{int(matches.sum())}/{len(matches)}"
-                    if len(matches)
-                    else "N/A"
-                ),
-            )
-
-    display = out.copy()
-
-    for col in (
-        "reference_close",
-        "predicted_open",
-        "predicted_high",
-        "predicted_low",
-        "predicted_close",
-        "purchase_price",
-        "sale_price",
-        "stop_price",
-        "actual_open",
-        "actual_high",
-        "actual_low",
-        "actual_close",
-    ):
-        if col in display.columns:
-            display[col] = display[col].map(
-                lambda value: (
-                    f"₹{value:,.2f}"
-                    if isinstance(
-                        value,
-                        (
-                            int,
-                            float,
-                            np.floating,
-                        ),
+        if row.get("status") != "OK":
+            st.error(
+                str(
+                    row.get(
+                        "status",
+                        "Prediction failed.",
                     )
-                    and np.isfinite(value)
-                    else value
                 )
             )
+            continue
 
-    for col in (
-        "p_up",
-        "expected_return",
-        "actual_return",
-        "predicted_vs_actual_close_pct",
-        "data_readiness",
-    ):
-        if col in display.columns:
-            display[col] = display[col].map(
-                lambda value: (
-                    f"{value:.2%}"
-                    if isinstance(
-                        value,
-                        (
-                            int,
-                            float,
-                            np.floating,
-                        ),
-                    )
-                    and np.isfinite(value)
-                    else value
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Target session",
+            str(
+                row.get(
+                    "prediction_date",
+                    "—",
+                )
+            ),
+        )
+
+        c2.metric(
+            "Model data through",
+            str(
+                row.get(
+                    "input_through_date",
+                    "—",
+                )
+            ),
+        )
+
+        c3.metric(
+            "Signal",
+            str(
+                row.get(
+                    "signal",
+                    "—",
+                )
+            ),
+        )
+
+        c4.metric(
+            "P(up)",
+            (
+                f"{float(row['p_up']):.1%}"
+                if "p_up" in row
+                and np.isfinite(
+                    float(row["p_up"])
+                )
+                else "—"
+            ),
+        )
+
+        st.markdown(
+            "### Model prediction"
+        )
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric(
+            "Expected move",
+            _pct(
+                row.get(
+                    "expected_return"
+                )
+            ),
+        )
+
+        m2.metric(
+            "Data readiness",
+            (
+                f"{float(row['data_readiness']):.0%}"
+                if "data_readiness" in row
+                and np.isfinite(
+                    float(row["data_readiness"])
+                )
+                else "—"
+            ),
+        )
+
+        m3.metric(
+            "Model",
+            "ALL-NSE 59-feature",
+        )
+
+        st.markdown(
+            "### Indicative price levels"
+        )
+
+        st.caption(
+            "Projected prices are derived from expected return and ATR; "
+            "they are not separate OHLC model targets."
+        )
+
+        p1, p2, p3, p4 = st.columns(4)
+
+        p1.metric(
+            "Reference close",
+            _money(
+                row.get(
+                    "reference_close"
+                )
+            ),
+        )
+
+        p2.metric(
+            "Projected open",
+            _money(
+                row.get(
+                    "predicted_open"
+                )
+            ),
+        )
+
+        p3.metric(
+            "Projected high",
+            _money(
+                row.get(
+                    "predicted_high"
+                )
+            ),
+        )
+
+        p4.metric(
+            "Projected low",
+            _money(
+                row.get(
+                    "predicted_low"
+                )
+            ),
+        )
+
+        p5, p6, p7, p8 = st.columns(4)
+
+        p5.metric(
+            "Projected close",
+            _money(
+                row.get(
+                    "predicted_close"
+                )
+            ),
+        )
+
+        p6.metric(
+            "Indicative purchase",
+            _money(
+                row.get(
+                    "purchase_price"
+                )
+            ),
+        )
+
+        p7.metric(
+            "Indicative sale target",
+            _money(
+                row.get(
+                    "sale_price"
+                )
+            ),
+        )
+
+        p8.metric(
+            "Risk stop reference",
+            _money(
+                row.get(
+                    "stop_price"
+                )
+            ),
+        )
+
+        st.markdown(
+            "### Actual target-session result"
+        )
+
+        a1, a2, a3, a4 = st.columns(4)
+
+        a1.metric(
+            "Actual open",
+            _money(
+                row.get(
+                    "actual_open"
+                )
+            ),
+        )
+
+        a2.metric(
+            "Actual high",
+            _money(
+                row.get(
+                    "actual_high"
+                )
+            ),
+        )
+
+        a3.metric(
+            "Actual low",
+            _money(
+                row.get(
+                    "actual_low"
+                )
+            ),
+        )
+
+        a4.metric(
+            "Actual close",
+            _money(
+                row.get(
+                    "actual_close"
+                )
+            ),
+        )
+
+        e1, e2, e3 = st.columns(3)
+
+        e1.metric(
+            "Actual return",
+            _pct(
+                row.get(
+                    "actual_return"
+                )
+            ),
+        )
+
+        e2.metric(
+            "Predicted vs actual close",
+            _pct(
+                row.get(
+                    "predicted_vs_actual_close_pct"
+                )
+            ),
+        )
+
+        e3.metric(
+            "Direction match",
+            "YES"
+            if bool(
+                row.get(
+                    "direction_match"
                 )
             )
+            else "NO",
+        )
 
-    preferred = [
-        "symbol",
-        "prediction_date",
-        "actual_date",
-        "prediction_source",
-        "model_version",
-        "benchmark_source",
-        "signal",
-        "p_up",
-        "expected_return",
-        "data_readiness",
-        "reference_close",
-        "predicted_open",
-        "predicted_high",
-        "predicted_low",
-        "predicted_close",
-        "purchase_price",
-        "sale_price",
-        "stop_price",
-        "actual_open",
-        "actual_high",
-        "actual_low",
-        "actual_close",
-        "actual_return",
-        "predicted_vs_actual_close_pct",
-        "predicted_direction",
-        "actual_direction",
-        "direction_match",
-        "status",
-    ]
+        st.caption(
+            f"Direction: "
+            f"{row.get('predicted_direction', '—')} → "
+            f"{row.get('actual_direction', '—')} | "
+            f"Benchmark: "
+            f"{row.get('benchmark_source', '—')}"
+        )
 
-    columns = [
-        col
-        for col in preferred
-        if col in display.columns
-    ]
+        with st.expander(
+            "Raw diagnostic data"
+        ):
 
-    st.dataframe(
-        display[columns],
-        width="stretch",
-        hide_index=True,
-    )
+            raw = row.to_dict()
+
+            for key in (
+                "reference_close",
+                "predicted_open",
+                "predicted_high",
+                "predicted_low",
+                "predicted_close",
+                "purchase_price",
+                "sale_price",
+                "stop_price",
+                "actual_open",
+                "actual_high",
+                "actual_low",
+                "actual_close",
+            ):
+
+                if key in raw:
+                    raw[key] = _money(
+                        raw[key]
+                    )
+
+            for key in (
+                "p_up",
+                "expected_return",
+                "actual_return",
+                "predicted_vs_actual_close_pct",
+                "data_readiness",
+            ):
+
+                if key in raw:
+                    raw[key] = _pct(
+                        raw[key]
+                    )
+
+            st.json(raw)
 
     st.caption(
-        "STORED_LIVE and HISTORICAL_ML_REPLAY are kept distinct. "
-        "Historical replay uses only data available on/before the selected "
-        "reference session. Benchmark source is explicitly reported. "
-        "Projected OHLC, purchase and sale levels are derived estimates."
+        "Historical replay is retrospective analysis. The selected target "
+        "session is excluded from model inputs. Price-path figures are "
+        "derived estimates rather than independently trained OHLC predictions."
     )
+
