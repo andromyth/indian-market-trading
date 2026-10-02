@@ -17,7 +17,6 @@ import streamlit as st
 
 from nse_data_layer import fetch_equity_history
 from prediction_ledger import load_records
-from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict
 
 
 def _root(symbol: str) -> str:
