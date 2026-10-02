@@ -47,6 +47,7 @@ from free_data import (
 )
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
+from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -925,6 +926,56 @@ def cached_delivery_validation():
 # ---------------------------------------------------------------- Production ML
 # Fetch all watchlist inputs first so the model can compute cross-sectional
 # ranks/breadth across the user's actual watchlist rather than one symbol at a time.
+# ---------------------------------------------------------------------------
+# Direct ALL-NSE Delivery inference
+# ---------------------------------------------------------------------------
+# Delivery ML must not depend on the legacy generic history loader. On a
+# completed NSE session the candidate's exact PIT snapshot in Drive is the
+# preferred source, so run the model directly for the requested NSE symbols.
+direct_delivery_results = {}
+direct_delivery_errors = {}
+direct_delivery_runtime = None
+
+if style == "Delivery":
+
+    try:
+        direct_delivery_runtime = all_nse_delivery_model_status()
+    except Exception as exc:
+        direct_delivery_runtime = {
+            "status": "MODEL_RUNTIME_ERROR",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+    for requested_symbol in symbols:
+
+        if not requested_symbol.endswith(".NS"):
+            direct_delivery_errors[requested_symbol] = {
+                "stage": "INPUT",
+                "error_type": "UNSUPPORTED_SUFFIX",
+                "error": (
+                    "The active ALL-NSE Delivery model is NSE-equity only; "
+                    "use SYMBOL.NS or a bare NSE symbol."
+                ),
+            }
+            continue
+
+        try:
+            result = all_nse_delivery_predict(
+                requested_symbol,
+                pd.Timestamp.now(
+                    tz="Asia/Kolkata"
+                ),
+            )
+            direct_delivery_results[requested_symbol] = result
+
+        except Exception as exc:
+            direct_delivery_errors[requested_symbol] = {
+                "stage": "ALL_NSE_DELIVERY_MODEL",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
 live_records = []
 data_diagnostics = []
 revision = int(st.session_state.get("watchlist_revision", 0))
@@ -1264,15 +1315,162 @@ if style == "Delivery" and live_records:
         st.error(f"Delivery ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
         delivery_results = {}
 
+if style == "Delivery" and direct_delivery_runtime is not None:
+    with st.expander("ALL-NSE Delivery runtime diagnostic", expanded=True):
+        st.json(direct_delivery_runtime)
+
+    if direct_delivery_errors:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": s,
+                        **details,
+                    }
+                    for s, details in direct_delivery_errors.items()
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
 if not live_records:
-    st.error("No stock analysis result was produced from the active watchlist.")
+    if style == "Delivery" and direct_delivery_results:
+        st.info(
+            "Delivery ML result is available from the dedicated ALL-NSE "
+            "model path. The legacy chart/context history path did not "
+            "produce a record; it does not block the model result."
+        )
+    else:
+        st.error(
+            "No stock analysis result was produced from the active watchlist."
+        )
+
     if data_diagnostics:
-        st.dataframe(pd.DataFrame(data_diagnostics), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame(data_diagnostics),
+            width="stretch",
+            hide_index=True,
+        )
+
     diag = source_diagnostics()
+
     if diag:
-        with st.expander("NSE transport diagnostic", expanded=True):
+        with st.expander(
+            "NSE transport diagnostic",
+            expanded=True,
+        ):
             st.json(diag)
-    st.info("NSE official data is the first remote source for NSE equities. Persistent/local data is used as cache; Dhan and Yahoo are fallbacks only when NSE cannot provide usable history.")
+
+    if style != "Delivery" or not direct_delivery_results:
+        st.info(
+            "NSE official data is the first remote source for NSE equities. "
+            "Persistent/local data is used as cache; Dhan and Yahoo are "
+            "fallbacks only when NSE cannot provide usable history."
+        )
+
+# Render direct ALL-NSE Delivery model results even when the generic
+# dashboard context history is unavailable.
+if style == "Delivery" and direct_delivery_results and not live_records:
+
+    for symbol, dlv in direct_delivery_results.items():
+
+        st.markdown(f"## {symbol}")
+
+        st.markdown(
+            "### Live ALL-NSE Delivery ML — next-session signal"
+        )
+
+        if dlv.get("prediction_status") == "PASS":
+
+            d1, d2, d3, d4, d5 = st.columns(5)
+
+            d1.metric(
+                "Delivery Signal",
+                dlv.get("signal", "HOLD"),
+            )
+
+            d2.metric(
+                "P(up) next session",
+                f"{dlv.get('probability_up_next_session', np.nan):.1%}",
+            )
+
+            d3.metric(
+                "Expected move",
+                f"{dlv.get('predicted_return_next_session', np.nan):+.2%}",
+            )
+
+            d4.metric(
+                "Confidence",
+                dlv.get("confidence", "UNKNOWN"),
+            )
+
+            d5.metric(
+                "Model inputs",
+                str(dlv.get("feature_count", 59)),
+            )
+
+            st.write({
+                "model_version":
+                    dlv.get("model_version"),
+                "reference_session":
+                    dlv.get("reference_session"),
+                "feature_source":
+                    dlv.get("feature_source"),
+                "PIT_snapshot_date":
+                    dlv.get("pit_snapshot_date"),
+                "data_readiness":
+                    dlv.get("data_readiness_score"),
+                "non_missing_features":
+                    (
+                        f"{dlv.get('non_missing_feature_count', 0)}/"
+                        f"{dlv.get('feature_count', 59)}"
+                    ),
+                "trainable_NSE_symbols":
+                    dlv.get("trainable_symbol_count"),
+                "NSE_universe_symbols":
+                    dlv.get("universe_symbol_count"),
+            })
+
+            st.caption(
+                "Direct Delivery inference from the exact persisted "
+                "ALL-NSE PIT feature snapshot. Intraday is unchanged. "
+                "No orders are placed."
+            )
+
+        elif dlv.get("prediction_status") == "BLOCKED":
+
+            st.error(
+                "Delivery prediction blocked: "
+                + str(dlv.get("reason", "unknown"))
+            )
+
+        else:
+
+            st.warning(
+                "Delivery model did not return a prediction."
+            )
+
+    if direct_delivery_errors:
+
+        with st.expander(
+            "Why some Delivery predictions failed",
+            expanded=True,
+        ):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "symbol": s,
+                            **details,
+                        }
+                        for s, details
+                        in direct_delivery_errors.items()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
 for rec in live_records:
     symbol = rec["symbol"]
@@ -1301,7 +1499,11 @@ for rec in live_records:
     previous_close = float(df["Close"].iloc[-2])
     pct_change = (latest_close - previous_close) / previous_close * 100 if previous_close else 0.0
 
-    primary = delivery_results.get(symbol) if style == "Delivery" else production_results.get(symbol)
+    primary = (
+        direct_delivery_results.get(symbol)
+        if style == "Delivery"
+        else production_results.get(symbol)
+    )
     primary_signal = primary.get("signal") if primary else "UNAVAILABLE"
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Primary Signal", primary_signal)
@@ -1326,7 +1528,7 @@ for rec in live_records:
         else:
             st.warning("Production ML prediction unavailable for this symbol; the rule-based context remains available.")
     else:
-        dlv = delivery_results.get(symbol)
+        dlv = direct_delivery_results.get(symbol) or delivery_results.get(symbol)
         st.markdown("### Live ALL-NSE Delivery ML — next-session signal")
         if dlv and dlv.get("prediction_status") == "PASS":
             d1, d2, d3, d4, d5 = st.columns(5)
