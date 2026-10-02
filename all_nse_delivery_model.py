@@ -579,17 +579,62 @@ def _market_features(market: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _dedupe_dataframe_columns(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Make duplicate column names deterministic by keeping the first."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    x = _dedupe_dataframe_columns(
+        frame
+    )
+
+    if x.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "market_ret_1",
+                "market_ret_3",
+                "market_ret_6",
+                "market_ret_12",
+                "market_rsi14",
+                "market_mood_proxy",
+                "market_stress_proxy",
+            ]
+        )
+
+
+    # Normalize labels first.
+    x.columns = [
+        str(col).strip().lower()
+        for col in x.columns
+    ]
+
+    if x.columns.duplicated().any():
+        x = x.loc[
+            :,
+            ~x.columns.duplicated(
+                keep="first"
+            ),
+        ].copy()
+
+    return x
+
+
 def _build_latest_features(
     history: pd.DataFrame,
     market: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    x = history.copy()
+    x = _dedupe_dataframe_columns(
+        history
+    )
 
-    x.columns = [
-        str(c).strip().lower()
-        for c in x.columns
-    ]
+    if x.empty:
+        raise RuntimeError(
+            "Historical NSE frame is empty after column normalization."
+        )
 
     required = [
         "date",
