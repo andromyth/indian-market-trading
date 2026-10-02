@@ -437,7 +437,7 @@ def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.Da
     )
 
 
-def fetch_index_history(index_symbol: str, start: date | datetime, end: date | datetime,
+def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end: date | datetime,
                         sync_drive: bool = False) -> pd.DataFrame:
     """Fetch/cache official NSE daily index history with bounded date chunks.
 
@@ -579,6 +579,81 @@ def fetch_index_history(index_symbol: str, start: date | datetime, end: date | d
         )
 
     return combined
+
+
+
+def fetch_index_history(
+    index_symbol: str,
+    start: date | datetime,
+    end: date | datetime,
+    sync_drive: bool = False,
+) -> pd.DataFrame:
+    """Fetch official NSE benchmark history with persistent Drive-first fallback.
+
+    Historical replay should not fail merely because the NSE index-history API
+    returns an HTML/non-JSON response from a hosted IP. The project already
+    persists official NIFTY 50 / NIFTY BANK history in Google Drive when those
+    files were previously retrieved successfully.
+    """
+    root = str(index_symbol).strip().upper()
+
+    if root not in INDEX_HISTORY_NAMES:
+        raise ValueError(
+            f"Unsupported NSE benchmark: {index_symbol}"
+        )
+
+    start_d = pd.Timestamp(start).date()
+    end_d = pd.Timestamp(end).date()
+
+    # 1) Prefer already-persisted official NSE benchmark history.
+    try:
+        drive_frame = _drive_index_history(
+            root,
+            start_d,
+            end_d,
+        )
+
+        if (
+            drive_frame is not None
+            and not drive_frame.empty
+        ):
+            return drive_frame
+
+    except Exception:
+        pass
+
+    # 2) Use the existing official NSE API implementation.
+    try:
+        return _fetch_index_history_nse_api(
+            root,
+            start_d,
+            end_d,
+            sync_drive=sync_drive,
+        )
+
+    except Exception as api_exc:
+
+        # 3) One final Drive retry after an API failure. This is deliberately
+        # non-invasive and still uses only official persisted data.
+        try:
+            drive_frame = _drive_index_history(
+                root,
+                start_d,
+                end_d,
+            )
+
+            if (
+                drive_frame is not None
+                and not drive_frame.empty
+            ):
+                return drive_frame
+
+        except Exception:
+            pass
+
+        raise api_exc
+
+
 
 
 NSE_CM_UDIFF_URL_TEMPLATE = (
