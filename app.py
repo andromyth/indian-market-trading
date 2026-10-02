@@ -48,6 +48,7 @@ from free_data import (
 from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status
+from directional_ensemble import enrich_delivery_prediction
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -1317,6 +1318,65 @@ if style == "Delivery" and live_records:
             delivery_results[r["symbol"]] = result
         cached_delivery_validation.clear()
     except Exception as exc:
+        # Enrich the already-produced ALL-NSE prediction with gated
+        # legacy-model votes and point-in-time information evidence.
+        # This does not replace the locked model's primary signal.
+        for rec in live_records:
+            symbol_key = rec["symbol"]
+            base_result = direct_delivery_results.get(symbol_key)
+            if not base_result or base_result.get("prediction_status") != "PASS":
+                continue
+
+            try:
+                hist = rec["raw_df"].copy()
+                if hasattr(hist.index, "name"):
+                    hist = hist.reset_index()
+                elif "date" not in hist.columns:
+                    hist = hist.reset_index()
+
+                market = rec.get("market_df")
+                if market is None:
+                    market = pd.DataFrame()
+                else:
+                    market = market.copy()
+                    if "date" not in market.columns:
+                        market = market.reset_index()
+
+                feature_row = all_nse_feature_builder(
+                    hist,
+                    market,
+                )
+
+                direct_delivery_results[symbol_key] = enrich_delivery_prediction(
+                    base_result,
+                    symbol_key,
+                    feature_row,
+                    hist,
+                    market,
+                    base_result.get(
+                        "decision_timestamp"
+                    ) or rec["raw_df"].index[-1],
+                    news_items=[
+                        *tag_news_items(
+                            rec.get("matched_news", [])
+                        ),
+                    ],
+                    announcements=rec.get(
+                        "announcements",
+                        [],
+                    ),
+                    fno=rec.get(
+                        "fo",
+                        {},
+                    ),
+                )
+
+            except Exception as enrich_exc:
+                base_result["ensemble_context_status"] = "ERROR"
+                base_result["ensemble_context_error"] = (
+                    f"{type(enrich_exc).__name__}: {enrich_exc}"
+                )
+
         st.error(f"Delivery ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
         delivery_results = {}
 
