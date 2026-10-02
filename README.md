@@ -2,9 +2,9 @@
 
 A Streamlit dashboard for NSE/BSE cash-equity decision support with current
 stock news, corporate-event triggers and F&O context. It generates ML-backed
-Delivery and Intraday signals for the currently validated universe, records every
-production prediction, continuously checks completed Delivery predictions against
-actual next-session prices, and **never places orders**.
+Delivery and Intraday signals, records every live prediction, continuously
+checks completed Delivery predictions against actual next-session prices, and
+**never places orders**.
 
 ## What changed in this version
 
@@ -448,10 +448,11 @@ context and creates the relative-return, market-RSI, mood-proxy and stress-proxy
 features point-in-time. News, F&O and fundamentals remain explicit missing inputs
 until timestamped point-in-time datasets are available.
 
-All-NSE candidate artifacts are written to a separate candidate directory and are
-**not automatically promoted** to production. Production continues to use the
-small certified artifact until the broader candidate has passed the required
-walk-forward and live D+1 validation gates.
+The ALL-NSE candidate artifacts are kept in a separate candidate directory and
+are now the active live Delivery inference path under explicit monitoring. The
+candidate is not described as a validated-profitability model; its prospective
+D1-D7 OOS evaluation continues independently. Intraday remains on the certified
+137-feature production model.
 
 ## NSE-first data layer (v5)
 
