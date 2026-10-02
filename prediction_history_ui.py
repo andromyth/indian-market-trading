@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from directional_ensemble import enrich_delivery_prediction, model_ensemble_direction
 
 
 def _root(symbol: str) -> str:
@@ -1074,6 +1075,61 @@ def _historical_prediction(
     else:
         signal = "HOLD"
 
+    # Enrich the replay with the same gated legacy-model registry and
+    # point-in-time directional information used by the live Delivery engine.
+    # This does not alter the locked 59-feature model output.
+    ensemble_info = {}
+    context_info = {}
+
+    try:
+        ensemble_info = model_ensemble_direction(
+            root,
+            features,
+            horizon="next_session",
+            fno_available=False,
+        )
+    except Exception as exc:
+        ensemble_info = {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    try:
+        from historical_replay import (
+            historical_news,
+            historical_announcements,
+        )
+
+        cutoff_ts = pd.Timestamp(
+            reference_date
+        ) + pd.Timedelta(
+            hours=15,
+            minutes=30,
+        )
+
+        hist_news = historical_news(
+            root,
+            cutoff_ts,
+        )
+
+        hist_announcements = historical_announcements(
+            root,
+            cutoff_ts,
+        )
+
+        context_info = {
+            "symbol": root,
+            "as_of": cutoff_ts.isoformat(),
+            "stock_news_count": len(hist_news),
+            "official_nse_announcement_count": len(hist_announcements),
+        }
+
+    except Exception as exc:
+        context_info = {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
     # Read the actual target row from the same cached compact history.
     # The target row is not passed into the feature builder.
     all_history = _historical_symbol_bulk_history(
@@ -1127,6 +1183,18 @@ def _historical_prediction(
         "purchase_price": path["purchase_price"],
         "sale_price": path["sale_price"],
         "stop_price": path["stop_price"],
+        "legacy_model_ensemble": ensemble_info,
+        "directional_information_context": context_info,
+        "ensemble_consensus_p_up": (
+            ensemble_info.get("consensus_p_up")
+            if isinstance(ensemble_info, dict)
+            else None
+        ),
+        "ensemble_consensus_direction": (
+            ensemble_info.get("consensus_direction", "UNKNOWN")
+            if isinstance(ensemble_info, dict)
+            else "UNKNOWN"
+        ),
     }
 
     if actual_rows.empty:
