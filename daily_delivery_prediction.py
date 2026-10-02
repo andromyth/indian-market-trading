@@ -26,6 +26,7 @@ from all_nse_delivery_model import (
     _load_manifest as load_all_nse_manifest,
 )
 from autonomous_engine import delivery_prediction
+from prediction_ledger import LOCAL_LEDGER, REMOTE_LEDGER
 from fo_analysis import summarize as fo_summarize
 from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
 from delivery_history_cache import ensure_delivery_history
@@ -112,7 +113,8 @@ def run_symbol(
             "symbol": root,
             "decision_timestamp": decision_timestamp,
         },
-        sync_drive=True,
+        # Batch Drive persistence once after all 2,372 symbols are processed.
+        sync_drive=False,
     )
 
     return {
@@ -198,6 +200,37 @@ def main() -> int:
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
             )
+
+    # Sync the completed all-NSE ledger once rather than issuing a
+    # Google Drive upload for every prediction row.
+    ledger_sync = "NOT_ATTEMPTED"
+
+    try:
+        from persistent_store import GoogleDriveStore
+
+        store = GoogleDriveStore()
+
+        sync_result = store.upload_or_update(
+            LOCAL_LEDGER,
+            REMOTE_LEDGER,
+            mime_type="application/x-ndjson",
+        )
+
+        ledger_sync = (
+            "OK"
+            if sync_result.get("status") == "OK"
+            else str(sync_result.get("status", "ERROR"))
+        )
+
+    except Exception as exc:
+        ledger_sync = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    for row in rows:
+        row["prediction_ledger_synced"] = (
+            ledger_sync == "OK"
+        )
 
     df = pd.DataFrame(rows)
     print("AUTONOMOUS DELIVERY PREDICTIONS")
