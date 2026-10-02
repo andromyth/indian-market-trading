@@ -555,6 +555,123 @@ def _augment_auxiliary_features(
             else pd.DataFrame()
         )
 
+        fo_payload = dict(
+            fno or {}
+        )
+
+        # Map fields that are genuinely derivable from the current NSE
+        # option-chain snapshot into the broader 137-feature surface.
+        # Futures/OI-change/IV fields remain missing unless their actual
+        # historical source is available.
+        chain = fo_payload.get(
+            "near_atm_chain"
+        )
+
+        if isinstance(
+            chain,
+            pd.DataFrame,
+        ) and not chain.empty:
+
+            for col in (
+                "CE_OI",
+                "PE_OI",
+                "CE_chgOI",
+                "PE_chgOI",
+                "CE_LTP",
+                "PE_LTP",
+            ):
+                if col in chain.columns:
+                    chain[col] = pd.to_numeric(
+                        chain[col],
+                        errors="coerce",
+                    )
+
+            fo_payload.setdefault(
+                "fno_pcr_oi",
+                fo_payload.get(
+                    "pcr"
+                ),
+            )
+
+            fo_payload.setdefault(
+                "fno_call_oi",
+                float(
+                    chain["CE_OI"].sum()
+                )
+                if "CE_OI" in chain.columns
+                else np.nan,
+            )
+
+            fo_payload.setdefault(
+                "fno_put_oi",
+                float(
+                    chain["PE_OI"].sum()
+                )
+                if "PE_OI" in chain.columns
+                else np.nan,
+            )
+
+            fo_payload.setdefault(
+                "fno_call_volume",
+                np.nan,
+            )
+
+            fo_payload.setdefault(
+                "fno_put_volume",
+                np.nan,
+            )
+
+            fo_payload.setdefault(
+                "fno_max_pain",
+                _safe(
+                    fo_payload.get(
+                        "max_pain"
+                    )
+                ),
+            )
+
+            fo_payload.setdefault(
+                "fno_underlying",
+                _safe(
+                    fo_payload.get(
+                        "spot"
+                    )
+                ),
+            )
+
+            expiry = fo_payload.get(
+                "expiry"
+            )
+
+            if expiry:
+                try:
+                    decision_day = pd.Timestamp(
+                        as_of
+                    ).date()
+
+                    expiry_day = pd.Timestamp(
+                        expiry
+                    ).date()
+
+                    days = (
+                        expiry_day
+                        - decision_day
+                    ).days
+
+                    fo_payload["fno_expiry_days"] = float(
+                        max(
+                            0,
+                            days,
+                        )
+                    )
+
+                    fo_payload["fno_near_expiry"] = float(
+                        days <= 7
+                    )
+
+                except Exception:
+                    pass
+
         item = {
             "symbol": symbol,
             "price_df": price,
@@ -562,7 +679,7 @@ def _augment_auxiliary_features(
             "matched_news": news_items or [],
             "announcements": announcements or [],
             "event_risk": event_risk,
-            "fo": fno or {},
+            "fo": fo_payload,
         }
 
         broad = build_feature_rows(
