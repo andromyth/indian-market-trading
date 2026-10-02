@@ -11,7 +11,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from delivery_training_universe import benchmark_for_symbol
+from delivery_training_universe import benchmark_for_symbol, training_roster
 from nse_data_layer import fetch_index_history
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
@@ -71,7 +71,7 @@ def add_features(x):
     for c0 in ("delivery_pct","delivery_qty"):
         if c0 not in z.columns: z[c0]=np.nan
     dp=z["delivery_pct"]; dq=z["delivery_qty"]
-    z["delivery_pct_change_1"]=dp.pct_change(); z["delivery_pct_ratio20"]=dp/dp.rolling(20).mean()
+    z["delivery_pct_change_1"]=dp.pct_change(fill_method=None); z["delivery_pct_ratio20"]=dp/dp.rolling(20).mean()
     z["delivery_pct_z20"]=(dp-dp.rolling(20).mean())/dp.rolling(20).std()
     z["delivery_qty_ratio20"]=dq/dq.rolling(20).mean(); z["delivery_qty_z20"]=(dq-dq.rolling(20).mean())/dq.rolling(20).std()
     return z
@@ -162,9 +162,18 @@ def merge_optional(panel):
         pieces=[]
         for sym,lp in out.groupby("symbol",sort=False):
             rp=f[f["symbol"].eq(sym)]
-            if rp.empty: continue
+            if rp.empty:
+                pieces.append(lp)
+                continue
             cols=["fundamental_available_at"]+[c for c in vals if c in rp.columns]
-            m=pd.merge_asof(lp.sort_values("decision_timestamp"),rp[cols].sort_values("fundamental_available_at"),left_on="decision_timestamp",right_on="fundamental_available_at",direction="backward",allow_exact_matches=True)
+            m=pd.merge_asof(
+                lp.sort_values("decision_timestamp"),
+                rp[cols].sort_values("fundamental_available_at"),
+                left_on="decision_timestamp",
+                right_on="fundamental_available_at",
+                direction="backward",
+                allow_exact_matches=True,
+            )
             pieces.append(m)
         if pieces: out=pd.concat(pieces,ignore_index=True)
         audit["fundamentals"]={"exists":True,"rows":int(len(f)),"symbols":int(f["symbol"].nunique())}
@@ -182,7 +191,7 @@ def fit_models(frame,horizon):
     cutoff=frame["decision_timestamp"].max()-pd.Timedelta(days=60); tr=frame[frame["decision_timestamp"]<cutoff]; te=frame[frame["decision_timestamp"]>=cutoff]
     if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique()<2: raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
     Xtr=tr[FEATURES_59].apply(pd.to_numeric,errors="coerce"); Xte=te[FEATURES_59].apply(pd.to_numeric,errors="coerce")
-    clf=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("scale",StandardScaler(with_mean=False)),("model",LogisticRegression(C=.5,class_weight="balanced",max_iter=800,random_state=42))])
+    clf=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("scale",StandardScaler(with_mean=False)),("model",LogisticRegression(C=.5,class_weight="balanced",solver="lbfgs",max_iter=2500,random_state=42))])
     reg=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("model",HistGradientBoostingRegressor(max_iter=180,learning_rate=.04,max_leaf_nodes=19,l2_regularization=2.0,random_state=42))])
     clf.fit(Xtr,tr[f"target_up_{horizon}"].astype(int)); reg.fit(Xtr,tr[f"target_return_{horizon}"].astype(float))
     p=clf.predict_proba(Xte)[:,1]; pr=reg.predict(Xte); y=te[f"target_up_{horizon}"].to_numpy()
@@ -191,8 +200,9 @@ def fit_models(frame,horizon):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--bulk-root",default=DEFAULT_BULK); ap.add_argument("--out",default=DEFAULT_OUT); ap.add_argument("--min-history",type=int,default=60); args=ap.parse_args()
     out=Path(args.out); out.mkdir(parents=True,exist_ok=True); bulk=load_bulk(Path(args.bulk_root))
-    counts=bulk.groupby("symbol")["date"].nunique(); all_symbols=sorted(counts.index.astype(str)); trainable=sorted(counts[counts>=args.min_history].index.astype(str))
-    universe={"universe_symbol_count":len(all_symbols),"symbols_with_bulk_history":len(all_symbols),"trainable_symbol_count":len(trainable),"excluded_symbol_count":len(all_symbols)-len(trainable),"minimum_history_sessions":args.min_history}
+    roster=training_roster(bulk,min_history=args.min_history)
+    trainable=list(roster["trainable_symbols"])
+    universe={"universe_source":roster.get("universe_source"),"universe_as_of":roster.get("universe_as_of"),"universe_symbol_count":int(roster["universe_symbol_count"]),"symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),"trainable_symbol_count":int(roster["trainable_symbol_count"]),"excluded_symbol_count":int(roster["excluded_symbol_count"]),"minimum_history_sessions":int(roster["minimum_history_sessions"])}
     panel,audit=merge_optional(make_panel(bulk,trainable))
     (out/"DATA_READINESS_REPORT_2026.json").write_text(json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},indent=2,default=str),encoding="utf-8")
     panel.to_parquet(out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet",index=False)
