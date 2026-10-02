@@ -1,366 +1,537 @@
 #!/usr/bin/env python3
-"""Build a broad ALL-NSE point-in-time fundamentals layer from Drive-resident NSE XBRL.
+"""Build a broad ALL-NSE PIT fundamentals layer from NSE Integrated Filing XBRL.
 
-The builder is intentionally conservative:
-- prefers existing PIT parquet sources when they cover the NSE roster;
-- supplements/rebuilds from Drive-resident NSE XBRL cache files;
-- never uses a filing before its publication/acceptance timestamp;
-- never forward-fills financial values across a filing date;
-- preserves missing values and emits coverage diagnostics.
+The source is NSE's Integrated Filing catalog plus the direct XBRL URLs hosted on
+nsearchives.nseindia.com. Existing Drive PIT files are retained as a seed, but
+the new layer is not restricted to the legacy three-stock pilot.
+
+PIT rule: fundamental_available_at is the filing/broadcast timestamp. The
+candidate builder may use a fundamental row only when that timestamp is at or
+before the decision_timestamp.
 """
 from __future__ import annotations
-import argparse, json, re, html
+
+import argparse
+import hashlib
+import json
+import threading
+import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import unquote
+
 import numpy as np
 import pandas as pd
+import requests
 
-from multifactor_data_layer_v2 import normalize_symbol
 from delivery_training_universe import training_roster
+from multifactor_data_layer_v2 import normalize_symbol
 
 BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
 DEFAULT_BULK = BASE / "production_data/nse_official/bulk_eod"
 DEFAULT_OUT = BASE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+CACHE_ROOT = BASE / "corporate/xbrl_cache/all_nse_2025_2026"
 
-RAW_VALUE_FIELDS = {
-    "fundamental_revenue": [
-        "revenuefromoperations", "revenuefromoperationsnetofexcise", "revenue",
-        "revenuefromoperation", "totalrevenue", "revenuefromcontractswithcustomers",
-        "turnover"
-    ],
-    "fundamental_pat": [
-        "profitloss", "profitlossaftertax", "profitaftertax", "profitforperiod",
-        "profitattributabletoparents", "netprofit", "netincome"
-    ],
-    "fundamental_eps": [
-        "earningspersharebasic", "earningspersharediluted", "basicearningspershare",
-        "dilutedeps", "eps"
-    ],
-    "fundamental_ebitda": [
-        "ebitda", "earningsbeforeinteresttaxdepreciationandamortisation",
-        "earningsbeforeinteresttaxdepreciationamortization"
-    ],
-    "fundamental_finance_cost": [
-        "financecosts", "financecost", "financecharges", "interestexpense",
-        "interestandbankcharges"
-    ],
-    "fundamental_total_equity": [
-        "totalequity", "equity", "totalshareholdersequity",
-        "equityattributabletoparent", "totalownersfunds"
-    ],
-    "fundamental_total_debt": [
-        "totaldebt", "debt", "borrowings", "totalborrowings",
-        "currentborrowings", "noncurrentborrowings"
-    ],
-    "fundamental_cash": [
-        "cashandcashequivalents", "cashandbankbalances", "cashandbank",
-        "cashandcashitems", "bankbalances"
-    ],
+NSE_HOME = "https://www.nseindia.com/"
+NSE_API = "https://www.nseindia.com/api/integrated-filing-results"
+
+FIELD_ALIASES = {
+    "fundamental_revenue": (
+        "RevenueFromOperations",
+        "RevenueFromOperationsNetOfExciseDuty",
+        "InterestEarned",
+        "GrossPremiumIncome",
+        "GrossPremiumsWritten",
+    ),
+    "fundamental_pat": (
+        "ProfitLossForPeriod",
+        "ProfitLossForThePeriod",
+        "ProfitLossAfterTax",
+        "ProfitLossAfterTaxesMinorityInterestAndShareOfProfitLossOfAssociates",
+        "ProfitLossFromOrdinaryActivitiesAfterTax",
+        "ProfitLossAfterTaxAndExtraordinaryItems",
+        "ProfitLossAfterTaxBeforeExtraordinaryItems",
+    ),
+    "fundamental_eps": (
+        "BasicAndDilutedEPSAfterExtraordinaryItemsNetOfTaxExpenseForThePeriodNotToBeAnnualized",
+        "BasicEarningsPerShare",
+        "DilutedEarningsPerShare",
+        "EarningsPerShareBasic",
+        "EarningsPerShareDiluted",
+    ),
+    "fundamental_finance_cost": ("FinanceCosts", "FinanceCost"),
+    "fundamental_total_equity": (
+        "TotalEquity",
+        "Equity",
+        "EquityAttributableToOwnersOfParent",
+        "OtherEquity",
+    ),
+    "fundamental_total_debt": (
+        "TotalDebt",
+        "Debt",
+        "Borrowings",
+        "BorrowingsCurrent",
+        "BorrowingsNoncurrent",
+    ),
+    "fundamental_cash": (
+        "CashAndCashEquivalents",
+        "CashAndBankBalances",
+        "CashAndBank",
+    ),
 }
 
-TAG_GROUPS = {
-    "symbol": {"symbol", "issuersymbol", "securitysymbol", "ticker", "tradingsymbol"},
-    "period_end": {"enddate", "periodend", "periodenddate", "reportingdate", "dateofreport"},
-    "available_at": {
-        "acceptancedatetime", "acceptancedate", "filingdatetime", "filingdate",
-        "submissiondatetime", "submissiondate", "dateoffiling", "eventdatetime",
-        "creationdatetime"
-    },
-    "period_start": {"startdate", "periodstart", "periodstartdate"},
-}
+_thread_local = threading.local()
 
-DATE_PATTERNS = [
-    re.compile(r"(\\d{2})(\\d{2})(\\d{4})(?:[_-]?(\\d{2})(\\d{2})(\\d{2}))?"),
-    re.compile(r"(\\d{4})[-/](\\d{2})[-/](\\d{2})(?:[ T](\\d{2})[:](\\d{2})[:](\\d{2}))?"),
-]
 
-def _localname(tag: str) -> str:
-    return str(tag).split("}", 1)[-1].split(":", 1)[-1].strip().lower().replace("-", "").replace("_", "")
+def _session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is not None:
+        return s
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "Chrome/134.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+            "Referer": "https://www.nseindia.com/companies-listing/corporate-integrated-filing",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+        }
+    )
+    try:
+        s.get(NSE_HOME, timeout=15)
+    except Exception:
+        pass
+    _thread_local.session = s
+    return s
 
-def _num(value: object) -> float:
-    if value is None: return np.nan
-    s = str(value).strip().replace(",", "").replace("₹", "").replace("%", "")
-    if not s or s.lower() in {"na", "n/a", "nan", "null", "none", "-"}: return np.nan
-    s = s.replace("(", "-").replace(")", "")
-    try: return float(re.sub(r"[^0-9eE+\\-.]", "", s))
-    except Exception: return np.nan
 
-def _parse_dt(value: object) -> pd.Timestamp:
-    if value is None: return pd.NaT
-    s = str(value).strip()
-    if not s: return pd.NaT
-    dt = pd.to_datetime(s, errors="coerce", utc=True, dayfirst=True)
-    return dt
+def _parse_dt(value) -> pd.Timestamp:
+    if value is None or str(value).strip() == "":
+        return pd.NaT
+    return pd.to_datetime(str(value).strip(), errors="coerce", utc=True, dayfirst=True)
 
-def _filename_timestamp(path: Path) -> pd.Timestamp:
-    s = unquote(path.name)
-    for pat in DATE_PATTERNS:
-        for m in pat.finditer(s):
-            g = m.groups()
-            try:
-                if len(g) == 6 and len(g[0]) == 2:
-                    return pd.Timestamp(
-                        year=int(g[2]), month=int(g[1]), day=int(g[0]),
-                        hour=int(g[3] or 0), minute=int(g[4] or 0), second=int(g[5] or 0),
-                        tz="UTC"
-                    )
-                if len(g) == 6 and len(g[0]) == 4:
-                    return pd.Timestamp(
-                        year=int(g[0]), month=int(g[1]), day=int(g[2]),
-                        hour=int(g[3] or 0), minute=int(g[4] or 0), second=int(g[5] or 0),
-                        tz="UTC"
-                    )
-            except Exception:
-                pass
-    return pd.NaT
 
-def _contexts(root: ET.Element) -> dict[str, tuple[pd.Timestamp,pd.Timestamp]]:
-    out={}
-    for e in root.iter():
-        if _localname(e.tag) != "context":
-            continue
-        cid=e.attrib.get("id")
-        if not cid: continue
-        start=end=None
-        for q in e.iter():
-            n=_localname(q.tag)
-            if n in TAG_GROUPS["period_start"] and (q.text or "").strip():
-                start=_parse_dt(q.text)
-            elif n in TAG_GROUPS["period_end"] and (q.text or "").strip():
-                end=_parse_dt(q.text)
-        if pd.notna(end): out[cid]=(start,end)
-    return out
+def _num(value) -> float:
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return np.nan
+        if text.startswith("(") and text.endswith(")"):
+            text = "-" + text[1:-1]
+        return float(text)
+    except Exception:
+        return np.nan
 
-def _extract_xml(path: Path) -> list[dict]:
-    raw=path.read_bytes()
-    root=None
-    for payload in (raw, html.unescape(raw.decode("utf-8","ignore")).encode("utf-8")):
+
+def _local(tag: str) -> str:
+    return str(tag).split("}", 1)[-1].split(":", 1)[-1]
+
+
+def _catalog_page(session: requests.Session, page: int, size: int, from_date: str, to_date: str):
+    params = {
+        "type": "Integrated Filing- Financials",
+        "index": "equities",
+        "from_date": from_date,
+        "to_date": to_date,
+        "page": page,
+        "size": size,
+    }
+    last = None
+    for attempt in range(3):
         try:
-            root=ET.fromstring(payload); break
-        except Exception:
-            continue
-    if root is None:
-        return _extract_regex(path, raw.decode("utf-8","ignore"))
-    contexts=_contexts(root)
-    symbol=""
-    available=pd.NaT
-    for e in root.iter():
-        n=_localname(e.tag); t=(e.text or "").strip()
-        if not t: continue
-        if n in TAG_GROUPS["symbol"] and not symbol:
-            symbol=normalize_symbol(t)
-        if n in TAG_GROUPS["available_at"] and pd.isna(available):
-            available=_parse_dt(t)
-    if not symbol:
-        symbol=_symbol_from_path(path)
-    if pd.isna(available):
-        available=_filename_timestamp(path)
-    facts=[]
-    for e in root.iter():
-        n=_localname(e.tag)
-        ctx=e.attrib.get("contextRef") or e.attrib.get("contextref")
-        if not ctx or ctx not in contexts: continue
-        val=_num(e.text)
-        if not np.isfinite(val): continue
-        _, end=contexts[ctx]
-        if pd.isna(end): continue
-        facts.append((n,val,end))
-    if not facts or not symbol or pd.isna(available): return []
-    return _facts_to_rows(symbol, available, facts, source=f"NSE_XBRL_PIT:{path}")
+            r = session.get(NSE_API, params=params, timeout=30)
+            if r.status_code in (403, 429, 500, 502, 503, 504):
+                last = RuntimeError(f"NSE catalog HTTP {r.status_code}")
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            data = payload.get("data", []) if isinstance(payload, dict) else payload
+            return data if isinstance(data, list) else []
+        except Exception as exc:
+            last = exc
+            time.sleep(1.5 * (attempt + 1))
+    raise last if last else RuntimeError("NSE catalog request failed")
 
-def _extract_regex(path: Path, text: str) -> list[dict]:
-    symbol=_symbol_from_path(path)
-    available=_filename_timestamp(path)
-    if not symbol or pd.isna(available): return []
-    facts=[]
-    for field,cands in RAW_VALUE_FIELDS.items():
-        for cand in cands:
-            m=re.search(
-                rf"<[^>]*{re.escape(cand)}[^>]*>([-+]?[(]?[0-9,]+(?:\\.[0-9]+)?[)]?)<",
-                text, flags=re.I
-            )
-            if m:
-                facts.append((cand,_num(m.group(1)),pd.NaT))
-                break
-    if not facts: return []
-    # Regex fallback lacks safe period context, so do not publish it without a
-    # document-level period end. This keeps the layer PIT-truthful.
-    return []
 
-def _symbol_from_path(path: Path) -> str:
-    parts=[normalize_symbol(p) for p in path.parts[::-1]]
-    known={"BHARTIARTL","RELIANCE","SBIN"}
-    for p in parts:
-        if p in known: return p
-    m=re.search(r"(?:symbol|ticker)[=_-]?([A-Z][A-Z0-9]+)", path.name, flags=re.I)
-    if m: return normalize_symbol(m.group(1))
-    return ""
-
-def _facts_to_rows(symbol: str, available: pd.Timestamp, facts: list[tuple], source: str) -> list[dict]:
-    by_period={}
-    for name,val,end in facts:
-        if pd.isna(end): continue
-        p=by_period.setdefault(pd.Timestamp(end).normalize(), {})
-        for fld,cands in RAW_VALUE_FIELDS.items():
-            if name in cands and fld not in p:
-                p[fld]=val
-    rows=[]
-    for period_end, vals in by_period.items():
-        row={"symbol":symbol,"period_end":period_end,"fundamental_available_at":available,
-             "fundamental_source":source,"fundamental_basis":"NSE_XBRL_PIT"}
-        row.update(vals)
-        if len(vals) >= 1:
-            rows.append(row)
+def catalog_all(from_date: str, to_date: str, size: int) -> list[dict]:
+    session = _session()
+    rows: list[dict] = []
+    for page in range(1, 2001):
+        batch = _catalog_page(session, page, size, from_date, to_date)
+        if not batch:
+            break
+        rows.extend(batch)
+        if page == 1 or page % 25 == 0:
+            print(f"NSE integrated catalog: page={page:,} rows={len(rows):,}")
+        if len(batch) < size:
+            break
+    print(f"NSE integrated catalog total rows={len(rows):,}")
     return rows
 
-def _load_existing() -> pd.DataFrame:
-    paths=[
-        BASE/"processed/features/PIT_FUNDAMENTAL_FEATURES_2026.parquet",
-        BASE/"processed/features/MASTER_PIT_WITH_FUNDAMENTALS_2026.parquet",
-        BASE/"corporate/fundamentals_v2/PIT_FUNDAMENTALS_STRICT_2025_2026.parquet",
-        BASE/"corporate/pit_fundamentals_filings_2025_2026.parquet",
-    ]
-    frames=[]
-    for p in paths:
-        if not p.exists(): continue
-        try: df=pd.read_parquet(p)
-        except Exception: continue
-        if "symbol" not in df.columns: continue
-        df["symbol"]=df["symbol"].map(normalize_symbol)
-        if "fundamental_available_at" in df.columns:
-            df["fundamental_available_at"]=pd.to_datetime(df["fundamental_available_at"],errors="coerce",utc=True)
-        elif "decision_timestamp" in df.columns:
-            df["fundamental_available_at"]=pd.to_datetime(df["decision_timestamp"],errors="coerce",utc=True)
-        if "period_end" not in df.columns:
-            df["period_end"]=pd.to_datetime(df.get("trade_date"),errors="coerce",utc=True)
-        cols=["symbol","period_end","fundamental_available_at","fundamental_source","fundamental_basis"]+list(RAW_VALUE_FIELDS)
-        for c in cols:
-            if c not in df.columns: df[c]=np.nan
-        frames.append(df[cols])
-    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
-def _scan_xbrl() -> pd.DataFrame:
-    roots=[
-        BASE/"corporate/xbrl_cache",
-        BASE/"corporate",
-        BASE/"processed/pit_replay",
-        BASE/"processed/features",
-    ]
-    paths=[]
-    seen=set()
-    for r in roots:
-        if not r.exists(): continue
-        for pat in ("*.xml","*.xbrl","*.html","*.htm"):
-            for p in r.rglob(pat):
-                sp=str(p)
-                if sp in seen: continue
-                seen.add(sp); paths.append(p)
-    rows=[]; total=0
-    for p in paths:
-        total += 1
+def choose_filings(rows: list[dict], symbols: set[str], max_filings: int) -> list[dict]:
+    clean = []
+    for r in rows:
+        if str(r.get("type", "")).strip().lower() != "integrated filing- financials":
+            continue
+        sym = normalize_symbol(r.get("symbol", ""))
+        url = str(r.get("xbrl") or "").strip()
+        period_end = _parse_dt(r.get("qe_Date"))
+        available = _parse_dt(r.get("broadcast_Date"))
+        consolidated = str(r.get("consolidated", "")).strip().lower() == "consolidated"
+        if (
+            not sym
+            or sym not in symbols
+            or not url
+            or pd.isna(period_end)
+            or pd.isna(available)
+        ):
+            continue
+        clean.append(
+            {
+                "symbol": sym,
+                "period_end": period_end.normalize(),
+                "fundamental_available_at": available,
+                "xbrl_url": url,
+                "consolidated": consolidated,
+                "audited": str(r.get("audited", "")).strip().lower() == "audited",
+                "company": r.get("cmName", ""),
+            }
+        )
+    if not clean:
+        return []
+
+    d = pd.DataFrame(clean)
+    chosen = []
+    for (sym, period_end), g in d.groupby(["symbol", "period_end"], sort=False):
+        g = g.sort_values(
+            ["consolidated", "fundamental_available_at"],
+            ascending=[False, False],
+        )
+        chosen.append(g.iloc[0].to_dict())
+
+    d = pd.DataFrame(chosen).sort_values(
+        ["symbol", "period_end", "fundamental_available_at"]
+    )
+    # Keep the latest N filed quarters for each symbol. Four quarters plus
+    # a previous quarter are enough for the 2026 growth features; the default
+    # of six gives additional PIT history without pulling the whole archive.
+    d = d.groupby("symbol", sort=False, group_keys=False).tail(max_filings)
+    return d.to_dict("records")
+
+
+def _cache_path(url: str) -> Path:
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
+    return CACHE_ROOT / f"{key}.xbrl"
+
+
+def _download_xbrl(url: str) -> bytes:
+    cp = _cache_path(url)
+    if cp.exists() and cp.stat().st_size > 0:
+        return cp.read_bytes()
+
+    session = _session()
+    last = None
+    for attempt in range(3):
         try:
-            rows.extend(_extract_xml(p))
+            r = session.get(
+                url,
+                headers={"Accept": "*/*", "Referer": "https://www.nseindia.com/"},
+                timeout=30,
+            )
+            if r.status_code in (403, 429, 500, 502, 503, 504):
+                last = RuntimeError(f"XBRL HTTP {r.status_code}")
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            content = r.content
+            if not content:
+                raise RuntimeError("empty XBRL response")
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            tmp = cp.with_suffix(".tmp")
+            tmp.write_bytes(content)
+            tmp.replace(cp)
+            return content
+        except Exception as exc:
+            last = exc
+            time.sleep(1.0 * (attempt + 1))
+    raise last if last else RuntimeError("XBRL download failed")
+
+
+def _contexts(root: ET.Element):
+    meta = {}
+    xbrli = "http://www.xbrl.org/2003/instance"
+    for ctx in root.findall(f"{{{xbrli}}}context"):
+        cid = ctx.get("id")
+        if not cid:
+            continue
+        start = end = instant = pd.NaT
+        period = ctx.find(f"{{{xbrli}}}period")
+        if period is not None:
+            for e in period:
+                name = _local(e.tag).lower()
+                if name == "startdate":
+                    start = _parse_dt(e.text)
+                elif name == "enddate":
+                    end = _parse_dt(e.text)
+                elif name == "instant":
+                    instant = _parse_dt(e.text)
+        has_dim = any(
+            _local(e.tag) in {"explicitMember", "typedMember"} for e in ctx.iter()
+        )
+        meta[cid] = (start, end, instant, has_dim)
+    return meta
+
+
+def _fact_map(root: ET.Element, meta: dict):
+    facts = {}
+    for e in root.iter():
+        ctx = e.get("contextRef")
+        if not ctx or e.text is None:
+            continue
+        m = meta.get(ctx)
+        if m and m[3]:
+            continue
+        value = _num(e.text)
+        if not np.isfinite(value):
+            continue
+        facts.setdefault(ctx, {})[_local(e.tag)] = value
+    return facts
+
+
+def _pick(facts: dict, aliases) -> float:
+    for name in aliases:
+        value = facts.get(name)
+        if value is not None and np.isfinite(value):
+            return float(value)
+    return np.nan
+
+
+def _parse_filing(f: dict):
+    try:
+        root = ET.fromstring(_download_xbrl(f["xbrl_url"]))
+        meta = _contexts(root)
+        facts = _fact_map(root, meta)
+        q = facts.get("OneD", {}) or {}
+        bs = facts.get("OneI", {}) or {}
+
+        revenue = _pick(q, FIELD_ALIASES["fundamental_revenue"])
+        pat = _pick(q, FIELD_ALIASES["fundamental_pat"])
+        eps = _pick(q, FIELD_ALIASES["fundamental_eps"])
+        finance_cost = _pick(q, FIELD_ALIASES["fundamental_finance_cost"])
+        equity = _pick(bs, FIELD_ALIASES["fundamental_total_equity"])
+        cash = _pick(bs, FIELD_ALIASES["fundamental_cash"])
+
+        current_debt = _pick(bs, ("BorrowingsCurrent",))
+        noncurrent_debt = _pick(bs, ("BorrowingsNoncurrent",))
+        total_debt = _pick(bs, ("TotalDebt", "Debt", "Borrowings"))
+        if np.isfinite(current_debt) or np.isfinite(noncurrent_debt):
+            total_debt = sum(
+                x for x in (current_debt, noncurrent_debt) if np.isfinite(x)
+            )
+
+        pbt = _pick(q, ("ProfitBeforeTax", "ProfitLossFromOrdinaryActivitiesBeforeTax"))
+        dep = _pick(
+            q,
+            (
+                "DepreciationDepletionAndAmortisationExpense",
+                "DepreciationAndAmortisationExpense",
+                "Depreciation",
+            ),
+        )
+        ebitda = np.nan
+        if np.isfinite(pbt):
+            ebit = pbt + (finance_cost if np.isfinite(finance_cost) else 0.0)
+            ebitda = ebit + (dep if np.isfinite(dep) else 0.0)
+
+        vals = {
+            "fundamental_revenue": revenue,
+            "fundamental_pat": pat,
+            "fundamental_eps": eps,
+            "fundamental_ebitda": ebitda,
+            "fundamental_finance_cost": finance_cost,
+            "fundamental_total_equity": equity,
+            "fundamental_total_debt": total_debt,
+            "fundamental_cash": cash,
+        }
+        if not any(np.isfinite(v) for v in vals.values()):
+            return None
+
+        return {
+            **f,
+            **vals,
+            "fundamental_source": "NSE_XBRL_PIT",
+            "fundamental_basis": "Integrated_Filing_OneD_OneI",
+        }
+    except Exception:
+        return None
+
+
+def _load_seed() -> pd.DataFrame:
+    paths = [
+        BASE / "processed/features/PIT_FUNDAMENTAL_FEATURES_2026.parquet",
+        BASE / "processed/features/MASTER_PIT_WITH_FUNDAMENTALS_2026.parquet",
+        BASE / "corporate/fundamentals_v2/PIT_FUNDAMENTALS_STRICT_2025_2026.parquet",
+        BASE / "corporate/pit_fundamentals_filings_2025_2026.parquet",
+    ]
+    wanted = [
+        "symbol",
+        "period_end",
+        "fundamental_available_at",
+        "fundamental_source",
+        "fundamental_basis",
+        *FIELD_ALIASES.keys(),
+    ]
+    out = []
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            df = pd.read_parquet(p)
         except Exception:
             continue
-        if total % 500 == 0:
-            print(f"XBRL scan: files={total:,} rows={len(rows):,}")
-    print(f"XBRL scan complete: files={total:,} extracted_rows={len(rows):,}")
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+        if "symbol" not in df.columns or "fundamental_available_at" not in df.columns:
+            continue
+        df["symbol"] = df["symbol"].map(normalize_symbol)
+        df["fundamental_available_at"] = pd.to_datetime(
+            df["fundamental_available_at"], errors="coerce", utc=True
+        )
+        if "period_end" not in df.columns:
+            if "trade_date" in df.columns:
+                df["period_end"] = pd.to_datetime(
+                    df["trade_date"], errors="coerce", utc=True
+                ).dt.normalize()
+            else:
+                continue
+        for c in wanted:
+            if c not in df.columns:
+                df[c] = np.nan
+        out.append(df[wanted])
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=wanted)
 
-def _finalize(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    df=df.copy()
-    df["symbol"]=df["symbol"].map(normalize_symbol)
-    df["fundamental_available_at"]=pd.to_datetime(df["fundamental_available_at"],errors="coerce",utc=True)
-    df["period_end"]=pd.to_datetime(df["period_end"],errors="coerce",utc=True).dt.normalize()
-    for c in RAW_VALUE_FIELDS:
-        df[c]=pd.to_numeric(df[c],errors="coerce")
-    df=df.dropna(subset=["symbol","fundamental_available_at","period_end"])
-    df=df[df["fundamental_available_at"].le(pd.Timestamp("2026-10-02",tz="UTC"))]
-    df=df.sort_values(["symbol","period_end","fundamental_available_at"])
-    # Keep the latest available filing for each symbol/period.
-    df=df.drop_duplicates(["symbol","period_end"],keep="last")
-    pieces=[]
-    for sym,g in df.groupby("symbol",sort=False):
-        g=g.sort_values("period_end").copy()
-        for base,chg in [
-            ("fundamental_revenue","fund_revenue_chg"),
-            ("fundamental_pat","fund_pat_chg"),
-            ("fundamental_eps","fund_eps_chg"),
-            ("fundamental_ebitda","fund_ebitda_chg"),
-        ]:
-            if base in g:
-                g[chg]=g[base].diff()
-                prev=g[base].shift(1)
-                g[chg.replace("_chg","_growth")]=g[chg]/prev.abs().replace(0,np.nan)
-        g["fund_pat_margin"]=g["fundamental_pat"]/g["fundamental_revenue"].replace(0,np.nan)
-        g["fund_debt_to_equity"]=g["fundamental_total_debt"]/g["fundamental_total_equity"].replace(0,np.nan)
-        g["fund_cash_to_debt"]=g["fundamental_cash"]/g["fundamental_total_debt"].replace(0,np.nan)
-        # If EBITDA was not explicitly reported, derive it only when all
-        # necessary accounting components exist.
-        if "fundamental_ebitda" in g:
-            g["fundamental_ebitda"]=g["fundamental_ebitda"].where(
-                g["fundamental_ebitda"].notna(),
-                g["fundamental_ebit"] if "fundamental_ebit" in g else np.nan,
-            )
-        g["fundamental_age_days"]=(
-            g["fundamental_available_at"]-g["period_end"]
-        ).dt.total_seconds()/86400.0
-        g["fundamental_stale_90d"]=(g["fundamental_age_days"]>90).astype("Int8")
-        g["fundamental_stale_180d"]=(g["fundamental_age_days"]>180).astype("Int8")
+
+def _derive(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    x = df.copy()
+    x["symbol"] = x["symbol"].map(normalize_symbol)
+    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce", utc=True).dt.normalize()
+    x["fundamental_available_at"] = pd.to_datetime(
+        x["fundamental_available_at"], errors="coerce", utc=True
+    )
+    for c in FIELD_ALIASES:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["symbol", "period_end", "fundamental_available_at"])
+    x = x.sort_values(["symbol", "period_end", "fundamental_available_at"])
+    x = x.drop_duplicates(["symbol", "period_end"], keep="last")
+
+    pieces = []
+    for symbol, g in x.groupby("symbol", sort=False):
+        g = g.sort_values("period_end").copy()
+        for base, growth in (
+            ("fundamental_revenue", "fund_revenue_growth"),
+            ("fundamental_pat", "fund_pat_growth"),
+            ("fundamental_eps", "fund_eps_growth"),
+            ("fundamental_ebitda", "fund_ebitda_growth"),
+        ):
+            g[growth] = g[base].pct_change(fill_method=None)
+        g["fund_pat_margin"] = g["fundamental_pat"] / g["fundamental_revenue"].replace(0, np.nan)
+        g["fund_debt_to_equity"] = (
+            g["fundamental_total_debt"] / g["fundamental_total_equity"].replace(0, np.nan)
+        )
+        g["fund_cash_to_debt"] = (
+            g["fundamental_cash"] / g["fundamental_total_debt"].replace(0, np.nan)
+        )
         pieces.append(g)
-    out=pd.concat(pieces,ignore_index=True)
-    return out.sort_values(["symbol","fundamental_available_at","period_end"]).reset_index(drop=True)
+
+    out = pd.concat(pieces, ignore_index=True)
+    return out.replace([np.inf, -np.inf], np.nan).sort_values(
+        ["symbol", "period_end", "fundamental_available_at"]
+    ).reset_index(drop=True)
+
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--bulk-root",default=str(DEFAULT_BULK))
-    ap.add_argument("--out",default=str(DEFAULT_OUT))
-    args=ap.parse_args()
-    bulk=Path(args.bulk_root)
-    roster=training_roster(pd.DataFrame(),min_history=0) if False else None
-    existing=_load_existing()
-    existing_symbols=set(existing["symbol"]) if not existing.empty else set()
-    target_symbols=None
-    try:
-        # Use the existing bulk archive to establish the current ALL-NSE roster.
-        from colab_build_all_nse_delivery_multifactor_candidate import load_bulk
-        b=load_bulk(bulk)
-        rr=training_roster(b,min_history=60)
-        target_symbols=set(rr["trainable_symbols"])
-    except Exception:
-        target_symbols=None
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bulk-root", default=str(DEFAULT_BULK))
+    ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--from-date", default="01-01-2025")
+    ap.add_argument("--to-date", default="30-09-2026")
+    ap.add_argument("--page-size", type=int, default=100)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--max-filings-per-symbol", type=int, default=6)
+    args = ap.parse_args()
 
-    # Existing parquet sources are retained as a seed; scan XBRL only when
-    # current seed coverage is poor.
-    seed=_finalize(existing)
-    seed_cov=len(set(seed["symbol"])) if not seed.empty else 0
-    target_cov=len(target_symbols) if target_symbols is not None else 0
-    print(f"SEED FUNDAMENTALS: symbols={seed_cov} target_trainable={target_cov}")
+    from colab_build_all_nse_delivery_multifactor_candidate import load_bulk
 
-    xbrl=_scan_xbrl() if (target_cov == 0 or seed_cov < max(50, int(target_cov*0.8))) else pd.DataFrame()
-    combined=pd.concat([seed,xbrl],ignore_index=True) if not xbrl.empty else seed
-    combined=_finalize(combined)
+    bulk = load_bulk(Path(args.bulk_root))
+    roster = training_roster(bulk, min_history=60)
+    symbols = set(roster["trainable_symbols"])
+    print(f"TARGET ALL-NSE TRAINABLE SYMBOLS: {len(symbols):,}")
 
-    if target_symbols is not None:
-        combined=combined[combined["symbol"].isin(target_symbols)].copy()
+    seed = _derive(_load_seed())
+    print(
+        "SEED FUNDAMENTALS:",
+        f"rows={len(seed):,}",
+        f"symbols={seed['symbol'].nunique() if not seed.empty else 0:,}",
+    )
 
-    out=Path(args.out); out.parent.mkdir(parents=True,exist_ok=True)
-    combined.to_parquet(out,index=False)
-    report={
-        "output":str(out),
-        "rows":int(len(combined)),
-        "unique_symbols":int(combined["symbol"].nunique()) if not combined.empty else 0,
-        "target_trainable_symbols":int(target_cov),
-        "symbol_coverage_pct":round(100*len(set(combined["symbol"])) / target_cov,3) if target_cov else None,
-        "fundamental_available_at_min":str(combined["fundamental_available_at"].min()) if not combined.empty else None,
-        "fundamental_available_at_max":str(combined["fundamental_available_at"].max()) if not combined.empty else None,
-        "pit_policy":"fundamental_available_at <= decision_timestamp required at merge time",
+    catalog = catalog_all(args.from_date, args.to_date, args.page_size)
+    filings = choose_filings(catalog, symbols, args.max_filings_per_symbol)
+    print(
+        "SELECTED FILINGS:",
+        f"{len(filings):,}",
+        f"symbols={len({f['symbol'] for f in filings}):,}",
+    )
+
+    parsed = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futures = [ex.submit(_parse_filing, f) for f in filings]
+        for i, fut in enumerate(as_completed(futures), 1):
+            row = fut.result()
+            if row:
+                parsed.append(row)
+            if i % 500 == 0:
+                print(f"XBRL progress: {i:,}/{len(filings):,}; parsed={len(parsed):,}")
+
+    fresh = _derive(pd.DataFrame(parsed)) if parsed else pd.DataFrame()
+    combined = (
+        _derive(pd.concat([seed, fresh], ignore_index=True))
+        if not fresh.empty
+        else seed
+    )
+    combined = combined[combined["symbol"].isin(symbols)].copy()
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(out, index=False)
+
+    report = {
+        "output": str(out),
+        "rows": int(len(combined)),
+        "symbols": int(combined["symbol"].nunique()) if not combined.empty else 0,
+        "target_trainable_symbols": len(symbols),
+        "symbol_coverage_pct": (
+            round(100.0 * combined["symbol"].nunique() / len(symbols), 3)
+            if symbols else 0.0
+        ),
+        "catalog_rows": len(catalog),
+        "filings_selected": len(filings),
+        "filings_parsed": len(fresh),
+        "feature_coverage_pct": {
+            c: round(100.0 * combined[c].notna().mean(), 3) if len(combined) else 0.0
+            for c in FIELD_ALIASES
+        },
+        "source": "NSE Integrated Filing catalog + NSE nsearchives XBRL; Drive PIT seed retained",
+        "pit_policy": "Only fundamental_available_at <= decision_timestamp is eligible at merge time",
     }
-    rp=out.with_suffix(".json")
-    rp.write_text(json.dumps(report,indent=2),encoding="utf-8")
-    print(json.dumps(report,indent=2))
+    out.with_suffix(".json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(json.dumps(report, indent=2))
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
