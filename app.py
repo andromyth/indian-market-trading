@@ -137,6 +137,13 @@ def normalize_symbol(value: str) -> str:
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
 
+# These are populated later by the NSE official-universe section. Initialize
+# them before the early input validation so first app render cannot raise
+# NameError before the NSE universe has been fetched.
+_nse_symbol_count = 0
+_nse_symbol_col = None
+_nse_universe = pd.DataFrame()
+
 # Validate NSE symbols against the official securities universe when the
 # universe file is available. This is an eligibility/provenance check only; it
 # does not pretend that every NSE-listed security already has a validated ML model.
