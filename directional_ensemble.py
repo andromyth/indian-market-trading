@@ -552,6 +552,7 @@ def _augment_auxiliary_features(
     announcements: list[dict[str, Any]] | None,
     fno: dict[str, Any] | None,
     event_risk: float = 0.0,
+    market_mood_score: float = np.nan,
     as_of: Any | None = None,
 ) -> pd.DataFrame:
     """Create the broad feature surface expected by older compatible models.
@@ -730,7 +731,7 @@ def _augment_auxiliary_features(
 
             if "market_mood_score" not in broad.columns:
                 broad["market_mood_score"] = _safe(
-                    event_risk
+                    market_mood_score
                 )
 
             if "news_mood_score" not in broad.columns:
@@ -1308,6 +1309,11 @@ def enrich_delivery_prediction(
         event_risk=_safe(
             context.get(
                 "event_risk"
+            )
+        ),
+        market_mood_score=_safe(
+            context.get(
+                "market_regime_score"
             )
         ),
         as_of=as_of,
