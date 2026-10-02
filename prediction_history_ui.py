@@ -1181,6 +1181,46 @@ def _historical_prediction(
             f"{type(exc).__name__}: {exc}"
         )
 
+    # Use the final integrated engine output consistently for everything shown
+    # below; do not leave the historical screen on the pre-enrichment p_up.
+    p_up = float(
+        result.get(
+            "probability_up_next_session",
+            p_up,
+        )
+    )
+
+    expected_return = float(
+        result.get(
+            "predicted_return_next_session",
+            expected_return,
+        )
+    )
+
+    signal = result.get(
+        "signal",
+        signal,
+    )
+
+    path = _price_path(
+        reference,
+        expected_return,
+        atr,
+    )
+
+    result.update({
+        "signal": signal,
+        "p_up": p_up,
+        "expected_return": expected_return,
+        "predicted_open": path["predicted_open"],
+        "predicted_high": path["predicted_high"],
+        "predicted_low": path["predicted_low"],
+        "predicted_close": path["predicted_close"],
+        "purchase_price": path["purchase_price"],
+        "sale_price": path["sale_price"],
+        "stop_price": path["stop_price"],
+    })
+
     if actual_rows.empty:
         result["status"] = (
             "Prediction generated from data through the previous session, "
