@@ -1092,6 +1092,18 @@ def enrich_delivery_prediction(
     # The current locked ALL-NSE output remains preserved in base_model_* fields.
     # is deliberately exposed as a separate consensus until prospective OOS
     # testing establishes a safe fusion weight.
+    # Keep the existing UI contract: the "signal" field is the engine's
+    # integrated next-session decision. The unblended 59-feature output is
+    # preserved as base_model_signal for auditability.
+    out["signal"] = out_signal
+    out["probability_up_next_session"] = integrated_p
+    out["probability_down_next_session"] = (
+        1.0 - integrated_p
+        if np.isfinite(integrated_p)
+        else np.nan
+    )
+    out["predicted_return_next_session"] = integrated_return
+
     out.update({
         "legacy_model_ensemble": ensemble,
         "multi_horizon_model_evidence": multi_horizon,
