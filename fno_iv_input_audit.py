@@ -24,35 +24,84 @@ KNOWN_ROOTS = [
 ]
 
 
-def discover_archives() -> tuple[Path, list[Path]]:
-    seen: set[Path] = set()
-    roots: list[Path] = []
+def discover_archives() -> tuple[Path, list[tuple[Path, pd.Timestamp, str]]]:
+    """Discover flat persisted F&O archives reliably on the mounted Drive."""
+    found: dict[Path, tuple[pd.Timestamp, str]] = {}
 
-    for root in KNOWN_ROOTS:
-        if root.exists():
-            roots.append(root)
-            try:
-                for p in root.rglob(f"{ARCHIVE_PREFIX}*{ARCHIVE_SUFFIX}"):
-                    if p.is_file():
-                        seen.add(p)
-            except OSError as exc:
-                print(f"DISCOVERY_WARNING: {root}: {type(exc).__name__}: {exc}")
+    udiff_roots = [
+        BASE / "production_data/nse_official/fno/raw_udiff",
+        BASE / "production_data/nse_official/fno",
+    ]
 
-    # Definitive mounted-Drive fallback: the preceding filesystem audit showed
-    # that historical UDiFF files may live outside the canonical production path.
-    if not seen and BASE.exists():
+    for root in udiff_roots:
+        if not root.exists():
+            continue
         try:
-            for p in BASE.rglob(f"{ARCHIVE_PREFIX}*{ARCHIVE_SUFFIX}"):
-                if p.is_file():
-                    seen.add(p)
+            for pattern in (
+                "BhavCopy_NSE_FO_*_F_0000.csv.zip",
+                "BhavCopy_NSE_FO_0_0_0_*_F_0000.csv.zip",
+            ):
+                for p in root.glob(pattern):
+                    if not p.is_file():
+                        continue
+                    try:
+                        token = p.name.split(
+                            "BhavCopy_NSE_FO_", 1
+                        )[1][:8]
+                        day = pd.Timestamp(
+                            token,
+                            format="%Y%m%d",
+                        )
+                        found[p] = (
+                            day,
+                            "NSE_UDIFF",
+                        )
+                    except Exception:
+                        continue
         except OSError as exc:
             print(
-                "DISCOVERY_WARNING: full research-root scan failed:",
-                f"{type(exc).__name__}: {exc}",
+                f"DISCOVERY_WARNING: {root}: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-    return BASE, sorted(seen)
+    # Legacy pre-UDiFF archive family retained for diagnostics only.
+    legacy_root = BASE / "fno/raw/2026"
+    if legacy_root.exists():
+        try:
+            for p in legacy_root.glob("fo_*.zip"):
+                if not p.is_file():
+                    continue
+                try:
+                    token = p.stem.split(
+                        "fo_", 1
+                    )[1][:8]
+                    day = pd.Timestamp(
+                        token,
+                        format="%Y%m%d",
+                    )
+                    found[p] = (
+                        day,
+                        "LEGACY_FO",
+                    )
+                except Exception:
+                    continue
+        except OSError as exc:
+            print(
+                f"DISCOVERY_WARNING: {legacy_root}: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
+    items = [
+        (path, day, source)
+        for path, (day, source) in sorted(
+            found.items(),
+            key=lambda kv: (
+                kv[1][0],
+                str(kv[0]),
+            ),
+        )
+    ]
+    return BASE, items
 
 def audit_file(path: Path) -> dict:
     try:
