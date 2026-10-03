@@ -1057,6 +1057,30 @@ for symbol in symbols:
                 "reason": f"{type(exc).__name__}: {exc}",
             })
 
+    # Intraday production ML uses the official NSE public quote-chart capture
+    # as its primary live price stream. A generic provider remains only a UI
+    # fallback when the exchange chart is unavailable outside/around market
+    # hours; it is never claimed as NSE provenance.
+    if style == "Intraday" and symbol.endswith(".NS"):
+        try:
+            official_intraday = nse_fetch_intraday_1m_current(
+                company_root,
+                sync_drive=True,
+            )
+            if official_intraday is not None and not official_intraday.empty:
+                raw_df = official_intraday.copy()
+                data_diagnostics.append({
+                    "symbol": symbol,
+                    "status": "NSE_OFFICIAL_INTRADAY",
+                    "rows": int(len(raw_df)),
+                })
+        except Exception as exc:
+            data_diagnostics.append({
+                "symbol": symbol,
+                "status": "NSE_OFFICIAL_INTRADAY_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+
     # Fallback is allowed for obtaining the UI chart/context only. The
     # all-NSE Delivery model itself independently verifies and fetches its
     # official NSE history.
