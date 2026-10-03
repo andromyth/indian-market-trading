@@ -304,19 +304,14 @@ def _drive_download(remote: str, local: Path) -> bool:
     except Exception:
         return False
 
-def _merge_and_persist(day_features: pd.DataFrame) -> None:
+def _persist_derived_rows(rows: pd.DataFrame) -> None:
     DERIVED.parent.mkdir(parents=True, exist_ok=True)
-    if not DERIVED.exists() or DERIVED.stat().st_size == 0:
-        _drive_download(
-            "production_data/nse_official/fno/fno_daily_features_2026.parquet",
-            DERIVED,
-        )
-    old = pd.read_parquet(DERIVED) if DERIVED.exists() and DERIVED.stat().st_size > 0 else pd.DataFrame()
-    all_rows = pd.concat([old, day_features], ignore_index=True) if not old.empty else day_features.copy()
+    all_rows = rows.copy()
     all_rows["symbol"] = all_rows["symbol"].astype(str).str.upper()
     all_rows["date"] = pd.to_datetime(all_rows["date"], errors="coerce").dt.normalize()
     all_rows = (
-        all_rows.drop_duplicates(["symbol", "date"], keep="last")
+        all_rows.dropna(subset=["symbol", "date"])
+        .drop_duplicates(["symbol", "date"], keep="last")
         .sort_values(["symbol", "date"])
         .reset_index(drop=True)
     )
@@ -325,21 +320,80 @@ def _merge_and_persist(day_features: pd.DataFrame) -> None:
         all_rows["fno_atm_iv"] = np.nan
     all_rows["fno_atm_iv"] = pd.to_numeric(all_rows["fno_atm_iv"], errors="coerce")
     all_rows["fno_iv_change"] = all_rows.groupby("symbol")["fno_atm_iv"].diff()
+
     all_rows.to_parquet(DERIVED, index=False)
     meta = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "rows": int(len(all_rows)),
         "symbols": int(all_rows["symbol"].nunique()),
-        "min_date": str(all_rows["date"].min().date()),
-        "max_date": str(all_rows["date"].max().date()),
+        "min_date": str(all_rows["date"].min().date()) if not all_rows.empty else None,
+        "max_date": str(all_rows["date"].max().date()) if not all_rows.empty else None,
         "source": "NSE_OFFICIAL_FNO_UDIFF",
+        "fno_iv_method": "ATM option IV from closing/settlement prices via Black-76, unit discount factor, near-expiry contracts",
+        "fno_basis_method": "NSE underlying_price when present; PIT-safe equity close fallback in candidate panel",
     }
     DERIVED_META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    GoogleDriveStore().upload_or_update(DERIVED, "production_data/nse_official/fno/fno_daily_features_2026.parquet")
-    GoogleDriveStore().upload_or_update(
+    g = GoogleDriveStore()
+    g.upload_or_update(
+        DERIVED,
+        "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+    )
+    g.upload_or_update(
         DERIVED_META,
         "production_data/nse_official/fno/fno_daily_features_2026.meta.json",
         mime_type="application/json",
+    )
+
+
+def _merge_and_persist(day_features: pd.DataFrame) -> None:
+    old = pd.read_parquet(DERIVED) if DERIVED.exists() and DERIVED.stat().st_size > 0 else pd.DataFrame()
+    all_rows = pd.concat([old, day_features], ignore_index=True) if not old.empty else day_features.copy()
+    _persist_derived_rows(all_rows)
+
+
+def _rebuild_derived_2026() -> None:
+    start = date(2026, 1, 1)
+    end = min(date.today(), date(2026, 12, 31))
+    frames = []
+    current = start
+    scanned = 0
+    loaded = 0
+    while current <= end:
+        if current.weekday() < 5:
+            scanned += 1
+            key = current.strftime("%Y%m%d")
+            out_dir = RAW_BASE / f"{current:%Y}" / f"{current:%m}" / f"{current:%d}"
+            zip_path = out_dir / f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip"
+            if not zip_path.exists() or zip_path.stat().st_size == 0:
+                _drive_download(
+                    f"production_data/nse_official/fno/raw/{current:%Y/%m/%d}/{zip_path.name}",
+                    zip_path,
+                )
+            try:
+                if not zip_path.exists() or zip_path.stat().st_size == 0:
+                    zip_path, raw = _download_day(current, force=False)
+                else:
+                    raw = _read_zip(zip_path.read_bytes())
+                features = _build_features(_normalize(raw, current))
+                if not features.empty:
+                    frames.append(features)
+                    loaded += 1
+                    print(
+                        f"{current}: rebuilt F&O features rows={len(features):,} symbols={features['symbol'].nunique():,}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"{current}: rebuild skipped {type(exc).__name__}: {exc}", flush=True)
+        current += timedelta(days=1)
+
+    if not frames:
+        raise RuntimeError("No 2026 F&O archives could be rebuilt")
+    combined = pd.concat(frames, ignore_index=True)
+    _persist_derived_rows(combined)
+    print(
+        f"F&O derived rebuild complete: weekday_dates_scanned={scanned:,} "
+        f"dates_loaded={loaded:,} rows={len(combined):,} symbols={combined['symbol'].nunique():,}",
+        flush=True,
     )
 
 def main() -> None:
@@ -347,7 +401,11 @@ def main() -> None:
     ap.add_argument("--date", default="")
     ap.add_argument("--days-back", type=int, default=3)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--rebuild-derived-2026", action="store_true", help="Rebuild the 2026 derived F&O feature file from cached Drive/raw archives.")
     args = ap.parse_args()
+    if args.rebuild_derived_2026:
+        _rebuild_derived_2026()
+        return
     if args.date:
         days = [pd.Timestamp(args.date).date()]
     else:
