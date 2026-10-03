@@ -322,60 +322,72 @@ def download_day(d: date, session: requests.Session, timeout=(8, 45)) -> Path | 
 
 
 def normalize_contracts(raw: pd.DataFrame, d: date) -> pd.DataFrame:
-    mapping = {}
+    """Normalize legacy and UDiFF schemas without alias-source collisions."""
+    targets = {}
     for target, aliases in ALIASES.items():
         col = find_col(raw, aliases)
         if col:
-            mapping[col] = target
+            targets[target] = col
 
-    x = raw.rename(columns=mapping).copy()
+    # Legacy bhavcopy has one INSTRUMENT field (e.g. FUTSTK/OPTSTK).
+    # UDiFF has FinInstrmNm plus FinInstrmTp. Never rename one source column
+    # twice; that was the cause of the original legacy backfill failure.
+    def source(target: str) -> pd.Series:
+        col = targets.get(target)
+        if col is None:
+            return pd.Series(np.nan, index=raw.index, dtype="object")
+        return raw[col]
 
-    missing = sorted(REQUIRED_BASE - set(x.columns))
-    if missing:
+    required_sources = []
+    for target in ("symbol", "expiry", "close"):
+        if targets.get(target) is None:
+            required_sources.append(target)
+
+    if targets.get("instrument") is None and targets.get("instrument_type") is None:
+        required_sources.append("instrument")
+
+    if required_sources:
         raise RuntimeError(
-            f"Normalized archive missing required fields: {missing}"
+            "Normalized archive missing required fields: "
+            f"{sorted(set(required_sources))}"
         )
 
-    x["symbol"] = x["symbol"].map(normalize_symbol)
-    x["instrument"] = (
-        x["instrument"].astype(str).str.strip().str.upper()
-    )
-    x["instrument_type"] = (
-        x.get(
-            "instrument_type",
-            pd.Series("", index=x.index),
-        )
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
-    x["option_type"] = (
-        x.get(
-            "option_type",
-            pd.Series("", index=x.index),
-        )
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
+    x = pd.DataFrame(index=raw.index)
+    x["symbol"] = source("symbol").astype(str).str.strip().str.upper()
+    x["instrument"] = source("instrument").astype(str).str.strip().str.upper()
+
+    # Legacy: instrument_type is the same semantic value as instrument.
+    # UDiFF: instrument_type is the compact code such as STF/STO.
+    if targets.get("instrument_type") is not None:
+        it = source("instrument_type").astype(str).str.strip().str.upper()
+        x["instrument_type"] = it
+    else:
+        x["instrument_type"] = x["instrument"]
 
     x["expiry"] = pd.to_datetime(
-        x["expiry"], errors="coerce"
+        source("expiry"), errors="coerce", dayfirst=False
     ).dt.normalize()
 
+    x["option_type"] = (
+        source("option_type").astype(str).str.strip().str.upper()
+    )
+
     for col in (
-        "open", "high", "low", "close", "settle",
-        "underlying_price", "strike_price",
-        "volume", "turnover", "oi", "oi_change",
+        "strike_price", "open", "high", "low", "close", "settle",
+        "underlying_price", "volume", "turnover", "oi", "oi_change",
     ):
-        if col not in x.columns:
-            x[col] = np.nan
+        s = source(col)
         x[col] = pd.to_numeric(
-            x[col].astype(str).str.replace(",", "", regex=False),
+            s.astype(str).str.replace(",", "", regex=False),
             errors="coerce",
         )
 
     x["date"] = pd.Timestamp(d).normalize()
+
+    # Legacy futures use OPTION_TYP=XX; retain that semantic explicitly.
+    # For UDiFF futures option_type may already be FF/FUT/blank.
+    legacy_xx = x["option_type"].eq("XX")
+    x.loc[legacy_xx, "option_type"] = "FUT"
 
     return x[
         [
@@ -385,7 +397,6 @@ def normalize_contracts(raw: pd.DataFrame, d: date) -> pd.DataFrame:
             "oi", "oi_change",
         ]
     ].copy()
-
 
 def is_future(frame: pd.DataFrame) -> pd.Series:
     instrument = frame["instrument"].astype(str).str.upper()
