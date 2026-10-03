@@ -133,16 +133,19 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
 
 def load_symbol(root: Path, sym: str) -> pd.DataFrame:
     parts = []
+    errors = []
 
-    # Historical seed consolidated into one or more Parquet files per symbol.
+    # Historical seed consolidated into one Parquet file per symbol.
     seed_dir = root / SEED_REL / f"symbol={sym}"
-    for p in sorted(seed_dir.glob("*.parquet")) if seed_dir.exists() else []:
+    seed_files = sorted(seed_dir.glob("*.parquet")) if seed_dir.exists() else []
+    for p in seed_files:
         try:
             z = pd.read_parquet(p)
-            if not z.empty:
-                parts.append(_norm(z))
-        except Exception:
-            pass
+            if z is None or z.empty:
+                continue
+            parts.append(_norm(z))
+        except Exception as exc:
+            errors.append(f"seed:{p.name}:{type(exc).__name__}:{exc}")
 
     # Official NSE incremental archive, if it already contains observations.
     official_dir = root / PERSISTENT_INTRADAY_REL
@@ -150,18 +153,25 @@ def load_symbol(root: Path, sym: str) -> pd.DataFrame:
         for p in sorted(official_dir.rglob(f"{sym}.parquet")):
             try:
                 z = pd.read_parquet(p)
-                if not z.empty:
-                    parts.append(_norm(z))
-            except Exception:
-                pass
+                if z is None or z.empty:
+                    continue
+                parts.append(_norm(z))
+            except Exception as exc:
+                errors.append(f"official:{p}:{type(exc).__name__}:{exc}")
 
+    if errors and not parts:
+        raise RuntimeError(
+            f"Could not read any intraday data for {sym}. "
+            + " | ".join(errors[:3])
+        )
+
+    parts = [p for p in parts if p is not None and not p.empty]
     if not parts:
         return pd.DataFrame()
 
     q = pd.concat(parts).sort_index()
     q = q[~q.index.duplicated(keep="last")]
     return q
-
 
 def load_market(root: Path) -> pd.DataFrame:
     cands = [
