@@ -245,6 +245,69 @@ def audit_file(path: Path) -> dict:
         }
 
 
+def _shell_find_archives() -> list[tuple[Path, pd.Timestamp, str]]:
+    """Use the mounted Drive's shell find when Python glob/FUSE enumeration is stale."""
+    import subprocess
+
+    command = [
+        "find",
+        str(BASE),
+        "-type",
+        "f",
+        "\\(",
+        "-name",
+        "BhavCopy_NSE_FO_*_F_0000.csv.zip",
+        "-o",
+        "-name",
+        "fo_*.zip",
+        "\\)",
+        "-print",
+    ]
+    try:
+        out = subprocess.check_output(
+            command,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        print(
+            "SHELL_FIND_FAILED:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return []
+
+    items = []
+    for line in out.splitlines():
+        p = Path(line.strip())
+        if not p.is_file():
+            continue
+        try:
+            if p.name.startswith("BhavCopy_NSE_FO_"):
+                token = p.name.split(
+                    "BhavCopy_NSE_FO_", 1
+                )[1][:8]
+                day = pd.Timestamp(
+                    token,
+                    format="%Y%m%d",
+                )
+                source = "NSE_UDIFF"
+            elif p.name.startswith("fo_"):
+                token = p.stem.split(
+                    "fo_", 1
+                )[1][:8]
+                day = pd.Timestamp(
+                    token,
+                    format="%Y%m%d",
+                )
+                source = "LEGACY_FO"
+            else:
+                continue
+            items.append((p, day, source))
+        except Exception:
+            continue
+    return items
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-days", type=int, default=20)
@@ -261,22 +324,57 @@ def main() -> int:
     )
 
     _, files = discover_archives()
-    print("ARCHIVE_DISCOVERY_PATHS:")
-    for root in KNOWN_ROOTS:
-        print(f"- {root}: {'EXISTS' if root.exists() else 'MISSING'}")
-    print("RAW_UDIFF_ARCHIVES_FOUND_ANYWHERE_UNDER_RESEARCH_ROOT:", len(files))
+    print(
+        "PYTHON_GLOB_ARCHIVES_FOUND:",
+        len(files),
+    )
+
+    if not files:
+        files = _shell_find_archives()
+        print(
+            "SHELL_FIND_ARCHIVES_FOUND:",
+            len(files),
+        )
 
     if not files:
         raise SystemExit(
-            "No NSE F&O UDiFF archives found anywhere under the mounted "
-            f"research root: {BASE}"
+            "No supported NSE F&O archives found under mounted research root: "
+            f"{BASE}"
         )
 
-    if args.sample_days > 0:
-        files = sorted(files, reverse=True)[: args.sample_days]
-        files = sorted(files)
+    # Prefer canonical UDiFF archives and choose the latest requested dates.
+    by_day = {}
+    for path, day, source in files:
+        key = day.normalize()
+        previous = by_day.get(key)
+        if (
+            previous is None
+            or (
+                source == "NSE_UDIFF"
+                and previous[2] != "NSE_UDIFF"
+            )
+        ):
+            by_day[key] = (path, day, source)
 
-    rows = [audit_file(path) for path in files]
+    selected_days = sorted(by_day)
+    if args.sample_days > 0:
+        selected_days = selected_days[-args.sample_days:]
+
+    selected = [by_day[d] for d in selected_days]
+
+    print("FILES_SELECTED:", len(selected))
+    if selected:
+        print(
+            "SELECTED_RANGE:",
+            selected[0][1].date(),
+            "->",
+            selected[-1][1].date(),
+        )
+
+    rows = [
+        audit_file(path, day, source)
+        for path, day, source in selected
+    ]
     df = pd.DataFrame(rows)
     good = df[df["status"].eq("PASS")].copy()
     bad = df[df["status"].ne("PASS")].copy()
@@ -293,13 +391,17 @@ def main() -> int:
             "symbols_with_future",
             "symbols_with_recoverable_atm_iv",
         ):
-            print(f"{col.upper()}: {int(good[col].sum())}")
+            print(
+                f"{col.upper()}:",
+                int(good[col].sum()),
+            )
 
         print("\nPer-file summary:")
         print(
             good[
                 [
                     "date",
+                    "source",
                     "relative_to_research_root",
                     "symbols",
                     "option_rows",
