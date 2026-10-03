@@ -1,0 +1,4 @@
+COLAB GPU HANDOFF 2026-10-03
+
+This branch is the clean GPU-runtime handoff.
+Expected source includes the fixed 59-feature V2 multifactor builder.
