@@ -33,9 +33,13 @@ jobs:
           validate_multifactor_candidate.py
           final_algorithm_data_readiness_v2.py
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
+          nse_fno_udiff_ingest.py
+          nse_fno_applicability_snapshot.py
+          COLAB_RUN_FNO_REPAIR_V2_20261003.py
 
       - name: Run multi-factor tests
         run: >
           pytest -q
           tests/test_multifactor_data_layer_v2.py
           tests/test_final_algorithm_data_readiness_v2.py
+          tests/test_nse_fno_udiff_ingest.py
