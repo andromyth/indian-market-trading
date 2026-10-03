@@ -8,7 +8,7 @@ from all_nse_delivery_model import (
     _build_latest_features as build_all_nse_features,
 )
 from directional_ensemble import enrich_delivery_prediction
-from production_model import build_feature_rows, predict as predict_intraday
+from all_nse_intraday_model import predict_symbol as predict_all_nse_intraday
 from prediction_ledger import append_prediction
 
 
@@ -103,20 +103,31 @@ def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[s
 
 
 def intraday_predictions(items: list[dict[str, Any]], sync_drive: bool = True) -> list[dict[str, Any]]:
-    feature_items = []
+    results = []
     for item in items:
-        feature_items.append({
-            "symbol": item["symbol"], "price_df": item["price_df"],
-            "market_df": item.get("market_df"), "matched_news": item.get("matched_news", []),
-            "announcements": item.get("announcements", []), "event_risk": item.get("event_risk", 0),
-            "fo": item.get("fo", {}),
-        })
-    frame = build_feature_rows(feature_items)
-    results = predict_intraday(frame)
-    for r in results:
+        try:
+            price_df = item["price_df"]
+            decision_ts = item.get("decision_timestamp")
+            if decision_ts is None and price_df is not None and not price_df.empty:
+                decision_ts = price_df.index[-1]
+            r = predict_all_nse_intraday(
+                item["symbol"],
+                price_df,
+                item.get("market_df"),
+                item.get("fo") or {},
+                decision_ts,
+            )
+        except Exception as exc:
+            r = {
+                "prediction_status": "ERROR",
+                "symbol": item.get("symbol"),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
         if r.get("prediction_status", "PASS") == "PASS":
             r["mode"] = "Intraday"
             r["prediction_horizon"] = "30m"
-            r["model_version"] = "production-2026.09"
+            r["model_version"] = "2026-all-nse-intraday-multifactor-replacement"
             append_prediction(r, sync_drive=sync_drive)
+        results.append(r)
     return results
