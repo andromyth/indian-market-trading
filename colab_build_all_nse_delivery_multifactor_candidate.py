@@ -936,7 +936,7 @@ def _candidate_artifacts_complete(out):
         m=json.loads(mp.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if m.get("promotion_status")!="CANDIDATE_ONLY" or m.get("features")!=FEATURES_59:
+    if m.get("promotion_status")!="BRANCH_REPLACEMENT_ONLY" or m.get("features")!=FEATURES_59:
         return False
     for item in m.get("artifacts",{}).values():
         if not isinstance(item,dict) or item.get("status")!="CANDIDATE_READY":
@@ -953,6 +953,7 @@ def main():
     ap.add_argument("--min-history",type=int,default=60)
     ap.add_argument("--refresh-fundamentals",action="store_true")
     ap.add_argument("--retry-failed-fundamentals",action="store_true")
+    ap.add_argument("--refresh-universe",action="store_true")
     ap.add_argument("--force-rebuild-candidate",action="store_true")
     args=ap.parse_args()
 
@@ -960,7 +961,7 @@ def main():
     out.mkdir(parents=True,exist_ok=True)
     bulk_root=Path(args.bulk_root)
     bulk=load_bulk(bulk_root)
-    roster=training_roster(bulk,min_history=args.min_history)
+    roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
     trainable=list(roster["trainable_symbols"])
 
     fund_report=_ensure_broad_fundamentals(
@@ -1027,7 +1028,7 @@ def main():
             }
 
     manifest={
-        "engine_version":"2026-all-nse-delivery-multifactor-59-candidate-v2",
+        "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
         "promotion_status":"BRANCH_REPLACEMENT_ONLY",
         "universe":universe,
         "universe_symbol_count":int(roster["universe_symbol_count"]),
