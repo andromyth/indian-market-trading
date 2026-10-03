@@ -44,7 +44,8 @@ def _norm(q: pd.DataFrame) -> pd.DataFrame:
         idx = pd.to_datetime(x.pop("Timestamp"), errors="coerce")
     else:
         idx = pd.to_datetime(x.index, errors="coerce")
-    if getattr(idx, "tz", None) is None:
+    idx = pd.DatetimeIndex(idx)
+    if idx.tz is None:
         idx = idx.tz_localize(IST)
     else:
         idx = idx.tz_convert(IST)
