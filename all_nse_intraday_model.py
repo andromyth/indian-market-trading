@@ -66,7 +66,8 @@ def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
     # timestamps as source-local; the project convention treats these as IST.
     # Official NSE live data may already be timezone-aware, so preserve an
     # existing timezone and only localize naive timestamps.
-    if getattr(idx, "tz", None) is None:
+    idx = pd.DatetimeIndex(idx)
+    if idx.tz is None:
         idx = idx.tz_localize("Asia/Kolkata")
     else:
         idx = idx.tz_convert("Asia/Kolkata")
