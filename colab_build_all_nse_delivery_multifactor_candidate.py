@@ -790,8 +790,6 @@ def merge_optional(panel):
         out=merge_pit_layer(out,layer,cols,kind)
         audit[kind]={"exists":True,"rows":int(len(layer)),"symbols":int(layer["symbol"].nunique())}
 
-    return attach_readiness_flags(out),audit
-
     # ONLY the broad ALL-NSE PIT fundamentals layer is accepted here.
     # Never silently fall back to the legacy three-stock pilot.
     fp=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
