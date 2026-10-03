@@ -319,8 +319,20 @@ def main():
     market = load_market(root)
     fno = load_fno(root)
 
+    # Colab RAM is limited, so never accumulate the complete minute-derived
+    # feature frame for all symbols. Each symbol is sampled evenly across its
+    # available decision history and only a bounded per-symbol quota is retained.
+    # This keeps all-NSE symbol coverage while bounding the pooled training matrix.
+    GLOBAL_RETAINED_ROWS = 1_000_000
+    per_symbol_cap = min(
+        args.max_train_rows_per_symbol,
+        max(100, GLOBAL_RETAINED_ROWS // max(1, len(universe))),
+    )
+
     frames = []
     coverage = []
+    trainable_symbols = 0
+    retained_rows = 0
 
     for i, sym in enumerate(universe, 1):
         raw = load_symbol(root, sym)
@@ -334,8 +346,8 @@ def main():
             continue
 
         # Build minute-level price/market features first, then sample. This
-        # dramatically reduces the rows entering the daily F&O PIT join while
-        # preserving all rolling features and the exact +30m target.
+        # preserves rolling information from 1-minute history while reducing
+        # the rows entering the daily F&O PIT join.
         feat = sample_decisions(feat, args.sample_minutes)
         feat = fno_join_features(feat, fno, sym)
         feat = feat.replace([np.inf, -np.inf], np.nan)
@@ -345,16 +357,34 @@ def main():
             coverage.append((sym, len(raw), "EXCLUDED_NO_LABELS"))
             continue
 
-        if len(feat) > args.max_train_rows_per_symbol + 500:
-            feat = feat.tail(args.max_train_rows_per_symbol + 500)
+        # Spread retained observations across the whole available history rather
+        # than keeping only the latest rows. The per-symbol quota is bounded so
+        # the total pooled matrix remains safe for a 12 GB Colab runtime.
+        if len(feat) > per_symbol_cap:
+            feat = feat.sample(
+                n=per_symbol_cap,
+                random_state=20261003 + i,
+            ).sort_index()
 
         feat["_symbol"] = sym
         feat["decision_ts"] = feat.index
         frames.append(feat)
+        trainable_symbols += 1
+        retained_rows += len(feat)
         coverage.append((sym, len(raw), "TRAINABLE"))
 
+        # Release the large 1-minute intermediates before continuing.
+        del raw, feat
+
         if i % 100 == 0:
-            print(f"prepared {i:,}/{len(universe):,} symbols", flush=True)
+            import gc
+            gc.collect()
+            print(
+                f"prepared {i:,}/{len(universe):,} symbols; "
+                f"trainable={trainable_symbols:,}; retained_rows={retained_rows:,}; "
+                f"per_symbol_cap={per_symbol_cap:,}",
+                flush=True,
+            )
 
     if not frames:
         raise RuntimeError(
@@ -362,6 +392,8 @@ def main():
         )
 
     data = pd.concat(frames, axis=0, ignore_index=False)
+    del frames
+
     data = data.sort_values("decision_ts")
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna(subset=["target_30m"])
@@ -415,6 +447,9 @@ def main():
         "minimum_rows_per_symbol": args.min_rows_symbol,
         "sample_minutes": args.sample_minutes,
         "max_train_rows_per_symbol": args.max_train_rows_per_symbol,
+        "effective_per_symbol_cap": int(per_symbol_cap),
+        "global_retained_row_cap": int(GLOBAL_RETAINED_ROWS),
+        "retained_rows_before_split": int(len(data)),
         "training_rows": int(len(train)),
         "holdout_rows": int(len(test)),
         "trained_until": str(train["decision_ts"].max()),
