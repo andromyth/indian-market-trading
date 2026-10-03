@@ -106,62 +106,114 @@ def discover_archives() -> tuple[Path, list[tuple[Path, pd.Timestamp, str]]]:
 def audit_file(path: Path) -> dict:
     try:
         raw = _read_zip(path.read_bytes())
-        token = path.name.split("_0_0_0_")[1][:8]
-        day = pd.Timestamp(token, format="%Y%m%d").date()
+        token = path.name.split(
+            "BhavCopy_NSE_FO_", 1
+        )[1][:8]
+        day = pd.Timestamp(
+            token, format="%Y%m%d"
+        ).date()
         x = _normalize(raw, day)
 
-        option = x[
-            x["option_type"].isin(["CE", "PE", "CALL", "PUT"])
-        ].copy()
+        option_mask = x["option_type"].isin(
+            ["CE", "PE", "CALL", "PUT"]
+        )
+        option = x[option_mask].copy()
 
         futures = x[
-            x["instrument"].str.contains("FUT", na=False)
+            x["instrument"].str.contains(
+                "FUT", na=False
+            )
         ].copy()
-        futures = futures.dropna(subset=["expiry"])
-        futures = futures[futures["expiry"] >= x["date"].iloc[0]]
+        futures = futures.dropna(
+            subset=["expiry"]
+        )
+        futures = futures[
+            futures["expiry"] >= x["date"].iloc[0]
+        ]
         futures = (
-            futures.sort_values(["symbol", "expiry"])
-            .drop_duplicates("symbol", keep="first")
+            futures.sort_values(
+                ["symbol", "expiry"]
+            )
+            .drop_duplicates(
+                "symbol",
+                keep="first",
+            )
         )
 
-        with_strike = int(option["strike_price"].notna().sum())
+        with_strike = int(
+            option["strike_price"].notna().sum()
+        )
         with_close = int(
-            pd.to_numeric(option["close"], errors="coerce").gt(0).sum()
+            pd.to_numeric(
+                option["close"],
+                errors="coerce",
+            ).gt(0).sum()
         )
         with_settle = int(
-            pd.to_numeric(option["settle"], errors="coerce").gt(0).sum()
+            pd.to_numeric(
+                option["settle"],
+                errors="coerce",
+            ).gt(0).sum()
         )
         with_underlying = int(
             pd.to_numeric(
-                option["underlying_price"], errors="coerce"
+                option["underlying_price"],
+                errors="coerce",
             ).gt(0).sum()
         )
         symbols_with_future = int(
-            futures["symbol"].isin(option["symbol"]).sum()
+            futures["symbol"].isin(
+                option["symbol"]
+            ).sum()
         )
 
         iv_symbols = 0
         iv_values = []
 
-        for sym in sorted(option["symbol"].dropna().unique()):
-            og = option[option["symbol"].eq(sym)]
-            fg = futures[futures["symbol"].eq(sym)]
-            fr = fg.iloc[0] if not fg.empty else None
+        for sym in sorted(
+            option["symbol"].dropna().unique()
+        ):
+            og = option[
+                option["symbol"].eq(sym)
+            ]
+            fg = futures[
+                futures["symbol"].eq(sym)
+            ]
+            fr = (
+                fg.iloc[0]
+                if not fg.empty
+                else None
+            )
             iv = _atm_iv(
                 og,
                 fr,
-                pd.Timestamp(x["date"].iloc[0]),
+                pd.Timestamp(
+                    x["date"].iloc[0]
+                ),
             )
             if np.isfinite(iv):
                 iv_symbols += 1
                 iv_values.append(float(iv))
 
+        instrument_counts = (
+            x["instrument"]
+            .value_counts()
+            .head(15)
+            .to_dict()
+        )
+        option_type_counts = (
+            x["option_type"]
+            .value_counts()
+            .head(10)
+            .to_dict()
+        )
+
         return {
             "file": str(path),
             "date": str(day),
-            "relative_to_research_root": str(path.relative_to(BASE))
-            if str(path).startswith(str(BASE) + os.sep)
-            else str(path),
+            "relative_to_research_root": str(
+                path.relative_to(BASE)
+            ),
             "rows": int(len(x)),
             "symbols": int(x["symbol"].nunique()),
             "option_rows": int(len(option)),
@@ -171,14 +223,23 @@ def audit_file(path: Path) -> dict:
             "option_rows_with_positive_underlying": with_underlying,
             "symbols_with_future": symbols_with_future,
             "symbols_with_recoverable_atm_iv": iv_symbols,
-            "median_atm_iv": float(np.median(iv_values))
-            if iv_values
-            else np.nan,
+            "median_atm_iv": (
+                float(np.median(iv_values))
+                if iv_values
+                else np.nan
+            ),
+            "instrument_types": str(
+                instrument_counts
+            ),
+            "option_types": str(
+                option_type_counts
+            ),
             "status": "PASS",
         }
     except Exception as exc:
         return {
             "file": str(path),
+            "date": None,
             "status": "FAIL",
             "error": f"{type(exc).__name__}: {exc}",
         }
