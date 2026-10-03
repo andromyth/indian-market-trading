@@ -19,7 +19,12 @@ import requests
 from nse_data_layer import HEADERS
 from persistent_store import GoogleDriveStore
 
-BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", "/tmp/Indian_Market_Research"))
+DEFAULT_BASE = (
+    "/content/drive/MyDrive/Indian_Market_Research"
+    if Path("/content/drive/MyDrive/Indian_Market_Research").exists()
+    else "/tmp/Indian_Market_Research"
+)
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
 RAW_BASE = BASE / "production_data/nse_official/fno/raw"
 DERIVED = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
 DERIVED_META = BASE / "production_data/nse_official/fno/fno_daily_features_2026.meta.json"
