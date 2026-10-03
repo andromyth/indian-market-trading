@@ -379,7 +379,11 @@ def panel_audit(path: Path, features: list[str], groups: dict[str,list[str]], tr
         flags[g]=pd.to_numeric(x[src],errors="coerce").astype("Int8") if src in x.columns else any_present(groups.get(g,[]))
     flags["fundamentals"]=pd.to_numeric(x["fundamentals_available"],errors="coerce").astype("Int8") if "fundamentals_available" in x.columns else any_present(groups.get("fundamentals",[]))
     for g,s in flags.items(): x[FLAG[g]]=s
-    flag_cols=list(FLAG.values()); x["strict_full_ready"]=x[flag_cols].eq(1).all(axis=1).astype("Int8")
+    flag_cols=list(FLAG.values())
+    # Strict readiness requires every modality to be explicitly known AND ready.
+    # Pandas nullable values must not be skipped by all(axis=1).
+    ready_matrix=x[flag_cols].apply(pd.to_numeric, errors="coerce")
+    x["strict_full_ready"]=(ready_matrix.notna().all(axis=1)&ready_matrix.eq(1).all(axis=1)).astype("Int8")
     for g,s in flags.items(): r["group_readiness"][g]={"known_rows":int(s.notna().sum()),"ready_rows":int(s.eq(1).sum()),"known_pct":round(100*float(s.notna().mean()),3),"ready_pct":round(100*float(s.eq(1).mean()),3),"ready_symbols":int(x.loc[s.eq(1),"symbol"].nunique())}
     r["strict_full_ready_pct"]=round(100*float(x["strict_full_ready"].mean()),3)
     # State-known semantics: 0 is a known state. For F&O, absence is NOT declared ineligible.
