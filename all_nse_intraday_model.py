@@ -194,6 +194,20 @@ def _manifest() -> dict[str,Any]:
 _MODEL_CACHE = {}
 
 
+def model_target_contract() -> dict[str, Any]:
+    return {
+        "target": "target_30m",
+        "positive_class": 1,
+        "positive_class_meaning": "UP: future 30-minute return > 0",
+        "negative_class": 0,
+        "negative_class_meaning": "DOWN/FLAT: future 30-minute return <= 0",
+        "probability_column": "probability_up_30m",
+        "signal_policy": "BUY if p>=0.60, SELL if p<=0.40, otherwise HOLD",
+        "feature_count": len(FEATURES),
+        "features": FEATURES,
+    }
+
+
 def model_status() -> dict[str,Any]:
     try:
         m=_manifest()
