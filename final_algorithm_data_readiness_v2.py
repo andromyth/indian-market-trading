@@ -410,7 +410,7 @@ def panel_audit(path: Path, features: list[str], groups: dict[str,list[str]], tr
         bad=[]
         for g,(col,v) in zip(FLAG.items(),zip(flag_cols,row)):
             if pd.isna(v) or v != 1:
-                bad.append(g)
+                bad.append(g if isinstance(g, str) else str(g))
         counts["+".join(bad) if bad else "ALL_READY"]+=1
     bdf=pd.DataFrame([{"missing_groups_combination":k,"rows":v,"pct_rows":round(100*v/len(x),3)} for k,v in counts.most_common()])
     sdf=x.groupby("symbol",as_index=False).agg(rows=("symbol","size"),first_date=("date","min"),last_date=("date","max"),strict_full_ready_pct=("strict_full_ready","mean"),feature_non_null_mean=(features[0],"count"))
