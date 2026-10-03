@@ -26,9 +26,7 @@ DEFAULT_BASE = (
 )
 BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
 
-# Canonical persisted location already present in the project/Drive.
 UDIFF_RAW_BASE = BASE / "production_data/nse_official/fno/raw_udiff"
-# Compatibility cache for files downloaded by older versions of this script.
 LEGACY_RAW_BASE = BASE / "production_data/nse_official/fno/raw"
 RAW_BASE = UDIFF_RAW_BASE
 
@@ -40,7 +38,8 @@ FALLBACK = "https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{d
 
 ALIASES = {
     "symbol": ["tckrsymb", "ticker", "symbol", "underlying", "undrlyg"],
-    "instrument": ["fininstrmtp", "fininstrmnm", "instrumenttype", "instrument"],
+    "instrument": ["fininstrmnm", "fininstrmtp", "instrumenttype", "instrument"],
+    "instrument_type": ["fininstrmtp", "instrumenttype", "instrument_type"],
     "expiry": ["xprydt", "expirydate", "expiry"],
     "option_type": ["optn_tp", "optn_tp_cd", "optiontype", "optn type", "optn_t"],
     "strike_price": ["strkpric", "strikeprice", "strike"],
@@ -48,7 +47,7 @@ ALIASES = {
     "settle": ["sttlmpric", "settleprice", "settlementprice"],
     "underlying_price": ["undrlygpric", "underlyingprice", "underlying_price"],
     "volume": ["ttltradgvol", "totaltradedvolume", "tottrdqty", "volume"],
-    "oi": ["ttloprnintrst", "totalopeninterest", "openinterest", "oi"],
+    "oi": ["opnintrst", "ttloprnintrst", "totalopeninterest", "openinterest", "oi"],
     "oi_change": ["chnginopnintrst", "changeinopeninterest", "oichange"],
 }
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
@@ -72,39 +71,38 @@ def _read_zip(content: bytes) -> pd.DataFrame:
         members = [n for n in zf.namelist() if not n.endswith("/")]
         if not members:
             raise RuntimeError("NSE F&O UDiFF archive is empty")
-        member = next((n for n in members if n.lower().endswith(".csv")), members[0])
+        member = next(
+            (n for n in members if n.lower().endswith(".csv")),
+            members[0],
+        )
         raw = zf.read(member)
     last = None
     for enc in ("utf-8-sig", "utf-8", "cp1252"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False)
+            return pd.read_csv(
+                io.BytesIO(raw),
+                encoding=enc,
+                low_memory=False,
+            )
         except Exception as exc:
             last = exc
-    raise RuntimeError(f"Unable to parse NSE F&O UDiFF CSV: {last}")
+    raise RuntimeError(
+        f"Unable to parse NSE F&O UDiFF CSV: {last}"
+    )
 
 
 def _udiff_existing_flat_path(d: date) -> Path:
     key = d.strftime("%Y%m%d")
-    return (
-        UDIFF_RAW_BASE
-        / f"BhavCopy_NSE_FO_{key}_F_0000.csv.zip"
-    )
+    return UDIFF_RAW_BASE / f"BhavCopy_NSE_FO_{key}_F_0000.csv.zip"
 
 
 def _udiff_downloaded_path(d: date) -> Path:
-    UDIFF_RAW_BASE.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    UDIFF_RAW_BASE.mkdir(parents=True, exist_ok=True)
     key = d.strftime("%Y%m%d")
-    return (
-        UDIFF_RAW_BASE
-        / f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip"
-    )
+    return UDIFF_RAW_BASE / f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip"
 
 
 def _udiff_local_path(d: date) -> Path:
-    """Path used for newly downloaded NSE UDiFF archives."""
     return _udiff_downloaded_path(d)
 
 
@@ -116,15 +114,71 @@ def _legacy_partition_path(d: date) -> Path:
     )
 
 
+def _shell_find_local_archives(d: date) -> list[Path]:
+    """Find exact-date archives when mounted Drive Path enumeration is stale."""
+    import subprocess
+
+    key = d.strftime("%Y%m%d")
+    patterns = [
+        f"BhavCopy_NSE_FO_{key}_F_0000.csv.zip",
+        f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip",
+        f"fo_{key}.zip",
+    ]
+    found: list[Path] = []
+    for pattern in patterns:
+        command = [
+            "find",
+            str(BASE),
+            "-type",
+            "f",
+            "-name",
+            pattern,
+            "-print",
+        ]
+        try:
+            out = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+        for line in out.splitlines():
+            p = Path(line.strip())
+            if p.is_file() and p.stat().st_size > 0:
+                found.append(p)
+
+    # Preserve order but deduplicate.
+    return list(dict.fromkeys(found))
+
+
 def _existing_local_archive(d: date) -> Path | None:
-    candidates = (
+    candidates = [
         _udiff_existing_flat_path(d),
         _udiff_downloaded_path(d),
         _legacy_partition_path(d),
-    )
+    ]
+
     for candidate in candidates:
-        if candidate.exists() and candidate.stat().st_size > 0:
-            return candidate
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+
+    shell_hits = _shell_find_local_archives(d)
+    if shell_hits:
+        # Prefer canonical UDiFF archive names over legacy files.
+        shell_hits.sort(
+            key=lambda p: (
+                0
+                if p.name.startswith("BhavCopy_NSE_FO_")
+                else 1,
+                len(str(p)),
+            )
+        )
+        return shell_hits[0]
+
     return None
 
 
@@ -139,18 +193,25 @@ def _download_day(d: date, force: bool = False) -> tuple[Path, pd.DataFrame]:
         try:
             r = requests.get(
                 url,
-                headers={**HEADERS, "Accept": "application/zip,text/plain,*/*"},
+                headers={
+                    **HEADERS,
+                    "Accept": "application/zip,text/plain,*/*",
+                },
                 timeout=(5, 30),
             )
             r.raise_for_status()
             if not r.content.startswith(b"PK"):
-                raise RuntimeError("NSE response is not a ZIP archive")
+                raise RuntimeError(
+                    "NSE response is not a ZIP archive"
+                )
             zip_path.write_bytes(r.content)
             return zip_path, _read_zip(r.content)
         except Exception as exc:
             last = exc
             time.sleep(1.5)
-    raise RuntimeError(f"F&O UDiFF unavailable for {key}: {last}")
+    raise RuntimeError(
+        f"F&O UDiFF unavailable for {key}: {last}"
+    )
 
 
 def _normalize(raw: pd.DataFrame, d: date) -> pd.DataFrame:
@@ -159,18 +220,44 @@ def _normalize(raw: pd.DataFrame, d: date) -> pd.DataFrame:
         c = _find_col(raw, aliases)
         if c:
             cols[target] = c
+
     if "symbol" not in cols or "close" not in cols:
         raise RuntimeError(
             "F&O UDiFF lacks required symbol/close fields: "
             f"{list(raw.columns)[:80]}"
         )
-    x = raw.rename(columns={v: k for k, v in cols.items()}).copy()
-    x["symbol"] = x["symbol"].astype(str).str.strip().str.upper()
-    x["instrument"] = x.get("instrument", pd.Series("", index=x.index)).astype(str).str.upper()
-    x["option_type"] = x.get("option_type", pd.Series("", index=x.index)).astype(str).str.upper()
+
+    x = raw.rename(
+        columns={v: k for k, v in cols.items()}
+    ).copy()
+
+    x["symbol"] = (
+        x["symbol"].astype(str).str.strip().str.upper()
+    )
+
+    x["instrument"] = x.get(
+        "instrument",
+        pd.Series("", index=x.index),
+    ).astype(str).str.strip().str.upper()
+
+    x["instrument_type"] = x.get(
+        "instrument_type",
+        pd.Series("", index=x.index),
+    ).astype(str).str.strip().str.upper()
+
+    x["option_type"] = x.get(
+        "option_type",
+        pd.Series("", index=x.index),
+    ).astype(str).str.strip().str.upper()
+
     x["expiry"] = pd.to_datetime(
-        x.get("expiry", pd.Series(pd.NaT, index=x.index)), errors="coerce"
+        x.get(
+            "expiry",
+            pd.Series(pd.NaT, index=x.index),
+        ),
+        errors="coerce",
     ).dt.normalize()
+
     for c in (
         "close",
         "settle",
@@ -182,20 +269,31 @@ def _normalize(raw: pd.DataFrame, d: date) -> pd.DataFrame:
     ):
         if c in x.columns:
             x[c] = pd.to_numeric(
-                x[c].astype(str).str.replace(",", "", regex=False),
+                x[c].astype(str).str.replace(
+                    ",", "", regex=False
+                ),
                 errors="coerce",
             )
         else:
             x[c] = np.nan
+
     x["date"] = pd.Timestamp(d).normalize()
     return x
 
 
 def _normal_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+    return 0.5 * (
+        1.0 + math.erf(float(x) / math.sqrt(2.0))
+    )
 
 
-def _black76_price(forward: float, strike: float, t_years: float, sigma: float, is_call: bool) -> float:
+def _black76_price(
+    forward: float,
+    strike: float,
+    t_years: float,
+    sigma: float,
+    is_call: bool,
+) -> float:
     if not all(
         np.isfinite(v)
         for v in (forward, strike, t_years, sigma)
@@ -208,8 +306,14 @@ def _black76_price(forward: float, strike: float, t_years: float, sigma: float, 
     ) / vol_sqrt_t
     d2 = d1 - vol_sqrt_t
     if is_call:
-        return forward * _normal_cdf(d1) - strike * _normal_cdf(d2)
-    return strike * _normal_cdf(-d2) - forward * _normal_cdf(-d1)
+        return (
+            forward * _normal_cdf(d1)
+            - strike * _normal_cdf(d2)
+        )
+    return (
+        strike * _normal_cdf(-d2)
+        - forward * _normal_cdf(-d1)
+    )
 
 
 def _implied_vol_black76(
@@ -287,7 +391,9 @@ def _atm_iv(
         og["settle"] = pd.to_numeric(
             og["settle"], errors="coerce"
         )
-    og = og.dropna(subset=["strike_price", "expiry"])
+    og = og.dropna(
+        subset=["strike_price", "expiry"]
+    )
     og = og[
         (og["expiry"] > day_date.normalize())
         & (og["strike_price"] > 0)
@@ -366,18 +472,34 @@ def _atm_iv(
         if np.isfinite(iv) and 0.0001 <= iv <= 5.0:
             ivs.append(iv)
 
-    return float(np.median(ivs)) if ivs else np.nan
+    return (
+        float(np.median(ivs))
+        if ivs
+        else np.nan
+    )
 
 
-def _is_future(series: pd.Series) -> pd.Series:
-    return series.str.contains("FUT", na=False)
+def _is_future(x: pd.DataFrame) -> pd.Series:
+    instrument = x["instrument"].astype(str).str.upper()
+    type_code = x.get(
+        "instrument_type",
+        pd.Series("", index=x.index),
+    ).astype(str).str.upper()
+    return (
+        instrument.str.contains("FUT", na=False)
+        | type_code.str.contains("FUT", na=False)
+    )
 
 
 def _is_stock_symbol(series: pd.Series) -> pd.Series:
     return (
         series.ne("")
         & ~series.isin(INDEX_SYMBOLS)
-        & ~series.str.contains("NIFTY|SENSEX", regex=True, na=False)
+        & ~series.str.contains(
+            "NIFTY|SENSEX",
+            regex=True,
+            na=False,
+        )
     )
 
 
@@ -386,16 +508,25 @@ def _build_features(day: pd.DataFrame) -> pd.DataFrame:
     if x.empty:
         return pd.DataFrame()
 
-    futures = x[_is_future(x["instrument"])].copy()
+    futures = x[_is_future(x)].copy()
     futures = futures.dropna(subset=["expiry"])
-    futures = futures[futures["expiry"] >= futures["date"]]
+    futures = futures[
+        futures["expiry"] >= futures["date"]
+    ]
     futures = (
-        futures.sort_values(["symbol", "expiry"])
-        .drop_duplicates("symbol", keep="first")
+        futures.sort_values(
+            ["symbol", "expiry"]
+        )
+        .drop_duplicates(
+            "symbol",
+            keep="first",
+        )
     )
 
     options = x[
-        x["option_type"].isin(["CE", "PE", "CALL", "PUT"])
+        x["option_type"].isin(
+            ["CE", "PE", "CALL", "PUT"]
+        )
     ].copy()
 
     rows = []
@@ -456,16 +587,22 @@ def _build_features(day: pd.DataFrame) -> pd.DataFrame:
                 fut_close = r.get("settle", np.nan)
             row["fno_fut_close"] = fut_close
             row["fno_fut_oi"] = r.get("oi", np.nan)
-            row["fno_fut_expiry"] = r.get("expiry", pd.NaT)
+            row["fno_fut_expiry"] = r.get(
+                "expiry",
+                pd.NaT,
+            )
 
-            under = r.get("underlying_price", np.nan)
+            under = r.get(
+                "underlying_price",
+                np.nan,
+            )
             if (
                 np.isfinite(fut_close)
                 and np.isfinite(under)
                 and under != 0
             ):
-                row["fno_fut_basis"] = (
-                    float(fut_close / under - 1.0)
+                row["fno_fut_basis"] = float(
+                    fut_close / under - 1.0
                 )
 
         future_row = (
@@ -529,7 +666,10 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
 
     all_rows = (
         all_rows.dropna(subset=["symbol", "date"])
-        .drop_duplicates(["symbol", "date"], keep="last")
+        .drop_duplicates(
+            ["symbol", "date"],
+            keep="last",
+        )
         .sort_values(["symbol", "date"])
         .reset_index(drop=True)
     )
@@ -581,10 +721,9 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
         encoding="utf-8",
     )
 
-    # When running in Colab, BASE is the mounted Google Drive and the
-    # files are already persistent. Drive API upload is only required when
-    # running outside the mounted Drive (for example GitHub Actions).
-    mounted_drive = str(BASE).startswith("/content/drive/MyDrive/")
+    mounted_drive = str(BASE).startswith(
+        "/content/drive/MyDrive/"
+    )
     if mounted_drive:
         print(
             "DRIVE_API_SYNC: SKIPPED_MOUNTED_DRIVE",
@@ -594,11 +733,13 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
         g = GoogleDriveStore()
         g.upload_or_update(
             DERIVED,
-            "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+            "production_data/nse_official/fno/"
+            "fno_daily_features_2026.parquet",
         )
         g.upload_or_update(
             DERIVED_META,
-            "production_data/nse_official/fno/fno_daily_features_2026.meta.json",
+            "production_data/nse_official/fno/"
+            "fno_daily_features_2026.meta.json",
             mime_type="application/json",
         )
 
@@ -610,7 +751,10 @@ def _merge_and_persist(day_features: pd.DataFrame) -> None:
         else pd.DataFrame()
     )
     all_rows = (
-        pd.concat([old, day_features], ignore_index=True)
+        pd.concat(
+            [old, day_features],
+            ignore_index=True,
+        )
         if not old.empty
         else day_features.copy()
     )
@@ -621,14 +765,13 @@ def _rebuild_derived_2026() -> None:
     start = date(2026, 1, 1)
     end = min(date.today(), date(2026, 12, 31))
     frames = []
-    current = start
     scanned = 0
     loaded = 0
 
+    current = start
     while current <= end:
         if current.weekday() < 5:
             scanned += 1
-
             try:
                 zip_path = _existing_local_archive(current)
 
@@ -743,25 +886,26 @@ def main() -> None:
                 )
                 continue
 
-            # Canonical remote archive location matches the persisted
-            # raw_udiff tree already used by this project.
-            if zip_path.parent == UDIFF_RAW_BASE:
-                remote_archive = (
-                    "production_data/nse_official/fno/"
-                    f"raw_udiff/{zip_path.name}"
+            remote_archive = (
+                "production_data/nse_official/fno/"
+                f"raw_udiff/{zip_path.name}"
+            )
+
+            mounted_drive = str(BASE).startswith(
+                "/content/drive/MyDrive/"
+            )
+            if mounted_drive:
+                print(
+                    f"{d}: RAW_ARCHIVE_PERSISTED: {zip_path}",
+                    flush=True,
                 )
             else:
-                # Legacy local cache is uploaded into the canonical UDiFF tree.
-                remote_archive = (
-                    "production_data/nse_official/fno/"
-                    f"raw_udiff/{zip_path.name}"
+                GoogleDriveStore().upload_or_update(
+                    zip_path,
+                    remote_archive,
+                    mime_type="application/zip",
                 )
 
-            GoogleDriveStore().upload_or_update(
-                zip_path,
-                remote_archive,
-                mime_type="application/zip",
-            )
             _merge_and_persist(features)
 
             print(
