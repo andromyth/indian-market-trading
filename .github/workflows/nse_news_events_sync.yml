@@ -45,6 +45,43 @@ jobs:
           print(f"Google Drive auth method: {status.get('auth_method')}")
           PY
 
+      - name: Download current ALL-NSE news/events archive from Drive
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from persistent_store import GoogleDriveStore
+          from googleapiclient.http import MediaIoBaseDownload
+
+          root = Path('/tmp/Indian_Market_Research')
+          targets = [
+              ('processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet', root / 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet'),
+              ('processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet', root / 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet'),
+          ]
+          g = GoogleDriveStore()
+          for remote, local in targets:
+              parts = remote.split('/')
+              parent = g.ensure_path('/'.join(parts[:-1]))
+              q = f"name = '{parts[-1]}' and '{parent}' in parents and trashed = false"
+              resp = g.service.files().list(q=q, spaces='drive', fields='files(id,name,size)', pageSize=10).execute()
+              hits = resp.get('files', [])
+              local.parent.mkdir(parents=True, exist_ok=True)
+              if not hits:
+                  print(f'No existing Drive archive: {remote}')
+                  continue
+              request = g.service.files().get_media(fileId=hits[0]['id'])
+              with local.open('wb') as fh:
+                  downloader = MediaIoBaseDownload(fh, request)
+                  done = False
+                  while not done:
+                      _, done = downloader.next_chunk()
+              print(f'Downloaded {remote}: {local.stat().st_size} bytes')
+          PY
+
       - name: Incremental ALL-NSE news and events update
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -66,3 +103,27 @@ jobs:
             --drive-root /tmp/Indian_Market_Research \
             --start "$START" \
             --end "$END"
+
+      - name: Upload updated ALL-NSE news/events archive to Drive
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from persistent_store import GoogleDriveStore
+
+          root = Path('/tmp/Indian_Market_Research')
+          g = GoogleDriveStore()
+          targets = [
+              (root / 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet', 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet'),
+              (root / 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet', 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet'),
+          ]
+          for local, remote in targets:
+              if not local.exists():
+                  raise SystemExit(f'Missing generated archive: {local}')
+              result = g.upload_or_update(local, remote, mime_type='application/octet-stream')
+              print(result)
+          PY
