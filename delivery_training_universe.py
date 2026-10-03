@@ -67,13 +67,13 @@ def official_nse_symbols(force_refresh: bool = False) -> list[str]:
     return sorted(load_official_nse_universe(force_refresh=force_refresh)["_symbol"].tolist())
 
 
-def training_roster(bulk_frame: pd.DataFrame, min_history: int = 60) -> dict[str, Any]:
+def training_roster(bulk_frame: pd.DataFrame, min_history: int = 60, force_refresh: bool = False) -> dict[str, Any]:
     """Return the full official roster plus trainable/excluded symbols.
 
     The bulk_frame is expected to be the already-normalized official NSE bulk
     EOD dataset. No public fallback data is substituted here.
     """
-    universe = set(official_nse_symbols(force_refresh=False))
+    universe = set(official_nse_symbols(force_refresh=force_refresh))
     bulk = bulk_frame.copy()
     bulk["_symbol"] = bulk["symbol"].map(normalize_symbol)
     counts = bulk.groupby("_symbol")["date"].nunique()
