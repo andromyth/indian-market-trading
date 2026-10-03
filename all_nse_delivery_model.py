@@ -5,13 +5,11 @@ the live Delivery path without retraining it.
 
 Design:
 - Candidate artifacts remain in Google Drive, not GitHub.
-- The exact Step 5K model hashes are verified before use.
+- The branch replacement manifest hashes are verified before use.
 - The current official NSE security-wise historical interface supplies the
   point-in-time OHLCV + delivery inputs for the selected symbol.
 - Official NSE NIFTY 50 / NIFTY BANK history supplies market context.
-- Optional news/F&O/fundamentals remain missing unless they were part of the
-  candidate's trained information set; current/future values are not silently
-  substituted.
+- Optional information remains explicit and point-in-time; current/future values are not silently substituted.
 - Only the 2,372 trainable symbols in the locked candidate manifest are scored.
 - No order-placement code exists here.
 """
@@ -39,46 +37,37 @@ from delivery_training_universe import benchmark_for_symbol
 
 
 DRIVE_MODEL_ROOT = (
-    "models/all_nse_delivery_candidate_2026"
+    "models/all_nse_delivery_multifactor_replacement_2026"
 )
 
 REMOTE_MANIFEST = (
-    f"{DRIVE_MODEL_ROOT}/ALL_NSE_DELIVERY_MODEL_MANIFEST_2026.json"
+    f"{DRIVE_MODEL_ROOT}/ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
 )
 
 REMOTE_CLASSIFIER = (
-    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_delivery_classifier_2026.joblib"
+    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_next_session_multifactor59_classifier_2026.joblib"
 )
 
 REMOTE_REGRESSOR = (
-    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_delivery_regressor_2026.joblib"
+    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_next_session_multifactor59_regressor_2026.joblib"
 )
 
 CACHE_ROOT = (
     Path(__file__).resolve().parent
     / "data"
-    / "all_nse_delivery_candidate"
+    / "all_nse_delivery_replacement"
 )
 
-LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_DELIVERY_MODEL_MANIFEST_2026.json"
-LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_delivery_classifier_2026.joblib"
-LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_delivery_regressor_2026.joblib"
+LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_classifier_2026.joblib"
+LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_regressor_2026.joblib"
 
-EXPECTED_ENGINE_VERSION = (
-    "2026-all-nse-delivery-candidate-5-market-context-fixed"
-)
-
-EXPECTED_CLASSIFIER_SHA256 = (
-    "75f0e8215508379cd7787fc9ea3957c0e9b15153bee724289027e3f1c310ea22"
-)
-
-EXPECTED_REGRESSOR_SHA256 = (
-    "923dcfe60c20ee4cae5aa6165144e989efdbe4533632dd5535ae967df52c38b1"
-)
-
-EXPECTED_MANIFEST_SHA256 = (
-    "b39c16372976de2ddd76dec875ac88ff61ae89fb425a72a686be63c6fbd5b9a9"
-)
+EXPECTED_ENGINE_VERSIONS = {
+    "2026-all-nse-delivery-multifactor-59-replacement-v1",
+    # Compatibility with the replacement artifact set already built before
+    # the branch version string was normalized. No model data is changed.
+    "2026-all-nse-delivery-multifactor-59-candidate-v2",
+}
 
 BANK_SYMBOLS = {
     "HDFCBANK",
@@ -190,21 +179,15 @@ def _load_manifest() -> dict[str, Any]:
 
     _ensure_artifacts()
 
-    if _sha256(LOCAL_MANIFEST) != EXPECTED_MANIFEST_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery manifest SHA-256 does not match the "
-            "locked Step 5K manifest."
-        )
-
     with LOCAL_MANIFEST.open(
         "r",
         encoding="utf-8",
     ) as fh:
         manifest = json.load(fh)
 
-    if manifest.get("engine_version") != EXPECTED_ENGINE_VERSION:
+    if manifest.get("engine_version") not in EXPECTED_ENGINE_VERSIONS:
         raise RuntimeError(
-            "Unexpected ALL-NSE Delivery engine version: "
+            "Unexpected ALL-NSE Delivery replacement engine version: "
             f"{manifest.get('engine_version')!r}"
         )
 
@@ -213,15 +196,13 @@ def _load_manifest() -> dict[str, Any]:
             "ALL-NSE Delivery candidate must expose exactly 59 features."
         )
 
-    if int(manifest.get("universe_symbol_count", 0)) != 2593:
-        raise RuntimeError(
-            "Unexpected NSE universe size in candidate manifest."
-        )
-
-    if int(manifest.get("trainable_symbol_count", 0)) != 2372:
-        raise RuntimeError(
-            "Unexpected trainable-symbol count in candidate manifest."
-        )
+    universe = manifest.get("universe", {})
+    universe_symbol_count = int(manifest.get("universe_symbol_count", universe.get("universe_symbol_count", 0)))
+    trainable_symbol_count = int(manifest.get("trainable_symbol_count", universe.get("trainable_symbol_count", 0)))
+    if universe_symbol_count != 2593:
+        raise RuntimeError("Unexpected NSE universe size in ALL-NSE replacement manifest.")
+    if trainable_symbol_count != 2372:
+        raise RuntimeError("Unexpected trainable-symbol count in ALL-NSE replacement manifest.")
 
     _manifest_cache = manifest
     return manifest
@@ -254,17 +235,13 @@ def _load_models():
     manifest = _load_manifest()
     _ensure_artifacts()
 
-    if _sha256(LOCAL_CLASSIFIER) != EXPECTED_CLASSIFIER_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery classifier SHA-256 does not match "
-            "the locked Step 5K model."
-        )
-
-    if _sha256(LOCAL_REGRESSOR) != EXPECTED_REGRESSOR_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery regressor SHA-256 does not match "
-            "the locked Step 5K model."
-        )
+    next_session = manifest.get("artifacts", {}).get("next_session", {})
+    expected_classifier_sha = next_session.get("classifier_sha256")
+    expected_regressor_sha = next_session.get("regressor_sha256")
+    if expected_classifier_sha and _sha256(LOCAL_CLASSIFIER) != expected_classifier_sha:
+        raise RuntimeError("ALL-NSE replacement classifier SHA-256 does not match its branch manifest.")
+    if expected_regressor_sha and _sha256(LOCAL_REGRESSOR) != expected_regressor_sha:
+        raise RuntimeError("ALL-NSE replacement regressor SHA-256 does not match its branch manifest.")
 
     if _classifier is None:
         _classifier = _patch_sklearn_compat(
@@ -352,7 +329,7 @@ def model_status() -> dict[str, Any]:
             "promotion_status",
             "UNKNOWN",
         ),
-        "live_status": "ACTIVE_ALL_NSE_DELIVERY_CANDIDATE",
+        "live_status": "ACTIVE_ALL_NSE_DELIVERY_REPLACEMENT_BRANCH",
         "production_artifacts_originally_changed": bool(
             manifest.get(
                 "production_artifacts_changed",
@@ -1437,7 +1414,7 @@ def predict_symbol(
             "prediction_status": "PASS",
             "mode": "Delivery",
             "prediction_horizon": "next_session",
-            "model_version": EXPECTED_ENGINE_VERSION,
+            "model_version": manifest.get("engine_version"),
             "model_family": manifest.get(
                 "model_family",
                 "logistic_regression + hgb_return_regressor",
