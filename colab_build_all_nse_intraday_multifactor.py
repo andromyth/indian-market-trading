@@ -235,8 +235,13 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
         "fno_basis": ("fno_basis", "fut_basis", "fno_fut_basis"),
     }
 
+    idx = pd.DatetimeIndex(feature_frame.index)
+    if idx.tz is None:
+        idx = idx.tz_localize(IST)
+    else:
+        idx = idx.tz_convert(IST)
     session_dates = pd.Series(
-        feature_frame.index.tz_convert(IST).normalize().date,
+        idx.normalize().date,
         index=feature_frame.index,
     )
     available_dates = sorted(z["_date"].dt.date.dropna().unique())
