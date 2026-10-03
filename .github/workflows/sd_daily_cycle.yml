@@ -1,0 +1,47 @@
+name: Self-driving daily cycle (global cues, news archive, predict, validate)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # after the existing NSE EOD (13:15 UTC), F&O and news/events (13:45 UTC) syncs
+    - cron: '30 14 * * 1-5'
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Unit tests (PIT, no look-ahead, gate rejects noise)
+        run: python -m pytest -q tests/test_selfdriving.py
+
+      - name: Verify Google Drive authentication
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          s = drive_status(); print(s)
+          if not s.get('configured') or s.get('reachable') is False:
+              raise SystemExit('Google Drive authentication check failed')
+          PY
+
+      # Each step below pulls its parquet from Drive, appends today's data, and uploads it back,
+      # using the same GoogleDriveStore pattern as nse_news_events_sync.yml.
+      # Step bodies are in sd_github_job.py so the YAML stays short.
+      - name: Global cues + headline archive + predictions + live validation
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: python -u -m selfdriving.sd_github_job
