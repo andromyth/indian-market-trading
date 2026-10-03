@@ -41,7 +41,18 @@ if not REPO.exists():
     ])
 else:
     run(["git", "-C", str(REPO), "fetch", "origin", BRANCH])
-    run(["git", "-C", str(REPO), "checkout", BRANCH])
+    local_branch = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "--verify", BRANCH],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if local_branch:
+        run(["git", "-C", str(REPO), "checkout", BRANCH])
+    else:
+        run([
+            "git", "-C", str(REPO), "checkout", "-b", BRANCH,
+            f"origin/{BRANCH}"
+        ])
     run(["git", "-C", str(REPO), "pull", "--ff-only", "origin", BRANCH])
 
 if not SCRIPT.exists():
