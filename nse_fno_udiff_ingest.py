@@ -557,16 +557,26 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
         encoding="utf-8",
     )
 
-    g = GoogleDriveStore()
-    g.upload_or_update(
-        DERIVED,
-        "production_data/nse_official/fno/fno_daily_features_2026.parquet",
-    )
-    g.upload_or_update(
-        DERIVED_META,
-        "production_data/nse_official/fno/fno_daily_features_2026.meta.json",
-        mime_type="application/json",
-    )
+    # When running in Colab, BASE is the mounted Google Drive and the
+    # files are already persistent. Drive API upload is only required when
+    # running outside the mounted Drive (for example GitHub Actions).
+    mounted_drive = str(BASE).startswith("/content/drive/MyDrive/")
+    if mounted_drive:
+        print(
+            "DRIVE_API_SYNC: SKIPPED_MOUNTED_DRIVE",
+            flush=True,
+        )
+    else:
+        g = GoogleDriveStore()
+        g.upload_or_update(
+            DERIVED,
+            "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+        )
+        g.upload_or_update(
+            DERIVED_META,
+            "production_data/nse_official/fno/fno_daily_features_2026.meta.json",
+            mime_type="application/json",
+        )
 
 
 def _merge_and_persist(day_features: pd.DataFrame) -> None:
