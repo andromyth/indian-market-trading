@@ -45,7 +45,7 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
-from all_nse_intraday_model import predict_symbol as all_nse_intraday_predict, model_status as all_nse_intraday_model_status
+from all_nse_intraday_model import predict_symbol as all_nse_intraday_predict, model_status as all_nse_intraday_model_status, model_target_contract
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
 from directional_ensemble import enrich_delivery_prediction
