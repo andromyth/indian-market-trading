@@ -76,9 +76,21 @@ def main() -> None:
     }
     META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    store = GoogleDriveStore()
-    store.upload_or_update(OUT, "production_data/nse_official/fno/fno_current_underlyings_2026.parquet")
-    store.upload_or_update(META, "production_data/nse_official/fno/fno_current_underlyings_2026.meta.json", mime_type="application/json")
+    # In Colab the output is already on the persistent mounted Drive.
+    # Use Drive API only when running from a non-mounted environment.
+    if str(BASE).startswith("/content/drive/MyDrive/"):
+        print("DRIVE_API_SYNC: SKIPPED_MOUNTED_DRIVE")
+    else:
+        store = GoogleDriveStore()
+        store.upload_or_update(
+            OUT,
+            "production_data/nse_official/fno/fno_current_underlyings_2026.parquet",
+        )
+        store.upload_or_update(
+            META,
+            "production_data/nse_official/fno/fno_current_underlyings_2026.meta.json",
+            mime_type="application/json",
+        )
 
     print(f"CURRENT NSE F&O UNDERLYINGS: {len(out):,}")
     print(f"OUTPUT: {OUT}")
