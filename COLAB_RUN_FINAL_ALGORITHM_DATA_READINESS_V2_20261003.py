@@ -55,8 +55,7 @@ sys.path.insert(0, str(REPO))
 
 from multifactor_data_layer_v2 import FEATURES_59, GROUPS
 
-print("
-SOURCE")
+print("\nSOURCE")
 print("branch:", subprocess.check_output(
     ["git", "branch", "--show-current"], text=True
 ).strip())
@@ -69,15 +68,13 @@ print("groups:", list(GROUPS.keys()))
 if len(FEATURES_59) != 59:
     raise SystemExit(f"59-feature contract check failed: {len(FEATURES_59)}")
 
-print("
-RUNNING READ-ONLY DIAGNOSTIC")
+print("\nRUNNING READ-ONLY DIAGNOSTIC")
 run([
     sys.executable, "-u", str(SCRIPT),
     "--output-dir", str(DRIVE_ROOT / "diagnostics" / "final_readiness_v2")
 ])
 
-print("
-COMPLETE")
+print("\nCOMPLETE")
 print("Output:", DRIVE_ROOT / "diagnostics" / "final_readiness_v2")
 print("NO MODEL TRAINING")
 print("NO MODEL PROMOTION")
