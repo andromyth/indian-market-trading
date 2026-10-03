@@ -252,7 +252,9 @@ def build_layers(ann_rows, action_rows, universe: set[str], start: date, end: da
         sym = normalize_symbol(pick(r, "SYMBOL", "symbol", "sym"))
         if not sym or sym not in universe:
             continue
-        ts = parse_ts(pick(r, "EX-DATE", "EX_DATE", "exDate", "ANNOUNCEMENT_DATE", "announcementDate", "date"), start)
+        # Ex-date is the corporate-action effective date, not information-availability time.
+        # Never use it as PIT timestamp; require an announcement/publication/API timestamp.
+        ts = parse_ts(pick(r, "ANNOUNCEMENT_DATE", "announcementDate", "broadcastDate", "BROADCAST_DATE", "broadcastDateTime", "BROADCAST_DATE_TIME", "date"), None)
         if pd.isna(ts):
             continue
         purpose = str(pick(r, "PURPOSE", "purpose", "details", "DETAILS") or "").strip()
