@@ -272,6 +272,10 @@ def _fund_parse(f):
         if not any(np.isfinite(v) for v in vals.values()):
             return None
         return {**f,**vals,"fundamental_source":"NSE_XBRL_PIT","fundamental_basis":"Integrated_Filing_period_aware_OneD_OneI_fallback"}
+    except Exception as exc:
+        print(f"fundamental parse failed for {f.get('symbol', '')}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
 def _funding_key(f):
     raw="|".join([
         str(f.get("symbol","")),
