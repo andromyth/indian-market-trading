@@ -482,7 +482,8 @@ def main() -> int:
     panel_syms=set(panel_df["symbol"]) if not panel_df.empty else set()
     universe_cross={"manifest_trainable":len(trainable),"panel_symbols":len(panel_syms),"manifest_trainable_observed_in_panel":len(trainable&panel_syms),"trainable_missing_from_panel":len(trainable-panel_syms),"panel_not_in_trainable":len(panel_syms-trainable),"exact_symbol_match":trainable==panel_syms}
     structural=[]
-    if fno_r.get("unobserved_trainable_symbols"): structural.append("FNO_ABSENCE_IS_NOT_AUTOMATIC_INELIGIBILITY")
+    if fno_r.get("unobserved_trainable_symbols"): structural.append("FNO_ARCHIVE_ABSENCE_REQUIRES_APPLICABILITY_CLASSIFICATION")
+    if not panel_r.get("current_fno_snapshot_loaded"): structural.append("CURRENT_OFFICIAL_FNO_SNAPSHOT_NOT_LOADED")
     if fund_r.get("comparison",{}).get("cache_only_trainable"): structural.append("BROAD_FUNDAMENTALS_NARROWER_THAN_FILING_CACHE")
     blocking=[]
     for rr in (model_r,panel_r,news_r,events_r,fno_r,fund_r):
@@ -498,6 +499,12 @@ def main() -> int:
         "panel":panel_r,
         "fno_derived":fno_r,
         "fno_raw_normalized_archive":fno_raw,
+        "fno_current_official_snapshot":{
+            "loaded":bool(panel_r.get("current_fno_snapshot_loaded")),
+            "symbols":int(panel_r.get("current_official_fno_symbols",0)),
+            "path":str(FNO_CURRENT),
+            "pit_scope":"current_reference_only_not_historical",
+        },
         "news_pit_replay":news_r,
         "events_fundamentals_pit_replay":events_r,
         "fundamentals":fund_r,
@@ -512,7 +519,7 @@ def main() -> int:
         "interpretation":{
             "strict_full_ready":"Literal simultaneous readiness of all six production groups.",
             "state_known":"Explicit 0/1 availability values are known states, not missing values.",
-            "fno_applicability":"Symbols absent from derived F&O are classified as applicability unknown, not ineligible.",
+            "fno_applicability":"Current applicability comes from the official NSE current-underlyings snapshot when loaded; historical training remains date-specific and does not backcast the current list.",
             "fno_relaxed_upper_bound":"Diagnostic upper bound only; not a production readiness score.",
             "pit":"decision_timestamp is the canonical replay PIT field; legacy latest_event_available_at is not substituted for it.",
             "fno_raw_duplicates":"Expected because normalized F&O archive is contract-level; symbol/date uniqueness is enforced in the derived feature layer."
