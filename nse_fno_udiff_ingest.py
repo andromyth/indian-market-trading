@@ -83,24 +83,48 @@ def _read_zip(content: bytes) -> pd.DataFrame:
     raise RuntimeError(f"Unable to parse NSE F&O UDiFF CSV: {last}")
 
 
-def _udiff_local_path(d: date) -> Path:
-    UDIFF_RAW_BASE.mkdir(parents=True, exist_ok=True)
+def _udiff_existing_flat_path(d: date) -> Path:
     key = d.strftime("%Y%m%d")
-    return UDIFF_RAW_BASE / f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip"
+    return (
+        UDIFF_RAW_BASE
+        / f"BhavCopy_NSE_FO_{key}_F_0000.csv.zip"
+    )
+
+
+def _udiff_downloaded_path(d: date) -> Path:
+    UDIFF_RAW_BASE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    key = d.strftime("%Y%m%d")
+    return (
+        UDIFF_RAW_BASE
+        / f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip"
+    )
+
+
+def _udiff_local_path(d: date) -> Path:
+    """Path used for newly downloaded NSE UDiFF archives."""
+    return _udiff_downloaded_path(d)
 
 
 def _legacy_partition_path(d: date) -> Path:
     out_dir = LEGACY_RAW_BASE / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
-    return out_dir / f"BhavCopy_NSE_FO_0_0_0_{d:%Y%m%d}_F_0000.csv.zip"
+    return (
+        out_dir
+        / f"BhavCopy_NSE_FO_0_0_0_{d:%Y%m%d}_F_0000.csv.zip"
+    )
 
 
 def _existing_local_archive(d: date) -> Path | None:
-    canonical = _udiff_local_path(d)
-    if canonical.exists() and canonical.stat().st_size > 0:
-        return canonical
-    legacy = _legacy_partition_path(d)
-    if legacy.exists() and legacy.stat().st_size > 0:
-        return legacy
+    candidates = (
+        _udiff_existing_flat_path(d),
+        _udiff_downloaded_path(d),
+        _legacy_partition_path(d),
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
     return None
 
 
