@@ -561,13 +561,8 @@ def _stored_nifty50_daily(start_date, end_date) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame()
 
-    x = (
-        pd.concat(parts, ignore_index=True)
-        .sort_values("date")
-        .drop_duplicates(["date", "close"], keep="last")
-        .groupby("date", as_index=False)["close"]
-        .last()
-    )
+    x = pd.concat(parts, ignore_index=True).sort_values("date", kind="stable")
+    x = x.groupby("date", as_index=False, sort=True)["close"].last()
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
     x = x[(x["date"] >= start_ts) & (x["date"] <= end_ts)].reset_index(drop=True)
