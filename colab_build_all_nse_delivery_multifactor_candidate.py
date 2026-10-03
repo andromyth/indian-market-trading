@@ -18,7 +18,7 @@ from nse_data_layer import fetch_index_history
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
 DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
-DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_candidate_2026"
+DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_replacement_2026"
 BASE=Path("/content/drive/MyDrive/Indian_Market_Research")
 
 FUND_PARSER_VERSION="2026-10-02-period-context-v3"
@@ -913,7 +913,7 @@ def _candidate_input_signature(bulk_root,bulk,trainable,fund_report):
         BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet",
     ]
     sig={
-        "engine_version":"2026-all-nse-delivery-multifactor-59-candidate-v2",
+        "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
         "feature_contract_hash":hashlib.sha256(json.dumps(FEATURES_59,separators=(",",":")).encode()).hexdigest(),
         "feature_count":len(FEATURES_59),
         "bulk_root":str(bulk_root),
@@ -1028,8 +1028,13 @@ def main():
 
     manifest={
         "engine_version":"2026-all-nse-delivery-multifactor-59-candidate-v2",
-        "promotion_status":"CANDIDATE_ONLY",
+        "promotion_status":"BRANCH_REPLACEMENT_ONLY",
         "universe":universe,
+        "universe_symbol_count":int(roster["universe_symbol_count"]),
+        "trainable_symbol_count":int(roster["trainable_symbol_count"]),
+        "excluded_symbol_count":int(roster["excluded_symbol_count"]),
+        "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+        "trainable_symbols":trainable,
         "feature_count":len(FEATURES_59),
         "features":FEATURES_59,
         "feature_contract_hash":input_sig["feature_contract_hash"],
@@ -1037,6 +1042,7 @@ def main():
         "data_readiness_path":str(out/"DATA_READINESS_REPORT_2026.json"),
         "pit_policy":"Only observations at or before decision_timestamp are eligible. Missing information is not fabricated.",
         "no_auto_orders":True,
+        "branch_replacement_target":"production_delivery_model",
     }
     (out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json").write_text(
         json.dumps(manifest,indent=2,default=str),
