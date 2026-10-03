@@ -11,209 +11,205 @@ import pandas as pd
 
 from nse_fno_udiff_ingest import _atm_iv, _normalize, _read_zip, UDIFF_RAW_BASE
 
-ARCHIVE_PREFIX = "BhavCopy_NSE_FO_0_0_0_"
-ARCHIVE_SUFFIX = "_F_0000.csv.zip"
-BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", "/content/drive/MyDrive/Indian_Market_Research"))
+BASE = Path(
+    os.getenv(
+        "INDIAN_MARKET_RESEARCH_ROOT",
+        "/content/drive/MyDrive/Indian_Market_Research",
+    )
+)
 OUTPUT = BASE / "diagnostics/fno_iv_input_audit_20261003.csv"
 
-KNOWN_ROOTS = [
-    BASE / "production_data/nse_official/fno/raw_udiff",
-    BASE / "production_data/nse_official/fno",
-    BASE / "fno/raw/2026",
-    BASE / "raw/nse_fno",
-]
+
+def _parse_udiff_date(name: str) -> pd.Timestamp | None:
+    """Parse YYYYMMDD from either flat NSE archive filename family."""
+    marker = "BhavCopy_NSE_FO_"
+    if marker in name:
+        rest = name.split(marker, 1)[1]
+        token = rest[:8]
+    elif name.startswith("fo_"):
+        token = name[3:11]
+    else:
+        return None
+    try:
+        return pd.Timestamp(token, format="%Y%m%d")
+    except Exception:
+        return None
+
+
+def _record_archive(found: dict[Path, tuple[pd.Timestamp, str]], p: Path, source: str) -> None:
+    if not p.is_file() or p.stat().st_size <= 0:
+        return
+    day = _parse_udiff_date(p.name)
+    if day is not None:
+        found[p] = (day, source)
 
 
 def discover_archives() -> tuple[Path, list[tuple[Path, pd.Timestamp, str]]]:
-    """Discover flat persisted F&O archives reliably on the mounted Drive."""
+    """Discover persisted NSE F&O archives, tolerating mounted-Drive enumeration quirks."""
     found: dict[Path, tuple[pd.Timestamp, str]] = {}
 
-    udiff_roots = [
-        BASE / "production_data/nse_official/fno/raw_udiff",
-        BASE / "production_data/nse_official/fno",
+    roots = [
+        (BASE / "production_data/nse_official/fno/raw_udiff", "NSE_UDIFF"),
+        (BASE / "production_data/nse_official/fno", "NSE_UDIFF"),
+        (BASE / "fno/raw/2026", "LEGACY_FO"),
+        (BASE / "raw/nse_fno", "LEGACY_FO"),
     ]
 
-    for root in udiff_roots:
+    for root, source in roots:
         if not root.exists():
             continue
         try:
-            for pattern in (
-                "BhavCopy_NSE_FO_*_F_0000.csv.zip",
-                "BhavCopy_NSE_FO_0_0_0_*_F_0000.csv.zip",
-            ):
+            patterns = (
+                ("BhavCopy_NSE_FO_*.csv.zip", "NSE_UDIFF"),
+                ("fo_*.zip", "LEGACY_FO"),
+            )
+            for pattern, pattern_source in patterns:
+                if source == "NSE_UDIFF" and pattern_source != "NSE_UDIFF":
+                    continue
+                if source == "LEGACY_FO" and pattern_source != "LEGACY_FO":
+                    continue
                 for p in root.glob(pattern):
-                    if not p.is_file():
-                        continue
-                    try:
-                        token = p.name.split(
-                            "BhavCopy_NSE_FO_", 1
-                        )[1][:8]
-                        day = pd.Timestamp(
-                            token,
-                            format="%Y%m%d",
-                        )
-                        found[p] = (
-                            day,
-                            "NSE_UDIFF",
-                        )
-                    except Exception:
-                        continue
+                    _record_archive(found, p, source)
         except OSError as exc:
             print(
                 f"DISCOVERY_WARNING: {root}: "
                 f"{type(exc).__name__}: {exc}"
             )
 
-    # Legacy pre-UDiFF archive family retained for diagnostics only.
-    legacy_root = BASE / "fno/raw/2026"
-    if legacy_root.exists():
-        try:
-            for p in legacy_root.glob("fo_*.zip"):
-                if not p.is_file():
-                    continue
-                try:
-                    token = p.stem.split(
-                        "fo_", 1
-                    )[1][:8]
-                    day = pd.Timestamp(
-                        token,
-                        format="%Y%m%d",
-                    )
-                    found[p] = (
-                        day,
-                        "LEGACY_FO",
-                    )
-                except Exception:
-                    continue
-        except OSError as exc:
-            print(
-                f"DISCOVERY_WARNING: {legacy_root}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    items = [
+    return BASE, [
         (path, day, source)
         for path, (day, source) in sorted(
             found.items(),
-            key=lambda kv: (
-                kv[1][0],
-                str(kv[0]),
-            ),
+            key=lambda kv: (kv[1][0], str(kv[0])),
         )
     ]
-    return BASE, items
 
-def audit_file(path: Path) -> dict:
+
+def _shell_find_archives() -> list[tuple[Path, pd.Timestamp, str]]:
+    """Use shell find with separate expressions; Colab Drive FUSE can enumerate here."""
+    import subprocess
+
+    expressions = [
+        ["-name", "BhavCopy_NSE_FO_*.csv.zip"],
+        ["-name", "fo_*.zip"],
+    ]
+    items: dict[Path, tuple[pd.Timestamp, str]] = {}
+
+    for expr in expressions:
+        command = ["find", str(BASE), "-type", "f", *expr, "-print"]
+        try:
+            out = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as exc:
+            print(
+                "SHELL_FIND_FAILED:",
+                f"{type(exc).__name__}: {exc}",
+            )
+            continue
+
+        for line in out.splitlines():
+            p = Path(line.strip())
+            if not p.is_file():
+                continue
+            source = "NSE_UDIFF" if p.name.startswith("BhavCopy_NSE_FO_") else "LEGACY_FO"
+            _record_archive(items, p, source)
+
+    return [
+        (path, day, source)
+        for path, (day, source) in sorted(
+            items.items(),
+            key=lambda kv: (kv[1][0], str(kv[0])),
+        )
+    ]
+
+
+def _select_stock_futures(x: pd.DataFrame) -> pd.DataFrame:
+    """Select nearest non-expired stock future using both UDiFF type/name evidence."""
+    if x.empty:
+        return x.iloc[0:0].copy()
+
+    instrument = x["instrument"].astype(str).str.upper()
+    fin_name = x.get(
+        "fin_instrm_nm",
+        pd.Series("", index=x.index),
+    ).astype(str).str.upper()
+    future_mask = (
+        instrument.str.contains("FUT", na=False)
+        | fin_name.str.contains(r"\bFUT\b|FUT", regex=True, na=False)
+    )
+    index_mask = x["symbol"].isin(
+        {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+    )
+    futures = x[future_mask & ~index_mask].copy()
+    if futures.empty:
+        return futures
+
+    futures = futures.dropna(subset=["expiry"])
+    futures = futures[futures["expiry"] >= x["date"].iloc[0]]
+    return (
+        futures.sort_values(["symbol", "expiry"])
+        .drop_duplicates("symbol", keep="first")
+    )
+
+
+def audit_file(path: Path, day_hint: pd.Timestamp | None = None, source: str = "NSE_UDIFF") -> dict:
     try:
         raw = _read_zip(path.read_bytes())
-        token = path.name.split(
-            "BhavCopy_NSE_FO_", 1
-        )[1][:8]
-        day = pd.Timestamp(
-            token, format="%Y%m%d"
-        ).date()
-        x = _normalize(raw, day)
+        day = day_hint or _parse_udiff_date(path.name)
+        if day is None:
+            raise RuntimeError(f"Cannot determine trading date from archive: {path.name}")
 
-        option_mask = x["option_type"].isin(
-            ["CE", "PE", "CALL", "PUT"]
+        x = _normalize(raw, day.date())
+
+        # Preserve UDiFF's instrument-name evidence when available.
+        name_col = next(
+            (c for c in raw.columns if "".join(ch for ch in str(c).strip().lower() if ch.isalnum()) == "fininstrmnm"),
+            None,
         )
+        if name_col:
+            x["fin_instrm_nm"] = raw[name_col].astype(str).str.strip().str.upper()
+
+        option_mask = x["option_type"].isin(["CE", "PE", "CALL", "PUT"])
         option = x[option_mask].copy()
+        futures = _select_stock_futures(x)
 
-        futures = x[
-            x["instrument"].str.contains(
-                "FUT", na=False
-            )
-        ].copy()
-        futures = futures.dropna(
-            subset=["expiry"]
-        )
-        futures = futures[
-            futures["expiry"] >= x["date"].iloc[0]
-        ]
-        futures = (
-            futures.sort_values(
-                ["symbol", "expiry"]
-            )
-            .drop_duplicates(
-                "symbol",
-                keep="first",
-            )
-        )
-
-        with_strike = int(
-            option["strike_price"].notna().sum()
-        )
+        with_strike = int(option["strike_price"].notna().sum())
         with_close = int(
-            pd.to_numeric(
-                option["close"],
-                errors="coerce",
-            ).gt(0).sum()
+            pd.to_numeric(option["close"], errors="coerce").gt(0).sum()
         )
         with_settle = int(
-            pd.to_numeric(
-                option["settle"],
-                errors="coerce",
-            ).gt(0).sum()
+            pd.to_numeric(option["settle"], errors="coerce").gt(0).sum()
         )
         with_underlying = int(
-            pd.to_numeric(
-                option["underlying_price"],
-                errors="coerce",
-            ).gt(0).sum()
+            pd.to_numeric(option["underlying_price"], errors="coerce").gt(0).sum()
         )
         symbols_with_future = int(
-            futures["symbol"].isin(
-                option["symbol"]
-            ).sum()
+            futures["symbol"].isin(option["symbol"]).sum()
         )
 
         iv_symbols = 0
-        iv_values = []
+        iv_values: list[float] = []
 
-        for sym in sorted(
-            option["symbol"].dropna().unique()
-        ):
-            og = option[
-                option["symbol"].eq(sym)
-            ]
-            fg = futures[
-                futures["symbol"].eq(sym)
-            ]
-            fr = (
-                fg.iloc[0]
-                if not fg.empty
-                else None
-            )
-            iv = _atm_iv(
-                og,
-                fr,
-                pd.Timestamp(
-                    x["date"].iloc[0]
-                ),
-            )
+        for sym in sorted(option["symbol"].dropna().unique()):
+            og = option[option["symbol"].eq(sym)]
+            fg = futures[futures["symbol"].eq(sym)]
+            fr = fg.iloc[0] if not fg.empty else None
+            iv = _atm_iv(og, fr, pd.Timestamp(day))
             if np.isfinite(iv):
                 iv_symbols += 1
                 iv_values.append(float(iv))
 
-        instrument_counts = (
-            x["instrument"]
-            .value_counts()
-            .head(15)
-            .to_dict()
-        )
-        option_type_counts = (
-            x["option_type"]
-            .value_counts()
-            .head(10)
-            .to_dict()
-        )
+        instrument_counts = x["instrument"].value_counts().head(20).to_dict()
+        option_type_counts = x["option_type"].value_counts().head(10).to_dict()
 
         return {
             "file": str(path),
-            "date": str(day),
-            "relative_to_research_root": str(
-                path.relative_to(BASE)
-            ),
+            "date": str(day.date()),
+            "source": source,
+            "relative_to_research_root": str(path.relative_to(BASE)),
             "rows": int(len(x)),
             "symbols": int(x["symbol"].nunique()),
             "option_rows": int(len(option)),
@@ -223,89 +219,19 @@ def audit_file(path: Path) -> dict:
             "option_rows_with_positive_underlying": with_underlying,
             "symbols_with_future": symbols_with_future,
             "symbols_with_recoverable_atm_iv": iv_symbols,
-            "median_atm_iv": (
-                float(np.median(iv_values))
-                if iv_values
-                else np.nan
-            ),
-            "instrument_types": str(
-                instrument_counts
-            ),
-            "option_types": str(
-                option_type_counts
-            ),
+            "median_atm_iv": float(np.median(iv_values)) if iv_values else np.nan,
+            "instrument_types": str(instrument_counts),
+            "option_types": str(option_type_counts),
             "status": "PASS",
         }
     except Exception as exc:
         return {
             "file": str(path),
             "date": None,
+            "source": source,
             "status": "FAIL",
             "error": f"{type(exc).__name__}: {exc}",
         }
-
-
-def _shell_find_archives() -> list[tuple[Path, pd.Timestamp, str]]:
-    """Use the mounted Drive's shell find when Python glob/FUSE enumeration is stale."""
-    import subprocess
-
-    command = [
-        "find",
-        str(BASE),
-        "-type",
-        "f",
-        "\\(",
-        "-name",
-        "BhavCopy_NSE_FO_*_F_0000.csv.zip",
-        "-o",
-        "-name",
-        "fo_*.zip",
-        "\\)",
-        "-print",
-    ]
-    try:
-        out = subprocess.check_output(
-            command,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        print(
-            "SHELL_FIND_FAILED:",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return []
-
-    items = []
-    for line in out.splitlines():
-        p = Path(line.strip())
-        if not p.is_file():
-            continue
-        try:
-            if p.name.startswith("BhavCopy_NSE_FO_"):
-                token = p.name.split(
-                    "BhavCopy_NSE_FO_", 1
-                )[1][:8]
-                day = pd.Timestamp(
-                    token,
-                    format="%Y%m%d",
-                )
-                source = "NSE_UDIFF"
-            elif p.name.startswith("fo_"):
-                token = p.stem.split(
-                    "fo_", 1
-                )[1][:8]
-                day = pd.Timestamp(
-                    token,
-                    format="%Y%m%d",
-                )
-                source = "LEGACY_FO"
-            else:
-                continue
-            items.append((p, day, source))
-        except Exception:
-            continue
-    return items
 
 
 def main() -> int:
@@ -324,17 +250,11 @@ def main() -> int:
     )
 
     _, files = discover_archives()
-    print(
-        "PYTHON_GLOB_ARCHIVES_FOUND:",
-        len(files),
-    )
+    print("PYTHON_GLOB_ARCHIVES_FOUND:", len(files))
 
     if not files:
         files = _shell_find_archives()
-        print(
-            "SHELL_FIND_ARCHIVES_FOUND:",
-            len(files),
-        )
+        print("SHELL_FIND_ARCHIVES_FOUND:", len(files))
 
     if not files:
         raise SystemExit(
@@ -342,24 +262,20 @@ def main() -> int:
             f"{BASE}"
         )
 
-    # Prefer canonical UDiFF archives and choose the latest requested dates.
-    by_day = {}
-    for path, day, source in files:
+    # Prefer canonical UDiFF archives for each date over legacy archives.
+    by_day: dict[pd.Timestamp, tuple[Path, pd.Timestamp, str]] = {}
+    for item in files:
+        path, day, source = item
         key = day.normalize()
         previous = by_day.get(key)
-        if (
-            previous is None
-            or (
-                source == "NSE_UDIFF"
-                and previous[2] != "NSE_UDIFF"
-            )
+        if previous is None or (
+            source == "NSE_UDIFF" and previous[2] != "NSE_UDIFF"
         ):
-            by_day[key] = (path, day, source)
+            by_day[key] = item
 
     selected_days = sorted(by_day)
     if args.sample_days > 0:
         selected_days = selected_days[-args.sample_days:]
-
     selected = [by_day[d] for d in selected_days]
 
     print("FILES_SELECTED:", len(selected))
@@ -371,10 +287,7 @@ def main() -> int:
             selected[-1][1].date(),
         )
 
-    rows = [
-        audit_file(path, day, source)
-        for path, day, source in selected
-    ]
+    rows = [audit_file(path, day, source) for path, day, source in selected]
     df = pd.DataFrame(rows)
     good = df[df["status"].eq("PASS")].copy()
     bad = df[df["status"].ne("PASS")].copy()
@@ -391,10 +304,7 @@ def main() -> int:
             "symbols_with_future",
             "symbols_with_recoverable_atm_iv",
         ):
-            print(
-                f"{col.upper()}:",
-                int(good[col].sum()),
-            )
+            print(f"{col.upper()}:", int(good[col].sum()))
 
         print("\nPer-file summary:")
         print(
