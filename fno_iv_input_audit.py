@@ -44,86 +44,46 @@ def _record_archive(found: dict[Path, tuple[pd.Timestamp, str]], p: Path, source
         found[p] = (day, source)
 
 
+
+def _archive_source(path: Path) -> str:
+    if path.name.startswith("BhavCopy_NSE_FO_"):
+        return "NSE_UDIFF"
+    if path.name.startswith("fo_"):
+        return "LEGACY_FO"
+    return "UNKNOWN"
+
+
 def discover_archives() -> tuple[Path, list[tuple[Path, pd.Timestamp, str]]]:
-    """Discover persisted NSE F&O archives, tolerating mounted-Drive enumeration quirks."""
-    found: dict[Path, tuple[pd.Timestamp, str]] = {}
+    """
+    Discover persisted archives by probing exact expected paths for
+    trading dates rather than recursively enumerating Google Drive.
+    """
+    from datetime import date, timedelta
 
-    roots = [
-        (BASE / "production_data/nse_official/fno/raw_udiff", "NSE_UDIFF"),
-        (BASE / "production_data/nse_official/fno", "NSE_UDIFF"),
-        (BASE / "fno/raw/2026", "LEGACY_FO"),
-        (BASE / "raw/nse_fno", "LEGACY_FO"),
-    ]
+    found: list[tuple[Path, pd.Timestamp, str]] = []
 
-    for root, source in roots:
-        if not root.exists():
-            continue
-        try:
-            patterns = (
-                ("BhavCopy_NSE_FO_*.csv.zip", "NSE_UDIFF"),
-                ("fo_*.zip", "LEGACY_FO"),
-            )
-            for pattern, pattern_source in patterns:
-                if source == "NSE_UDIFF" and pattern_source != "NSE_UDIFF":
-                    continue
-                if source == "LEGACY_FO" and pattern_source != "LEGACY_FO":
-                    continue
-                for p in root.glob(pattern):
-                    _record_archive(found, p, source)
-        except OSError as exc:
-            print(
-                f"DISCOVERY_WARNING: {root}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+    # Work backwards so --sample-days can stop after finding the newest
+    # available persisted dates.
+    current = min(date.today(), date(2026, 12, 31))
+    start = date(2026, 1, 1)
 
-    return BASE, [
-        (path, day, source)
-        for path, (day, source) in sorted(
-            found.items(),
-            key=lambda kv: (kv[1][0], str(kv[0])),
-        )
-    ]
+    while current >= start:
+        if current.weekday() < 5:
+            path = None
 
+            # Importing this helper keeps audit and rebuild discovery
+            # identical.
+            from nse_fno_udiff_ingest import _existing_local_archive
+            path = _existing_local_archive(current)
 
-def _shell_find_archives() -> list[tuple[Path, pd.Timestamp, str]]:
-    """Use shell find with separate expressions; Colab Drive FUSE can enumerate here."""
-    import subprocess
+            if path is not None:
+                day = pd.Timestamp(current)
+                found.append((path, day, _archive_source(path)))
 
-    expressions = [
-        ["-name", "BhavCopy_NSE_FO_*.csv.zip"],
-        ["-name", "fo_*.zip"],
-    ]
-    items: dict[Path, tuple[pd.Timestamp, str]] = {}
+        current -= timedelta(days=1)
 
-    for expr in expressions:
-        command = ["find", str(BASE), "-type", "f", *expr, "-print"]
-        try:
-            out = subprocess.check_output(
-                command,
-                text=True,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as exc:
-            print(
-                "SHELL_FIND_FAILED:",
-                f"{type(exc).__name__}: {exc}",
-            )
-            continue
-
-        for line in out.splitlines():
-            p = Path(line.strip())
-            if not p.is_file():
-                continue
-            source = "NSE_UDIFF" if p.name.startswith("BhavCopy_NSE_FO_") else "LEGACY_FO"
-            _record_archive(items, p, source)
-
-    return [
-        (path, day, source)
-        for path, (day, source) in sorted(
-            items.items(),
-            key=lambda kv: (kv[1][0], str(kv[0])),
-        )
-    ]
+    found.sort(key=lambda x: (x[1], str(x[0])))
+    return BASE, found
 
 
 def _select_stock_futures(x: pd.DataFrame) -> pd.DataFrame:
@@ -250,11 +210,7 @@ def main() -> int:
     )
 
     _, files = discover_archives()
-    print("PYTHON_GLOB_ARCHIVES_FOUND:", len(files))
-
-    if not files:
-        files = _shell_find_archives()
-        print("SHELL_FIND_ARCHIVES_FOUND:", len(files))
+    print("EXACT_PATH_ARCHIVES_FOUND:", len(files))
 
     if not files:
         raise SystemExit(

@@ -114,71 +114,60 @@ def _legacy_partition_path(d: date) -> Path:
     )
 
 
-def _shell_find_local_archives(d: date) -> list[Path]:
-    """Find exact-date archives when mounted Drive Path enumeration is stale."""
-    import subprocess
 
-    key = d.strftime("%Y%m%d")
-    patterns = [
-        f"BhavCopy_NSE_FO_{key}_F_0000.csv.zip",
-        f"BhavCopy_NSE_FO_0_0_0_{key}_F_0000.csv.zip",
-        f"fo_{key}.zip",
+def _legacy_flat_path(d: date) -> Path:
+    """Known legacy flat archive location retained for compatibility."""
+    return BASE / "fno/raw/2026" / f"fo_{d:%Y%m%d}.zip"
+
+
+def _raw_nse_fno_flat_path(d: date) -> Path:
+    """Known older raw/nse_fno flat location, if present."""
+    return BASE / "raw/nse_fno" / f"fo_{d:%Y%m%d}.zip"
+
+
+def _candidate_local_archives(d: date) -> list[Path]:
+    """
+    Return only deterministic archive paths whose names/locations are
+    already part of this project's persisted data layout.
+    """
+    return [
+        # Current canonical flat UDiFF filename observed in Drive.
+        _udiff_existing_flat_path(d),
+
+        # Current downloaded UDiFF filename used by this project.
+        _udiff_downloaded_path(d),
+
+        # Older partitioned UDiFF location.
+        _legacy_partition_path(d),
+
+        # Older flat legacy F&O location observed in Drive.
+        _legacy_flat_path(d),
+
+        # Compatibility location retained from the earlier data layer.
+        _raw_nse_fno_flat_path(d),
     ]
-    found: list[Path] = []
-    for pattern in patterns:
-        command = [
-            "find",
-            str(BASE),
-            "-type",
-            "f",
-            "-name",
-            pattern,
-            "-print",
-        ]
-        try:
-            out = subprocess.check_output(
-                command,
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            continue
-        for line in out.splitlines():
-            p = Path(line.strip())
-            if p.is_file() and p.stat().st_size > 0:
-                found.append(p)
 
-    # Preserve order but deduplicate.
-    return list(dict.fromkeys(found))
+
+def _direct_readable_archive(path: Path) -> bool:
+    """
+    Probe the exact mounted-Drive file directly.
+
+    Do not depend on directory enumeration because Google Drive/FUSE
+    enumeration has already been observed to disagree with direct access.
+    """
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(4)
+        return len(header) == 4 and header[:2] == b"PK"
+    except (OSError, ValueError):
+        return False
 
 
 def _existing_local_archive(d: date) -> Path | None:
-    candidates = [
-        _udiff_existing_flat_path(d),
-        _udiff_downloaded_path(d),
-        _legacy_partition_path(d),
-    ]
-
-    for candidate in candidates:
-        try:
-            if candidate.exists() and candidate.stat().st_size > 0:
-                return candidate
-        except OSError:
-            continue
-
-    shell_hits = _shell_find_local_archives(d)
-    if shell_hits:
-        # Prefer canonical UDiFF archive names over legacy files.
-        shell_hits.sort(
-            key=lambda p: (
-                0
-                if p.name.startswith("BhavCopy_NSE_FO_")
-                else 1,
-                len(str(p)),
-            )
-        )
-        return shell_hits[0]
-
+    """Find one persisted archive by exact known paths only."""
+    for candidate in _candidate_local_archives(d):
+        if _direct_readable_archive(candidate):
+            return candidate
     return None
 
 
