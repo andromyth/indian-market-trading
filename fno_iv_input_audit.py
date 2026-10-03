@@ -11,13 +11,47 @@ import pandas as pd
 
 from nse_fno_udiff_ingest import _atm_iv, _normalize, _read_zip, UDIFF_RAW_BASE
 
-
 ARCHIVE_PREFIX = "BhavCopy_NSE_FO_0_0_0_"
 ARCHIVE_SUFFIX = "_F_0000.csv.zip"
-OUTPUT = Path(
-    "/content/drive/MyDrive/Indian_Market_Research/"
-    "diagnostics/fno_iv_input_audit_20261003.csv"
-)
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", "/content/drive/MyDrive/Indian_Market_Research"))
+OUTPUT = BASE / "diagnostics/fno_iv_input_audit_20261003.csv"
+
+KNOWN_ROOTS = [
+    BASE / "production_data/nse_official/fno/raw_udiff",
+    BASE / "production_data/nse_official/fno",
+    BASE / "fno/raw/2026",
+    BASE / "raw/nse_fno",
+]
+
+
+def discover_archives() -> tuple[Path, list[Path]]:
+    seen: set[Path] = set()
+    roots: list[Path] = []
+
+    for root in KNOWN_ROOTS:
+        if root.exists():
+            roots.append(root)
+            try:
+                for p in root.rglob(f"{ARCHIVE_PREFIX}*{ARCHIVE_SUFFIX}"):
+                    if p.is_file():
+                        seen.add(p)
+            except OSError as exc:
+                print(f"DISCOVERY_WARNING: {root}: {type(exc).__name__}: {exc}")
+
+    # Definitive mounted-Drive fallback: the preceding filesystem audit showed
+    # that historical UDiFF files may live outside the canonical production path.
+    if not seen and BASE.exists():
+        try:
+            for p in BASE.rglob(f"{ARCHIVE_PREFIX}*{ARCHIVE_SUFFIX}"):
+                if p.is_file():
+                    seen.add(p)
+        except OSError as exc:
+            print(
+                "DISCOVERY_WARNING: full research-root scan failed:",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    return BASE, sorted(seen)
 
 
 def audit_file(path: Path) -> dict:
@@ -43,19 +77,14 @@ def audit_file(path: Path) -> dict:
 
         with_strike = int(option["strike_price"].notna().sum())
         with_close = int(
-            pd.to_numeric(
-                option["close"], errors="coerce"
-            ).gt(0).sum()
+            pd.to_numeric(option["close"], errors="coerce").gt(0).sum()
         )
         with_settle = int(
-            pd.to_numeric(
-                option["settle"], errors="coerce"
-            ).gt(0).sum()
+            pd.to_numeric(option["settle"], errors="coerce").gt(0).sum()
         )
         with_underlying = int(
             pd.to_numeric(
-                option["underlying_price"],
-                errors="coerce",
+                option["underlying_price"], errors="coerce"
             ).gt(0).sum()
         )
         symbols_with_future = int(
@@ -81,6 +110,9 @@ def audit_file(path: Path) -> dict:
         return {
             "file": str(path),
             "date": str(day),
+            "relative_to_research_root": str(path.relative_to(BASE))
+            if str(path).startswith(str(BASE) + os.sep)
+            else str(path),
             "rows": int(len(x)),
             "symbols": int(x["symbol"].nunique()),
             "option_rows": int(len(option)),
@@ -90,11 +122,9 @@ def audit_file(path: Path) -> dict:
             "option_rows_with_positive_underlying": with_underlying,
             "symbols_with_future": symbols_with_future,
             "symbols_with_recoverable_atm_iv": iv_symbols,
-            "median_atm_iv": (
-                float(np.median(iv_values))
-                if iv_values
-                else np.nan
-            ),
+            "median_atm_iv": float(np.median(iv_values))
+            if iv_values
+            else np.nan,
             "status": "PASS",
         }
     except Exception as exc:
@@ -107,91 +137,60 @@ def audit_file(path: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--raw-root",
-        default=os.getenv(
-            "FNO_UDIFF_RAW_ROOT",
-            str(UDIFF_RAW_BASE),
-        ),
-    )
     ap.add_argument("--sample-days", type=int, default=20)
     args = ap.parse_args()
 
-    root = Path(args.raw_root)
     print("=" * 90)
     print("NSE F&O IV INPUT AUDIT")
     print("=" * 90)
-    print("RAW_UDIFF_ROOT:", root)
-    print("INDIAN_MARKET_RESEARCH_ROOT:",
-          os.environ.get("INDIAN_MARKET_RESEARCH_ROOT", ""))
-
-    files = sorted(
-        root.rglob(
-            f"{ARCHIVE_PREFIX}*{ARCHIVE_SUFFIX}"
-        )
+    print("RESEARCH_ROOT:", BASE)
+    print("CANONICAL_RAW_ROOT:", UDIFF_RAW_BASE)
+    print(
+        "INDIAN_MARKET_RESEARCH_ROOT:",
+        os.environ.get("INDIAN_MARKET_RESEARCH_ROOT", ""),
     )
 
-    print("RAW_UDIFF_ARCHIVES_FOUND:", len(files))
+    _, files = discover_archives()
+    print("ARCHIVE_DISCOVERY_PATHS:")
+    for root in KNOWN_ROOTS:
+        print(f"- {root}: {'EXISTS' if root.exists() else 'MISSING'}")
+    print("RAW_UDIFF_ARCHIVES_FOUND_ANYWHERE_UNDER_RESEARCH_ROOT:", len(files))
 
     if not files:
         raise SystemExit(
-            "No NSE F&O UDiFF archives found under "
-            f"{root}"
+            "No NSE F&O UDiFF archives found anywhere under the mounted "
+            f"research root: {BASE}"
         )
 
     if args.sample_days > 0:
-        files = sorted(files, reverse=True)[:args.sample_days]
+        files = sorted(files, reverse=True)[: args.sample_days]
         files = sorted(files)
 
     rows = [audit_file(path) for path in files]
     df = pd.DataFrame(rows)
-
     good = df[df["status"].eq("PASS")].copy()
     bad = df[df["status"].ne("PASS")].copy()
 
     print("FILES_SCANNED:", len(df))
 
     if not good.empty:
-        print("OPTION_ROWS:",
-              int(good["option_rows"].sum()))
-        print(
-            "OPTION_ROWS_WITH_STRIKE:",
-            int(good["option_rows_with_strike"].sum()),
-        )
-        print(
-            "OPTION_ROWS_WITH_POSITIVE_CLOSE:",
-            int(good["option_rows_with_positive_close"].sum()),
-        )
-        print(
-            "OPTION_ROWS_WITH_POSITIVE_SETTLE:",
-            int(good["option_rows_with_positive_settle"].sum()),
-        )
-        print(
-            "OPTION_ROWS_WITH_POSITIVE_UNDERLYING:",
-            int(
-                good[
-                    "option_rows_with_positive_underlying"
-                ].sum()
-            ),
-        )
-        print(
-            "SYMBOLS_WITH_FUTURE:",
-            int(good["symbols_with_future"].sum()),
-        )
-        print(
-            "SYMBOLS_WITH_RECOVERABLE_ATM_IV:",
-            int(
-                good[
-                    "symbols_with_recoverable_atm_iv"
-                ].sum()
-            ),
-        )
+        for col in (
+            "option_rows",
+            "option_rows_with_strike",
+            "option_rows_with_positive_close",
+            "option_rows_with_positive_settle",
+            "option_rows_with_positive_underlying",
+            "symbols_with_future",
+            "symbols_with_recoverable_atm_iv",
+        ):
+            print(f"{col.upper()}: {int(good[col].sum())}")
 
         print("\nPer-file summary:")
         print(
             good[
                 [
                     "date",
+                    "relative_to_research_root",
                     "symbols",
                     "option_rows",
                     "option_rows_with_strike",
@@ -212,7 +211,6 @@ def main() -> int:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT, index=False)
     print("\nOUTPUT:", OUTPUT)
-
     return 0
 
 
