@@ -59,13 +59,18 @@ def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
                "volume":"Volume","vol":"Volume","timestamp":"Timestamp","datetime":"Timestamp","date":"Timestamp","time":"Timestamp"}
     x = x.rename(columns={c: aliases.get(str(c).strip().lower(), c) for c in x.columns})
     if "Timestamp" in x.columns:
-        idx = pd.to_datetime(x.pop("Timestamp"), errors="coerce", utc=True)
-        if hasattr(idx, "dt"):
-            idx = idx.dt.tz_convert("Asia/Kolkata")
-        x.index = idx
+        idx = pd.to_datetime(x.pop("Timestamp"), errors="coerce")
     else:
-        idx = pd.to_datetime(x.index, errors="coerce", utc=True)
-        x.index = idx.tz_convert("Asia/Kolkata")
+        idx = pd.to_datetime(x.index, errors="coerce")
+    # The historical seed source provides no timezone field and documents its
+    # timestamps as source-local; the project convention treats these as IST.
+    # Official NSE live data may already be timezone-aware, so preserve an
+    # existing timezone and only localize naive timestamps.
+    if getattr(idx, "tz", None) is None:
+        idx = idx.tz_localize("Asia/Kolkata")
+    else:
+        idx = idx.tz_convert("Asia/Kolkata")
+    x.index = idx
     for c in ("Open","High","Low","Close","Volume"):
         if c not in x.columns:
             x[c] = np.nan
