@@ -1,0 +1,129 @@
+name: NSE ALL-NSE news and events sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'Optional first NSE date (YYYY-MM-DD)'
+        required: false
+        default: ''
+      end:
+        description: 'Optional last NSE date (YYYY-MM-DD)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '45 13 * * 1-5'
+
+jobs:
+  sync-nse-news-events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Google Drive authentication
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status()
+          print(status)
+          if not status.get('configured') or status.get('reachable') is False:
+              raise SystemExit('Google Drive authentication check failed')
+          print(f"Google Drive auth method: {status.get('auth_method')}")
+          PY
+
+      - name: Download current ALL-NSE news/events archive from Drive
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from persistent_store import GoogleDriveStore
+          from googleapiclient.http import MediaIoBaseDownload
+
+          root = Path('/tmp/Indian_Market_Research')
+          targets = [
+              ('processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet', root / 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet'),
+              ('processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet', root / 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet'),
+          ]
+          g = GoogleDriveStore()
+          for remote, local in targets:
+              parts = remote.split('/')
+              parent = g.ensure_path('/'.join(parts[:-1]))
+              q = f"name = '{parts[-1]}' and '{parent}' in parents and trashed = false"
+              resp = g.service.files().list(q=q, spaces='drive', fields='files(id,name,size)', pageSize=10).execute()
+              hits = resp.get('files', [])
+              local.parent.mkdir(parents=True, exist_ok=True)
+              if not hits:
+                  print(f'No existing Drive archive: {remote}')
+                  continue
+              request = g.service.files().get_media(fileId=hits[0]['id'])
+              with local.open('wb') as fh:
+                  downloader = MediaIoBaseDownload(fh, request)
+                  done = False
+                  while not done:
+                      _, done = downloader.next_chunk()
+              print(f'Downloaded {remote}: {local.stat().st_size} bytes')
+          PY
+
+      - name: Incremental ALL-NSE news and events update
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.start }}" ] && [ -n "${{ inputs.end }}" ]; then
+            START='${{ inputs.start }}'
+            END='${{ inputs.end }}'
+          else
+            END=$(date -u +%Y-%m-%d)
+            START=$(date -u -d '7 days ago' +%Y-%m-%d)
+          fi
+
+          echo "ALL-NSE news/events sync: ${START}..${END}"
+          PYTHONUNBUFFERED=1 python -u build_all_nse_news_events_pit.py \
+            --drive-root /tmp/Indian_Market_Research \
+            --start "$START" \
+            --end "$END"
+
+      - name: Upload updated ALL-NSE news/events archive to Drive
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from persistent_store import GoogleDriveStore
+
+          root = Path('/tmp/Indian_Market_Research')
+          g = GoogleDriveStore()
+          targets = [
+              (root / 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet', 'processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet'),
+              (root / 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet', 'processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet'),
+          ]
+          for local, remote in targets:
+              if not local.exists():
+                  raise SystemExit(f'Missing generated archive: {local}')
+              result = g.upload_or_update(local, remote, mime_type='application/octet-stream')
+              print(result)
+          PY
