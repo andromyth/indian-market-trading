@@ -81,36 +81,47 @@ def read_archive(content: bytes, universe: set[str], src_name: str) -> pd.DataFr
 
 
 def build_symbol_partitions(seed_root: Path) -> dict:
-    daily_dir=seed_root/"daily"
-    symbol_dir=seed_root/"symbols"
-    symbol_dir.mkdir(parents=True,exist_ok=True)
-    daily_files=sorted(daily_dir.glob("*.parquet"))
+    daily_dir = seed_root / "daily"
+    symbol_dir = seed_root / "symbols"
+    symbol_dir.mkdir(parents=True, exist_ok=True)
+    daily_files = sorted(daily_dir.glob("*.parquet"))
     if not daily_files:
         raise RuntimeError("No filtered daily seed files were produced.")
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise RuntimeError("duckdb is required for symbol partitioning; install requirements.txt or pip install duckdb") from exc
 
-    # Rebuild deterministically from the filtered daily seed set. This produces
-    # one queryable symbol-partitioned Parquet dataset without millions of files.
-    if symbol_dir.exists():
-        for p in symbol_dir.glob("symbol=*"):
-            if p.is_dir():
-                shutil.rmtree(p)
-    glob=str(daily_dir/"*.parquet").replace("\","/")
-    con=duckdb.connect()
-    try:
-        con.execute(
-            f"COPY (SELECT symbol, timestamp, Open, High, Low, Close, Volume, source, source_file "
-            f"FROM read_parquet('{glob}')) TO '{symbol_dir.as_posix()}' "
-            "(FORMAT PARQUET, PARTITION_BY (symbol), OVERWRITE_OR_IGNORE)"
-        )
-    finally:
-        con.close()
-    parts=sorted(symbol_dir.glob("symbol=*/*.parquet"))
-    return {"partition_files":len(parts),"partition_symbols":len({p.parent.name for p in parts})}
+    # Avoid DuckDB/COPY glob quoting entirely: concatenate the already-filtered
+    # daily parquet files with pandas, then split by symbol. This is slower than
+    # DuckDB but robust for Colab and keeps the seed deterministic.
+    frames = []
+    for p in daily_files:
+        try:
+            z = pd.read_parquet(p)
+            if not z.empty:
+                frames.append(z)
+        except Exception as exc:
+            print(f"WARNING: cannot read seed file {p.name}: {type(exc).__name__}: {exc}", flush=True)
+    if not frames:
+        raise RuntimeError("Filtered seed files exist but none could be read.")
 
+    data = pd.concat(frames, ignore_index=True)
+    data = data.sort_values(["symbol", "timestamp"])
+    data = data.drop_duplicates(["symbol", "timestamp"], keep="last")
+
+    for p in symbol_dir.glob("symbol=*"):
+        if p.is_dir():
+            shutil.rmtree(p)
+
+    symbols_written = 0
+    for sym, group in data.groupby("symbol", sort=True):
+        out_dir = symbol_dir / f"symbol={sym}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        group.to_parquet(out_dir / "part-000.parquet", index=False)
+        symbols_written += 1
+
+    return {
+        "partition_files": symbols_written,
+        "partition_symbols": symbols_written,
+        "seed_rows": int(len(data)),
+    }
 
 def main():
     ap=argparse.ArgumentParser()
