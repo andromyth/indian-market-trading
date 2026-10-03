@@ -62,9 +62,12 @@ LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
 LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_classifier_2026.joblib"
 LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_regressor_2026.joblib"
 
-EXPECTED_ENGINE_VERSION = (
-    "2026-all-nse-delivery-multifactor-59-replacement-v1"
-)
+EXPECTED_ENGINE_VERSIONS = {
+    "2026-all-nse-delivery-multifactor-59-replacement-v1",
+    # Compatibility with the replacement artifact set already built before
+    # the branch version string was normalized. No model data is changed.
+    "2026-all-nse-delivery-multifactor-59-candidate-v2",
+}
 
 BANK_SYMBOLS = {
     "HDFCBANK",
@@ -182,9 +185,9 @@ def _load_manifest() -> dict[str, Any]:
     ) as fh:
         manifest = json.load(fh)
 
-    if manifest.get("engine_version") != EXPECTED_ENGINE_VERSION:
+    if manifest.get("engine_version") not in EXPECTED_ENGINE_VERSIONS:
         raise RuntimeError(
-            "Unexpected ALL-NSE Delivery engine version: "
+            "Unexpected ALL-NSE Delivery replacement engine version: "
             f"{manifest.get('engine_version')!r}"
         )
 
@@ -1411,7 +1414,7 @@ def predict_symbol(
             "prediction_status": "PASS",
             "mode": "Delivery",
             "prediction_horizon": "next_session",
-            "model_version": EXPECTED_ENGINE_VERSION,
+            "model_version": manifest.get("engine_version"),
             "model_family": manifest.get(
                 "model_family",
                 "logistic_regression + hgb_return_regressor",
