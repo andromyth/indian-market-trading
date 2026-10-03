@@ -100,7 +100,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
         m = _norm(market)
         mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
         for n in (1, 3, 5, 10, 15, 30):
-            out[f"market_ret_{n}"] = mc.pct_change(n)
+            out[f"market_ret_{n}"] = mc.pct_change(n, fill_method=None)
         out["market_rsi14"] = rsi_series(mc)
     else:
         for n in (1, 3, 5, 10, 15, 30):
@@ -203,8 +203,9 @@ def load_fno(root: Path) -> pd.DataFrame:
 
 
 def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) -> pd.DataFrame:
+    fno_cols = ["fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"]
     if fno is None or fno.empty:
-        for c in ("fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"):
+        for c in fno_cols:
             feature_frame[c] = np.nan
         feature_frame["fno_available"] = 0.0
         return feature_frame
@@ -215,15 +216,17 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
     datecol = next((lower[k] for k in ("date", "trade_date", "timestamp") if k in lower), None)
     symcol = next((lower[k] for k in ("symbol", "ticker", "underlying") if k in lower), None)
     if not datecol or not symcol:
-        for c in ("fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"):
+        for c in fno_cols:
             feature_frame[c] = np.nan
         feature_frame["fno_available"] = 0.0
         return feature_frame
 
     z["_date"] = pd.to_datetime(z[datecol], errors="coerce").dt.normalize()
-    z = z[z[symcol].astype(str).str.upper().str.replace(".NS", "", regex=False).eq(sym.upper())].sort_values("_date")
+    z = z[
+        z[symcol].astype(str).str.upper().str.replace(".NS", "", regex=False).eq(sym.upper())
+    ].sort_values("_date")
     if z.empty:
-        for c in ("fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"):
+        for c in fno_cols:
             feature_frame[c] = np.nan
         feature_frame["fno_available"] = 0.0
         return feature_frame
@@ -241,36 +244,45 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
         idx = idx.tz_localize(IST)
     else:
         idx = idx.tz_convert(IST)
-    session_dates = pd.Series(
-        idx.normalize().date,
-        index=feature_frame.index,
-    )
-    available_dates = sorted(z["_date"].dt.date.dropna().unique())
+
+    # Point-in-time rule: for an intraday session, use only an F&O observation
+    # from a strictly earlier trading date. merge_asof performs this in one
+    # vectorized operation instead of scanning all available dates row-by-row.
+    left = pd.DataFrame({
+        "_row_ts": feature_frame.index,
+        "_session_date": idx.normalize().tz_localize(None),
+    }).sort_values("_session_date")
 
     for outc, aliases in alias_map.items():
         src = next((lower[a] for a in aliases if a in lower), None)
         if not src:
             feature_frame[outc] = np.nan
             continue
-        d = z[["_date", src]].dropna(subset=["_date"]).copy()
+
+        d = z[["_date", src]].copy()
         d["value"] = pd.to_numeric(d[src], errors="coerce")
-        mapping = dict(
-            zip(
-                d.loc[d["value"].notna(), "_date"].dt.date,
-                d.loc[d["value"].notna(), "value"],
-            )
+        d = d.dropna(subset=["_date", "value"]).drop_duplicates("_date", keep="last")
+        if d.empty:
+            feature_frame[outc] = np.nan
+            continue
+
+        d = d[["_date", "value"]].sort_values("_date")
+        # Shift F&O observations forward to the next trading session's intraday
+        # rows by matching each session to the latest strictly prior F&O date.
+        left_key = left[["_row_ts", "_session_date"]].copy()
+        merged = pd.merge_asof(
+            left_key,
+            d,
+            left_on="_session_date",
+            right_on="_date",
+            direction="backward",
+            allow_exact_matches=False,
         )
-        vals = []
-        for dt in session_dates:
-            prior = [q for q in available_dates if q < dt]
-            vals.append(mapping.get(prior[-1]) if prior else np.nan)
-        feature_frame[outc] = vals
+        vals = merged.set_index("_row_ts")["value"].reindex(feature_frame.index)
+        feature_frame[outc] = vals.to_numpy()
 
-    feature_frame["fno_available"] = feature_frame[
-        ["fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"]
-    ].notna().any(axis=1).astype(float)
+    feature_frame["fno_available"] = feature_frame[fno_cols].notna().any(axis=1).astype(float)
     return feature_frame
-
 
 def sample_decisions(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if frame.empty or minutes <= 1:
@@ -321,8 +333,11 @@ def main():
             coverage.append((sym, len(raw), "EXCLUDED_FEATURE_BUILD"))
             continue
 
-        feat = fno_join_features(feat, fno, sym)
+        # Build minute-level price/market features first, then sample. This
+        # dramatically reduces the rows entering the daily F&O PIT join while
+        # preserving all rolling features and the exact +30m target.
         feat = sample_decisions(feat, args.sample_minutes)
+        feat = fno_join_features(feat, fno, sym)
         feat = feat.replace([np.inf, -np.inf], np.nan)
         feat = feat.dropna(subset=["target_30m"])
 
