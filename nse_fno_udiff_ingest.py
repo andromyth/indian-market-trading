@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import os
 import time
 import zipfile
@@ -31,6 +32,7 @@ ALIASES = {
     "instrument": ["fininstrmtp", "fininstrmnm", "instrumenttype", "instrument"],
     "expiry": ["xprydt", "expirydate", "expiry"],
     "option_type": ["optn_tp", "optn_tp_cd", "optiontype", "optn type", "optn_t"],
+    "strike_price": ["strkpric", "strikeprice", "strike"],
     "close": ["clspric", "close", "closeprice"],
     "settle": ["sttlmpric", "settleprice", "settlementprice"],
     "underlying_price": ["undrlygpric", "underlyingprice", "underlying_price"],
@@ -106,7 +108,7 @@ def _normalize(raw: pd.DataFrame, d: date) -> pd.DataFrame:
     x["expiry"] = pd.to_datetime(
         x.get("expiry", pd.Series(pd.NaT, index=x.index)), errors="coerce"
     ).dt.normalize()
-    for c in ("close", "settle", "underlying_price", "volume", "oi", "oi_change"):
+    for c in ("close", "settle", "underlying_price", "strike_price", "volume", "oi", "oi_change"):
         if c in x.columns:
             x[c] = pd.to_numeric(
                 x[c].astype(str).str.replace(",", "", regex=False),
@@ -116,6 +118,98 @@ def _normalize(raw: pd.DataFrame, d: date) -> pd.DataFrame:
             x[c] = np.nan
     x["date"] = pd.Timestamp(d).normalize()
     return x
+
+def _normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+
+def _black76_price(forward: float, strike: float, t_years: float, sigma: float, is_call: bool) -> float:
+    if not all(np.isfinite(v) for v in (forward, strike, t_years, sigma)) or forward <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
+        return np.nan
+    vol_sqrt_t = sigma * math.sqrt(t_years)
+    d1 = (math.log(forward / strike) + 0.5 * sigma * sigma * t_years) / vol_sqrt_t
+    d2 = d1 - vol_sqrt_t
+    if is_call:
+        return forward * _normal_cdf(d1) - strike * _normal_cdf(d2)
+    return strike * _normal_cdf(-d2) - forward * _normal_cdf(-d1)
+
+
+def _implied_vol_black76(price: float, forward: float, strike: float, t_years: float, is_call: bool) -> float:
+    """Return Black-76 IV with unit discount factor; invalid/illiquid prices remain NaN."""
+    if not all(np.isfinite(v) for v in (price, forward, strike, t_years)) or price <= 0 or forward <= 0 or strike <= 0 or t_years <= 0:
+        return np.nan
+    intrinsic = max(forward - strike, 0.0) if is_call else max(strike - forward, 0.0)
+    upper = forward if is_call else strike
+    if price <= intrinsic + 1e-10 or price >= upper - 1e-10:
+        return np.nan
+    lo, hi = 1e-4, 5.0
+    hi_price = _black76_price(forward, strike, t_years, hi, is_call)
+    while np.isfinite(hi_price) and hi_price < price and hi < 10.0:
+        hi *= 2.0
+        hi_price = _black76_price(forward, strike, t_years, hi, is_call)
+    if not np.isfinite(hi_price) or hi_price < price:
+        return np.nan
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        val = _black76_price(forward, strike, t_years, mid, is_call)
+        if not np.isfinite(val):
+            return np.nan
+        if val < price:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _atm_iv(options: pd.DataFrame, futures_row: pd.Series | None, day_date: pd.Timestamp) -> float:
+    if options.empty or "strike_price" not in options.columns:
+        return np.nan
+    og = options.copy()
+    og["strike_price"] = pd.to_numeric(og["strike_price"], errors="coerce")
+    og["expiry"] = pd.to_datetime(og["expiry"], errors="coerce").dt.normalize()
+    og["close"] = pd.to_numeric(og["close"], errors="coerce")
+    if "settle" in og.columns:
+        og["settle"] = pd.to_numeric(og["settle"], errors="coerce")
+    og = og.dropna(subset=["strike_price", "expiry"])
+    og = og[(og["expiry"] > day_date.normalize()) & (og["strike_price"] > 0)]
+    if og.empty:
+        return np.nan
+
+    near_expiry = og["expiry"].min()
+    og = og[og["expiry"].eq(near_expiry)].copy()
+
+    forward = np.nan
+    if futures_row is not None and not futures_row.empty:
+        forward = pd.to_numeric(pd.Series([futures_row.get("close", np.nan)]), errors="coerce").iloc[0]
+        if not np.isfinite(forward):
+            forward = pd.to_numeric(pd.Series([futures_row.get("settle", np.nan)]), errors="coerce").iloc[0]
+    if not np.isfinite(forward):
+        uv = pd.to_numeric(og.get("underlying_price", pd.Series(dtype=float)), errors="coerce")
+        if len(uv):
+            forward = float(uv.dropna().median()) if uv.notna().any() else np.nan
+    if not np.isfinite(forward) or forward <= 0:
+        return np.nan
+
+    og["atm_distance"] = (og["strike_price"] / float(forward) - 1.0).abs()
+    near = og[og["atm_distance"] <= 0.05].copy()
+    if near.empty:
+        near = og.nsmallest(min(12, len(og)), "atm_distance").copy()
+
+    ivs = []
+    t_years = max((near_expiry - day_date.normalize()).days, 1) / 365.0
+    for rr in near.itertuples(index=False):
+        option_type = str(getattr(rr, "option_type", "")).upper()
+        is_call = option_type in {"CE", "CALL"}
+        if option_type not in {"CE", "PE", "CALL", "PUT"}:
+            continue
+        px = getattr(rr, "close", np.nan)
+        if not np.isfinite(px) or px <= 0:
+            px = getattr(rr, "settle", np.nan)
+        iv = _implied_vol_black76(float(px), float(forward), float(getattr(rr, "strike_price")), t_years, is_call)
+        if np.isfinite(iv) and 0.0001 <= iv <= 5.0:
+            ivs.append(iv)
+    return float(np.median(ivs)) if ivs else np.nan
+
 
 def _is_future(series: pd.Series) -> pd.Series:
     return series.str.contains("FUT", na=False)
@@ -151,6 +245,7 @@ def _build_features(day: pd.DataFrame) -> pd.DataFrame:
             "fno_fut_return": np.nan,
             "fno_fut_oi": np.nan,
             "fno_fut_expiry": pd.NaT,
+            "fno_atm_iv": np.nan,
         }
         og = options[options["symbol"].eq(sym)]
         if not og.empty:
@@ -177,6 +272,8 @@ def _build_features(day: pd.DataFrame) -> pd.DataFrame:
             under = r.get("underlying_price", np.nan)
             if np.isfinite(fut_close) and np.isfinite(under) and under != 0:
                 row["fno_fut_basis"] = float(fut_close / under - 1.0)
+        future_row = fg.iloc[0] if not fg.empty else None
+        row["fno_atm_iv"] = _atm_iv(og, future_row, pd.Timestamp(g["date"].iloc[0]))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -224,6 +321,10 @@ def _merge_and_persist(day_features: pd.DataFrame) -> None:
         .reset_index(drop=True)
     )
     all_rows["fno_fut_return"] = all_rows.groupby("symbol")["fno_fut_close"].pct_change(fill_method=None)
+    if "fno_atm_iv" not in all_rows.columns:
+        all_rows["fno_atm_iv"] = np.nan
+    all_rows["fno_atm_iv"] = pd.to_numeric(all_rows["fno_atm_iv"], errors="coerce")
+    all_rows["fno_iv_change"] = all_rows.groupby("symbol")["fno_atm_iv"].diff()
     all_rows.to_parquet(DERIVED, index=False)
     meta = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
