@@ -5,13 +5,11 @@ the live Delivery path without retraining it.
 
 Design:
 - Candidate artifacts remain in Google Drive, not GitHub.
-- The exact Step 5K model hashes are verified before use.
+- The branch replacement manifest hashes are verified before use.
 - The current official NSE security-wise historical interface supplies the
   point-in-time OHLCV + delivery inputs for the selected symbol.
 - Official NSE NIFTY 50 / NIFTY BANK history supplies market context.
-- Optional news/F&O/fundamentals remain missing unless they were part of the
-  candidate's trained information set; current/future values are not silently
-  substituted.
+- Optional information remains explicit and point-in-time; current/future values are not silently substituted.
 - Only the 2,372 trainable symbols in the locked candidate manifest are scored.
 - No order-placement code exists here.
 """
@@ -57,7 +55,7 @@ REMOTE_REGRESSOR = (
 CACHE_ROOT = (
     Path(__file__).resolve().parent
     / "data"
-    / "all_nse_delivery_candidate"
+    / "all_nse_delivery_replacement"
 )
 
 LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
@@ -328,7 +326,7 @@ def model_status() -> dict[str, Any]:
             "promotion_status",
             "UNKNOWN",
         ),
-        "live_status": "ACTIVE_ALL_NSE_DELIVERY_CANDIDATE",
+        "live_status": "ACTIVE_ALL_NSE_DELIVERY_REPLACEMENT_BRANCH",
         "production_artifacts_originally_changed": bool(
             manifest.get(
                 "production_artifacts_changed",
