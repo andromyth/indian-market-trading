@@ -254,7 +254,12 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
             continue
         d = z[["_date", src]].dropna(subset=["_date"]).copy()
         d["value"] = pd.to_numeric(d[src], errors="coerce")
-        mapping = {row._date.date(): row.value for row in d.itertuples() if pd.notna(row.value)}
+        mapping = dict(
+            zip(
+                d.loc[d["value"].notna(), "_date"].dt.date,
+                d.loc[d["value"].notna(), "value"],
+            )
+        )
         vals = []
         for dt in session_dates:
             prior = [q for q in available_dates if q < dt]
