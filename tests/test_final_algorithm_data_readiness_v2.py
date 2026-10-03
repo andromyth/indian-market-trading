@@ -73,3 +73,17 @@ def test_feature_contract_hash_is_deterministic():
     h2 = v2.hash_features(features)
     assert h1 == h2
     assert len(h1) == 64
+
+
+def test_strict_readiness_does_not_skip_unknown_flags():
+    flags = pd.DataFrame(
+        {
+            "a": pd.Series([1, pd.NA], dtype="Int8"),
+            "b": pd.Series([1, 1], dtype="Int8"),
+        }
+    )
+    ready = (
+        flags.notna().all(axis=1)
+        & flags.eq(1).all(axis=1)
+    )
+    assert ready.tolist() == [True, False]
