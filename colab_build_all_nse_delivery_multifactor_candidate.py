@@ -747,8 +747,15 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     f = f.sort_values(["symbol", "decision_timestamp"])
     f = f.drop_duplicates(["symbol", "decision_timestamp"], keep="last")
 
+    # The candidate panel may already contain the legacy three-stock F&O pilot
+    # columns. Remove those target columns before merging so the authoritative
+    # broad NSE layer lands on the canonical 59-feature names rather than being
+    # silently suffixed (for example, fno_pcr_broad_fno).
+    target_columns = [x for x in present.values() if x in panel.columns]
+    panel_for_merge = panel.drop(columns=target_columns, errors="ignore")
+
     merged = merge_pit_layer(
-        panel,
+        panel_for_merge,
         f,
         [x for x in present.values()],
         "broad_fno",
