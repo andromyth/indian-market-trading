@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -17,7 +18,7 @@ import requests
 from nse_data_layer import HEADERS
 from persistent_store import GoogleDriveStore
 
-BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", "/tmp/Indian_Market_Research"))
 RAW_BASE = BASE / "production_data/nse_official/fno/raw"
 DERIVED = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
 DERIVED_META = BASE / "production_data/nse_official/fno/fno_daily_features_2026.meta.json"
