@@ -97,7 +97,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     out["tod_cos"] = np.cos(2 * np.pi * mins / 390.0)
 
     if market is not None and not market.empty:
-        m = _norm(market)
+        m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
         mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
         for n in (1, 3, 5, 10, 15, 30):
             out[f"market_ret_{n}"] = mc.pct_change(n, fill_method=None)
