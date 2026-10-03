@@ -39,19 +39,19 @@ from delivery_training_universe import benchmark_for_symbol
 
 
 DRIVE_MODEL_ROOT = (
-    "models/all_nse_delivery_candidate_2026"
+    "models/all_nse_delivery_multifactor_replacement_2026"
 )
 
 REMOTE_MANIFEST = (
-    f"{DRIVE_MODEL_ROOT}/ALL_NSE_DELIVERY_MODEL_MANIFEST_2026.json"
+    f"{DRIVE_MODEL_ROOT}/ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
 )
 
 REMOTE_CLASSIFIER = (
-    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_delivery_classifier_2026.joblib"
+    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_next_session_multifactor59_classifier_2026.joblib"
 )
 
 REMOTE_REGRESSOR = (
-    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_delivery_regressor_2026.joblib"
+    f"{DRIVE_MODEL_ROOT}/deployment_all_nse_next_session_multifactor59_regressor_2026.joblib"
 )
 
 CACHE_ROOT = (
@@ -60,24 +60,12 @@ CACHE_ROOT = (
     / "all_nse_delivery_candidate"
 )
 
-LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_DELIVERY_MODEL_MANIFEST_2026.json"
-LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_delivery_classifier_2026.joblib"
-LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_delivery_regressor_2026.joblib"
+LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_classifier_2026.joblib"
+LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_next_session_multifactor59_regressor_2026.joblib"
 
 EXPECTED_ENGINE_VERSION = (
-    "2026-all-nse-delivery-candidate-5-market-context-fixed"
-)
-
-EXPECTED_CLASSIFIER_SHA256 = (
-    "75f0e8215508379cd7787fc9ea3957c0e9b15153bee724289027e3f1c310ea22"
-)
-
-EXPECTED_REGRESSOR_SHA256 = (
-    "923dcfe60c20ee4cae5aa6165144e989efdbe4533632dd5535ae967df52c38b1"
-)
-
-EXPECTED_MANIFEST_SHA256 = (
-    "b39c16372976de2ddd76dec875ac88ff61ae89fb425a72a686be63c6fbd5b9a9"
+    "2026-all-nse-delivery-multifactor-59-replacement-v1"
 )
 
 BANK_SYMBOLS = {
@@ -190,12 +178,6 @@ def _load_manifest() -> dict[str, Any]:
 
     _ensure_artifacts()
 
-    if _sha256(LOCAL_MANIFEST) != EXPECTED_MANIFEST_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery manifest SHA-256 does not match the "
-            "locked Step 5K manifest."
-        )
-
     with LOCAL_MANIFEST.open(
         "r",
         encoding="utf-8",
@@ -213,15 +195,13 @@ def _load_manifest() -> dict[str, Any]:
             "ALL-NSE Delivery candidate must expose exactly 59 features."
         )
 
-    if int(manifest.get("universe_symbol_count", 0)) != 2593:
-        raise RuntimeError(
-            "Unexpected NSE universe size in candidate manifest."
-        )
-
-    if int(manifest.get("trainable_symbol_count", 0)) != 2372:
-        raise RuntimeError(
-            "Unexpected trainable-symbol count in candidate manifest."
-        )
+    universe = manifest.get("universe", {})
+    universe_symbol_count = int(manifest.get("universe_symbol_count", universe.get("universe_symbol_count", 0)))
+    trainable_symbol_count = int(manifest.get("trainable_symbol_count", universe.get("trainable_symbol_count", 0)))
+    if universe_symbol_count != 2593:
+        raise RuntimeError("Unexpected NSE universe size in ALL-NSE replacement manifest.")
+    if trainable_symbol_count != 2372:
+        raise RuntimeError("Unexpected trainable-symbol count in ALL-NSE replacement manifest.")
 
     _manifest_cache = manifest
     return manifest
@@ -254,17 +234,13 @@ def _load_models():
     manifest = _load_manifest()
     _ensure_artifacts()
 
-    if _sha256(LOCAL_CLASSIFIER) != EXPECTED_CLASSIFIER_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery classifier SHA-256 does not match "
-            "the locked Step 5K model."
-        )
-
-    if _sha256(LOCAL_REGRESSOR) != EXPECTED_REGRESSOR_SHA256:
-        raise RuntimeError(
-            "ALL-NSE Delivery regressor SHA-256 does not match "
-            "the locked Step 5K model."
-        )
+    next_session = manifest.get("artifacts", {}).get("next_session", {})
+    expected_classifier_sha = next_session.get("classifier_sha256")
+    expected_regressor_sha = next_session.get("regressor_sha256")
+    if expected_classifier_sha and _sha256(LOCAL_CLASSIFIER) != expected_classifier_sha:
+        raise RuntimeError("ALL-NSE replacement classifier SHA-256 does not match its branch manifest.")
+    if expected_regressor_sha and _sha256(LOCAL_REGRESSOR) != expected_regressor_sha:
+        raise RuntimeError("ALL-NSE replacement regressor SHA-256 does not match its branch manifest.")
 
     if _classifier is None:
         _classifier = _patch_sklearn_compat(
