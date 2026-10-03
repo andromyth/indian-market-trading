@@ -529,14 +529,94 @@ def add_features(x):
     z["delivery_qty_ratio20"]=dq/dq.rolling(20).mean(); z["delivery_qty_z20"]=(dq-dq.rolling(20).mean())/dq.rolling(20).std()
     return z
 
-def _official_market_context(index_symbol: str, start_date, end_date) -> pd.DataFrame:
-    """Load official NSE benchmark history from Drive first, API second."""
-    frame = fetch_index_history(
-        index_symbol,
-        pd.Timestamp(start_date).date(),
-        pd.Timestamp(end_date).date(),
-        sync_drive=True,
+def _stored_nifty50_daily(start_date, end_date) -> pd.DataFrame:
+    """Build daily NIFTY 50 benchmark closes from the project's persisted NSE archive.
+
+    The archive already contains NSE NIFTY 50 one-minute data in Drive. Reusing
+    that persisted official archive avoids an unnecessary historical-index API
+    call while preserving the same benchmark semantics.
+    """
+    paths = [
+        BASE / "raw/2018_2025/NIFTY50-INDEX.parquet",
+        BASE / "raw/2026/NIFTY50-INDEX.parquet",
+    ]
+    parts = []
+    for path in paths:
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        try:
+            x = pd.read_parquet(path)
+        except Exception:
+            continue
+        cols = {str(c).strip().lower(): c for c in x.columns}
+        if "date" not in cols or "close" not in cols:
+            continue
+        x = x.rename(columns={cols["date"]: "date", cols["close"]: "close"})
+        x["date"] = pd.to_datetime(x["date"], errors="coerce")
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = x.dropna(subset=["date", "close"]).copy()
+        x["date"] = x["date"].dt.normalize()
+        parts.append(x[["date", "close"]])
+
+    if not parts:
+        return pd.DataFrame()
+
+    x = (
+        pd.concat(parts, ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates(["date", "close"], keep="last")
+        .groupby("date", as_index=False)["close"]
+        .last()
     )
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    x = x[(x["date"] >= start_ts) & (x["date"] <= end_ts)].reset_index(drop=True)
+
+    if x.empty:
+        return x
+
+    first = x["date"].min().date()
+    last = x["date"].max().date()
+    span_days = max(1, (end_ts - start_ts).days)
+    expected_weekdays = max(1, int(span_days * 5 / 7))
+    if (
+        first > (start_ts + pd.Timedelta(days=10)).date()
+        or last < (end_ts - pd.Timedelta(days=10)).date()
+        or len(x) < max(30, int(expected_weekdays * 0.50))
+    ):
+        return pd.DataFrame()
+
+    return x
+
+
+def _official_market_context(index_symbol: str, start_date, end_date) -> pd.DataFrame:
+    """Load the official NSE benchmark history with a persisted-archive-first policy."""
+    root = str(index_symbol).strip().upper()
+
+    if root == "^NSEI":
+        stored = _stored_nifty50_daily(start_date, end_date)
+        if not stored.empty:
+            frame = stored
+            print(
+                f"market context: reused persisted NSE NIFTY 50 archive "
+                f"rows={len(frame):,} range={frame['date'].min().date()}..{frame['date'].max().date()}",
+                flush=True,
+            )
+        else:
+            frame = fetch_index_history(
+                root,
+                pd.Timestamp(start_date).date(),
+                pd.Timestamp(end_date).date(),
+                sync_drive=True,
+            )
+    else:
+        frame = fetch_index_history(
+            root,
+            pd.Timestamp(start_date).date(),
+            pd.Timestamp(end_date).date(),
+            sync_drive=True,
+        )
+
     if frame is None or frame.empty:
         raise RuntimeError(
             f"Official NSE benchmark history unavailable for {index_symbol}: "
