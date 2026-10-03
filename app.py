@@ -45,7 +45,7 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
-from production_model import build_feature_rows, predict as production_predict, model_status as production_model_status, model_target_contract
+from all_nse_intraday_model import predict_symbol as all_nse_intraday_predict, model_status as all_nse_intraday_model_status
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
 from directional_ensemble import enrich_delivery_prediction
@@ -71,12 +71,12 @@ st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
 st.title("Indian Stock Signal Dashboard")
 st.caption(
     "Multi-factor decision-support dashboard for NSE/BSE cash equity with F&O context. "
-    "Signals are not guarantees and no orders are placed. Delivery uses the active all-NSE 59-feature candidate; Intraday uses the certified 30-minute production model."
+    "Signals are not guarantees and no orders are placed. Delivery uses the active all-NSE 59-feature replacement; Intraday uses the active pooled ALL-NSE 30-minute replacement model."
 )
 
 st.info(
     "Production ML is connected for Delivery and Intraday workflows. "
-    "Delivery uses the active all-NSE 59-feature classifier/regressor candidate; Intraday uses the certified 30-minute production model. "
+    "Delivery uses the active all-NSE 59-feature classifier/regressor replacement; Intraday uses the active pooled ALL-NSE 30-minute classifier/regressor replacement. "
     "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
     "No orders are placed."
 )
@@ -352,8 +352,7 @@ if analysis_view == "Historical Replay":
                         "event_risk": event_risk_score(hist_news, hist_ann), "fo": {}, "decision_ts": decision_ts,
                     }]
                     try:
-                        feature_frame = build_feature_rows(item)
-                        ml = production_predict(feature_frame)[0]
+                        ml = all_nse_intraday_predict(replay_symbol, price_df[price_df.index <= decision_ts], benchmark_df, {}, decision_ts)
                         entry_info = _entry_exit_metrics(price_df[price_df.index <= decision_ts], decision_ts, "Intraday", int(replay_horizon))
                         outcome = actual_outcome(price_df, decision_ts, ml["signal"], "Intraday", int(replay_horizon), entry_info)
                         st.markdown(f"### {replay_symbol} — {replay_mode} replay")
@@ -416,8 +415,8 @@ if analysis_view == "Historical Replay":
                         else:
                             st.warning(outcome.get("status", "Future data unavailable."))
                         readiness = {
-                            "price/volume": bool(np.isfinite(float(feature_frame.iloc[0].get("close", np.nan)))),
-                            "market context": bool(np.isfinite(float(feature_frame.iloc[0].get("nifty_close", np.nan)))),
+                            "intraday price": bool(not price_df[price_df.index <= decision_ts].empty),
+                            "market context": bool(not benchmark_df.empty),
                             "historical news": bool(hist_news),
                             "corporate announcements": bool(hist_ann),
                             "historical F&O chain": False,
@@ -437,7 +436,7 @@ if analysis_view == "Historical Replay":
                                 for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
                         if replay_mode.startswith("F&O"):
                             st.warning("This F&O replay currently uses the underlying stock's production 30-minute model. Historical option-chain/OI/IV fields are not substituted with today's chain; they remain unavailable until a timestamped historical derivatives archive is wired in.")
-                        st.caption("Production model: certified Logistic Regression · 137-feature contract · target_30m. Class 1/BUY means the model estimates a positive future 30-minute return. Historical replay actual direction uses future close vs decision close over the same 30-minute horizon.")
+                        st.caption("Intraday model: pooled ALL-NSE Logistic Regression + Ridge · 34-feature contract · target_30m. Class 1/BUY means the model estimates a positive future 30-minute return. Historical replay actual direction uses future close vs decision close over the same 30-minute horizon.")
                         ledger = {
                             "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": replay_mode,
                             "prediction": ml["signal"], "probability_up_30m": ml["probability_up_30m"],
@@ -507,16 +506,16 @@ else:
     st.sidebar.info("Local persistent store active. Add Google Drive secrets for durable cloud storage.")
 st.sidebar.caption(f"Local persistent 1m: {pstore.get('local_files', 0)} partitions · {pstore.get('local_gb', 0):.4f} GB")
 
-if st.sidebar.button("Capture current 1-minute data", help="Fetch the latest 1-minute bars for the current watchlist and append them to the persistent store."):
+if st.sidebar.button("Capture current 1-minute data", help="Fetch the latest official NSE 1-minute chart data for the current watchlist and persist it. Reported volume is never fabricated."):
     capture_results = []
-    with st.spinner("Capturing latest 1-minute bars…"):
+    with st.spinner("Capturing latest official NSE 1-minute bars…"):
         for symbol in symbols:
             try:
-                df_1m = get_historical(symbol, period="5d", interval="1m")
-                persisted = persist_1m_frame(symbol, df_1m, source="yfinance_1m_capture", sync_drive=True)
-                capture_results.append({"symbol": symbol, "status": persisted.get("status"), "rows_added": persisted.get("rows_added", 0), "partitions": len(persisted.get("partitions", [])), "drive_synced": sum(1 for q in persisted.get("partitions", []) if q.get("drive_sync") == "OK")})
+                company_root = symbol.replace(".NS", "").replace(".BO", "").upper()
+                df_1m = nse_fetch_intraday_1m_current(company_root, sync_drive=True)
+                capture_results.append({"symbol": symbol, "status": "OK" if df_1m is not None and not df_1m.empty else "NO_DATA", "rows_returned": 0 if df_1m is None else int(len(df_1m)), "source": "NSE_OFFICIAL_CHART_1M"})
             except Exception as exc:
-                capture_results.append({"symbol": symbol, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"})
+                capture_results.append({"symbol": symbol, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}", "source": "NSE_OFFICIAL_CHART_1M"})
     st.session_state["persistent_capture_results"] = pd.DataFrame(capture_results)
     cached_persistent_storage_summary.clear()
 
@@ -1315,18 +1314,12 @@ production_results = {}
 delivery_results = {}
 if style == "Intraday" and live_records:
     try:
-        feature_items = [
-            {
-                "symbol": r["symbol"], "price_df": r["raw_df"], "market_df": r["market_df"],
-                "matched_news": r["matched_news"], "announcements": r["announcements"],
-                "event_risk": r["event_risk"], "fo": r["fo"],
-            }
-            for r in live_records
-        ]
-        feature_frame = build_feature_rows(feature_items)
-        production_results = {
-            x["symbol"]: x for x in production_predict(feature_frame)
-        }
+        for r in live_records:
+            try:
+                ml = all_nse_intraday_predict(r["symbol"], r["raw_df"], r.get("market_df"), r.get("fo") or {}, r["raw_df"].index[-1] if not r["raw_df"].empty else None)
+                production_results[r["symbol"]] = ml
+            except Exception as inner_exc:
+                production_results[r["symbol"]] = {"prediction_status":"ERROR","symbol":r["symbol"],"error_type":type(inner_exc).__name__,"error":str(inner_exc)}
     except Exception as exc:
         st.error(f"Production ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
         production_results = {}
