@@ -99,7 +99,9 @@ def attach_readiness_flags(frame: pd.DataFrame) -> pd.DataFrame:
     flags=list(READINESS_COLUMNS.values())
     x["information_groups_available"]=x[flags].notna().sum(axis=1).astype("Int8")
     x["information_groups_ready"]=x[flags].fillna(0).astype(float).sum(axis=1).astype("Int8")
-    x["multi_factor_full_ready"]=x[flags].eq(1).all(axis=1).astype("Int8")
+    # A row is fully multifactor-ready only when all six groups are explicitly ready.
+    # DataFrame.all(skipna=True) would otherwise treat unavailable groups as satisfied.
+    x["multi_factor_full_ready"]=x[flags].eq(1).fillna(False).all(axis=1).astype("Int8")
     x["core_market_ready"]=(x["ready_market_price"].eq(1)&x["ready_market_context"].eq(1)).astype("Int8")
     x["data_readiness_score"]=x[flags].fillna(0).astype(float).sum(axis=1)/len(flags)
     x["feature_non_null_fraction"]=x[FEATURES_59].notna().mean(axis=1)
