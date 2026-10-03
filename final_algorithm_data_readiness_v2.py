@@ -34,6 +34,7 @@ NEWS = DRIVE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
 EVENTS = DRIVE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
 FNO = DRIVE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
 FNO_RAW = DRIVE / "production_data/nse_official/fno/normalized_daily/2026"
+FNO_CURRENT = DRIVE / "production_data/nse_official/fno/fno_current_underlyings_2026.parquet"
 FUND_BROAD = DRIVE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
 FUND_CACHE = DRIVE / "corporate/pit_fundamentals_filing_cache_2025_2026_v3.parquet"
 
@@ -421,7 +422,36 @@ def panel_audit(path: Path, features: list[str], groups: dict[str,list[str]], tr
     sdf=x.groupby("symbol",as_index=False).agg(rows=("symbol","size"),first_date=("date","min"),last_date=("date","max"),strict_full_ready_pct=("strict_full_ready","mean"),feature_non_null_mean=(features[0],"count"))
     if not x.empty:
         sdf["strict_full_ready_pct"]*=100
-    fdf=pd.DataFrame({"symbol":sorted(trainable),"observed_in_derived_fno":[s in fno_symbols for s in sorted(trainable)],"classification":["FNO_OBSERVED" if s in fno_symbols else "FNO_NOT_OBSERVED_APPLICABILITY_UNKNOWN" for s in sorted(trainable)]})
+    current_fno=set()
+    if FNO_CURRENT.exists() and FNO_CURRENT.stat().st_size>0:
+        try:
+            cf=pd.read_parquet(FNO_CURRENT)
+            if "symbol" in cf.columns:
+                current_fno=set(cf["symbol"].map(norm_symbol).dropna().astype(str))
+        except Exception:
+            current_fno=set()
+    syms=sorted(trainable)
+    classes=[]
+    for s in syms:
+        observed=s in fno_symbols
+        current=s in current_fno
+        if current and observed:
+            cls="FNO_CURRENT_OFFICIAL_ELIGIBLE_AND_OBSERVED"
+        elif current and not observed:
+            cls="FNO_CURRENT_OFFICIAL_ELIGIBLE_DATA_MISSING"
+        elif observed and not current:
+            cls="FNO_NOT_CURRENTLY_LISTED_BUT_HISTORICALLY_OBSERVED"
+        else:
+            cls="FNO_NOT_CURRENTLY_LISTED_NOT_OBSERVED"
+        classes.append(cls)
+    fdf=pd.DataFrame({
+        "symbol":syms,
+        "observed_in_derived_fno":[s in fno_symbols for s in syms],
+        "current_official_fno_eligible":[s in current_fno for s in syms],
+        "classification":classes,
+    })
+    r["current_official_fno_symbols"]=int(len(current_fno))
+    r["current_fno_snapshot_loaded"]=bool(current_fno)
     r["status"]="FAIL" if r["hard_failures"] else "PASS"
     return r,x,feature_df,bdf,sdf,fdf
 
