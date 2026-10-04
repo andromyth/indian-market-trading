@@ -48,4 +48,4 @@ jobs:
         run: python -u delivery_policy_update.py --min-samples 80
 
       - name: Syntax check
-        run: python -m py_compile delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
+        run: python -m py_compile delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
