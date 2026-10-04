@@ -228,11 +228,14 @@ if not _search_df.empty:
         )
         selected_symbol = selected_search.split(" — ", 1)[0].strip().upper()
         if st.sidebar.button("Add to watchlist", width="stretch"):
-            current = [
-                normalize_symbol(item)
-                for item in st.session_state.get("active_watchlist", default_watchlist).split(",")
-                if item.strip()
-            ]
+            current = []
+            for item in st.session_state.get("active_watchlist", default_watchlist).split(","):
+                value = item.strip().upper()
+                if not value:
+                    continue
+                if not value.endswith((".NS", ".BO")) and not value.startswith("^"):
+                    value = f"{value}.NS"
+                current.append(value)
             selected_ns = f"{selected_symbol}.NS"
             if selected_ns not in current:
                 current.append(selected_ns)
