@@ -538,12 +538,16 @@ def main():
         p_cal=best_classifier_weight*p_hgb_cal+(1.0-best_classifier_weight)*p_log_cal
         r_hgb_cal=reg_hgb.predict(Xcal)
         r_ridge_cal=reg_ridge.predict(Xcal)
-        abs_move=float(np.nanmedian(np.abs(fit["future_return"].astype(float).to_numpy())))
-        if not np.isfinite(abs_move) or abs_move<=0:
-            abs_move=float(np.nanmean(np.abs(fit["future_return"].astype(float).to_numpy())))
-        if not np.isfinite(abs_move) or abs_move<=0:
-            abs_move=0.001
-        direction_ret=(2.0*p_cal-1.0)*abs_move
+        fit_returns=fit["future_return"].astype(float).to_numpy()
+        positive_returns=fit_returns[fit_returns>0]
+        nonpositive_returns=fit_returns[fit_returns<=0]
+        direction_up_return=float(np.nanmedian(positive_returns)) if len(positive_returns) else 0.001
+        direction_down_return=float(np.nanmedian(nonpositive_returns)) if len(nonpositive_returns) else -0.001
+        if not np.isfinite(direction_up_return) or direction_up_return<=0:
+            direction_up_return=0.001
+        if not np.isfinite(direction_down_return) or direction_down_return>=0:
+            direction_down_return=-0.001
+        direction_ret=p_cal*direction_up_return+(1.0-p_cal)*direction_down_return
 
         best=None
         best_mae=float("inf")
@@ -593,7 +597,8 @@ def main():
             "regressor_hgb_weight":float(reg_weight_hgb),
             "return_alpha":float(return_alpha),
             "return_beta_direction":float(return_beta),
-            "direction_move_scale":float(abs_move),
+            "direction_up_return":float(direction_up_return),
+            "direction_down_return":float(direction_down_return),
             "fit_rows":int(len(fit)),
             "calibration_rows":int(len(cal)),
             "train_rows":int(len(fit)),
@@ -653,9 +658,7 @@ def main():
             model__sample_weight=deploy_weights,
         )
         reg_ridge_final.fit(Xdeploy,deploy["future_return"].astype(float))
-        deployment_abs_move=float(np.nanmedian(np.abs(deploy["future_return"].astype(float).to_numpy())))
-        if not np.isfinite(deployment_abs_move) or deployment_abs_move<=0:
-            deployment_abs_move=abs_move
+        deployment_abs_move=abs_move
         training_rows_by_horizon[str(h)] = int(len(deploy))
         validation[str(h)]["deployment_train_rows"] = int(len(deploy))
         bundle[str(h)]={
@@ -668,7 +671,8 @@ def main():
                 "regressor_hgb_weight":float(reg_weight_hgb),
                 "return_alpha":float(return_alpha),
                 "return_beta_direction":float(return_beta),
-                "direction_move_scale":float(deployment_abs_move),
+                "direction_up_return":float(direction_up_return),
+                "direction_down_return":float(direction_down_return),
             },
         }
         print(
