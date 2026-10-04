@@ -29,7 +29,7 @@ from all_nse_intraday_5m_model import FEATURES, HORIZONS
 IST = "Asia/Kolkata"
 INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
-CHECKPOINT_SCHEMA_VERSION = 4
+CHECKPOINT_SCHEMA_VERSION = 5
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
