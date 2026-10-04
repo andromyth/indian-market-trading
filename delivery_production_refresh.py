@@ -37,14 +37,14 @@ def _download_file(store, remote: str, local: Path) -> bool:
     from googleapiclient.http import MediaIoBaseDownload
     local.parent.mkdir(parents=True, exist_ok=True)
     temp = local.with_suffix(local.suffix + ".tmp")
-    downloader = MediaIoBaseDownload(temp.open("wb"), store.service.files().get_media(fileId=hit["id"]))
-    done = False
-    try:
+    with temp.open("wb") as fh:
+        downloader = MediaIoBaseDownload(
+            fh,
+            store.service.files().get_media(fileId=hit["id"]),
+        )
+        done = False
         while not done:
             _, done = downloader.next_chunk()
-    finally:
-        try: downloader._fd.close()
-        except Exception: pass
     temp.replace(local)
     return True
 
@@ -181,7 +181,7 @@ def main():
     delivery_status=_download_recent_delivery(store,args.delivery_lookback_days)
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
     from delivery_training_universe import training_roster
-    from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags,readiness_report
+    from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags
     from nse_delivery_data_layer import load_delivery_history
     today=datetime.now(timezone.utc).date()
     bulk=_load_eod(EOD_LOCAL_ROOT,today-timedelta(days=args.lookback_days),today)
