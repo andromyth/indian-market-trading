@@ -53,6 +53,8 @@ def _join():
     v=v[[c for c in keepv if c in v.columns]]
     x=p.merge(v,on="prediction_id",how="inner")
     x=x[x["validation_status"].eq("VALIDATED")].copy()
+    if "production_data_quality_gate" in x.columns:
+        x=x[x["production_data_quality_gate"].fillna(False).astype(bool)].copy()
     x["decision_timestamp"]=pd.to_datetime(x["decision_timestamp"],errors="coerce",utc=True)
     return x.dropna(subset=["decision_timestamp","probability_up_next_session","predicted_return_next_session","actual_direction_d1"]).sort_values("decision_timestamp").drop_duplicates("prediction_id",keep="last")
 
