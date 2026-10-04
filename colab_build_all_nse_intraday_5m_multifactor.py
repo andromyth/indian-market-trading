@@ -71,15 +71,32 @@ def _regular_session(x: pd.DataFrame) -> pd.DataFrame:
 
 
 def _feature_lookback_ok(index: pd.DatetimeIndex, window: int = 50) -> pd.Series:
-    """Require 1-minute continuity within the recent feature window."""
+    """Require a fully contiguous 1-minute lookback inside one NSE session."""
     idx = pd.DatetimeIndex(index)
-    if len(idx) == 0:
-        return pd.Series(dtype=bool, index=idx)
+    out = pd.Series(False, index=idx, dtype=bool)
+    if len(idx) < window:
+        return out
+
+    # A window of N observations contains N-1 links. The previous
+    # implementation rolled over N boolean links and therefore had an
+    # off-by-one error: after the first valid 50-bar window, every later
+    # row in the same continuous run was incorrectly rejected.
     diffs = pd.Series(idx, index=idx).diff()
-    day_change = pd.Series(idx.normalize(), index=idx).diff().ne(pd.Timedelta(0))
-    link_ok = diffs.eq(pd.Timedelta(minutes=1)) | day_change
-    link_ok.iloc[0] = False
-    return link_ok.rolling(window, min_periods=window).sum().eq(window - 1).reindex(idx).fillna(False).astype(bool)
+    one_minute_link = diffs.eq(pd.Timedelta(minutes=1))
+
+    # Require the entire N-observation lookback to belong to one
+    # regular-session date; overnight gaps are never treated as 1-minute
+    # continuity.
+    session = pd.Series(idx.normalize(), index=idx)
+    same_session = session.eq(session.shift(window - 1))
+
+    valid_links = one_minute_link.rolling(
+        window - 1,
+        min_periods=window - 1,
+    ).sum().eq(window - 1)
+
+    out.loc[:] = (valid_links & same_session).fillna(False).astype(bool)
+    return out
 
 
 def _rsi(c: pd.Series, n:int=14) -> pd.Series:
