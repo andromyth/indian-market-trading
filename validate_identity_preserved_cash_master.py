@@ -266,9 +266,9 @@ def main() -> int:
             f"OR TRY_CAST({qident(oc)} AS DOUBLE)>TRY_CAST({qident(hc)} AS DOUBLE)"
         )
         con.execute(
-            f"SELECT {qident(sc)} symbol,{qident(dc)} date,{qident(sec)} series,"
-            f"{qident(oc)} open,{qident(hc)} high,{qident(lc)} low,{qident(cc)} close,"
-            f"{qident(lic)} listing_id FROM {src} WHERE {where} LIMIT 5000"
+            f"SELECT {qident(sc)} AS symbol,{qident(dc)} AS trade_date,{qident(sec)} AS series,"
+            f"{qident(oc)} AS open_price,{qident(hc)} AS high_price,{qident(lc)} AS low_price,{qident(cc)} AS close_price,"
+            f"{qident(lic)} AS listing_identity FROM {src} WHERE {where} LIMIT 5000"
         ).df().to_csv(anomaly_path,index=False)
 
     report={
