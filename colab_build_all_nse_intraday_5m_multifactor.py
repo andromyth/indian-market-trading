@@ -451,7 +451,7 @@ def main():
         flush=True,
     )
 
-    bundle={}; validation={}; training_rows_by_horizon={}; trainable_symbols=sorted(data["symbol"].unique().tolist())
+    bundle={}; validation={}; training_rows_by_horizon={}; oos_prediction_frames=[]; trainable_symbols=sorted(data["symbol"].unique().tolist())
     for h in HORIZONS:
         z=data[data["horizon"]==h].copy().sort_values("decision_ts")
         cut_fit=z["decision_ts"].quantile(0.70)
@@ -579,6 +579,41 @@ def main():
         base_price=test["reference_close"].astype(float).to_numpy()
         pred_price=base_price*(1.0+expected_ret)
         actual_price=test["future_close"].astype(float).to_numpy()
+
+        # Preserve every row from the untouched chronological holdout. This
+        # creates explicit 5-minute-step prediction data (+5 through +30)
+        # rather than retaining only aggregate validation metrics.
+        test_direction_return=p*direction_up_return+(1.0-p)*direction_down_return
+        prediction_rows=pd.DataFrame({
+            "symbol":test["symbol"].astype(str).to_numpy(),
+            "decision_timestamp":pd.to_datetime(test["decision_ts"],utc=True).astype(str).to_numpy(),
+            "horizon_minutes":int(h),
+            "prediction_step_index":int(h//5),
+            "target_timestamp":(
+                pd.to_datetime(test["decision_ts"],utc=True)+pd.Timedelta(minutes=int(h))
+            ).astype(str).to_numpy(),
+            "reference_price":base_price,
+            "actual_future_price":actual_price,
+            "actual_return":test["future_return"].astype(float).to_numpy(),
+            "target":ytest.to_numpy(),
+            "probability_up":p,
+            "probability_down":1.0-p,
+            "direction_prediction":pred,
+            "raw_return":raw_ret,
+            "direction_return":test_direction_return,
+            "expected_return":expected_ret,
+            "predicted_price":pred_price,
+            "predicted_change":pred_price-base_price,
+            "price_error":pred_price-actual_price,
+            "abs_price_error":np.abs(pred_price-actual_price),
+            "signal":np.where(
+                (p>=0.60)&(expected_ret>0),"BUY",
+                np.where((p<=0.40)&(expected_ret<0),"SELL","HOLD"),
+            ),
+            "model_version":"2026-5m-step-multihorizon-v2",
+        })
+        oos_prediction_frames.append(prediction_rows)
+
         model_mae=float(mean_absolute_error(actual_price,pred_price))
         base_mae=float(mean_absolute_error(actual_price,base_price))
         auc=float(roc_auc_score(ytest,p))
@@ -692,6 +727,23 @@ def main():
     )
 
     out.mkdir(parents=True,exist_ok=True)
+
+    if not oos_prediction_frames:
+        raise RuntimeError("No holdout prediction rows were generated")
+    holdout_predictions=pd.concat(oos_prediction_frames,ignore_index=True)
+    holdout_predictions=holdout_predictions.sort_values(
+        ["decision_timestamp","symbol","horizon_minutes"]
+    ).reset_index(drop=True)
+    holdout_predictions_path=out/"holdout_predictions_all_horizons_2026.parquet"
+    holdout_predictions.to_parquet(holdout_predictions_path,index=False)
+    holdout_predictions_csv=out/"holdout_predictions_all_horizons_2026.csv"
+    holdout_predictions.to_csv(holdout_predictions_csv,index=False)
+    print(
+        f"PREDICTION_DATASET: rows={len(holdout_predictions):,} "
+        f"interval=5m horizons={list(HORIZONS)}",
+        flush=True,
+    )
+
     bundle_path=out/"deployment_all_nse_intraday_5m_multihorizon_bundle_2026.joblib"
     joblib.dump(bundle,bundle_path)
     sha=hashlib.sha256(bundle_path.read_bytes()).hexdigest()
@@ -708,6 +760,15 @@ def main():
         "training_symbols":trainable_symbols,
         "training_rows_by_horizon":training_rows_by_horizon,
         "validation":validation,
+        "prediction_dataset":{
+            "holdout_rows":int(len(holdout_predictions)),
+            "interval_minutes":5,
+            "horizons_minutes":list(HORIZONS),
+            "one_row_per_symbol_decision_horizon":True,
+            "parquet_path":str(holdout_predictions_path),
+            "csv_path":str(holdout_predictions_csv),
+            "split":"untouched final 15% chronological holdout per horizon",
+        },
         "verified_horizons":[int(h) for h in HORIZONS] if verified else [],
         "trained_until":max(validation[str(h)]["deployment_trained_until"] for h in HORIZONS),
         "bundle_sha256":sha,
