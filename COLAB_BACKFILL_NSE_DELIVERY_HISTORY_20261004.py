@@ -175,8 +175,7 @@ def main() -> None:
     for i, trade_date in enumerate(pending, 1):
 
         print(
-            f"
-[{i:,}/{len(pending):,}] "
+            f"\n[{i:,}/{len(pending):,}] "
             f"{trade_date}",
             flush=True,
         )
