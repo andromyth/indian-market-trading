@@ -703,6 +703,7 @@ if interface_mode == "Live Test":
                     "signal_price_reference": np.nan,
                     "confidence": "—",
                     "input_missing": np.nan,
+                    "_input_audit": {},
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -768,6 +769,7 @@ if interface_mode == "Live Test":
                     "signal_price_reference": result.get("signal_price_reference"),
                     "confidence": result.get("confidence"),
                     "input_missing": (result.get("input_audit") or {}).get("missing_input_feature_count"),
+                    "_input_audit": result.get("input_audit") or {},
                     "readiness": result.get("data_readiness_score"),
                     "live_1m_rows": len(price_1m),
                     "latest_bar": str(decision_ts),
@@ -857,6 +859,26 @@ if interface_mode == "Live Test":
                     f"Confidence={row.get('confidence','—')} · "
                     f"missing model inputs={row.get('input_missing','—')}."
                 )
+
+            with st.expander("Production input audit", expanded=False):
+                for row in rows:
+                    if row.get("status") != "PASS":
+                        continue
+                    symbol = row.get("symbol")
+                    audit = row.get("_input_audit") or {}
+                    st.write(
+                        f"**{symbol}** — missing current inputs: "
+                        f"{audit.get('missing_input_feature_count','—')}/{audit.get('feature_count','—')}"
+                    )
+                    missing_names = audit.get("missing_input_features") or []
+                    if missing_names:
+                        st.caption("Missing in this live row: " + ", ".join(missing_names))
+                    empty_fit = audit.get("model_fit_empty_features") or []
+                    if empty_fit:
+                        st.caption(
+                            "Features with no observed training statistic in the loaded imputer: "
+                            + ", ".join(empty_fit)
+                        )
 
             st.caption(
                 "Intraday uses the certified production model against the current NSE 1-minute stream. "
