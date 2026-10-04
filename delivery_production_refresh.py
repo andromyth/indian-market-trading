@@ -235,6 +235,14 @@ def main():
             panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
 
     panel=attach_readiness_flags(panel)
+
+    # A present source pipeline means missing per-symbol observations are a
+    # known no-data/not-applicable state. Apply this after readiness columns
+    # are created so the production gate does not confuse absence with unknown.
+    for source, flag in source_to_flag.items():
+        if source_status.get(source) in {"LOCAL", "DOWNLOADED"} and flag in panel.columns:
+            panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
+
     panel["decision_timestamp"]=pd.to_datetime(panel["decision_timestamp"],errors="coerce",utc=True)
     panel=panel.dropna(subset=["symbol","decision_timestamp"]).sort_values(["symbol","decision_timestamp"]).drop_duplicates("symbol",keep="last").reset_index(drop=True)
     missing=[c for c in FEATURES_59 if c not in panel.columns]
