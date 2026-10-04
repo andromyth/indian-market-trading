@@ -690,6 +690,7 @@ if interface_mode == "Live Test":
             st.error(f"Intraday model status failed: {type(exc).__name__}: {exc}")
 
         rows = []
+        live_frames = {}
         for sym in symbols:
             if not sym.endswith(".NS"):
                 rows.append({
