@@ -78,13 +78,23 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
     elif signal == "SELL": direction_match = actual_direction == "DOWN"
     elif signal == "HOLD": direction_match = actual_direction == "FLAT"
 
+    probability_up = float(record.get("probability_up_next_session", np.nan))
+    base_probability_up = float(record.get("base_model_probability_up_next_session", np.nan))
+    production_quality = float(record.get("production_data_quality_score", np.nan))
+
     out: dict[str, Any] = {
         "prediction_id": record.get("prediction_id"),
         "symbol": record.get("symbol"),
         "decision_timestamp": record.get("decision_timestamp"),
         "signal": signal,
+        "probability_up_next_session": probability_up,
+        "base_model_probability_up_next_session": base_probability_up,
         "predicted_return_next_session": predicted_return,
         "predicted_price_next_session": predicted_price,
+        "production_data_quality_gate": record.get("production_data_quality_gate"),
+        "production_data_quality_score": production_quality,
+        "decision_engine_version": record.get("decision_engine_version"),
+        "model_version": record.get("model_version"),
         "actual_d1_close": actual_d1_close,
         "actual_d1_return": actual_d1_return,
         "absolute_price_error_d1": actual_d1_close - predicted_price if np.isfinite(predicted_price) else np.nan,
@@ -133,10 +143,21 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
     matches = pd.to_numeric(x.get("direction_match_d1"), errors="coerce")
     valid_matches = matches.dropna()
     mae = pd.to_numeric(x.get("percentage_error_d1"), errors="coerce").abs().mean()
+    probs = pd.to_numeric(x.get("probability_up_next_session"), errors="coerce")
+    actual_up = x.get("actual_direction_d1", pd.Series(index=x.index)).astype(str).str.upper().map({"UP":1.0,"DOWN":0.0})
+    brier = ((probs - actual_up) ** 2).dropna().mean()
+    action = x["signal"].astype(str).str.upper().isin(["BUY","SELL"])
+    action_correct = (
+        ((x["signal"].astype(str).str.upper()=="BUY") & x["actual_direction_d1"].astype(str).str.upper().eq("UP"))
+        | ((x["signal"].astype(str).str.upper()=="SELL") & x["actual_direction_d1"].astype(str).str.upper().eq("DOWN"))
+    )
     return {
         "status": "PASS" if len(x) else "NO_DATA",
         "completed_predictions": int(len(x)),
         "directional_accuracy_7_predictions": float(valid_matches.mean()) if len(valid_matches) else None,
         "mean_absolute_percentage_price_error": float(mae) if pd.notna(mae) else None,
+        "brier_score_7_predictions": float(brier) if pd.notna(brier) else None,
+        "action_precision_7_predictions": float(action_correct[action].mean()) if bool(action.any()) else None,
+        "action_coverage_7_predictions": float(action.mean()) if len(action) else None,
         "latest_decision_date": str(x["decision_timestamp"].iloc[-1]) if len(x) else None,
     }
