@@ -33,6 +33,15 @@ FEATURES = list(_MANIFEST["features"])
 
 def model_status() -> dict[str, Any]:
     sha = hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest() if MODEL_PATH.exists() else None
+    training_end = _MANIFEST.get("training_end_exclusive")
+    model_age_days = None
+    try:
+        end_ts = pd.Timestamp(training_end)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        model_age_days = max(0, int((pd.Timestamp.now(tz="UTC") - end_ts).total_seconds() // 86400))
+    except Exception:
+        pass
     return {
         "model_family": _MANIFEST.get("model_family"),
         "target": _MANIFEST.get("target"),
@@ -41,7 +50,8 @@ def model_status() -> dict[str, Any]:
         "manifest_sha256_match": MODEL_PATH.exists() and sha == _MANIFEST.get("model_sha256"),
         "model_path": str(MODEL_PATH),
         "training_rows": _MANIFEST.get("training_rows"),
-        "training_end_exclusive": _MANIFEST.get("training_end_exclusive"),
+        "training_end_exclusive": training_end,
+        "model_age_days": model_age_days,
     }
 
 
