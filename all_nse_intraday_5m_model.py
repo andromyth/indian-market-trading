@@ -87,10 +87,13 @@ def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def _returns(c: pd.Series, n: int) -> float:
-    x = pd.to_numeric(c, errors="coerce").dropna()
+    x = pd.to_numeric(c, errors="coerce")
     if len(x) <= n:
         return np.nan
-    return _safe(x.iloc[-1] / x.iloc[-1-n] - 1.0)
+    window = x.iloc[-(n + 1):]
+    if window.isna().any():
+        return np.nan
+    return _safe(window.iloc[-1] / window.iloc[0] - 1.0)
 
 
 def _rsi(c: pd.Series, n: int = 14) -> float:
