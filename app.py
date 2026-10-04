@@ -183,6 +183,270 @@ def normalize_symbol(value: str) -> str:
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
 
+# ---------------------------------------------------------------------------
+# Simplified live-test interface
+# ---------------------------------------------------------------------------
+# The full application retains research/audit tooling below, but the default
+# live-test interface intentionally exposes only the controls needed for a
+# first production test: watchlist, Delivery/Intraday mode, market status,
+# model status, live data, signal, readiness and ledger persistence.
+interface_mode = st.sidebar.radio(
+    "Interface",
+    ["Live Test", "Research / Diagnostics"],
+    index=0,
+    help="Live Test is the production-facing screen. Research / Diagnostics contains replay, audits and legacy investigation tools.",
+)
+
+if interface_mode == "Live Test":
+    st.sidebar.subheader("Live mode")
+    live_mode = st.sidebar.radio(
+        "Prediction type",
+        ["Delivery", "Intraday"],
+        index=0,
+        key="live_test_mode",
+    )
+    refresh_live = st.sidebar.button(
+        "Refresh live data",
+        type="primary",
+        width="stretch",
+        help="Fetch fresh production inputs and run the selected model. No orders are placed.",
+    )
+    if refresh_live:
+        st.cache_data.clear()
+        st.session_state["live_test_revision"] = int(
+            st.session_state.get("live_test_revision", 0)
+        ) + 1
+
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    if now_ist.hour < 9 or (now_ist.hour == 9 and now_ist.minute < 15):
+        session_label = "PRE-OPEN / BEFORE REGULAR SESSION"
+    elif now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute > 30):
+        session_label = "MARKET CLOSED"
+    elif now_ist.hour == 15 and now_ist.minute == 30:
+        session_label = "REGULAR SESSION CLOSE"
+    else:
+        session_label = "REGULAR SESSION OPEN"
+
+    st.title("Indian Market — Live Test")
+    st.caption(
+        "Production decision-support only · no order placement · "
+        "NSE is the primary exchange-data source."
+    )
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("NSE session", session_label)
+    s2.metric("IST time", now_ist.strftime("%d %b %Y %H:%M:%S"))
+    s3.metric("Symbols selected", str(len(symbols)))
+
+    if live_mode == "Delivery":
+        try:
+            model = all_nse_delivery_model_status()
+            ready = (
+                model.get("status") == "READY"
+                and int(model.get("feature_count", 0)) == 59
+            )
+            if ready:
+                st.success(
+                    f"Delivery model READY · {int(model.get('trainable_symbol_count', 0)):,} "
+                    f"trainable / {int(model.get('universe_symbol_count', 0)):,} NSE universe · "
+                    "locked 59-feature contract"
+                )
+            else:
+                st.error("Delivery model is not ready.")
+        except Exception as exc:
+            st.error(f"Delivery model status failed: {type(exc).__name__}: {exc}")
+            model = {}
+
+        if now_ist.date() in [pd.Timestamp("2026-10-04").date()]:
+            st.info(
+                "October 4, 2026 is Sunday. The latest completed NSE session is October 1; "
+                "the Delivery signal currently represents the next-session forecast from the latest persisted PIT snapshot."
+            )
+
+        rows = []
+        for sym in symbols:
+            if not sym.endswith(".NS"):
+                rows.append({
+                    "symbol": sym,
+                    "status": "BLOCKED",
+                    "signal": "—",
+                    "probability_up": np.nan,
+                    "expected_move": np.nan,
+                    "data_gate": False,
+                    "reference_session": "—",
+                    "ledger": "—",
+                })
+                continue
+
+            try:
+                result = delivery_prediction(
+                    {
+                        "symbol": sym.replace(".NS", "").upper(),
+                        "decision_timestamp": now_ist,
+                    },
+                    sync_drive=True,
+                )
+                rows.append({
+                    "symbol": sym,
+                    "status": result.get("prediction_status"),
+                    "signal": result.get("signal", "—"),
+                    "probability_up": result.get("probability_up_next_session"),
+                    "expected_move": result.get("predicted_return_next_session"),
+                    "data_gate": result.get("production_data_quality_gate"),
+                    "reference_session": result.get("reference_session"),
+                    "ledger": result.get("prediction_ledger_status", "—"),
+                })
+            except Exception as exc:
+                rows.append({
+                    "symbol": sym,
+                    "status": "ERROR",
+                    "signal": "—",
+                    "probability_up": np.nan,
+                    "expected_move": np.nan,
+                    "data_gate": False,
+                    "reference_session": "—",
+                    "ledger": f"{type(exc).__name__}: {exc}",
+                })
+
+        result_df = pd.DataFrame(rows)
+        if not result_df.empty:
+            display_df = result_df.copy()
+            display_df["probability_up"] = pd.to_numeric(
+                display_df["probability_up"], errors="coerce"
+            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+            display_df["expected_move"] = pd.to_numeric(
+                display_df["expected_move"], errors="coerce"
+            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+            display_df["data_gate"] = display_df["data_gate"].map(
+                lambda x: "PASS" if bool(x) else "BLOCKED"
+            )
+
+            st.subheader("Delivery — next-session production signal")
+            st.dataframe(
+                display_df[
+                    [
+                        "symbol", "signal", "probability_up",
+                        "expected_move", "data_gate",
+                        "reference_session", "ledger",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.caption(
+                "Delivery uses the latest persisted point-in-time 59-feature snapshot. "
+                "During a trading day it does not become an intraday signal; a new Delivery "
+                "forecast is generated after the next completed NSE session."
+            )
+
+    else:
+        try:
+            model = certified_intraday_model_status()
+            ready = (
+                int(model.get("feature_count", 0)) == 137
+                and bool(model.get("manifest_sha256_match"))
+            )
+            if ready:
+                st.success(
+                    "Intraday model VERIFIED · 137-feature certified contract · target_30m"
+                )
+            else:
+                st.error("Intraday model verification failed.")
+        except Exception as exc:
+            st.error(f"Intraday model status failed: {type(exc).__name__}: {exc}")
+
+        rows = []
+        for sym in symbols:
+            if not sym.endswith(".NS"):
+                rows.append({
+                    "symbol": sym,
+                    "status": "BLOCKED",
+                    "signal": "—",
+                    "p_up_30m": np.nan,
+                    "readiness": np.nan,
+                    "live_1m_rows": 0,
+                    "latest_bar": "—",
+                    "ledger": "—",
+                })
+                continue
+
+            root = sym.replace(".NS", "").upper()
+            try:
+                price_1m = nse_fetch_intraday_1m_current(
+                    root,
+                    sync_drive=True,
+                )
+                if price_1m is None or price_1m.empty:
+                    raise RuntimeError("NSE live 1-minute stream returned no rows")
+
+                decision_ts = price_1m.index[-1]
+                result = certified_intraday_prediction(
+                    sym,
+                    price_1m,
+                    pd.DataFrame(),
+                    {},
+                    decision_ts,
+                )
+                rows.append({
+                    "symbol": sym,
+                    "status": result.get("prediction_status"),
+                    "signal": result.get("signal", "—"),
+                    "p_up_30m": result.get("probability_up_30m"),
+                    "readiness": result.get("data_readiness_score"),
+                    "live_1m_rows": len(price_1m),
+                    "latest_bar": str(decision_ts),
+                    "ledger": result.get("prediction_ledger_status", "—"),
+                })
+            except Exception as exc:
+                rows.append({
+                    "symbol": sym,
+                    "status": "ERROR",
+                    "signal": "—",
+                    "p_up_30m": np.nan,
+                    "readiness": np.nan,
+                    "live_1m_rows": 0,
+                    "latest_bar": "—",
+                    "ledger": f"{type(exc).__name__}: {exc}",
+                })
+
+        result_df = pd.DataFrame(rows)
+        if not result_df.empty:
+            display_df = result_df.copy()
+            display_df["p_up_30m"] = pd.to_numeric(
+                display_df["p_up_30m"], errors="coerce"
+            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+            display_df["readiness"] = pd.to_numeric(
+                display_df["readiness"], errors="coerce"
+            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+
+            st.subheader("Intraday — next 30-minute production signal")
+            st.dataframe(
+                display_df[
+                    [
+                        "symbol", "signal", "p_up_30m",
+                        "readiness", "live_1m_rows",
+                        "latest_bar", "ledger",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.caption(
+                "Intraday uses the certified production model against the current NSE 1-minute stream. "
+                "Refresh manually during the first live test so each observed prediction can be tied to a specific timestamp."
+            )
+
+    st.divider()
+    st.subheader("What to watch tomorrow")
+    st.write(
+        "For the first live test, verify only: NSE data arrives → model is READY → "
+        "signal is produced → readiness is explicit → prediction is persisted. "
+        "Do not use the research/replay screens to judge live performance."
+    )
+    st.stop()
+
 # These are populated later by the NSE official-universe section. Initialize
 # them before the early input validation so first app render cannot raise
 # NameError before the NSE universe has been fetched.
@@ -207,7 +471,7 @@ analysis_view = st.sidebar.radio(
 )
 
 if analysis_view == "Historical Replay":
-    st.markdown("## Historical Prediction Replay & Audit")
+    st.markdown("## Historical Prediction Replay & Audit — Research Only")
     st.caption(
         "Pick a past date/time. The replay uses only information available up to that timestamp, then compares the prediction with what actually happened afterward. "
         "Unavailable historical news/F&O sources are shown as missing rather than replaced with current data."
@@ -359,7 +623,7 @@ if analysis_view == "Historical Replay":
                     if hist_ann:
                         st.markdown("#### Historical corporate announcements")
                         for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
-                    st.caption("The Step 52 audit is research context, not an input to this replay. No current/future news or F&O snapshot is injected into a past decision.")
+                    st.caption("Research only. Note: the current Delivery replay path uses the legacy rule-based replay function; it is not the active ALL-NSE 59-feature production Delivery model. Use the persistent production ledger for live-model validation.")
                     ledger = {
                         "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": "Delivery",
                         "prediction": label, "score": combined, "decision_price": entry_info.get("entry_reference"),
