@@ -674,10 +674,16 @@ if interface_mode == "Live Test":
                 st.success(
                     "Intraday model VERIFIED · 137-feature certified contract · target_30m"
                 )
+                model_age_days = model.get("model_age_days")
                 st.caption(
                     f"Production model training data ends at: **{trained_until}**. "
                     "Live predictions use current NSE inputs; the model weights are not changed at runtime."
                 )
+                if isinstance(model_age_days, (int, float)) and model_age_days >= 30:
+                    st.warning(
+                        f"The certified Intraday model is {int(model_age_days)} days old. "
+                        "This is a model-freshness warning only; the certified artifact is still used unchanged."
+                    )
             else:
                 st.error("Intraday model verification failed.")
         except Exception as exc:
