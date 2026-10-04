@@ -255,6 +255,11 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
     current_price = _safe(pd.to_numeric(price_df["Close"], errors="coerce").dropna().iloc[-1])
     predictions = []
     for horizon in HORIZONS:
+        target_ts = ts + pd.Timedelta(minutes=int(horizon))
+        # Only emit horizons whose target remains inside the NSE regular
+        # session. Near the close, the table therefore naturally shortens.
+        if target_ts.time() > pd.Timestamp("15:30").time():
+            continue
         h = str(horizon)
         clf = bundle[h]["classifier"]
         reg = bundle[h]["regressor"]
@@ -265,7 +270,6 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
             if np.isfinite(current_price) and np.isfinite(expected_return)
             else np.nan
         )
-        target_ts = ts + pd.Timedelta(minutes=horizon)
         predictions.append({
             "horizon_minutes": int(horizon),
             "target_timestamp": str(target_ts),
