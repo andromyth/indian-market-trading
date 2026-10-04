@@ -734,15 +734,33 @@ if interface_mode == "Live Test":
             )
             st.stop()
 
-        candidates = [s for s in symbols if s.endswith(".NS")]
-        if not candidates:
-            st.info("Select an NSE (.NS) stock from the watchlist/search.")
+        universe_df = _searchable_nse_universe()
+        if universe_df is None or universe_df.empty:
+            candidates = [s for s in symbols if s.endswith(".NS")]
+            candidate_labels = {s: s for s in candidates}
         else:
+            candidates = [f"{s}.NS" for s in universe_df["symbol"].astype(str).str.upper()]
+            candidate_labels = {
+                f"{row.symbol}.NS": (
+                    f"{row.symbol} — {row.company}"
+                    if str(row.company).strip() and str(row.company).lower() != "nan"
+                    else str(row.symbol)
+                )
+                for row in universe_df.itertuples()
+            }
+        if not candidates:
+            st.info("Official NSE equity universe is unavailable for 5-minute selection.")
+        else:
+            live_default = st.session_state.get("live_intraday_selected_symbol")
+            if live_default not in candidates:
+                live_default = candidates[0]
             selected_symbol = st.selectbox(
                 "Stock for continuous 5-minute forecast",
                 candidates,
+                index=candidates.index(live_default),
+                format_func=lambda s: candidate_labels.get(s, s),
                 key="live_intraday_selected_symbol",
-                help="One selected NSE stock is recalculated whenever a new completed 1-minute bar arrives.",
+                help="Select any current NSE equity; forecast recalculates whenever a new completed 1-minute bar arrives.",
             )
             auto_update = st.checkbox(
                 "Continuous recalculation every new 1-minute bar",
