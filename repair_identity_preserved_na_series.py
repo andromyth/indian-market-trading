@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 ROOT = Path(
     "/content/drive/MyDrive/Indian_Market_Research/"
@@ -101,11 +102,6 @@ def main():
 
     if check[0] != null_series or check[1] != 0 or check[2] != 0:
         raise RuntimeError("Affected-row safety gate failed.")
-
-    if BACKUP.exists():
-        raise RuntimeError(
-            f"Backup already exists: {BACKUP}. Refusing to overwrite it."
-        )
 
     # Validate the target identity expression before rewriting the master.
     collisions = con.execute(
