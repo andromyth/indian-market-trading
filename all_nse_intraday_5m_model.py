@@ -1,6 +1,6 @@
 """ALL-NSE multi-horizon 5-minute-step Intraday model adapter.
 
-This is a separate candidate model family and does not replace or modify the
+This is a separate 5-minute-step model family and does not replace or modify the
 certified 30-minute production artifact.
 
 For every live 1-minute update it can estimate direct prices at +5, +10, +15,
@@ -22,10 +22,15 @@ import pandas as pd
 HORIZONS = (5, 10, 15, 20, 25, 30)
 FEATURES = [
     "ret_1","ret_3","ret_5","ret_10","ret_15","ret_30",
-    "rsi14","atr14_pct","ma5_ratio","ma10_ratio","ma20_ratio","ma50_ratio",
-    "range_pct","body_pct","volume_ratio","volume_z20","tod_sin","tod_cos",
+    "rsi7","rsi14","atr14_pct","ema8_ratio","ema21_ratio",
+    "ma5_ratio","ma10_ratio","ma20_ratio","ma50_ratio",
+    "volatility_5","volatility_15","session_return","day_high_ratio","day_low_ratio",
+    "vwap_ratio","range_pct","body_pct","volume_ratio","volume_z20","volume_trend",
+    "ret_accel_1_5","tod_sin","tod_cos",
     "market_ret_1","market_ret_3","market_ret_5","market_ret_10","market_ret_15","market_ret_30",
-    "market_rsi14","relative_ret_1","relative_ret_5","relative_ret_15",
+    "market_rsi14","market_volatility_15","market_ma10_ratio",
+    "relative_ret_1","relative_ret_5","relative_ret_15","relative_ret_30",
+    "log_price",
     "fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis","fno_available",
 ]
 
@@ -120,47 +125,82 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     x = _norm(price_df)
     if x.empty or x["Close"].dropna().empty:
         raise ValueError("No usable intraday OHLC data")
-    c,h,l,o,v = x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
-    close = _safe(c.iloc[-1])
-    open_ = _safe(o.iloc[-1])
-    ma = {n: c.rolling(n, min_periods=n).mean().iloc[-1] for n in (5,10,20,50)}
-    vma = v.rolling(20, min_periods=20).mean().iloc[-1]
-    vsd = v.rolling(20, min_periods=20).std().iloc[-1]
-    vals = {
-        "ret_1":_returns(c,1),"ret_3":_returns(c,3),"ret_5":_returns(c,5),
-        "ret_10":_returns(c,10),"ret_15":_returns(c,15),"ret_30":_returns(c,30),
-        "rsi14":_rsi(c),"atr14_pct":_atr_pct(x),
-        "ma5_ratio":_safe(close/ma[5]-1) if np.isfinite(close) and pd.notna(ma[5]) and ma[5] else np.nan,
-        "ma10_ratio":_safe(close/ma[10]-1) if np.isfinite(close) and pd.notna(ma[10]) and ma[10] else np.nan,
-        "ma20_ratio":_safe(close/ma[20]-1) if np.isfinite(close) and pd.notna(ma[20]) and ma[20] else np.nan,
-        "ma50_ratio":_safe(close/ma[50]-1) if np.isfinite(close) and pd.notna(ma[50]) and ma[50] else np.nan,
-        "range_pct":_safe((h.iloc[-1]-l.iloc[-1])/close) if np.isfinite(close) and close else np.nan,
-        "body_pct":_safe((close-open_)/open_) if np.isfinite(close) and np.isfinite(open_) and open_ else np.nan,
-        "volume_ratio":_safe(v.iloc[-1]/vma) if np.isfinite(v.iloc[-1]) and np.isfinite(vma) and vma else np.nan,
-        "volume_z20":_safe((v.iloc[-1]-vma)/vsd) if np.isfinite(v.iloc[-1]) and np.isfinite(vma) and np.isfinite(vsd) and vsd else np.nan,
-    }
-    ts = pd.Timestamp(decision_timestamp) if decision_timestamp is not None else x.index[-1]
-    if ts.tzinfo is None: ts = ts.tz_localize(IST)
-    else: ts = ts.tz_convert(IST)
-    session_minutes = max(0, min(389, ts.hour*60+ts.minute-(9*60+15)))
-    vals["tod_sin"] = float(np.sin(2*np.pi*session_minutes/390.0))
-    vals["tod_cos"] = float(np.cos(2*np.pi*session_minutes/390.0))
 
-    mc = _market_series(market_df)
+    c,h,l,o,v=x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
+    close=_safe(c.iloc[-1]); open_=_safe(o.iloc[-1])
+    vals: dict[str,float]={}
+
     for n in (1,3,5,10,15,30):
-        vals[f"market_ret_{n}"] = _returns(mc,n)
-    vals["market_rsi14"] = _rsi(mc)
-    vals["relative_ret_1"] = _safe(vals["ret_1"]-vals["market_ret_1"]) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["market_ret_1"]) else np.nan
-    vals["relative_ret_5"] = _safe(vals["ret_5"]-vals["market_ret_5"]) if np.isfinite(vals["ret_5"]) and np.isfinite(vals["market_ret_5"]) else np.nan
-    vals["relative_ret_15"] = _safe(vals["ret_15"]-vals["market_ret_15"]) if np.isfinite(vals["ret_15"]) and np.isfinite(vals["market_ret_15"]) else np.nan
+        vals[f"ret_{n}"]=_returns(c,n)
+    vals["rsi7"]=_rsi(c,7)
+    vals["rsi14"]=_rsi(c,14)
+    vals["atr14_pct"]=_atr_pct(x)
 
-    fo = fno or {}
-    vals["fno_pcr"] = _safe(fo.get("pcr", fo.get("fno_pcr")))
-    vals["fno_oi_change"] = _safe(fo.get("oi_change", fo.get("fno_oi_change")))
-    vals["fno_fut_return"] = _safe(fo.get("fut_return", fo.get("fno_fut_return")))
-    vals["fno_fut_oi"] = _safe(fo.get("fut_oi", fo.get("fno_fut_oi")))
-    vals["fno_basis"] = _safe(fo.get("basis", fo.get("fno_basis")))
-    vals["fno_available"] = 1.0 if any(pd.notna(vals[k]) for k in ("fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis")) else 0.0
+    for span in (8,21):
+        ema=c.ewm(span=span,adjust=False,min_periods=span).mean().iloc[-1]
+        vals[f"ema{span}_ratio"]=_safe(close/ema-1) if np.isfinite(close) and np.isfinite(ema) and ema else np.nan
+    for n in (5,10,20,50):
+        ma=c.rolling(n,min_periods=n).mean().iloc[-1]
+        vals[f"ma{n}_ratio"]=_safe(close/ma-1) if np.isfinite(close) and np.isfinite(ma) and ma else np.nan
+
+    one_min_ret=c.pct_change()
+    vals["volatility_5"]=_safe(one_min_ret.rolling(5,min_periods=5).std().iloc[-1])
+    vals["volatility_15"]=_safe(one_min_ret.rolling(15,min_periods=15).std().iloc[-1])
+
+    session_key=pd.Series(x.index.normalize(),index=x.index)
+    session_open=o.groupby(session_key).transform("first").iloc[-1]
+    session_high=h.groupby(session_key).cummax().iloc[-1]
+    session_low=l.groupby(session_key).cummin().iloc[-1]
+    vals["session_return"]=_safe(close/session_open-1) if np.isfinite(close) and np.isfinite(session_open) and session_open else np.nan
+    vals["day_high_ratio"]=_safe(close/session_high-1) if np.isfinite(close) and np.isfinite(session_high) and session_high else np.nan
+    vals["day_low_ratio"]=_safe(close/session_low-1) if np.isfinite(close) and np.isfinite(session_low) and session_low else np.nan
+
+    pv=((h+l+c)/3.0)*v
+    cum_pv=pv.groupby(session_key).cumsum().iloc[-1]
+    cum_v=v.groupby(session_key).cumsum().iloc[-1]
+    if np.isfinite(cum_pv) and np.isfinite(cum_v) and cum_v:
+        vals["vwap_ratio"]=_safe(close/(cum_pv/cum_v)-1)
+    else:
+        vals["vwap_ratio"]=np.nan
+
+    vm20=v.rolling(20,min_periods=20).mean().iloc[-1]
+    vs20=v.rolling(20,min_periods=20).std().iloc[-1]
+    vm5=v.rolling(5,min_periods=5).mean().iloc[-1]
+    vals["range_pct"]=_safe((h.iloc[-1]-l.iloc[-1])/close) if np.isfinite(close) and close else np.nan
+    vals["body_pct"]=_safe((close-open_)/open_) if np.isfinite(close) and np.isfinite(open_) and open_ else np.nan
+    vals["volume_ratio"]=_safe(v.iloc[-1]/vm20) if np.isfinite(v.iloc[-1]) and np.isfinite(vm20) and vm20 else np.nan
+    vals["volume_z20"]=_safe((v.iloc[-1]-vm20)/vs20) if np.isfinite(v.iloc[-1]) and np.isfinite(vm20) and np.isfinite(vs20) and vs20 else np.nan
+    vals["volume_trend"]=_safe(vm5/vm20-1) if np.isfinite(vm5) and np.isfinite(vm20) and vm20 else np.nan
+    vals["ret_accel_1_5"]=_safe(vals["ret_1"]-vals["ret_5"]/5.0) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["ret_5"]) else np.nan
+
+    ts=pd.Timestamp(decision_timestamp) if decision_timestamp is not None else x.index[-1]
+    if ts.tzinfo is None: ts=ts.tz_localize(IST)
+    else: ts=ts.tz_convert(IST)
+    session_minutes=max(0,min(389,ts.hour*60+ts.minute-(9*60+15)))
+    vals["tod_sin"]=float(np.sin(2*np.pi*session_minutes/390.0))
+    vals["tod_cos"]=float(np.cos(2*np.pi*session_minutes/390.0))
+
+    mc=_market_series(market_df)
+    for n in (1,3,5,10,15,30):
+        vals[f"market_ret_{n}"]=_returns(mc,n)
+    vals["market_rsi14"]=_rsi(mc)
+    market_ret_1=mc.pct_change()
+    vals["market_volatility_15"]=_safe(market_ret_1.rolling(15,min_periods=15).std().iloc[-1]) if len(mc) else np.nan
+    market_ma10=mc.rolling(10,min_periods=10).mean().iloc[-1] if len(mc) else np.nan
+    vals["market_ma10_ratio"]=_safe(mc.iloc[-1]/market_ma10-1) if len(mc) and np.isfinite(mc.iloc[-1]) and np.isfinite(market_ma10) and market_ma10 else np.nan
+    vals["relative_ret_1"]=_safe(vals["ret_1"]-vals["market_ret_1"]) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["market_ret_1"]) else np.nan
+    vals["relative_ret_5"]=_safe(vals["ret_5"]-vals["market_ret_5"]) if np.isfinite(vals["ret_5"]) and np.isfinite(vals["market_ret_5"]) else np.nan
+    vals["relative_ret_15"]=_safe(vals["ret_15"]-vals["market_ret_15"]) if np.isfinite(vals["ret_15"]) and np.isfinite(vals["market_ret_15"]) else np.nan
+    vals["relative_ret_30"]=_safe(vals["ret_30"]-vals["market_ret_30"]) if np.isfinite(vals["ret_30"]) and np.isfinite(vals["market_ret_30"]) else np.nan
+    vals["log_price"]=_safe(np.log1p(max(close,0.0))) if np.isfinite(close) else np.nan
+
+    fo=fno or {}
+    vals["fno_pcr"]=_safe(fo.get("pcr",fo.get("fno_pcr")))
+    vals["fno_oi_change"]=_safe(fo.get("oi_change",fo.get("fno_oi_change")))
+    vals["fno_fut_return"]=_safe(fo.get("fut_return",fo.get("fno_fut_return")))
+    vals["fno_fut_oi"]=_safe(fo.get("fut_oi",fo.get("fno_fut_oi")))
+    vals["fno_basis"]=_safe(fo.get("basis",fo.get("fno_basis")))
+    vals["fno_available"]=1.0 if any(pd.notna(vals[k]) for k in ("fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis")) else 0.0
     return {k:_safe(vals.get(k)) for k in FEATURES}
 
 
@@ -253,38 +293,57 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
     row = _latest_features(price_df, market_df, fno, ts)
     frame = pd.DataFrame([row], columns=FEATURES)
     current_price = _safe(pd.to_numeric(price_df["Close"], errors="coerce").dropna().iloc[-1])
-    predictions = []
+    predictions=[]
+
     for horizon in HORIZONS:
-        target_ts = ts + pd.Timedelta(minutes=int(horizon))
-        # Only emit horizons whose target remains inside the NSE regular
-        # session. Near the close, the table therefore naturally shortens.
-        if target_ts.time() > pd.Timestamp("15:30").time():
+        target_ts=ts+pd.Timedelta(minutes=int(horizon))
+        if target_ts.time()>pd.Timestamp("15:30").time():
             continue
-        h = str(horizon)
-        clf = bundle[h]["classifier"]
-        reg = bundle[h]["regressor"]
-        p = float(np.clip(clf.predict_proba(frame)[:,1][0], 0.0, 1.0))
-        expected_return = _safe(reg.predict(frame)[0])
-        predicted_price = (
-            current_price * (1.0 + expected_return)
-            if np.isfinite(current_price) and np.isfinite(expected_return)
-            else np.nan
-        )
+        h=str(horizon)
+        model_set=bundle[h]
+
+        if "classifier_hgb" in model_set:
+            blend=model_set.get("blend",{})
+            clf_w=float(blend.get("classifier_hgb_weight",0.5))
+            reg_w=float(blend.get("regressor_hgb_weight",0.5))
+            alpha=float(blend.get("return_alpha",1.0))
+            beta=float(blend.get("return_beta_direction",0.0))
+            move_scale=float(blend.get("direction_move_scale",0.001))
+            p_hgb=float(model_set["classifier_hgb"].predict_proba(frame)[:,1][0])
+            p_log=float(model_set["classifier_logistic"].predict_proba(frame)[:,1][0])
+            p=float(np.clip(clf_w*p_hgb+(1.0-clf_w)*p_log,0.0,1.0))
+            r_hgb=_safe(model_set["regressor_hgb"].predict(frame)[0])
+            r_ridge=_safe(model_set["regressor_ridge"].predict(frame)[0])
+            raw_return=reg_w*r_hgb+(1.0-reg_w)*r_ridge
+            direction_return=(2.0*p-1.0)*move_scale
+            expected_return=_safe(alpha*raw_return+beta*direction_return)
+            model_family="hgb+logistic / hgb(abs)+ridge calibrated ensemble"
+        else:
+            clf=model_set["classifier"]
+            reg=model_set["regressor"]
+            p=float(np.clip(clf.predict_proba(frame)[:,1][0],0.0,1.0))
+            expected_return=_safe(reg.predict(frame)[0])
+            model_family="legacy 5m logistic+ridge"
+
+        predicted_price=current_price*(1.0+expected_return) if np.isfinite(current_price) and np.isfinite(expected_return) else np.nan
+        signal="BUY" if p>=BUY_P and expected_return>0 else ("SELL" if p<=SELL_P and expected_return<0 else "HOLD")
         predictions.append({
-            "horizon_minutes": int(horizon),
-            "target_timestamp": str(target_ts),
-            "probability_up": p,
-            "probability_down": float(1.0-p),
-            "signal": "BUY" if p >= BUY_P else ("SELL" if p <= SELL_P else "HOLD"),
-            "expected_return": expected_return,
-            "current_price": current_price,
-            "predicted_price": predicted_price,
-            "predicted_change": (
+            "horizon_minutes":int(horizon),
+            "target_timestamp":str(target_ts),
+            "probability_up":p,
+            "probability_down":float(1.0-p),
+            "signal":signal,
+            "expected_return":expected_return,
+            "current_price":current_price,
+            "predicted_price":predicted_price,
+            "predicted_change":(
                 predicted_price-current_price
                 if np.isfinite(predicted_price) and np.isfinite(current_price)
                 else np.nan
             ),
+            "model_family":model_family,
         })
+
     return {
         "prediction_status": "PASS",
         "symbol": str(symbol),
@@ -293,5 +352,5 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
         "horizons": predictions,
         "feature_count": len(FEATURES),
         "model_status": model_status(),
-        "model_version": "2026-5m-step-multihorizon",
+        "model_version": "2026-5m-step-multihorizon-v2",
     }
