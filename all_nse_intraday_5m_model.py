@@ -271,6 +271,57 @@ def _drive_download(remote: str, local: Path) -> None:
     local.write_bytes(buf.getvalue())
 
 
+REMOTE_FNO = "production_data/nse_official/fno/fno_daily_features_2026.parquet"
+LOCAL_FNO = CACHE_ROOT / "fno_daily_features_2026.parquet"
+_FNO_DAILY: pd.DataFrame | None = None
+
+
+def _load_pit_fno(symbol: str, decision_ts: pd.Timestamp) -> dict[str, float]:
+    """Use the previous-session daily F&O snapshot, matching training semantics."""
+    global _FNO_DAILY
+    if _FNO_DAILY is None:
+        try:
+            if not LOCAL_FNO.exists() or LOCAL_FNO.stat().st_size == 0:
+                _drive_download(REMOTE_FNO, LOCAL_FNO)
+            z = pd.read_parquet(LOCAL_FNO)
+            z.columns = [str(col).strip() for col in z.columns]
+            lower = {str(col).strip().lower(): col for col in z.columns}
+            dc = next((lower[k] for k in ("date","trade_date","timestamp") if k in lower), None)
+            sc = next((lower[k] for k in ("symbol","ticker","underlying") if k in lower), None)
+            if dc is None or sc is None:
+                _FNO_DAILY = pd.DataFrame()
+            else:
+                z["_date"] = pd.to_datetime(z[dc], errors="coerce").dt.normalize()
+                z["_symbol"] = z[sc].astype(str).str.upper().str.replace(".NS","",regex=False)
+                _FNO_DAILY = z.dropna(subset=["_date"]).copy()
+        except Exception:
+            _FNO_DAILY = pd.DataFrame()
+
+    z = _FNO_DAILY
+    if z is None or z.empty:
+        return {}
+    root = str(symbol).upper().replace(".NS","").replace(".BO","")
+    cutoff = pd.Timestamp(decision_ts).tz_convert(IST).normalize().tz_localize(None)
+    z = z[(z["_symbol"] == root) & (z["_date"] < cutoff)].sort_values("_date")
+    if z.empty:
+        return {}
+    row = z.iloc[-1]
+    lower = {str(col).strip().lower(): col for col in z.columns}
+    aliases = {
+        "pcr": ("fno_pcr","pcr"),
+        "oi_change": ("fno_oi_change","oi_change"),
+        "fut_return": ("fno_fut_return","fut_return"),
+        "fut_oi": ("fno_fut_oi","fut_oi"),
+        "basis": ("fno_basis","fut_basis","fno_fut_basis"),
+    }
+    out = {}
+    for target, names in aliases.items():
+        col = next((lower[n] for n in names if n in lower), None)
+        if col is not None:
+            out[target] = _safe(row.get(col))
+    return out
+
+
 def _ensure_artifact() -> dict[str, Any]:
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     for remote, local in ((REMOTE_MANIFEST, LOCAL_MANIFEST), (REMOTE_BUNDLE, LOCAL_BUNDLE)):
@@ -328,7 +379,8 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
         raise RuntimeError("5-minute-step prediction unavailable after 15:25 IST")
 
     bundle = _bundle_models()
-    row = _latest_features(price_df, market_df, fno, ts)
+    pit_fno = _load_pit_fno(symbol, ts)
+    row = _latest_features(price_df, market_df, pit_fno, ts)
     frame = pd.DataFrame([row], columns=FEATURES)
     current_price = _safe(pd.to_numeric(price_df["Close"], errors="coerce").dropna().iloc[-1])
     predictions=[]
@@ -390,6 +442,7 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
         "prediction_status": "PASS",
         "symbol": str(symbol),
         "decision_timestamp": str(ts),
+        "fno_data_mode": "previous_session_daily_pit" if pit_fno else "unavailable",
         "base_price": current_price,
         "horizons": predictions,
         "feature_count": len(FEATURES),
