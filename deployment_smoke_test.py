@@ -63,6 +63,7 @@ def main() -> None:
     # validates adapter import and declared routing surface.
     import all_nse_delivery_model as delivery
     import all_nse_intraday_model as legacy_intraday
+    import all_nse_intraday_5m_model as intraday_5m
     import production_model as certified_intraday
     import autonomous_engine
     import prediction_ledger
@@ -78,7 +79,7 @@ def main() -> None:
     if len(legacy_intraday.FEATURES) != 34:
         raise SystemExit("Legacy/compatibility Intraday adapter feature contract changed unexpectedly")
     checks.append("OK compatibility Intraday adapter remains 34-feature and isolated")
-
+\n    if len(intraday_5m.FEATURES) != 49:\n        raise SystemExit("5-minute Intraday V2 adapter feature contract is not 49")\n    if tuple(intraday_5m.HORIZONS) != (5, 10, 15, 20, 25, 30):\n        raise SystemExit("5-minute Intraday V2 horizon contract changed unexpectedly")\n    checks.append("OK 5-minute Intraday V2 adapter exposes 49 features / six direct horizons")\n
     if len(certified_intraday.FEATURES) != 137:
         raise SystemExit("Certified Intraday adapter feature contract is not 137")
     checks.append("OK certified Intraday adapter exposes 137 features")
