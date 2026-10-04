@@ -129,11 +129,11 @@ def main() -> int:
     ).fetchone()[0])
 
     series_df = con.execute(
-        f"SELECT UPPER(TRIM(CAST({qident(sec)} AS VARCHAR))) series, COUNT(*) rows "
+        f"SELECT UPPER(TRIM(CAST({qident(sec)} AS VARCHAR))) AS series, COUNT(*) AS row_count "
         f"FROM {src} GROUP BY 1 ORDER BY 2 DESC"
     ).df()
     series_counts = {
-        ("" if pd.isna(r["series"]) else str(r["series"])): int(r["rows"])
+        ("" if pd.isna(r["series"]) else str(r["series"])): int(r["row_count"])
         for _,r in series_df.iterrows()
     }
     unexpected_series = [
