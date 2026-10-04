@@ -261,8 +261,7 @@ def main() -> None:
             max(0.0, args.sleep_seconds)
         )
 
-    print("
-" + "=" * 90)
+    print("\n" + "=" * 90)
     print("BACKFILL RUN COMPLETE")
     print("=" * 90)
     print(
