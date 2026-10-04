@@ -661,6 +661,7 @@ def main():
         reg_ridge_final.fit(Xdeploy,deploy["future_return"].astype(float))
         training_rows_by_horizon[str(h)] = int(len(deploy))
         validation[str(h)]["deployment_train_rows"] = int(len(deploy))
+        validation[str(h)]["deployment_trained_until"] = str(deploy["decision_ts"].max())
         bundle[str(h)]={
             "classifier_hgb":clf_hgb_final,
             "classifier_logistic":clf_log_final,
@@ -708,8 +709,7 @@ def main():
         "training_rows_by_horizon":training_rows_by_horizon,
         "validation":validation,
         "verified_horizons":[int(h) for h in HORIZONS] if verified else [],
-        "trained_until":max(str(pd.Timestamp(pd.concat([data[data["horizon"]==h]["decision_ts"]]).max())) for h in HORIZONS),
-        "holdout_evaluation_end":max(validation[str(h)]["holdout_start"] for h in HORIZONS),
+        "trained_until":max(validation[str(h)]["deployment_trained_until"] for h in HORIZONS),
         "bundle_sha256":sha,
         "no_auto_orders":True,
         "point_in_time_fno":True,
