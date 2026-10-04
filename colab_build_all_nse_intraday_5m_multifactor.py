@@ -211,6 +211,15 @@ def main():
     if not universe: raise RuntimeError("Official NSE universe is empty")
     market=load_market(root); fno=load_fno(root)
     frames=[]; coverage=[]; retained=0
+    # Allocate the global training budget across the full live NSE universe
+    # and all six horizons so early symbols cannot consume the whole pool.
+    per_symbol_horizon_cap = max(
+        25,
+        min(
+            int(args.max_train_rows_per_symbol),
+            int(args.global_retained_row_cap // max(1, len(universe) * len(HORIZONS))),
+        ),
+    )
     for i,sym in enumerate(universe,1):
         raw=load_symbol(root,sym)
         if len(raw)<args.min_rows_symbol:
@@ -218,20 +227,20 @@ def main():
         table=build_label_table(raw,market,fno,sym)
         if table.empty:
             coverage.append((sym,len(raw),"EXCLUDED_NO_LABELS")); continue
+        # Bound each symbol's contribution separately for every horizon.
+        pieces=[]
+        for h,z in table.groupby("horizon"):
+            if len(z)>per_symbol_horizon_cap:
+                pos=np.linspace(0,len(z)-1,per_symbol_horizon_cap,dtype=int)
+                z=z.iloc[np.unique(pos)]
+            pieces.append(z)
+        table=pd.concat(pieces,axis=0)
         if retained + len(table) > args.global_retained_row_cap:
             allowed=max(0,args.global_retained_row_cap-retained)
             if allowed<=0:
                 coverage.append((sym,len(raw),"EXCLUDED_GLOBAL_ROW_CAP")); continue
-            positions=np.linspace(0,len(table)-1,allowed,dtype=int)
-            table=table.iloc[np.unique(positions)]
-        # cap per symbol per horizon to avoid overweighting liquid names
-        pieces=[]
-        for h,z in table.groupby("horizon"):
-            if len(z)>args.max_train_rows_per_symbol:
-                pos=np.linspace(0,len(z)-1,args.max_train_rows_per_symbol,dtype=int)
-                z=z.iloc[np.unique(pos)]
-            pieces.append(z)
-        table=pd.concat(pieces,axis=0)
+            pos=np.linspace(0,len(table)-1,allowed,dtype=int)
+            table=table.iloc[np.unique(pos)]
         frames.append(table)
         retained += len(table)
         coverage.append((sym,len(raw),"TRAINABLE"))
