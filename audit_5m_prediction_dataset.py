@@ -48,10 +48,12 @@ def main() -> int:
     duplicate_keys = int(df.duplicated(KEY).sum())
     bad_horizon = int((~horizon.isin(HORIZONS)).sum())
 
-    groups = df.groupby(["symbol", "decision_timestamp"])["horizon_minutes"].apply(
-        lambda x: set(int(v) for v in x.dropna())
+    counts_by_horizon = (
+        horizon.value_counts()
+        .reindex(HORIZONS, fill_value=0)
+        .astype(int)
+        .to_dict()
     )
-    incomplete_groups = int((groups.apply(lambda x: x != set(HORIZONS))).sum())
 
     checks = {
         "DUPLICATE_KEYS": duplicate_keys,
@@ -62,12 +64,12 @@ def main() -> int:
         "ACTUAL_NA_ROWS": int(actual.isna().sum()),
         "PREDICTED_PRICE_NA_ROWS": int(pd.to_numeric(df["predicted_price"], errors="coerce").isna().sum()),
         "ACTUAL_PRICE_NA_ROWS": int(pd.to_numeric(df["actual_future_price"], errors="coerce").isna().sum()),
-        "DECISION_GROUPS_MISSING_HORIZONS": incomplete_groups,
     }
 
     print("ROWS:", len(df))
     print("SYMBOLS:", int(df["symbol"].nunique()))
     print("HORIZONS:", sorted(horizon.dropna().unique().tolist()))
+    print("ROWS_BY_HORIZON:", counts_by_horizon)
     for k, v in checks.items():
         print(f"{k}:", v)
 
