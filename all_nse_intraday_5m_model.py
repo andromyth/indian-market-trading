@@ -311,14 +311,18 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
             reg_w=float(blend.get("regressor_hgb_weight",0.5))
             alpha=float(blend.get("return_alpha",1.0))
             beta=float(blend.get("return_beta_direction",0.0))
-            move_scale=float(blend.get("direction_move_scale",0.001))
             p_hgb=float(model_set["classifier_hgb"].predict_proba(frame)[:,1][0])
             p_log=float(model_set["classifier_logistic"].predict_proba(frame)[:,1][0])
             p=float(np.clip(clf_w*p_hgb+(1.0-clf_w)*p_log,0.0,1.0))
             r_hgb=_safe(model_set["regressor_hgb"].predict(frame)[0])
             r_ridge=_safe(model_set["regressor_ridge"].predict(frame)[0])
             raw_return=reg_w*r_hgb+(1.0-reg_w)*r_ridge
-            direction_return=(2.0*p-1.0)*move_scale
+            up_move=_safe(blend.get("direction_up_return",0.001))
+            down_move=_safe(blend.get("direction_down_return",-0.001))
+            if np.isfinite(up_move) and np.isfinite(down_move):
+                direction_return=p*up_move+(1.0-p)*down_move
+            else:
+                direction_return=(2.0*p-1.0)*0.001
             expected_return=_safe(alpha*raw_return+beta*direction_return)
             model_family="hgb+logistic / hgb(abs)+ridge calibrated ensemble"
         else:
