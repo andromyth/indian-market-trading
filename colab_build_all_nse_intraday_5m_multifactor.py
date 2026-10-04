@@ -28,7 +28,7 @@ from all_nse_intraday_5m_model import FEATURES, HORIZONS
 IST = "Asia/Kolkata"
 INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
@@ -69,33 +69,74 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     if x.empty: return pd.DataFrame()
     c,h,l,o,v=x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
     out=pd.DataFrame(index=x.index)
-    for n in (1,3,5,10,15,30): out[f"ret_{n}"]=c.pct_change(n)
-    out["rsi14"]=_rsi(c)
+
+    for n in (1,3,5,10,15,30):
+        out[f"ret_{n}"]=c.pct_change(n)
+    out["rsi7"]=_rsi(c,7)
+    out["rsi14"]=_rsi(c,14)
+
     pc=c.shift(1)
     tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    out["atr14_pct"]=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/c
-    for n in (5,10,20,50): out[f"ma{n}_ratio"]=c/c.rolling(n,min_periods=n).mean()-1
+    atr14=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    out["atr14_pct"]=atr14/c
+
+    for span in (8,21):
+        ema=c.ewm(span=span,adjust=False,min_periods=span).mean()
+        out[f"ema{span}_ratio"]=c/ema-1
+    for n in (5,10,20,50):
+        out[f"ma{n}_ratio"]=c/c.rolling(n,min_periods=n).mean()-1
+
+    one_min_ret=c.pct_change()
+    out["volatility_5"]=one_min_ret.rolling(5,min_periods=5).std()
+    out["volatility_15"]=one_min_ret.rolling(15,min_periods=15).std()
+
+    session_key=pd.Series(x.index.normalize(),index=x.index)
+    session_open=o.groupby(session_key).transform("first")
+    session_high=h.groupby(session_key).cummax()
+    session_low=l.groupby(session_key).cummin()
+    out["session_return"]=c/session_open-1
+    out["day_high_ratio"]=c/session_high-1
+    out["day_low_ratio"]=c/session_low-1
+
+    pv=((h+l+c)/3.0)*v
+    cum_pv=pv.groupby(session_key).cumsum()
+    cum_v=v.groupby(session_key).cumsum()
+    session_vwap=cum_pv/cum_v
+    out["vwap_ratio"]=c/session_vwap-1
+
     out["range_pct"]=(h-l)/c
     out["body_pct"]=(c-o)/o
-    vm=v.rolling(20,min_periods=20).mean()
-    vs=v.rolling(20,min_periods=20).std()
-    out["volume_ratio"]=v/vm
-    out["volume_z20"]=(v-vm)/vs
+    out["volume_ratio"]=v/v.rolling(20,min_periods=20).mean()
+    out["volume_z20"]=(v-v.rolling(20,min_periods=20).mean())/v.rolling(20,min_periods=20).std()
+    out["volume_trend"]=v.rolling(5,min_periods=5).mean()/v.rolling(20,min_periods=20).mean()-1
+    out["ret_accel_1_5"]=out["ret_1"]-(out["ret_5"]/5.0)
+
     mins=x.index.hour*60+x.index.minute-(9*60+15)
     mins=np.clip(mins,0,389)
     out["tod_sin"]=np.sin(2*np.pi*mins/390.0)
     out["tod_cos"]=np.cos(2*np.pi*mins/390.0)
+
     if market is not None and not market.empty:
         m=market if isinstance(market.index,pd.DatetimeIndex) else _norm(market)
         mc=m["Close"].reindex(x.index,method="ffill",tolerance=pd.Timedelta(minutes=2))
-        for n in (1,3,5,10,15,30): out[f"market_ret_{n}"]=mc.pct_change(n,fill_method=None)
+        for n in (1,3,5,10,15,30):
+            out[f"market_ret_{n}"]=mc.pct_change(n,fill_method=None)
         out["market_rsi14"]=_rsi(mc)
+        market_ret_1=mc.pct_change()
+        out["market_volatility_15"]=market_ret_1.rolling(15,min_periods=15).std()
+        market_ma10=mc.rolling(10,min_periods=10).mean()
+        out["market_ma10_ratio"]=mc/market_ma10-1
     else:
         for n in (1,3,5,10,15,30): out[f"market_ret_{n}"]=np.nan
         out["market_rsi14"]=np.nan
+        out["market_volatility_15"]=np.nan
+        out["market_ma10_ratio"]=np.nan
+
     out["relative_ret_1"]=out["ret_1"]-out["market_ret_1"]
     out["relative_ret_5"]=out["ret_5"]-out["market_ret_5"]
     out["relative_ret_15"]=out["ret_15"]-out["market_ret_15"]
+    out["relative_ret_30"]=out["ret_30"]-out["market_ret_30"]
+    out["log_price"]=np.log1p(c.clip(lower=0))
     return out
 
 
@@ -411,54 +452,176 @@ def main():
 
     bundle={}; validation={}; training_rows_by_horizon={}; trainable_symbols=sorted(data["symbol"].unique().tolist())
     for h in HORIZONS:
-        z=data[data["horizon"]==h].copy()
-        cut=z["decision_ts"].quantile(0.80)
-        train=z[z["decision_ts"]<cut].copy()
-        test=z[z["decision_ts"]>=cut].copy()
-        if len(train)<500 or len(test)<200:
-            raise RuntimeError(f"Insufficient split for +{h}m: train={len(train)} test={len(test)}")
-        ytr=train["target"].astype(int); yte=test["target"].astype(int)
-        if ytr.nunique()!=2 or yte.nunique()!=2:
-            raise RuntimeError(f"Target split missing class for +{h}m")
-        clf=Pipeline([
-            ("imputer",SimpleImputer(strategy="median")),
+        z=data[data["horizon"]==h].copy().sort_values("decision_ts")
+        cut_fit=z["decision_ts"].quantile(0.70)
+        cut_cal=z["decision_ts"].quantile(0.85)
+        fit=z[z["decision_ts"]<cut_fit].copy()
+        cal=z[(z["decision_ts"]>=cut_fit)&(z["decision_ts"]<cut_cal)].copy()
+        test=z[z["decision_ts"]>=cut_cal].copy()
+
+        if len(fit)<500 or len(cal)<200 or len(test)<200:
+            raise RuntimeError(
+                f"Insufficient chronological split for +{h}m: "
+                f"fit={len(fit)} calibration={len(cal)} holdout={len(test)}"
+            )
+        for name,frame in (("fit",fit),("cal",cal),("test",test)):
+            if frame["target"].nunique()!=2:
+                raise RuntimeError(f"+{h}m {name} split missing one target class")
+
+        Xfit=fit[FEATURES]
+        Xcal=cal[FEATURES]
+        Xtest=test[FEATURES]
+        yfit=fit["target"].astype(int)
+        ycal=cal["target"].astype(int)
+        ytest=test["target"].astype(int)
+
+        # Nonlinear tree models capture threshold/interactions that the first
+        # linear candidate could not represent. Logistic/Ridge are retained as
+        # stable ensemble members rather than discarded.
+        clf_hgb=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("model",__import__("sklearn.ensemble",fromlist=["HistGradientBoostingClassifier"]).HistGradientBoostingClassifier(
+                max_iter=180,
+                learning_rate=0.05,
+                max_leaf_nodes=31,
+                min_samples_leaf=40,
+                l2_regularization=1.0,
+                random_state=20261004+h,
+            )),
+        ])
+        clf_log=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
             ("scale",StandardScaler()),
             ("model",LogisticRegression(max_iter=3000,class_weight="balanced",random_state=20261004+h)),
         ])
-        reg=Pipeline([
-            ("imputer",SimpleImputer(strategy="median")),
-            ("scale",StandardScaler()),
-            ("model",Ridge(alpha=1.0)),
+        reg_hgb=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("model",__import__("sklearn.ensemble",fromlist=["HistGradientBoostingRegressor"]).HistGradientBoostingRegressor(
+                loss="absolute_error",
+                max_iter=180,
+                learning_rate=0.05,
+                max_leaf_nodes=31,
+                min_samples_leaf=50,
+                l2_regularization=1.0,
+                random_state=20261004+h,
+            )),
         ])
-        clf.fit(train[FEATURES],ytr)
-        reg.fit(train[FEATURES],train["future_return"].astype(float))
-        p=clf.predict_proba(test[FEATURES])[:,1]
+        reg_ridge=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("scale",StandardScaler()),
+            ("model",Ridge(alpha=2.0)),
+        ])
+
+        clf_hgb.fit(Xfit,yfit)
+        clf_log.fit(Xfit,yfit)
+
+        # Weight the tree regressor by reference-price level so absolute
+        # price-error performance is represented during fitting.
+        price_weights=fit["reference_close"].astype(float).to_numpy()
+        price_weights=price_weights/np.nanmedian(price_weights)
+        price_weights=np.clip(price_weights,0.25,4.0)
+        reg_hgb.fit(Xfit,fit["future_return"].astype(float),model__sample_weight=price_weights)
+        reg_ridge.fit(Xfit,fit["future_return"].astype(float))
+
+        p_hgb_cal=clf_hgb.predict_proba(Xcal)[:,1]
+        p_log_cal=clf_log.predict_proba(Xcal)[:,1]
+        best_classifier_weight=0.0
+        best_brier=float("inf")
+        for w in np.linspace(0.0,1.0,9):
+            p=w*p_hgb_cal+(1.0-w)*p_log_cal
+            b=float(brier_score_loss(ycal,p))
+            if b<best_brier:
+                best_brier=b
+                best_classifier_weight=float(w)
+
+        p_cal=best_classifier_weight*p_hgb_cal+(1.0-best_classifier_weight)*p_log_cal
+        r_hgb_cal=reg_hgb.predict(Xcal)
+        r_ridge_cal=reg_ridge.predict(Xcal)
+        abs_move=float(np.nanmedian(np.abs(fit["future_return"].astype(float).to_numpy())))
+        if not np.isfinite(abs_move) or abs_move<=0:
+            abs_move=float(np.nanmean(np.abs(fit["future_return"].astype(float).to_numpy())))
+        if not np.isfinite(abs_move) or abs_move<=0:
+            abs_move=0.001
+        direction_ret=(2.0*p_cal-1.0)*abs_move
+
+        best=None
+        best_mae=float("inf")
+        cal_base=cal["reference_close"].astype(float).to_numpy()
+        cal_actual=cal["future_close"].astype(float).to_numpy()
+        for rw in np.linspace(0.0,1.0,5):
+            raw_ret=rw*r_hgb_cal+(1.0-rw)*r_ridge_cal
+            for alpha in (0.0,0.25,0.5,0.75,1.0):
+                for beta in (0.0,0.5,1.0):
+                    pred_ret=alpha*raw_ret+beta*direction_ret
+                    pred_price=cal_base*(1.0+pred_ret)
+                    mae=float(mean_absolute_error(cal_actual,pred_price))
+                    if mae<best_mae:
+                        best_mae=mae
+                        best=(float(rw),float(alpha),float(beta))
+
+        reg_weight_hgb,return_alpha,return_beta=best
+
+        p_hgb=clf_hgb.predict_proba(Xtest)[:,1]
+        p_log=clf_log.predict_proba(Xtest)[:,1]
+        p=best_classifier_weight*p_hgb+(1.0-best_classifier_weight)*p_log
+        pred_hgb=reg_hgb.predict(Xtest)
+        pred_ridge=reg_ridge.predict(Xtest)
+        raw_ret=reg_weight_hgb*pred_hgb+(1.0-reg_weight_hgb)*pred_ridge
+        expected_ret=return_alpha*raw_ret+return_beta*((2.0*p-1.0)*abs_move)
+
         pred=(p>=0.5).astype(int)
-        pred_ret=reg.predict(test[FEATURES])
         base_price=test["reference_close"].astype(float).to_numpy()
-        pred_price=base_price*(1.0+pred_ret)
+        pred_price=base_price*(1.0+expected_ret)
         actual_price=test["future_close"].astype(float).to_numpy()
-        model_mae=float(mean_absolute_error(actual_price,pred_price))
+        model_mae=float(mean_absolute_absolute_error(actual_price,pred_price)) if False else float(mean_absolute_error(actual_price,pred_price))
         base_mae=float(mean_absolute_error(actual_price,base_price))
-        auc=float(roc_auc_score(yte,p))
-        acc=float(accuracy_score(yte,pred))
+        auc=float(roc_auc_score(ytest,p))
+        acc=float(accuracy_score(ytest,pred))
         validation[str(h)]={
             "accuracy":acc,
             "roc_auc":auc,
-            "brier":float(brier_score_loss(yte,p)),
-            "return_mae":float(mean_absolute_error(test["future_return"],pred_ret)),
+            "brier":float(brier_score_loss(ytest,p)),
+            "return_mae":float(mean_absolute_error(test["future_return"],expected_ret)),
             "price_mae":model_mae,
             "baseline_current_price_mae":base_mae,
             "price_mae_improvement_pct":float(100*(base_mae-model_mae)/base_mae) if base_mae>0 else None,
             "model_beats_current_price_baseline":bool(model_mae<base_mae),
-            "train_rows":int(len(train)),
+            "calibration_price_mae":float(best_mae),
+            "calibration_baseline_price_mae":float(mean_absolute_error(cal_actual,cal_base)),
+            "classifier_hgb_weight":float(best_classifier_weight),
+            "regressor_hgb_weight":float(reg_weight_hgb),
+            "return_alpha":float(return_alpha),
+            "return_beta_direction":float(return_beta),
+            "direction_move_scale":float(abs_move),
+            "fit_rows":int(len(fit)),
+            "calibration_rows":int(len(cal)),
+            "train_rows":int(len(fit)),
             "holdout_rows":int(len(test)),
-            "trained_until":str(train["decision_ts"].max()),
+            "trained_until":str(fit["decision_ts"].max()),
+            "calibration_end":str(cal["decision_ts"].max()),
             "holdout_start":str(test["decision_ts"].min()),
         }
-        training_rows_by_horizon[str(h)] = int(len(train))
-        bundle[str(h)]={"classifier":clf,"regressor":reg}
-        print(f"+{h}m AUC={auc:.4f} acc={acc:.4f} price_MAE={model_mae:.6f} baseline_MAE={base_mae:.6f}",flush=True)
+        training_rows_by_horizon[str(h)] = int(len(fit))
+        bundle[str(h)]={
+            "classifier_hgb":clf_hgb,
+            "classifier_logistic":clf_log,
+            "regressor_hgb":reg_hgb,
+            "regressor_ridge":reg_ridge,
+            "blend":{
+                "classifier_hgb_weight":float(best_classifier_weight),
+                "regressor_hgb_weight":float(reg_weight_hgb),
+                "return_alpha":float(return_alpha),
+                "return_beta_direction":float(return_beta),
+                "direction_move_scale":float(abs_move),
+            },
+        }
+        print(
+            f"+{h}m AUC={auc:.4f} acc={acc:.4f} "
+            f"price_MAE={model_mae:.6f} baseline_MAE={base_mae:.6f} "
+            f"cal_MAE={best_mae:.6f}",
+            flush=True,
+        )
+
 
     verified = all(
         validation[str(h)]["model_beats_current_price_baseline"]
@@ -474,7 +637,7 @@ def main():
     manifest={
         "status":"VERIFIED" if verified else "CANDIDATE",
         "production_ready":bool(verified),
-        "model_family":"logistic_regression+ridge_per_horizon",
+        "model_family":"hgb_classifier+logistic_ensemble+hgb_absolute_error_ridge_regressor_per_horizon_v2",
         "horizons_minutes":list(HORIZONS),
         "target_definitions":{str(h):f"future close at decision timestamp + {h} minutes; nearest observation within 1 minute; reference price is decision-time close" for h in HORIZONS},
         "feature_count":len(FEATURES),
@@ -490,7 +653,9 @@ def main():
         "no_auto_orders":True,
         "point_in_time_fno":True,
         "volume_policy":"Source-reported volume only; missing volume stays NaN.",
-        "promotion_rule":"Every horizon must beat current-price price-MAE baseline and exceed 0.50 ROC-AUC and 0.50 direction accuracy.",
+        "model_version":"2026-5m-step-multihorizon-v2",
+        "validation_protocol":"70% chronological fit / 15% calibration / 15% final holdout per horizon.",
+        "promotion_rule":"Every horizon must beat the current-price price-MAE baseline on the final untouched chronological holdout and exceed 0.50 ROC-AUC and 0.50 direction accuracy; calibration data is used only for ensemble/blend selection.",
     }
     (out/"ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
     pd.DataFrame(coverage,columns=["symbol","stored_rows","status"]).to_csv(out/"INTRADAY_5M_TRAINING_COVERAGE.csv",index=False)
