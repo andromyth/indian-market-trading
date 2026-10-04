@@ -587,32 +587,14 @@ def _stored_nifty50_daily(start_date, end_date) -> pd.DataFrame:
 
 
 def _official_market_context(index_symbol: str, start_date, end_date) -> pd.DataFrame:
-    """Load the official NSE benchmark history with a persisted-archive-first policy."""
+    """Load authoritative official NSE benchmark history without stale-cache bypasses."""
     root = str(index_symbol).strip().upper()
-
-    if root == "^NSEI":
-        stored = _stored_nifty50_daily(start_date, end_date)
-        if not stored.empty:
-            frame = stored
-            print(
-                f"market context: reused persisted NSE NIFTY 50 archive "
-                f"rows={len(frame):,} range={frame['date'].min().date()}..{frame['date'].max().date()}",
-                flush=True,
-            )
-        else:
-            frame = fetch_index_history(
-                root,
-                pd.Timestamp(start_date).date(),
-                pd.Timestamp(end_date).date(),
-                sync_drive=True,
-            )
-    else:
-        frame = fetch_index_history(
-            root,
-            pd.Timestamp(start_date).date(),
-            pd.Timestamp(end_date).date(),
-            sync_drive=True,
-        )
+    frame = fetch_index_history(
+        root,
+        pd.Timestamp(start_date).date(),
+        pd.Timestamp(end_date).date(),
+        sync_drive=True,
+    )
 
     if frame is None or frame.empty:
         raise RuntimeError(
