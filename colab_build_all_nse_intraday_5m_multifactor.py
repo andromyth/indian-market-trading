@@ -787,9 +787,34 @@ def main():
     holdout_predictions.to_parquet(holdout_predictions_path,index=False)
     holdout_predictions_csv=out/"holdout_predictions_all_horizons_2026.csv"
     holdout_predictions.to_csv(holdout_predictions_csv,index=False)
+
+    duplicate_keys=int(
+        holdout_predictions.duplicated(
+            ["symbol","decision_timestamp","horizon_minutes"]
+        ).sum()
+    )
+    alignment=pd.to_numeric(
+        holdout_predictions["target_alignment_seconds"],
+        errors="coerce",
+    )
+    prediction_data_failures=(
+        duplicate_keys
+        or int(alignment.isna().sum())
+        or int((alignment < 0).sum())
+        or int((alignment > 60).sum())
+    )
+    if prediction_data_failures:
+        raise RuntimeError(
+            "5-minute prediction dataset authenticity audit failed: "
+            f"duplicates={duplicate_keys} "
+            f"alignment_na={int(alignment.isna().sum())} "
+            f"actual_before_target={int((alignment < 0).sum())} "
+            f"alignment_over_60s={int((alignment > 60).sum())}"
+        )
     print(
         f"PREDICTION_DATASET: rows={len(holdout_predictions):,} "
-        f"interval=5m horizons={list(HORIZONS)}",
+        f"interval=5m horizons={list(HORIZONS)} "
+        f"duplicates={duplicate_keys} alignment_max_s={float(alignment.max()):.1f}",
         flush=True,
     )
 
