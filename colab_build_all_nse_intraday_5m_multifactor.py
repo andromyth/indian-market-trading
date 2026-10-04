@@ -187,6 +187,10 @@ def build_label_table(raw:pd.DataFrame,market:pd.DataFrame,fno:pd.DataFrame,sym:
         merged=pd.merge_asof(left,right,on="future_ts",direction="nearest",tolerance=pd.Timedelta(minutes=1))
         future=merged.set_index("decision_ts")["future_close"].reindex(feat.index)
         z=feat.copy()
+        # Preserve the decision-time/reference price for price-baseline and
+        # predicted-price validation. It is not a model feature.
+        z["reference_close"]=c.to_numpy()
+        z["future_close"]=future.to_numpy()
         z["future_return"]=future/c-1
         z["target"] = np.where(z["future_return"].notna(),(z["future_return"]>0).astype(float),np.nan)
         z["horizon"]=h
@@ -278,9 +282,9 @@ def main():
         p=clf.predict_proba(test[FEATURES])[:,1]
         pred=(p>=0.5).astype(int)
         pred_ret=reg.predict(test[FEATURES])
-        base_price=test["Close"].astype(float).to_numpy()
+        base_price=test["reference_close"].astype(float).to_numpy()
         pred_price=base_price*(1.0+pred_ret)
-        actual_price=base_price*(1.0+test["future_return"].astype(float).to_numpy())
+        actual_price=test["future_close"].astype(float).to_numpy()
         model_mae=float(mean_absolute_error(actual_price,pred_price))
         base_mae=float(mean_absolute_error(actual_price,base_price))
         auc=float(roc_auc_score(yte,p))
@@ -319,7 +323,7 @@ def main():
         "production_ready":bool(verified),
         "model_family":"logistic_regression+ridge_per_horizon",
         "horizons_minutes":list(HORIZONS),
-        "target_definitions":{str(h):f"future close at decision timestamp + {h} minutes; nearest observation within 1 minute" for h in HORIZONS},
+        "target_definitions":{str(h):f"future close at decision timestamp + {h} minutes; nearest observation within 1 minute; reference price is decision-time close" for h in HORIZONS},
         "feature_count":len(FEATURES),
         "features":FEATURES,
         "universe_size":int(len(universe)),
