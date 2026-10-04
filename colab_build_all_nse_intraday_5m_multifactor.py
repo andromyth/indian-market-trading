@@ -227,7 +227,7 @@ def build_label_table(raw:pd.DataFrame,market:pd.DataFrame,fno:pd.DataFrame,sym:
     out=[]
     for h in HORIZONS:
         left=pd.DataFrame({"decision_ts":feat.index,"future_ts":feat.index+pd.Timedelta(minutes=h)}).sort_values("future_ts")
-        merged=pd.merge_asof(left,right,on="future_ts",direction="nearest",tolerance=pd.Timedelta(minutes=1))
+        merged=pd.merge_asof(left,right,on="future_ts",direction="forward",tolerance=pd.Timedelta(minutes=1))
         future=merged.set_index("decision_ts")["future_close"].reindex(feat.index)
         z=feat.copy()
         # Preserve the decision-time/reference price for price-baseline and
@@ -603,17 +603,72 @@ def main():
             "holdout_start":str(test["decision_ts"].min()),
         }
         training_rows_by_horizon[str(h)] = int(len(fit))
+        # Final deployment fit: after the untouched holdout metrics are frozen,
+        # refit the same model classes on all pre-holdout observations (fit + calibration).
+        # The holdout remains completely untouched for the reported OOS metrics.
+        deploy= pd.concat([fit,cal], axis=0).sort_values("decision_ts")
+        Xdeploy=deploy[FEATURES]
+        ydeploy=deploy["target"].astype(int)
+        clf_hgb_final=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("model",HistGradientBoostingClassifier(
+                max_iter=180,
+                learning_rate=0.05,
+                max_leaf_nodes=31,
+                min_samples_leaf=40,
+                l2_regularization=1.0,
+                random_state=20261004+h,
+            )),
+        ])
+        clf_log_final=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("scale",StandardScaler()),
+            ("model",LogisticRegression(max_iter=3000,class_weight="balanced",random_state=20261004+h)),
+        ])
+        reg_hgb_final=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("model",HistGradientBoostingRegressor(
+                loss="absolute_error",
+                max_iter=180,
+                learning_rate=0.05,
+                max_leaf_nodes=31,
+                min_samples_leaf=50,
+                l2_regularization=1.0,
+                random_state=20261004+h,
+            )),
+        ])
+        reg_ridge_final=Pipeline([
+            ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
+            ("scale",StandardScaler()),
+            ("model",Ridge(alpha=2.0)),
+        ])
+        clf_hgb_final.fit(Xdeploy,ydeploy)
+        clf_log_final.fit(Xdeploy,ydeploy)
+        deploy_weights=deploy["reference_close"].astype(float).to_numpy()
+        deploy_weights=deploy_weights/np.nanmedian(deploy_weights)
+        deploy_weights=np.clip(deploy_weights,0.25,4.0)
+        reg_hgb_final.fit(
+            Xdeploy,
+            deploy["future_return"].astype(float),
+            model__sample_weight=deploy_weights,
+        )
+        reg_ridge_final.fit(Xdeploy,deploy["future_return"].astype(float))
+        deployment_abs_move=float(np.nanmedian(np.abs(deploy["future_return"].astype(float).to_numpy())))
+        if not np.isfinite(deployment_abs_move) or deployment_abs_move<=0:
+            deployment_abs_move=abs_move
+        training_rows_by_horizon[str(h)] = int(len(deploy))
+        validation[str(h)]["deployment_train_rows"] = int(len(deploy))
         bundle[str(h)]={
-            "classifier_hgb":clf_hgb,
-            "classifier_logistic":clf_log,
-            "regressor_hgb":reg_hgb,
-            "regressor_ridge":reg_ridge,
+            "classifier_hgb":clf_hgb_final,
+            "classifier_logistic":clf_log_final,
+            "regressor_hgb":reg_hgb_final,
+            "regressor_ridge":reg_ridge_final,
             "blend":{
                 "classifier_hgb_weight":float(best_classifier_weight),
                 "regressor_hgb_weight":float(reg_weight_hgb),
                 "return_alpha":float(return_alpha),
                 "return_beta_direction":float(return_beta),
-                "direction_move_scale":float(abs_move),
+                "direction_move_scale":float(deployment_abs_move),
             },
         }
         print(
@@ -640,7 +695,7 @@ def main():
         "production_ready":bool(verified),
         "model_family":"hgb_classifier+logistic_ensemble+hgb_absolute_error_ridge_regressor_per_horizon_v2",
         "horizons_minutes":list(HORIZONS),
-        "target_definitions":{str(h):f"future close at decision timestamp + {h} minutes; nearest observation within 1 minute; reference price is decision-time close" for h in HORIZONS},
+        "target_definitions":{str(h):f"first future close at or after decision timestamp + {h} minutes, within 1 minute tolerance; reference price is decision-time close" for h in HORIZONS},
         "feature_count":len(FEATURES),
         "features":FEATURES,
         "universe_size":int(len(universe)),
@@ -655,7 +710,7 @@ def main():
         "point_in_time_fno":True,
         "volume_policy":"Source-reported volume only; missing volume stays NaN.",
         "model_version":"2026-5m-step-multihorizon-v2",
-        "validation_protocol":"70% chronological fit / 15% calibration / 15% final holdout per horizon.",
+        "validation_protocol":"70% chronological fit / 15% calibration / 15% final holdout per horizon; final deployment models refit on the full 85% pre-holdout period after OOS metrics are frozen.",
         "promotion_rule":"Every horizon must beat the current-price price-MAE baseline on the final untouched chronological holdout and exceed 0.50 ROC-AUC and 0.50 direction accuracy; calibration data is used only for ensemble/blend selection.",
     }
     (out/"ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
