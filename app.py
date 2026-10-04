@@ -726,6 +726,14 @@ if interface_mode == "Live Test":
             model = {}
             st.error(f"5-minute Intraday model status failed: {type(exc).__name__}: {exc}")
 
+        if model.get("status") != "READY":
+            st.info(
+                "The 5-minute-step model is not available for live prediction yet. "
+                "The existing certified 30-minute production model remains unchanged. "
+                "Run the 5-minute Colab trainer and verify the six-horizon holdout gates before live use."
+            )
+            st.stop()
+
         candidates = [s for s in symbols if s.endswith(".NS")]
         if not candidates:
             st.info("Select an NSE (.NS) stock from the watchlist/search.")
