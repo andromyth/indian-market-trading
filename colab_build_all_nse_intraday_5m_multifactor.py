@@ -29,7 +29,7 @@ from all_nse_intraday_5m_model import FEATURES, HORIZONS
 IST = "Asia/Kolkata"
 INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
@@ -58,6 +58,30 @@ def _norm(q: pd.DataFrame) -> pd.DataFrame:
     return x[~x.index.duplicated(keep="last")]
 
 
+def _regular_session(x: pd.DataFrame) -> pd.DataFrame:
+    """Keep regular NSE cash-market session bars only."""
+    if x is None or x.empty:
+        return pd.DataFrame()
+    idx = pd.DatetimeIndex(x.index)
+    mask = (
+        (idx.time >= pd.Timestamp("09:15").time())
+        & (idx.time < pd.Timestamp("15:30").time())
+    )
+    return x.loc[mask].copy()
+
+
+def _feature_lookback_ok(index: pd.DatetimeIndex, window: int = 50) -> pd.Series:
+    """Require 1-minute continuity within the recent feature window."""
+    idx = pd.DatetimeIndex(index)
+    if len(idx) == 0:
+        return pd.Series(dtype=bool, index=idx)
+    diffs = pd.Series(idx, index=idx).diff()
+    day_change = pd.Series(idx.normalize(), index=idx).diff().ne(pd.Timedelta(0))
+    link_ok = diffs.eq(pd.Timedelta(minutes=1)) | day_change
+    link_ok.iloc[0] = False
+    return link_ok.rolling(window, min_periods=window).sum().eq(window - 1).reindex(idx).fillna(False).astype(bool)
+
+
 def _rsi(c: pd.Series, n:int=14) -> pd.Series:
     d=c.diff()
     up=d.clip(lower=0).ewm(alpha=1/n,adjust=False,min_periods=n).mean()
@@ -66,7 +90,7 @@ def _rsi(c: pd.Series, n:int=14) -> pd.Series:
 
 
 def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
-    x=_norm(g)
+    x=_regular_session(_norm(g))
     if x.empty: return pd.DataFrame()
     c,h,l,o,v=x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
     out=pd.DataFrame(index=x.index)
@@ -138,6 +162,8 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     out["relative_ret_15"]=out["ret_15"]-out["market_ret_15"]
     out["relative_ret_30"]=out["ret_30"]-out["market_ret_30"]
     out["log_price"]=np.log1p(c.clip(lower=0))
+    valid_feature_window=_feature_lookback_ok(x.index, window=50)
+    out=out.loc[valid_feature_window]
     return out
 
 
@@ -219,22 +245,33 @@ def join_fno(x:pd.DataFrame,fno:pd.DataFrame,sym:str)->pd.DataFrame:
 
 
 def build_label_table(raw:pd.DataFrame,market:pd.DataFrame,fno:pd.DataFrame,sym:str)->pd.DataFrame:
-    feat=make_features(raw,market)
+    raw_clean=_regular_session(_norm(raw))
+    if raw_clean.empty: return pd.DataFrame()
+    feat=make_features(raw_clean,market)
     if feat.empty: return feat
     feat=join_fno(feat,fno,sym)
-    c=_norm(raw)["Close"]
-    right=pd.DataFrame({"future_ts":c.index,"future_close":c.to_numpy()}).sort_values("future_ts")
+    c=raw_clean["Close"]
+    right=pd.DataFrame({"actual_future_ts":c.index,"future_close":c.to_numpy()}).sort_values("actual_future_ts")
     out=[]
     for h in HORIZONS:
-        left=pd.DataFrame({"decision_ts":feat.index,"future_ts":feat.index+pd.Timedelta(minutes=h)}).sort_values("future_ts")
-        merged=pd.merge_asof(left,right,on="future_ts",direction="forward",tolerance=pd.Timedelta(minutes=1))
+        left=pd.DataFrame({
+            "decision_ts":feat.index,
+            "target_ts":feat.index+pd.Timedelta(minutes=h),
+        }).sort_values("target_ts")
+        merged=pd.merge_asof(
+            left,right,left_on="target_ts",right_on="actual_future_ts",
+            direction="forward",tolerance=pd.Timedelta(minutes=1),
+        )
         future=merged.set_index("decision_ts")["future_close"].reindex(feat.index)
+        actual_future_ts=merged.set_index("decision_ts")["actual_future_ts"].reindex(feat.index)
         z=feat.copy()
         # Preserve the decision-time/reference price for price-baseline and
         # predicted-price validation. It is not a model feature.
-        z["reference_close"]=c.to_numpy()
+        c_ref=c.reindex(feat.index)
+        z["reference_close"]=c_ref.to_numpy()
         z["future_close"]=future.to_numpy()
-        z["future_return"]=future/c-1
+        z["actual_future_timestamp"]=actual_future_ts.to_numpy()
+        z["future_return"]=future/c_ref-1
         z["target"] = np.where(z["future_return"].notna(),(z["future_return"]>0).astype(float),np.nan)
         z["horizon"]=h
         z["symbol"]=sym
@@ -592,6 +629,18 @@ def main():
             "target_timestamp":(
                 pd.to_datetime(test["decision_ts"],utc=True)+pd.Timedelta(minutes=int(h))
             ).astype(str).to_numpy(),
+            "actual_future_timestamp":pd.to_datetime(test["actual_future_timestamp"],utc=True).astype(str).to_numpy(),
+            "target_alignment_seconds":(
+                pd.to_datetime(test["actual_future_timestamp"],utc=True)
+                - (
+                    pd.to_datetime(test["decision_ts"],utc=True)
+                    + pd.Timedelta(minutes=int(h))
+                )
+            ).dt.total_seconds().to_numpy(),
+            "realized_horizon_seconds":(
+                pd.to_datetime(test["actual_future_timestamp"],utc=True)
+                - pd.to_datetime(test["decision_ts"],utc=True)
+            ).dt.total_seconds().to_numpy(),
             "reference_price":base_price,
             "actual_future_price":actual_price,
             "actual_return":test["future_return"].astype(float).to_numpy(),
@@ -768,6 +817,7 @@ def main():
             "parquet_path":str(holdout_predictions_path),
             "csv_path":str(holdout_predictions_csv),
             "split":"untouched final 15% chronological holdout per horizon",
+            "target_rule":"actual future bar is forward-only and at most 60 seconds after nominal horizon",
         },
         "verified_horizons":[int(h) for h in HORIZONS] if verified else [],
         "trained_until":max(validation[str(h)]["deployment_trained_until"] for h in HORIZONS),
