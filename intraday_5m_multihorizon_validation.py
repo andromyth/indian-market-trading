@@ -153,7 +153,7 @@ def main() -> int:
 
     records = [
         r for r in load_records()
-        if str(r.get("model_version", "")) == "2026-5m-step-multihorizon"
+        if str(r.get("model_version", "")) in {"2026-5m-step-multihorizon","2026-5m-step-multihorizon-v2"}
         and str(r.get("mode", "")).lower() == "intraday"
     ]
     if args.symbols.strip():
