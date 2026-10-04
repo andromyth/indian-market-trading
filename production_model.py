@@ -203,8 +203,8 @@ def _price_features(df: pd.DataFrame) -> dict[str, float]:
 
     return {
         "open": open_,
-        "high": high_,
-        "low": low_,
+        "high": high,
+        "low": low,
         "close": close,
         "volume": vol,
         "volume_ma20": vma20,

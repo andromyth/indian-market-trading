@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 ROOT = Path(
     "/content/drive/MyDrive/Indian_Market_Research/"
@@ -102,11 +103,6 @@ def main():
     if check[0] != null_series or check[1] != 0 or check[2] != 0:
         raise RuntimeError("Affected-row safety gate failed.")
 
-    if BACKUP.exists():
-        raise RuntimeError(
-            f"Backup already exists: {BACKUP}. Refusing to overwrite it."
-        )
-
     # Validate the target identity expression before rewriting the master.
     collisions = con.execute(
         """
@@ -158,14 +154,35 @@ def main():
         )
 
     print("Predicted post-repair identity collisions:", collisions)
-    print("Creating backup:", BACKUP)
 
-    # Byte-level copy inside the mounted filesystem before replacement.
+    # A previous attempt may have created the backup and then failed during
+    # the DuckDB COPY statement. Reuse that backup after validating it rather
+    # than refusing to continue or overwriting evidence.
     import shutil
-    shutil.copy2(MASTER, BACKUP)
+    if BACKUP.exists():
+        backup_rows = con.execute(
+            "SELECT COUNT(*) FROM read_parquet(?)",
+            [str(BACKUP)],
+        ).fetchone()[0]
+        if backup_rows != total:
+            raise RuntimeError(
+                f"Backup row-count mismatch: expected={total:,} "
+                f"found={backup_rows:,}"
+            )
+        print("Existing validated backup reused:", BACKUP)
+    else:
+        print("Creating backup:", BACKUP)
+        shutil.copy2(MASTER, BACKUP)
 
-    con.execute(
-        """
+    if TMP.exists():
+        TMP.unlink()
+
+    # DuckDB parameters work for read_parquet(?) but not for COPY ... TO ?.
+    # Use safely quoted SQL string literals for the two COPY file paths.
+    master_sql = str(MASTER).replace("'", "''")
+    tmp_sql = str(TMP).replace("'", "''")
+
+    repair_sql = f"""
         COPY (
             SELECT
                 symbol,
@@ -239,13 +256,13 @@ def main():
                 traded_value,
                 num_trades,
                 raw_archive
-            FROM read_parquet(?)
+            FROM read_parquet('{master_sql}')
         )
-        TO ?
+        TO '{tmp_sql}'
         (FORMAT PARQUET, COMPRESSION ZSTD)
-        """,
-        [str(MASTER), str(TMP)],
-    )
+    """
+
+    con.execute(repair_sql)
 
     post_total = con.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
@@ -307,22 +324,15 @@ def main():
     )
     META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # Correct the per-archive audit fields that were inflated by NULL keys.
+    # Synchronize the per-archive audit without another DuckDB COPY-to-path
+    # parameterization issue.
     if AUDIT.exists():
-        con.execute(
-            """
-            COPY (
-                SELECT
-                    a.* EXCLUDE(identity_duplicate_rows, identity_duplicate_keys),
-                    0 AS identity_duplicate_rows,
-                    0 AS identity_duplicate_keys
-                FROM read_csv_auto(?, HEADER=TRUE) a
-            )
-            TO ? (HEADER, DELIMITER ',')
-            """,
-            [str(AUDIT), str(AUDIT.with_suffix(".repaired.csv"))],
-        )
-        AUDIT.with_suffix(".repaired.csv").replace(AUDIT)
+        audit_df = pd.read_csv(AUDIT)
+        for col in ("identity_duplicate_rows", "identity_duplicate_keys"):
+            if col in audit_df.columns:
+                audit_df[col] = 0
+        audit_df.to_csv(AUDIT, index=False)
+
 
     report = {
         "master": str(MASTER),
