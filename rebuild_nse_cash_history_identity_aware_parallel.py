@@ -202,11 +202,36 @@ def worker(item):
 def ensure_schema(df: pd.DataFrame) -> pa.Table:
     x = df.copy()
 
-    # Make the final contract explicit so legacy all-null columns and
-    # UDiFF populated columns produce a consistent master schema.
+    # NSE raw sources do not guarantee stable pandas dtypes. In particular,
+    # UDiFF instrument_id can be numeric in one archive and string in another,
+    # while legacy-only fields can be all-null. Normalize to the exact Arrow
+    # contract before creating the master Parquet.
+    string_fields = {
+        "symbol", "series", "isin", "economic_security_id", "listing_id",
+        "row_identity_key", "security_class", "instrument_type",
+        "source_format", "instrument_id", "instrument_name", "segment",
+        "source", "actual_expiry", "raw_archive",
+    }
+    datetime_fields = {"date", "business_date"}
+    numeric_fields = {
+        "open", "high", "low", "close", "last", "prev_close",
+        "last_price_for_research", "research_price",
+        "volume", "traded_value", "num_trades",
+    }
+
     for field in ARROW_SCHEMA:
-        if field.name not in x.columns:
-            x[field.name] = pd.NA
+        name = field.name
+        if name not in x.columns:
+            x[name] = pd.NA
+
+        if name in string_fields:
+            x[name] = x[name].astype("string")
+        elif name in datetime_fields:
+            x[name] = pd.to_datetime(x[name], errors="coerce")
+        elif name in numeric_fields:
+            x[name] = pd.to_numeric(x[name], errors="coerce").astype("float64")
+        elif name == "last_price_zero":
+            x[name] = x[name].fillna(False).astype(bool)
 
     return pa.Table.from_pandas(
         x[list(ARROW_SCHEMA.names)],
@@ -404,7 +429,140 @@ def main():
         action="store_true",
         help="Remove partial identity-preserved output before starting.",
     )
+    parser.add_argument(
+        "--consolidate-only",
+        action="store_true",
+        help=(
+            "Skip raw-archive processing and consolidate existing temporary "
+            "shards left by a completed archive-processing phase."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.consolidate_only:
+        print("=" * 100)
+        print("NSE CASH — RESUME: MONTHLY CONSOLIDATION ONLY")
+        print("=" * 100)
+        print("Temporary shard root:", TMP_SHARDS)
+        print()
+
+        shard_files = sorted(TMP_SHARDS.glob("*/*/*/*.parquet"))
+        if not shard_files:
+            raise RuntimeError(
+                "No temporary shards found. The archive-processing phase "
+                "must be rerun."
+            )
+
+        # Reconstruct the audit from the local Parquet shards. This avoids
+        # reopening/reparsing the 2,654 raw ZIP archives after the previous
+        # archive-processing phase already finished successfully.
+        archive_rows = {}
+        for p in shard_files:
+            archive_idx = int(p.stem.split("_")[-1])
+            part = pd.read_parquet(p)
+
+            rec = archive_rows.setdefault(
+                archive_idx,
+                {
+                    "rows": 0,
+                    "dates": set(),
+                    "symbols": set(),
+                    "isins": set(),
+                    "be_rows": 0,
+                    "zero_last_rows": 0,
+                    "identity_keys": set(),
+                },
+            )
+            rec["rows"] += len(part)
+            rec["dates"].update(
+                pd.to_datetime(part["date"], errors="coerce")
+                .dropna()
+                .dt.strftime("%Y-%m-%d")
+            )
+            rec["symbols"].update(part["symbol"].dropna().astype(str))
+            rec["isins"].update(
+                part.loc[valid_isin(part["isin"]), "isin"].astype(str)
+            )
+            rec["be_rows"] += int(part["series"].eq("BE").sum())
+            rec["zero_last_rows"] += int(part["last_price_zero"].sum())
+            rec["identity_keys"].update(
+                part["row_identity_key"].dropna().astype(str)
+            )
+
+        archives = archive_list()
+        audit_rows = []
+        for idx, (source, archive) in enumerate(archives, 1):
+            rec = archive_rows.get(idx)
+            if rec is None:
+                audit_rows.append({
+                    "archive_index": idx,
+                    "source": source,
+                    "archive": str(archive),
+                    "date_min": "",
+                    "date_max": "",
+                    "raw_rows": 0,
+                    "normalized_rows": 0,
+                    "unique_row_identity_keys": 0,
+                    "identity_duplicate_rows": 0,
+                    "identity_duplicate_keys": 0,
+                    "symbol_count": 0,
+                    "isin_count": 0,
+                    "be_rows": 0,
+                    "zero_last_rows": 0,
+                    "status": "ERROR",
+                    "error": "No temporary shard found.",
+                })
+            else:
+                dates = sorted(rec["dates"])
+                audit_rows.append({
+                    "archive_index": idx,
+                    "source": source,
+                    "archive": str(archive),
+                    "date_min": dates[0] if dates else "",
+                    "date_max": dates[-1] if dates else "",
+                    "raw_rows": rec["rows"],
+                    "normalized_rows": rec["rows"],
+                    "unique_row_identity_keys": len(rec["identity_keys"]),
+                    "identity_duplicate_rows": 0,
+                    "identity_duplicate_keys": 0,
+                    "symbol_count": len(rec["symbols"]),
+                    "isin_count": len(rec["isins"]),
+                    "be_rows": rec["be_rows"],
+                    "zero_last_rows": rec["zero_last_rows"],
+                    "status": "OK",
+                    "error": "",
+                })
+
+        audit_df = pd.DataFrame(audit_rows)
+        print(f"Temporary shards : {len(shard_files):,}")
+        print(
+            "Archive audit     :",
+            f"OK={(audit_df['status'] == 'OK').sum():,}",
+            f"ERROR={(audit_df['status'] == 'ERROR').sum():,}",
+        )
+        print()
+
+        meta = consolidate_monthly(audit_df)
+
+        print()
+        print("=" * 100)
+        print("RESUMED PARALLEL REBUILD COMPLETE")
+        print("=" * 100)
+        print("Rows                  :", f"{meta['rows']:,}")
+        print("Symbols               :", f"{meta['symbols']:,}")
+        print("Economic securities   :", f"{meta['economic_securities']:,}")
+        print("Listing identities    :", f"{meta['listing_ids']:,}")
+        print("Dates                 :", f"{meta['dates']:,}")
+        print("Min date              :", meta["min_date"])
+        print("Max date              :", meta["max_date"])
+        print("Duplicate identity rows:", f"{meta['duplicate_row_identity_rows']:,}")
+        print("Archive errors        :", f"{meta['error_archives']:,}")
+        print()
+        print("Master:", MASTER)
+        print("Meta  :", META)
+        print("Audit :", AUDIT)
+        print("Class :", CLASS_AUDIT)
+        return
 
     if args.workers < 1 or args.workers > 16:
         raise SystemExit("--workers must be between 1 and 16.")
