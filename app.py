@@ -802,9 +802,11 @@ if interface_mode == "Live Test":
                             return
                         benchmark_symbol = benchmark_for_symbol(selected_symbol)
                         market_df = _cached_live_market_context(benchmark_symbol)
-                        fo = _cached_live_option_chain(root)
+                        # The 5m model loads the same previous-session PIT F&O
+                        # snapshot used during training; do not pass today's live
+                        # option-chain values into this model.
                         result = multihorizon_intraday_prediction(
-                            selected_symbol, completed, market_df, fo, latest_ts
+                            selected_symbol, completed, market_df, None, latest_ts
                         )
                         st.session_state[state_key] = str(latest_ts)
                         st.session_state[result_key] = result
