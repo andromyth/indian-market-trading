@@ -313,6 +313,7 @@ def consolidate_monthly(audit_df):
     economic_securities = set()
     listings = set()
     duplicate_identity_rows = 0
+    null_identity_rows = 0
     zero_last = 0
 
     class_rows = {}
@@ -325,6 +326,9 @@ def consolidate_monthly(audit_df):
 
             duplicate_identity_rows += int(
                 part["row_identity_key"].duplicated(keep=False).sum()
+            )
+            null_identity_rows += int(
+                part["row_identity_key"].isna().sum()
             )
 
             rows += len(part)
@@ -366,6 +370,13 @@ def consolidate_monthly(audit_df):
         if writer is not None:
             writer.close()
 
+    if null_identity_rows:
+        raise RuntimeError(
+            f"Identity-preserved master contains {null_identity_rows:,} "
+            "null row_identity_key rows. Rebuild must be corrected before "
+            "production promotion."
+        )
+
     master_tmp.replace(MASTER)
 
     class_df = pd.DataFrame(
@@ -397,6 +408,7 @@ def consolidate_monthly(audit_df):
         "min_date": min(dates) if dates else None,
         "max_date": max(dates) if dates else None,
         "duplicate_row_identity_rows": int(duplicate_identity_rows),
+        "null_row_identity_rows": int(null_identity_rows),
         "zero_last_rows": int(zero_last),
         "master": str(MASTER),
         "audit": str(AUDIT),
@@ -633,6 +645,7 @@ def main():
     print("Min date              :", meta["min_date"])
     print("Max date              :", meta["max_date"])
     print("Duplicate identity rows:", f"{meta['duplicate_row_identity_rows']:,}")
+    print("Null identity rows     :", f"{meta['null_row_identity_rows']:,}")
     print("Archive errors        :", f"{meta['error_archives']:,}")
     print()
     print("Master:", MASTER)
