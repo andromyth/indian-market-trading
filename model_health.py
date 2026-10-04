@@ -38,12 +38,30 @@ def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7,
             "reason": f"Need at least {min_samples} completed delivery predictions for the rolling health gate.",
         }
     accuracy = float(matches.mean())
+    signal = x.get("signal", pd.Series(index=x.index, dtype="object")).astype(str).str.upper()
+    actual = x.get("actual_direction_d1", pd.Series(index=x.index, dtype="object")).astype(str).str.upper()
+    action = signal.isin(["BUY", "SELL"])
+    action_correct = ((signal == "BUY") & actual.eq("UP")) | ((signal == "SELL") & actual.eq("DOWN"))
+    action_precision = float(action_correct[action].mean()) if bool(action.any()) else None
+    action_coverage = float(action.mean()) if len(action) else None
+    probability = pd.to_numeric(x.get("probability_up_next_session"), errors="coerce")
+    actual_up = actual.map({"UP": 1.0, "DOWN": 0.0})
+    brier = ((probability - actual_up) ** 2).dropna().mean()
+
+    # Use BUY/SELL precision as the primary health warning when enough actual
+    # actions exist; otherwise fall back to the target-aligned directional rate.
+    primary_health = action_precision if action_precision is not None and int(action.sum()) >= 10 else accuracy
+
     return {
         "status": "MONITOR",
         "sample_count": int(len(matches)),
         "directional_accuracy": accuracy,
+        "action_precision": action_precision,
+        "action_coverage": action_coverage,
+        "brier_score": float(brier) if pd.notna(brier) else None,
         "mean_absolute_percentage_error": float(mape) if pd.notna(mape) else None,
         # This is intentionally only a flag. It never changes the production model.
-        "retraining_candidate": accuracy < 0.50,
-        "rule": "candidate flag when rolling directional accuracy falls below 50%; candidate still requires full retraining + walk-forward + 7-prediction validation before promotion.",
+        "retraining_candidate": primary_health < 0.50,
+        "health_metric_used": "action_precision" if action_precision is not None and int(action.sum()) >= 10 else "directional_accuracy",
+        "rule": "candidate flag when the primary OOS health metric falls below 50%; candidate still requires full retraining + walk-forward + validation before promotion.",
     }
