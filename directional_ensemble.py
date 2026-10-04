@@ -1461,19 +1461,39 @@ def enrich_delivery_prediction(
     else:
         integrated_return = base_return
 
+    try:
+        from all_nse_delivery_model import _signal_policy
+        policy = _signal_policy()
+    except Exception:
+        policy = {
+            "status": "DEFAULT",
+            "samples": 0,
+            "buy_probability_threshold": 0.60,
+            "sell_probability_threshold": 0.40,
+            "min_expected_return": 0.0015,
+        }
+
+    buy_threshold = float(policy.get("buy_probability_threshold", 0.60))
+    sell_threshold = float(policy.get("sell_probability_threshold", 0.40))
+    min_expected_return = float(policy.get("min_expected_return", 0.0015))
+
+    data_quality_gate = result.get("production_data_quality_gate", True)
+
     if (
-        np.isfinite(integrated_p)
-        and integrated_p >= 0.60
+        data_quality_gate
+        and np.isfinite(integrated_p)
+        and integrated_p >= buy_threshold
         and np.isfinite(integrated_return)
-        and integrated_return > 0.0015
+        and integrated_return > min_expected_return
     ):
         integrated_signal = "BUY"
 
     elif (
-        np.isfinite(integrated_p)
-        and integrated_p <= 0.40
+        data_quality_gate
+        and np.isfinite(integrated_p)
+        and integrated_p <= sell_threshold
         and np.isfinite(integrated_return)
-        and integrated_return < -0.0015
+        and integrated_return < -min_expected_return
     ):
         integrated_signal = "SELL"
 
@@ -1535,6 +1555,11 @@ def enrich_delivery_prediction(
         ),
         "decision_engine_validation_status": (
             "NOT_YET_PROSPECTIVE_VALIDATED"
+        ),
+        "signal_policy": policy,
+        "production_data_quality_gate": bool(data_quality_gate),
+        "production_data_quality_score": _safe(
+            result.get("production_data_quality_score")
         ),
         "ensemble_context_direction": (
             context.get(
