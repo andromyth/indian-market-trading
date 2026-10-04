@@ -238,6 +238,13 @@ def main():
         if len(feat)>args.max_train_rows_per_symbol:
             positions=np.linspace(0,len(feat)-1,args.max_train_rows_per_symbol,dtype=int)
             feat=feat.iloc[np.unique(positions)]
+        if retained + len(feat) > args.global_retained_row_cap:
+            remaining = args.global_retained_row_cap - retained
+            if remaining <= 0:
+                coverage.append((sym,len(raw),"EXCLUDED_GLOBAL_ROW_CAP"))
+                continue
+            positions=np.linspace(0,len(feat)-1,remaining,dtype=int)
+            feat=feat.iloc[np.unique(positions)]
         feat["_symbol"]=sym
         feat["decision_ts"]=feat.index
         frames.append(feat)
@@ -272,8 +279,12 @@ def main():
     p=clf.predict_proba(test[FEATURES])[:,1]
     pred=(p>=0.5).astype(int)
     pred_ret=reg.predict(test[FEATURES])
-    pred_price=test["Close"].astype(float).to_numpy()*(1.0+pred_ret)
-    actual_price=test["Close"].astype(float).to_numpy()*(1.0+test["future_return_5m"].astype(float).to_numpy())
+    base_price=test["Close"].astype(float).to_numpy()
+    pred_price=base_price*(1.0+pred_ret)
+    actual_price=base_price*(1.0+test["future_return_5m"].astype(float).to_numpy())
+    baseline_price_mae=float(mean_absolute_error(actual_price,base_price))
+    model_price_mae=float(mean_absolute_error(actual_price,pred_price))
+    direction_hit_rate=float(accuracy_score(yte,pred))
     manifest={
         "status":"CANDIDATE",
         "model_family":"logistic_regression+ridge",
@@ -292,11 +303,18 @@ def main():
         "holdout_start":str(test["decision_ts"].min()),
         "target_definition":"future close at decision timestamp + 5 minutes; nearest observation within 1 minute",
         "validation":{
-            "accuracy":float(accuracy_score(yte,pred)),
+            "accuracy":direction_hit_rate,
             "roc_auc":float(roc_auc_score(yte,p)),
             "brier":float(brier_score_loss(yte,p)),
             "return_mae":float(mean_absolute_error(test["future_return_5m"],pred_ret)),
-            "price_mae":float(mean_absolute_error(actual_price,pred_price)),
+            "price_mae":model_price_mae,
+            "baseline_current_price_mae":baseline_price_mae,
+            "price_mae_improvement_pct":(
+                float(100.0*(baseline_price_mae-model_price_mae)/baseline_price_mae)
+                if baseline_price_mae > 0 else None
+            ),
+            "model_beats_current_price_baseline":bool(model_price_mae < baseline_price_mae),
+            "direction_hit_rate":direction_hit_rate,
         },
         "no_auto_orders":True,
         "point_in_time_fno":True,
@@ -308,8 +326,11 @@ def main():
     joblib.dump(clf,cp); joblib.dump(reg,rp)
     manifest["classifier_sha256"]=hashlib.sha256(cp.read_bytes()).hexdigest()
     manifest["regressor_sha256"]=hashlib.sha256(rp.read_bytes()).hexdigest()
-    # Only a VERIFIED artifact can be consumed by the future live adapter.
-    manifest["status"]="VERIFIED"
+    # Training creates a candidate only. Explicit verification/promotion must
+    # happen after reviewing the holdout metrics; the existing 30-minute
+    # production model remains untouched in the meantime.
+    manifest["status"]="CANDIDATE"
+    manifest["production_ready"]=False
     (out/"ALL_NSE_INTRADAY_5M_MULTIFACTOR_2026_MODEL_MANIFEST.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
     pd.DataFrame(coverage,columns=["symbol","stored_rows","status"]).to_csv(out/"INTRADAY_5M_TRAINING_COVERAGE.csv",index=False)
     print(json.dumps(manifest,indent=2))
