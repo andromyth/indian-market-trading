@@ -30,18 +30,20 @@ All values can be changed from the sidebar.
 
 The dashboard now routes Delivery mode to the live ALL-NSE 59-feature
 classifier/regressor candidate and Intraday mode to the certified `target_30m`
-production model. A signal is displayed directly after a stock is searched. Unknown symbols
-are blocked instead of receiving an unvalidated score.
+production model. Delivery now consumes a daily persisted PIT snapshot assembled
+from official NSE EOD/delivery plus available F&O, news/events and fundamentals.
+Current NSE equities are eligible automatically once they have 60 clean sessions;
+the build-time roster no longer permanently freezes IPO eligibility.
 
 ### 4. Continuous seven-prediction validation
 
 Every production Delivery prediction is written to an idempotent prediction ledger.
 When the next trading-session actual becomes available, the system compares the
 predicted return/price with the real close, records the validation, and preserves
-D+2 through D+7 follow-through observations as monitoring. A rolling seven-
-completed-prediction scorecard is shown in the dashboard. A miss does not cause
-immediate model replacement; the model-health monitor can raise a retraining
-candidate flag after enough completed observations.
+D+2 through D+7 follow-through observations as monitoring. The automated
+production cycle also performs OOS-gated signal-policy tuning when sufficient
+history exists. Model weights are not replaced merely because a short rolling
+window is weak.
 
 ### 5. More evidence, not more certainty
 The live score now combines:
@@ -67,9 +69,11 @@ The dashboard reports:
 * a matched-duration random benchmark;
 * a last-30%-of-history holdout run.
 
-The historical test does **not** pretend to validate live news sentiment,
-because a dependable historical archive of the exact news feed is not provided
-by the free data sources used here.
+The historical test does **not** claim that current RSS news has been
+historically replayed unless a timestamped news archive exists. Live Delivery
+predictions still consume the latest available stock news/corporate events,
+and the production PIT builder records source-readiness/audit state so missing
+modalities cannot silently masquerade as valid data.
 
 ## Data sources and limitations
 
@@ -99,12 +103,14 @@ Open `http://localhost:8501`.
 ## Important interpretation note
 
 `BUY`, `SELL`, and `HOLD` are model classifications for decision support, not
-guarantees of return. Delivery currently uses the ALL-NSE candidate roster:
-2,372 trainable symbols from the 2,593-stock official NSE equity universe, with
-a 60-session minimum-history gate. The candidate remains under prospective OOS
-monitoring and is not presented as a profitability guarantee. Symbols outside
-the trainable roster are blocked rather than silently generalized. No order
-execution is implemented.
+guarantees of return. Delivery uses a pooled/global ALL-NSE 59-feature model with a 60-session
+clean-history gate. The current official NSE universe is refreshed independently,
+so a newly listed IPO can enter the live scoring population automatically when
+its 60th clean session is available. Historical validation remains prospective;
+no honest system can guarantee 100% directional accuracy. The production cycle
+therefore favors causal PIT data, explicit readiness gates, OOS validation,
+selective thresholds and conservative policy adaptation rather than pretending
+that every prediction will be correct. No order execution is implemented.
 
 ## Next upgrade path
 
