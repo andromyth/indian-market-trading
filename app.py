@@ -53,6 +53,7 @@ from production_model import (
 )
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
+from all_nse_intraday_5m_model import predict_multihorizon as intraday_5m_predict_multihorizon, model_status as intraday_5m_model_status
 from directional_ensemble import enrich_delivery_prediction
 
 
@@ -113,7 +114,52 @@ def certified_intraday_prediction(
     if persisted.get("sync_error"):
         result["prediction_ledger_sync_error"] = persisted["sync_error"]
     return result
-from prediction_ledger import load_records, load_validation_records, save_validation_results, append_prediction
+from prediction_ledger import load_records, load_validation_records, save_validation_results, append_prediction, append_predictions
+
+
+def multihorizon_intraday_prediction(
+    symbol,
+    price_df,
+    market_df=None,
+    fo=None,
+    decision_ts=None,
+):
+    """Run direct +5/+10/+15/+20/+25/+30 forecasts and persist each horizon."""
+    result = intraday_5m_predict_multihorizon(
+        symbol,
+        price_df,
+        market_df,
+        fo,
+        decision_ts,
+    )
+    records = []
+    for item in result.get("horizons", []):
+        horizon = int(item.get("horizon_minutes"))
+        records.append({
+            "prediction_status": "PASS",
+            "mode": "Intraday",
+            "symbol": symbol,
+            "prediction_horizon": f"{horizon}m",
+            "horizon_minutes": horizon,
+            "decision_timestamp": result.get("decision_timestamp"),
+            "target_timestamp": item.get("target_timestamp"),
+            "signal": item.get("signal"),
+            "probability_up": item.get("probability_up"),
+            "probability_down": item.get("probability_down"),
+            "current_price": item.get("current_price"),
+            "predicted_price": item.get("predicted_price"),
+            "predicted_change": item.get("predicted_change"),
+            "expected_return": item.get("expected_return"),
+            "model_version": result.get("model_version"),
+            "feature_count": result.get("feature_count"),
+        })
+    result["ledger"] = append_predictions(records, sync_drive=True) if records else {
+        "status": "NO_DATA",
+        "new_rows": 0,
+        "existing_rows_seen": 0,
+        "synced": False,
+    }
+    return result
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
 from historical_audit import run_batch_intraday_audit
