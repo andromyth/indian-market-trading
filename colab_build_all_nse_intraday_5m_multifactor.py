@@ -72,7 +72,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     out=pd.DataFrame(index=x.index)
 
     for n in (1,3,5,10,15,30):
-        out[f"ret_{n}"]=c.pct_change(n)
+        out[f"ret_{n}"]=c.pct_change(n,fill_method=None)
     out["rsi7"]=_rsi(c,7)
     out["rsi14"]=_rsi(c,14)
 
@@ -87,7 +87,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     for n in (5,10,20,50):
         out[f"ma{n}_ratio"]=c/c.rolling(n,min_periods=n).mean()-1
 
-    one_min_ret=c.pct_change()
+    one_min_ret=c.pct_change(fill_method=None)
     out["volatility_5"]=one_min_ret.rolling(5,min_periods=5).std()
     out["volatility_15"]=one_min_ret.rolling(15,min_periods=15).std()
 
@@ -123,7 +123,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
         for n in (1,3,5,10,15,30):
             out[f"market_ret_{n}"]=mc.pct_change(n,fill_method=None)
         out["market_rsi14"]=_rsi(mc)
-        market_ret_1=mc.pct_change()
+        market_ret_1=mc.pct_change(fill_method=None)
         out["market_volatility_15"]=market_ret_1.rolling(15,min_periods=15).std()
         market_ma10=mc.rolling(10,min_periods=10).mean()
         out["market_ma10_ratio"]=mc/market_ma10-1
