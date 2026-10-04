@@ -33,7 +33,7 @@ def _latest_snapshot_path(snapshot_date: str | None) -> tuple[Path, str]:
         return path, snapshot_date
 
     candidates: list[tuple[date, Path]] = []
-    rx = re.compile(r"DELIVERY_PIT_FEATURES_(20\\d{2}-\\d{2}-\\d{2})\\.parquet$")
+    rx = re.compile(r"DELIVERY_PIT_FEATURES_(20\d{2}-\d{2}-\d{2})\.parquet$")
     for path in FEATURE_DIR.glob("DELIVERY_PIT_FEATURES_*.parquet"):
         m = rx.match(path.name)
         if not m:
