@@ -141,6 +141,22 @@ def main() -> int:
                 "base_model_probability_up_next_session": _safe_float(p_up[i]),
                 "probability_down_next_session": _safe_float(1.0 - p_up[i]),
                 "predicted_return_next_session": _safe_float(expected_return[i]),
+                "reference_open": _safe_float(row.get("open", np.nan)),
+                "reference_high": _safe_float(row.get("high", np.nan)),
+                "reference_low": _safe_float(row.get("low", np.nan)),
+                "reference_close": _safe_float(row.get("close", np.nan)),
+                "predicted_price_next_session": (
+                    _safe_float(row.get("close", np.nan)) * (1.0 + _safe_float(expected_return[i]))
+                    if np.isfinite(_safe_float(row.get("close", np.nan)))
+                    and np.isfinite(_safe_float(expected_return[i]))
+                    else np.nan
+                ),
+                "predicted_price_change_next_session": (
+                    _safe_float(row.get("close", np.nan)) * _safe_float(expected_return[i])
+                    if np.isfinite(_safe_float(row.get("close", np.nan)))
+                    and np.isfinite(_safe_float(expected_return[i]))
+                    else np.nan
+                ),
                 "signal": str(signals[i]),
                 "confidence": (
                     "HIGH" if abs(p_up[i] - 0.5) >= 0.25
