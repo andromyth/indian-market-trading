@@ -358,12 +358,55 @@ if interface_mode == "Live Test":
                     raise RuntimeError("NSE live 1-minute stream returned no rows")
 
                 decision_ts = price_1m.index[-1]
+                benchmark_symbol = benchmark_for_symbol(sym)
+                try:
+                    market_df = get_historical(
+                        benchmark_symbol,
+                        period="5d",
+                        interval="1m",
+                    )
+                except Exception:
+                    market_df = pd.DataFrame()
+
+                try:
+                    live_news_all = tag_news_items(get_news())
+                except Exception:
+                    live_news_all = []
+
+                matched_news = news_for_symbol(
+                    stock_news_keywords(sym),
+                    live_news_all,
+                )
+
+                try:
+                    announcements = get_corporate_announcements(root) or []
+                except Exception:
+                    announcements = []
+
+                try:
+                    event_news = matched_news + announcement_to_news(announcements)
+                    event_risk = event_risk_score(
+                        matched_news,
+                        announcements,
+                    )
+                except Exception:
+                    event_risk = 0.0
+
+                try:
+                    raw_chain = get_option_chain(root, is_index=False)
+                    fo = fo_summarize(raw_chain) if raw_chain else {}
+                except Exception:
+                    fo = {}
+
                 result = certified_intraday_prediction(
                     sym,
                     price_1m,
-                    pd.DataFrame(),
-                    {},
+                    market_df,
+                    fo,
                     decision_ts,
+                    matched_news,
+                    announcements,
+                    event_risk,
                 )
                 rows.append({
                     "symbol": sym,
@@ -373,6 +416,10 @@ if interface_mode == "Live Test":
                     "readiness": result.get("data_readiness_score"),
                     "live_1m_rows": len(price_1m),
                     "latest_bar": str(decision_ts),
+                    "news": "YES" if matched_news else "NO",
+                    "events": "YES" if announcements else "NO",
+                    "fno": "YES" if fo else "NO",
+                    "market": "YES" if market_df is not None and not market_df.empty else "NO",
                     "ledger": result.get("prediction_ledger_status", "—"),
                 })
             except Exception as exc:
@@ -403,7 +450,8 @@ if interface_mode == "Live Test":
                     [
                         "symbol", "signal", "p_up_30m",
                         "readiness", "live_1m_rows",
-                        "latest_bar", "ledger",
+                        "latest_bar", "news", "events",
+                        "fno", "market", "ledger",
                     ]
                 ],
                 width="stretch",
