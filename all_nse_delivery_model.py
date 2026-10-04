@@ -1457,6 +1457,34 @@ def predict_symbol(
             )[0]
         )
 
+        # Numeric price outputs are derived directly from the locked model's
+        # predicted next-session return and the causal PIT reference close.
+        # The production model itself remains unchanged.
+        reference_close = _safe_float(
+            pit_row.iloc[0].get("close", np.nan)
+        )
+        reference_open = _safe_float(
+            pit_row.iloc[0].get("open", np.nan)
+        )
+        reference_high = _safe_float(
+            pit_row.iloc[0].get("high", np.nan)
+        )
+        reference_low = _safe_float(
+            pit_row.iloc[0].get("low", np.nan)
+        )
+        predicted_price_next_session = (
+            reference_close * (1.0 + expected_return)
+            if np.isfinite(reference_close)
+            and np.isfinite(expected_return)
+            else np.nan
+        )
+        predicted_price_change_next_session = (
+            predicted_price_next_session - reference_close
+            if np.isfinite(predicted_price_next_session)
+            and np.isfinite(reference_close)
+            else np.nan
+        )
+
         policy = _signal_policy()
         buy_p = float(policy["buy_probability_threshold"])
         sell_p = float(policy["sell_probability_threshold"])
@@ -1516,6 +1544,12 @@ def predict_symbol(
             "probability_up_next_session": p_up,
             "probability_down_next_session": 1.0 - p_up,
             "predicted_return_next_session": expected_return,
+            "reference_open": reference_open,
+            "reference_high": reference_high,
+            "reference_low": reference_low,
+            "reference_close": reference_close,
+            "predicted_price_next_session": predicted_price_next_session,
+            "predicted_price_change_next_session": predicted_price_change_next_session,
             "signal": signal,
             "confidence": (
                 "HIGH"
