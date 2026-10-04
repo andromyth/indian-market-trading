@@ -140,7 +140,8 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
         x = x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").tail(7)
     if x.empty:
         return {"status": "NO_DATA"}
-    matches = pd.to_numeric(x.get("direction_match_d1"), errors="coerce")
+    raw_matches = x.get("direction_match_d1", pd.Series(index=x.index, dtype="object"))
+    matches = raw_matches.astype(str).str.strip().str.lower().map({"true": 1.0, "false": 0.0, "1": 1.0, "0": 0.0})
     valid_matches = matches.dropna()
     mae = pd.to_numeric(x.get("percentage_error_d1"), errors="coerce").abs().mean()
     probs = pd.to_numeric(x.get("probability_up_next_session"), errors="coerce")
