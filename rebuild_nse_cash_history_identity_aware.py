@@ -77,6 +77,9 @@ def read_zip_csv(path: Path) -> pd.DataFrame:
                 io.BytesIO(raw),
                 encoding=enc,
                 low_memory=False,
+                # NSE security-series codes can legitimately be literal
+                # "NA" (for debt/NCD-style instruments). Preserve them.
+                keep_default_na=False,
             )
         except Exception as exc:
             last = exc
