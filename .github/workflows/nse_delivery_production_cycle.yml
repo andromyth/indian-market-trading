@@ -41,7 +41,11 @@ jobs:
         run: python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150
       - name: Validate completed Delivery predictions
         run: python -u validate_prediction_ledger.py
+      - name: Generate Delivery OOS diagnostics
+        run: python -u delivery_validation_diagnostics.py
+
       - name: Update OOS-gated adaptive Delivery policy
         run: python -u delivery_policy_update.py --min-samples 80
+
       - name: Syntax check
-        run: python -m py_compile delivery_production_refresh.py delivery_policy_update.py
+        run: python -m py_compile delivery_production_refresh.py delivery_policy_update.py delivery_validation_diagnostics.py
