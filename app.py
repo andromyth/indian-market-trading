@@ -110,29 +110,20 @@ from persistent_store import (
     sync_pending as persistent_sync_pending,
 )
 
-st.set_page_config(page_title="Indian Stock Signal Dashboard", layout="wide")
-st.title("Indian Stock Signal Dashboard")
-st.caption(
-    "Multi-factor decision-support dashboard for NSE/BSE cash equity with F&O context. "
-    "Signals are not guarantees and no orders are placed. Delivery uses the active all-NSE 59-feature replacement; Intraday uses the active pooled ALL-NSE 30-minute replacement model."
+st.set_page_config(page_title="Indian Market Trading", layout="wide")
+
+interface_mode = st.sidebar.radio(
+    "Interface",
+    ["Live Test", "Research / Diagnostics"],
+    index=0,
+    help="Live Test is the production-facing screen. Research / Diagnostics contains replay, audits and legacy investigation tools.",
 )
 
-st.info(
-    "Production ML is connected for Delivery and Intraday workflows. "
-    "Delivery uses the active all-NSE 59-feature classifier/regressor replacement; Intraday uses the active pooled ALL-NSE 30-minute classifier/regressor replacement. "
-    "Every production prediction is stored in a persistent ledger, and Delivery predictions are checked against the next actual session with a rolling 7-prediction validation view. "
-    "No orders are placed."
-)
-with st.expander("Step 52 PIT walk-forward audit", expanded=False):
-    st.write(
-        f"Frozen pilot: {', '.join(STEP52_SYMBOLS)} · {STEP52_JOINED_ROWS:,} joined rows · "
-        f"{STEP52_PREDICTORS} predictors · latest holdout date {STEP52_LAST_TEST_DATE}."
-    )
-    st.dataframe(pd.DataFrame(STEP52_AUDIT), width="stretch", hide_index=True)
+if interface_mode == "Research / Diagnostics":
+    st.title("Indian Market Trading — Research & Diagnostics")
     st.caption(
-        "The Step 52 model has not been connected to live signals. Its out-of-sample results do not establish a tradable edge. "
-        "The active Delivery live path is the separate 59-feature all-NSE candidate and remains under prospective OOS monitoring. "
-        "No order execution is available in this dashboard."
+        "Development and research tools. The active production Delivery model is the ALL-NSE 59-feature path; "
+        "the active Intraday model is the certified 137-feature target_30m path. No orders are placed."
     )
 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
@@ -182,20 +173,6 @@ def normalize_symbol(value: str) -> str:
     return f"{s}.NS"
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
-
-# ---------------------------------------------------------------------------
-# Simplified live-test interface
-# ---------------------------------------------------------------------------
-# The full application retains research/audit tooling below, but the default
-# live-test interface intentionally exposes only the controls needed for a
-# first production test: watchlist, Delivery/Intraday mode, market status,
-# model status, live data, signal, readiness and ledger persistence.
-interface_mode = st.sidebar.radio(
-    "Interface",
-    ["Live Test", "Research / Diagnostics"],
-    index=0,
-    help="Live Test is the production-facing screen. Research / Diagnostics contains replay, audits and legacy investigation tools.",
-)
 
 if interface_mode == "Live Test":
     st.sidebar.subheader("Live mode")
