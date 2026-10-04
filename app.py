@@ -607,8 +607,13 @@ if interface_mode == "Live Test":
                 and bool(model.get("manifest_sha256_match"))
             )
             if ready:
+                trained_until = model.get("training_end_exclusive") or "unknown"
                 st.success(
                     "Intraday model VERIFIED · 137-feature certified contract · target_30m"
+                )
+                st.caption(
+                    f"Production model training data ends at: **{trained_until}**. "
+                    "Live predictions use current NSE inputs; the model weights are not changed at runtime."
                 )
             else:
                 st.error("Intraday model verification failed.")
@@ -623,7 +628,11 @@ if interface_mode == "Live Test":
                     "status": "BLOCKED",
                     "signal": "—",
                     "p_up_30m": np.nan,
+                    "p_down_30m": np.nan,
                     "current_price": np.nan,
+                    "signal_horizon_end": "—",
+                    "signal_price_reference": np.nan,
+                    "confidence": "—",
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -701,7 +710,11 @@ if interface_mode == "Live Test":
                     "status": result.get("prediction_status"),
                     "signal": result.get("signal", "—"),
                     "p_up_30m": result.get("probability_up_30m"),
+                    "p_down_30m": result.get("probability_down_30m"),
                     "current_price": float(pd.to_numeric(price_1m["Close"] if "Close" in price_1m.columns else price_1m.iloc[:, 0], errors="coerce").dropna().iloc[-1]),
+                    "signal_horizon_end": result.get("signal_horizon_end"),
+                    "signal_price_reference": result.get("signal_price_reference"),
+                    "confidence": result.get("confidence"),
                     "readiness": result.get("data_readiness_score"),
                     "live_1m_rows": len(price_1m),
                     "latest_bar": str(decision_ts),
@@ -720,7 +733,11 @@ if interface_mode == "Live Test":
                     "status": "ERROR",
                     "signal": "—",
                     "p_up_30m": np.nan,
+                    "p_down_30m": np.nan,
                     "current_price": np.nan,
+                    "signal_horizon_end": "—",
+                    "signal_price_reference": np.nan,
+                    "confidence": "—",
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -737,8 +754,15 @@ if interface_mode == "Live Test":
             display_df["p_up_30m"] = pd.to_numeric(
                 display_df["p_up_30m"], errors="coerce"
             ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+            for probability_col in ["p_down_30m"]:
+                display_df[probability_col] = pd.to_numeric(
+                    display_df[probability_col], errors="coerce"
+                ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
             display_df["current_price"] = pd.to_numeric(
                 display_df["current_price"], errors="coerce"
+            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+            display_df["signal_price_reference"] = pd.to_numeric(
+                display_df["signal_price_reference"], errors="coerce"
             ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
             display_df["readiness"] = pd.to_numeric(
                 display_df["readiness"], errors="coerce"
@@ -749,8 +773,9 @@ if interface_mode == "Live Test":
                 display_df[
                     [
                         "symbol", "signal", "current_price",
-                        "p_up_30m", "readiness", "live_1m_rows",
-                        "latest_bar", "news", "events",
+                        "signal_price_reference", "p_up_30m", "p_down_30m",
+                        "confidence", "readiness", "live_1m_rows",
+                        "latest_bar", "signal_horizon_end", "news", "events",
                         "fno", "market", "ledger",
                     ]
                 ],
@@ -760,7 +785,19 @@ if interface_mode == "Live Test":
 
             st.caption(
                 "Intraday uses the certified production model against the current NSE 1-minute stream. "
-                "Refresh manually during the first live test so each observed prediction can be tied to a specific timestamp."
+                "Each refresh creates a new 30-minute directional decision from the latest available bar. "
+                "BUY = P(UP) ≥ 55%; SELL = P(UP) ≤ 45%; otherwise HOLD. "
+                "This is a directional model, not a guaranteed minute-by-minute price forecast."
+            )
+
+            st.markdown("### How to read the Intraday call")
+            st.info(
+                "At each refresh, the model evaluates the latest 1-minute information and estimates the probability "
+                "that the stock's return over the following 30 minutes will be positive. "
+                "Use **Current price** as the live market price at the signal timestamp. "
+                "**Signal price reference** is the exact price fed into the production feature row. "
+                "**Horizon end** is 30 minutes after that decision timestamp. "
+                "The model does not directly predict an OHLC path for each intervening minute."
             )
 
             st.subheader("Intraday — numeric 30-minute price map")
