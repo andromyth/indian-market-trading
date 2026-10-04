@@ -39,6 +39,7 @@ jobs:
           nse_fno_udiff_ingest.py
           nse_fno_applicability_snapshot.py
           repair_identity_preserved_na_series.py
+          validate_identity_preserved_cash_master.py
           deployment_smoke_test.py
           COLAB_RUN_FNO_REPAIR_V2_20261003.py
 
@@ -50,7 +51,6 @@ jobs:
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py
           tests/test_identity_preserved_cash_rebuild.py
-
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
