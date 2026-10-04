@@ -423,12 +423,14 @@ six expanding-window holdouts, ROC AUC ranged from 0.486 to 0.522 and balanced
 accuracy from 0.488 to 0.529. Those results are close to chance, so this model
 is marked **research only** and is not connected to live dashboard signals.
 
-The dashboard's live BUY/SELL/HOLD label remains a rule-based blend of price,
-current RSS headline sentiment, broad-market regime and event-risk dampening.
-The headline sentiment is shown as a perception score with its coverage and
-freshness; it is not a probability. The 1-year historical audit remains a
-price/market-only validation because the live RSS feed has no corresponding
-point-in-time news archive. No orders are placed.
+The live BUY/SELL/HOLD decision is the ALL-NSE ML output plus a gated
+multi-source context layer. Current RSS/news, corporate events, market regime,
+and available F&O/fundamental evidence are kept point-in-time and are not
+allowed to overwrite the trained model's core probability. The final decision
+is blocked to HOLD when the production data-quality gate is not satisfied.
+Historical news accuracy is still limited by the absence of a complete
+timestamped free news archive; current news is nevertheless used for live
+decisions. No orders are placed.
 
 ## Permanent 1-minute historical store (v4)
 
