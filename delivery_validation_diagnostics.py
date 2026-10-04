@@ -15,12 +15,19 @@ LOCAL=Path("/tmp/DELIVERY_VALIDATION_DIAGNOSTICS.json")
 
 def _evaluate(x):
     x=x.copy()
+    required={"probability_up_next_session","predicted_return_next_session","actual_direction_d1"}
+    if x.empty or not required.issubset(x.columns):
+        return {"samples":0}
     p=pd.to_numeric(x["probability_up_next_session"],errors="coerce")
     r=pd.to_numeric(x["predicted_return_next_session"],errors="coerce")
     actual=x["actual_direction_d1"].astype(str).str.upper()
     valid=actual.isin(["UP","DOWN"]) & p.notna() & r.notna()
-    x=x[valid].copy(); p=pd.to_numeric(x["probability_up_next_session"],errors="coerce"); r=pd.to_numeric(x["predicted_return_next_session"],errors="coerce"); actual=x["actual_direction_d1"].astype(str).str.upper()
-    if x.empty: return {"samples":0}
+    x=x[valid].copy()
+    if x.empty:
+        return {"samples":0}
+    p=pd.to_numeric(x["probability_up_next_session"],errors="coerce")
+    r=pd.to_numeric(x["predicted_return_next_session"],errors="coerce")
+    actual=x["actual_direction_d1"].astype(str).str.upper()
     y=actual.map({"UP":1,"DOWN":0}).astype(float)
     signal=np.where((p>=0.60)&(r>0.0015),"BUY",np.where((p<=0.40)&(r<-0.0015),"SELL","HOLD"))
     action=np.isin(signal,["BUY","SELL"])
