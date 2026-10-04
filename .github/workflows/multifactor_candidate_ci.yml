@@ -38,6 +38,14 @@ jobs:
           validate_multifactor_candidate.py
           final_algorithm_data_readiness_v2.py
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
+          all_nse_delivery_model.py
+          directional_ensemble.py
+          prediction_validation.py
+          model_health.py
+          autonomous_engine.py
+          delivery_production_refresh.py
+          delivery_policy_update.py
+          delivery_validation_diagnostics.py
           nse_fno_udiff_ingest.py
           nse_fno_applicability_snapshot.py
           repair_identity_preserved_na_series.py
