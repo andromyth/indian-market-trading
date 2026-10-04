@@ -45,10 +45,47 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
-from all_nse_intraday_model import predict_symbol as all_nse_intraday_predict, model_status as all_nse_intraday_model_status, model_target_contract
+from production_model import (
+    build_feature_rows as build_certified_intraday_features,
+    model_status as certified_intraday_model_status,
+    model_target_contract,
+    predict as certified_intraday_predict,
+)
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
 from directional_ensemble import enrich_delivery_prediction
+
+
+def certified_intraday_prediction(
+    symbol,
+    price_df,
+    market_df=None,
+    fo=None,
+    decision_ts=None,
+    matched_news=None,
+    announcements=None,
+    event_risk=0.0,
+):
+    """Run the certified target_30m / 137-feature Intraday model."""
+    feature_frame = build_certified_intraday_features([{
+        "symbol": symbol,
+        "price_df": price_df,
+        "market_df": market_df,
+        "matched_news": matched_news or [],
+        "announcements": announcements or [],
+        "event_risk": event_risk,
+        "fo": fo or {},
+        "decision_ts": decision_ts,
+    }])
+    predictions = certified_intraday_predict(feature_frame)
+    if not predictions:
+        raise RuntimeError("Certified Intraday model returned no prediction row")
+    result = predictions[0]
+    result["prediction_status"] = "PASS"
+    result["mode"] = "Intraday"
+    result["prediction_horizon"] = "30m"
+    result["model_version"] = "2026-certified-30m-137-feature"
+    return result
 from prediction_ledger import load_records, save_validation_results
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -352,7 +389,13 @@ if analysis_view == "Historical Replay":
                         "event_risk": event_risk_score(hist_news, hist_ann), "fo": {}, "decision_ts": decision_ts,
                     }]
                     try:
-                        ml = all_nse_intraday_predict(replay_symbol, price_df[price_df.index <= decision_ts], benchmark_df, {}, decision_ts)
+                        ml = certified_intraday_prediction(
+                            replay_symbol,
+                            price_df[price_df.index <= decision_ts],
+                            benchmark_df,
+                            {},
+                            decision_ts,
+                        )
                         entry_info = _entry_exit_metrics(price_df[price_df.index <= decision_ts], decision_ts, "Intraday", int(replay_horizon))
                         outcome = actual_outcome(price_df, decision_ts, ml["signal"], "Intraday", int(replay_horizon), entry_info)
                         st.markdown(f"### {replay_symbol} — {replay_mode} replay")
@@ -1340,7 +1383,16 @@ if style == "Intraday" and live_records:
     try:
         for r in live_records:
             try:
-                ml = all_nse_intraday_predict(r["symbol"], r["raw_df"], r.get("market_df"), r.get("fo") or {}, r["raw_df"].index[-1] if not r["raw_df"].empty else None)
+                ml = certified_intraday_prediction(
+                    r["symbol"],
+                    r["raw_df"],
+                    r.get("market_df"),
+                    r.get("fo") or {},
+                    r["raw_df"].index[-1] if not r["raw_df"].empty else None,
+                    r.get("matched_news", []),
+                    r.get("announcements", []),
+                    r.get("event_risk", 0.0),
+                )
                 production_results[r["symbol"]] = ml
             except Exception as inner_exc:
                 production_results[r["symbol"]] = {"prediction_status":"ERROR","symbol":r["symbol"],"error_type":type(inner_exc).__name__,"error":str(inner_exc)}
