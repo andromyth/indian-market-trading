@@ -256,6 +256,30 @@ def main():
     data=pd.concat(frames,ignore_index=False).sort_values("decision_ts")
     del frames
 
+    required_training_columns = list(FEATURES) + [
+        "reference_close", "future_close", "future_return",
+        "target", "horizon", "symbol", "decision_ts",
+    ]
+    missing_training_columns = [
+        col for col in required_training_columns if col not in data.columns
+    ]
+    if missing_training_columns:
+        raise RuntimeError(
+            "Prepared training table is missing required columns: "
+            + ", ".join(missing_training_columns)
+        )
+    if data["reference_close"].isna().all() or data["future_close"].isna().all():
+        raise RuntimeError(
+            "Prepared training table has no usable reference/future prices. "
+            "Refusing to train a price-regression model."
+        )
+    print(
+        f"prepared_training_table: rows={len(data):,} "
+        f"symbols={data['symbol'].nunique():,} "
+        f"horizons={sorted(data['horizon'].dropna().astype(int).unique().tolist())}",
+        flush=True,
+    )
+
     bundle={}; validation={}; training_rows_by_horizon={}; trainable_symbols=sorted(data["symbol"].unique().tolist())
     for h in HORIZONS:
         z=data[data["horizon"]==h].copy()
