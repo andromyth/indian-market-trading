@@ -37,7 +37,7 @@ FEATURES = [
 DRIVE_MODEL_ROOT = "models/all_nse_intraday_5m_multifactor_replacement_2026"
 REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json"
 REMOTE_BUNDLE = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_5m_multihorizon_bundle_2026.joblib"
-CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_5m_multihorizon"
+CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_5m_multihorizon_v2"
 LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json"
 LOCAL_BUNDLE = CACHE_ROOT / "deployment_all_nse_intraday_5m_multihorizon_bundle_2026.joblib"
 
@@ -253,10 +253,13 @@ def model_status() -> dict[str, Any]:
         manifest = _ensure_artifact()
         bundle_hash_ok = LOCAL_BUNDLE.exists() and _sha256(LOCAL_BUNDLE) == manifest.get("bundle_sha256")
         verified_horizons = manifest.get("verified_horizons") or []
+        manifest_features=list(manifest.get("features") or [])
+        contract_ok=(int(manifest.get("feature_count",0) or 0)==len(FEATURES) and manifest_features==FEATURES)
         return {
-            "status": "READY" if manifest.get("status") == "VERIFIED" and bundle_hash_ok and set(verified_horizons) == set(HORIZONS) else "UNVERIFIED",
+            "status": "READY" if manifest.get("status") == "VERIFIED" and bundle_hash_ok and contract_ok and set(verified_horizons) == set(HORIZONS) else "UNVERIFIED",
             "target_horizons": list(HORIZONS),
             "feature_count": len(FEATURES),
+            "feature_contract_ok": bool(contract_ok),
             "training_symbol_count": int(manifest.get("training_symbol_count", 0) or 0),
             "universe_size": int(manifest.get("universe_size", 0) or 0),
             "training_rows_by_horizon": manifest.get("training_rows_by_horizon", {}),
@@ -353,4 +356,5 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
         "feature_count": len(FEATURES),
         "model_status": model_status(),
         "model_version": "2026-5m-step-multihorizon-v2",
+        "ensemble": True,
     }
