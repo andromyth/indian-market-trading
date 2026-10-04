@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from delivery_training_universe import benchmark_for_symbol, training_roster
 from nse_data_layer import fetch_index_history, load_canonical_cash_research_history
+from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
 DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
@@ -655,7 +656,7 @@ def market_context_tables(bulk) -> dict[str, pd.DataFrame]:
     }
 
 
-def make_panel(bulk, symbols, sort_output=True):
+def make_panel(bulk, symbols, sort_output=True, delivery=None):
     # Normalize once, then restrict the canonical research frame to the
     # trainable universe before any per-symbol feature work. The previous
     # implementation re-scanned the full multi-million-row frame for every
@@ -669,6 +670,51 @@ def make_panel(bulk, symbols, sort_output=True):
     work = work[work["_symbol_norm"].isin(wanted)].copy()
     if work.empty:
         return pd.DataFrame()
+
+    if delivery is None:
+        delivery = load_delivery_history(
+            DEFAULT_DELIVERY_ROOT,
+            symbols=wanted,
+            start=work["date"].min(),
+            end=work["date"].max(),
+        )
+
+    if delivery is not None and not delivery.empty:
+        d = delivery.copy()
+        d["symbol"] = d["symbol"].map(normalize_symbol)
+        d["date"] = pd.to_datetime(
+            d["date"],
+            errors="coerce",
+        ).dt.normalize()
+        d = d.dropna(subset=["symbol", "date"]).copy()
+
+        value_cols = [
+            "delivery_qty",
+            "delivery_pct",
+        ]
+
+        for c in value_cols:
+            if c not in d.columns:
+                d[c] = np.nan
+
+        d = (
+            d[["symbol", "date"] + value_cols]
+            .sort_values(["symbol", "date"])
+            .drop_duplicates(["symbol", "date"], keep="last")
+        )
+
+        work = work.merge(
+            d,
+            on=["symbol", "date"],
+            how="left",
+            suffixes=("", "_delivery"),
+        )
+
+        for c in value_cols:
+            dc = f"{c}_delivery"
+            if dc in work.columns:
+                work[c] = work[dc]
+                work = work.drop(columns=[dc])
 
     ctxs = market_context_tables(work)
     parts = []
@@ -733,7 +779,7 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "fno_iv_change": "fno_iv_change",
         "fno_available": "fno_available",
         "fno_fut_close": "fno_fut_close",
-        "fno_fut_basis": "fno_basis",
+        "fno_fut_basis": "fno_fut_basis",
         "fno_fut_return": "fno_fut_return",
         "fno_fut_oi": "fno_fut_oi",
     }
@@ -990,6 +1036,8 @@ def main():
         action="store_true",
         help="Explicitly allow the older official bulk-EOD view when the canonical cash master is unavailable.",
     )
+    ap.add_argument("--delivery-root",default=str(DEFAULT_DELIVERY_ROOT),
+                    help="Persisted official NSE Security-wise Delivery Position files.")
     ap.add_argument("--out",default=DEFAULT_OUT)
     ap.add_argument("--min-history",type=int,default=60)
     ap.add_argument("--refresh-fundamentals",action="store_true")
@@ -1020,6 +1068,19 @@ def main():
     roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
     trainable=list(roster["trainable_symbols"])
 
+    delivery_root = Path(args.delivery_root)
+    delivery = load_delivery_history(
+        delivery_root,
+        symbols=trainable,
+        start=bulk["date"].min(),
+        end=bulk["date"].max(),
+    )
+    print(
+        f"Using persisted NSE delivery layer: {delivery_root}; "
+        f"rows={len(delivery):,}; symbols={delivery['symbol'].nunique() if not delivery.empty else 0:,}",
+        flush=True,
+    )
+
     fund_report=_ensure_broad_fundamentals(
         trainable,
         force_refresh=args.refresh_fundamentals,
@@ -1038,6 +1099,9 @@ def main():
 
     input_sig=_candidate_input_signature(cash_master,bulk,trainable,fund_report)
     input_sig["cash_source"]=bulk_source
+    input_sig["delivery_root"]=str(delivery_root)
+    input_sig["delivery_rows"]=int(len(delivery))
+    input_sig["delivery_symbols"]=int(delivery["symbol"].nunique()) if not delivery.empty else 0
     candidate_meta=out/CANDIDATE_META_NAME
     if not args.force_rebuild_candidate and not args.refresh_fundamentals and candidate_meta.exists() and _candidate_artifacts_complete(out):
         try:
@@ -1048,7 +1112,7 @@ def main():
         except Exception:
             pass
 
-    panel,audit=merge_optional(make_panel(bulk,trainable))
+    panel,audit=merge_optional(make_panel(bulk,trainable,delivery=delivery))
     (out/"DATA_READINESS_REPORT_2026.json").write_text(
         json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},
                    indent=2,default=str),
@@ -1093,6 +1157,10 @@ def main():
         "excluded_symbol_count":int(roster["excluded_symbol_count"]),
         "minimum_history_sessions":int(roster["minimum_history_sessions"]),
         "cash_data_source":bulk_source,
+        "delivery_data_source":"NSE_OFFICIAL_SECURITY_WISE_DELIVERY_MTO",
+        "delivery_root":str(delivery_root),
+        "delivery_row_count":int(len(delivery)),
+        "delivery_symbol_count":int(delivery["symbol"].nunique()) if not delivery.empty else 0,
         "canonical_cash_master":str(cash_master),
         "research_series_policy":["EQ","BE","BZ","SM","ST","SZ"],
         "t0_excluded_from_delivery_research":True,
