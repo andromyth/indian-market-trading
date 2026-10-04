@@ -465,7 +465,7 @@ if interface_mode == "Live Test":
     st.sidebar.subheader("Live mode")
     live_mode = st.sidebar.radio(
         "Prediction type",
-        ["Delivery", "Intraday"],
+        ["Delivery", "Intraday 5-minute"],
         index=0,
         key="live_test_mode",
     )
@@ -661,6 +661,136 @@ if interface_mode == "Live Test":
                         f"{root}: opening estimate unavailable; the production model still provides "
                         "the next-session close projection when its predicted return and reference close are available."
                     )
+
+    elif live_mode == "Intraday 5-minute":
+        try:
+            model = intraday_5m_model_status()
+            ready = model.get("status") == "READY"
+            if ready:
+                st.success("Intraday 5-minute model READY · direct +5/+10/+15/+20/+25/+30 minute forecasts")
+                st.caption(
+                    f"Training through: **{model.get('trained_until') or 'unknown'}** · "
+                    f"{int(model.get('training_symbol_count', 0) or 0):,} training symbols / "
+                    f"{int(model.get('universe_size', 0) or 0):,} NSE universe."
+                )
+            else:
+                st.warning("The 5-minute-step model is not yet VERIFIED. Run the Colab trainer before using this live mode.")
+                st.caption("The certified 30-minute production model remains untouched and is not used for these 5-minute forecasts.")
+        except Exception as exc:
+            model = {}
+            st.error(f"5-minute Intraday model status failed: {type(exc).__name__}: {exc}")
+
+        candidates = [s for s in symbols if s.endswith(".NS")]
+        if not candidates:
+            st.info("Select an NSE (.NS) stock from the watchlist/search.")
+        else:
+            selected_symbol = st.selectbox(
+                "Stock for continuous 5-minute forecast",
+                candidates,
+                key="live_intraday_selected_symbol",
+                help="One selected NSE stock is recalculated whenever a new completed 1-minute bar arrives.",
+            )
+            auto_update = st.checkbox(
+                "Continuous recalculation every new 1-minute bar",
+                value=True,
+                key="live_intraday_auto_update",
+            )
+            st.caption("The engine polls every minute but uses only completed 1-minute NSE bars. A new forecast is generated only when the completed-bar timestamp changes.")
+            run_every = "60s" if auto_update else None
+
+            @st.fragment(run_every=run_every, key="live_intraday_5m_stream")
+            def _render_live_5m_stream():
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                root = selected_symbol.replace(".NS", "").upper()
+                in_session = pd.Timestamp("09:15").time() <= now.time() <= pd.Timestamp("15:30").time()
+                if not in_session:
+                    st.info(f"5-minute forecast stream idle outside regular NSE hours · IST {now.strftime('%H:%M:%S')}")
+                    return
+
+                try:
+                    raw = nse_fetch_intraday_1m_current(root, sync_drive=True)
+                    if raw is None or raw.empty:
+                        st.warning("Waiting for NSE 1-minute data.")
+                        return
+                    cutoff = now.floor("min")
+                    completed = raw.loc[raw.index < cutoff].copy()
+                    if completed.empty:
+                        st.info("Waiting for the first completed 1-minute NSE bar.")
+                        return
+                    latest_ts = completed.index[-1]
+                    state_key = f"live_5m_last_ts::{root}"
+                    result_key = f"live_5m_result::{root}"
+                    previous_ts = st.session_state.get(state_key)
+                    if previous_ts == str(latest_ts) and result_key in st.session_state:
+                        result = st.session_state[result_key]
+                        recalculated = False
+                    else:
+                        if len(completed) < 50:
+                            st.info(f"Model warm-up: {len(completed)}/50 completed 1-minute bars available.")
+                            return
+                        benchmark_symbol = benchmark_for_symbol(selected_symbol)
+                        market_df = _cached_live_market_context(benchmark_symbol)
+                        fo = _cached_live_option_chain(root)
+                        result = multihorizon_intraday_prediction(
+                            selected_symbol, completed, market_df, fo, latest_ts
+                        )
+                        st.session_state[state_key] = str(latest_ts)
+                        st.session_state[result_key] = result
+                        recalculated = True
+
+                    hrows = result.get("horizons", [])
+                    base_price = pd.to_numeric(result.get("base_price"), errors="coerce")
+                    decision_ts = pd.Timestamp(result.get("decision_timestamp"))
+                    table_rows = []
+                    for item in hrows:
+                        target_ts = pd.Timestamp(item["target_timestamp"])
+                        if target_ts.tzinfo is None: target_ts = target_ts.tz_localize("Asia/Kolkata")
+                        table_rows.append({
+                            "Target": target_ts.strftime("%H:%M"),
+                            "Minutes": int(item["horizon_minutes"]),
+                            "Predicted ₹": f"₹{float(item['predicted_price']):,.2f}" if pd.notna(item.get("predicted_price")) else "—",
+                            "Change ₹": f"₹{float(item['predicted_change']):+,.2f}" if pd.notna(item.get("predicted_change")) else "—",
+                            "Expected return": f"{float(item['expected_return']):+.2%}" if pd.notna(item.get("expected_return")) else "—",
+                            "P(UP)": f"{float(item['probability_up']):.1%}",
+                            "P(DOWN)": f"{float(item['probability_down']):.1%}",
+                            "Signal": item["signal"],
+                        })
+
+                    if recalculated:
+                        st.success(f"Recalculated from new completed NSE bar · {latest_ts.strftime('%H:%M:%S')} IST")
+                    else:
+                        st.info(f"Showing latest forecast from {latest_ts.strftime('%H:%M:%S')} IST")
+
+                    h0 = hrows[0] if hrows else {}
+                    a, b, d, e = st.columns(4)
+                    a.metric("Reference price ₹", f"₹{float(base_price):,.2f}" if pd.notna(base_price) else "—")
+                    b.metric("Next 5m price ₹", f"₹{float(h0.get('predicted_price')):,.2f}" if pd.notna(h0.get("predicted_price")) else "—")
+                    d.metric("Next 5m signal", str(h0.get("signal", "—")))
+                    e.metric("Next 5m P(UP)", f"{float(h0.get('probability_up')):.1%}" if pd.notna(h0.get("probability_up")) else "—")
+
+                    st.subheader("Every 5-minute future prediction")
+                    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
+
+                    st.subheader("Future price prediction graph")
+                    st.caption("Each point is a direct model estimate for its horizon. The connecting line is for visualization; it is not a guaranteed tick-by-tick path.")
+                    plot_rows = [{"timestamp": decision_ts, "price": float(base_price)}]
+                    for item in hrows:
+                        if pd.notna(item.get("predicted_price")):
+                            ts = pd.Timestamp(item["target_timestamp"])
+                            if ts.tzinfo is None: ts = ts.tz_localize("Asia/Kolkata")
+                            plot_rows.append({"timestamp": ts, "price": float(item["predicted_price"])})
+                    plot_df = pd.DataFrame(plot_rows).drop_duplicates("timestamp").set_index("timestamp").sort_index()
+                    st.line_chart(plot_df, height=360)
+                    ledger = result.get("ledger") or {}
+                    st.caption(
+                        f"Signal source: direct 5-minute-step model · latest completed bar {latest_ts.strftime('%H:%M:%S')} IST · "
+                        f"ledger {ledger.get('status','—')} · new rows {ledger.get('new_rows','—')} · "
+                        f"Drive sync {'YES' if ledger.get('synced') else 'NO'}."
+                    )
+                except Exception as exc:
+                    st.error(f"Live 5-minute forecast failed: {type(exc).__name__}: {exc}")
+
+            _render_live_5m_stream()
 
     else:
         try:
