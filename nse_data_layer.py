@@ -870,7 +870,20 @@ def fetch_index_history(
             drive_frame is not None
             and not drive_frame.empty
         ):
-            return drive_frame
+            drive_dates = pd.to_datetime(
+                drive_frame["date"], errors="coerce"
+            ).dropna()
+            latest_drive_date = (
+                drive_dates.max().date()
+                if not drive_dates.empty
+                else None
+            )
+            # Do not silently accept materially stale benchmark data.
+            if (
+                latest_drive_date is not None
+                and latest_drive_date >= end_d - timedelta(days=4)
+            ):
+                return drive_frame
 
     except Exception:
         pass
