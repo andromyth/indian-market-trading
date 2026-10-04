@@ -169,14 +169,28 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--lookback-days",type=int,default=150)
     ap.add_argument("--delivery-lookback-days",type=int,default=150)
+    ap.add_argument("--source-wait-minutes",type=int,default=10)
     args=ap.parse_args()
     store=_store()
+
+    # Upstream F&O/news workflows can finish a little later than the Delivery
+    # archive job. Poll missing upstream files briefly rather than producing a
+    # falsely data-limited production snapshot during normal workflow overlap.
+    deadline=datetime.now(timezone.utc)+timedelta(minutes=max(0,args.source_wait_minutes))
     source_status={}
-    for k,remote in REMOTE_SOURCES.items():
-        local=BASE/remote
-        if local.exists() and local.stat().st_size>0: source_status[k]="LOCAL"
-        elif _download_file(store,remote,local): source_status[k]="DOWNLOADED"
-        else: source_status[k]="MISSING"
+    while True:
+        source_status={}
+        for k,remote in REMOTE_SOURCES.items():
+            local=BASE/remote
+            if local.exists() and local.stat().st_size>0: source_status[k]="LOCAL"
+            elif _download_file(store,remote,local): source_status[k]="DOWNLOADED"
+            else: source_status[k]="MISSING"
+        missing=[k for k,v in source_status.items() if v=="MISSING"]
+        if not missing or datetime.now(timezone.utc)>=deadline:
+            break
+        print(f"Waiting for upstream source files: {', '.join(missing)}",flush=True)
+        import time as _time
+        _time.sleep(60)
     eod_status=_download_recent_eod(store,args.lookback_days)
     delivery_status=_download_recent_delivery(store,args.delivery_lookback_days)
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
