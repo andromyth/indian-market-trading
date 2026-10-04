@@ -1418,9 +1418,10 @@ def _historical_prediction(
         "data_readiness": historical_readiness,
         "feature_count": historical_feature_count,
         "non_missing_feature_count": historical_non_missing_count,
-        "reference_close": float(
-            reference["close"]
-        ),
+        "reference_open": float(reference["open"]) if "open" in reference.index and pd.notna(reference["open"]) else np.nan,
+        "reference_high": float(reference["high"]) if "high" in reference.index and pd.notna(reference["high"]) else np.nan,
+        "reference_low": float(reference["low"]) if "low" in reference.index and pd.notna(reference["low"]) else np.nan,
+        "reference_close": float(reference["close"]),
         "predicted_open": path["predicted_open"],
         "predicted_high": path["predicted_high"],
         "predicted_low": path["predicted_low"],
@@ -1955,10 +1956,57 @@ def render_prediction_history() -> None:
         )
 
         st.info(
-            "Data readiness is shown as usable features / total model features. "
-            "It is not the number of model features. Missing optional news, "
-            "F&O or fundamental inputs are reported separately and are never "
-            "replaced with fabricated values."
+            "Feature values present is a diagnostic count of non-missing values in the 59-feature "
+            "historical reconstruction. It is not the production data-quality gate. Historical replay "
+            "must not substitute current news, F&O or fundamentals for information that was unavailable "
+            "at the selected timestamp."
+        )
+        st.caption(
+            f"Historical feature coverage: {readiness_text}. "
+            "A lower count is therefore possible even when the prediction itself is valid."
+        )
+
+        st.markdown(
+            "### Benchmark / Prediction / Actual"
+        )
+        st.caption(
+            "Benchmark = the previous-session OHLC used as the model reference; "
+            "Prediction = the reconstructed next-session OHLC estimate; "
+            "Actual = the selected target session's real OHLC."
+        )
+
+        comparison = pd.DataFrame(
+            [
+                {
+                    "": "Open",
+                    "Benchmark": _money(row.get("reference_open")),
+                    "Prediction": _money(row.get("predicted_open")),
+                    "Actual": _money(row.get("actual_open")),
+                },
+                {
+                    "": "Close",
+                    "Benchmark": _money(row.get("reference_close")),
+                    "Prediction": _money(row.get("predicted_close")),
+                    "Actual": _money(row.get("actual_close")),
+                },
+                {
+                    "": "Low",
+                    "Benchmark": _money(row.get("reference_low")),
+                    "Prediction": _money(row.get("predicted_low")),
+                    "Actual": _money(row.get("actual_low")),
+                },
+                {
+                    "": "High",
+                    "Benchmark": _money(row.get("reference_high")),
+                    "Prediction": _money(row.get("predicted_high")),
+                    "Actual": _money(row.get("actual_high")),
+                },
+            ]
+        )
+        st.dataframe(
+            comparison,
+            width="stretch",
+            hide_index=True,
         )
 
         st.markdown(
@@ -2134,6 +2182,9 @@ def render_prediction_history() -> None:
             raw = row.to_dict()
 
             for key in (
+                "reference_open",
+                "reference_high",
+                "reference_low",
                 "reference_close",
                 "predicted_open",
                 "predicted_high",
