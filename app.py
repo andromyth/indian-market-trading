@@ -85,8 +85,14 @@ def certified_intraday_prediction(
     result["mode"] = "Intraday"
     result["prediction_horizon"] = "30m"
     result["model_version"] = "2026-certified-30m-137-feature"
+    persisted = append_prediction(result, sync_drive=True)
+    result["prediction_id"] = persisted.get("prediction_id")
+    result["prediction_ledger_status"] = persisted.get("status")
+    result["prediction_ledger_synced"] = bool(persisted.get("synced"))
+    if persisted.get("sync_error"):
+        result["prediction_ledger_sync_error"] = persisted["sync_error"]
     return result
-from prediction_ledger import load_records, save_validation_results
+from prediction_ledger import load_records, load_validation_records, save_validation_results, append_prediction
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
 from historical_audit import run_batch_intraday_audit
@@ -926,83 +932,43 @@ def load_announcements(symbol):
 
 news_items = tag_news_items(load_news())
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cached_delivery_validation():
-    records = [r for r in load_records() if str(r.get("mode", "")).lower() == "delivery"][-100:]
+    """Read persisted Delivery validation results without fresh per-symbol NSE calls."""
+    records = [
+        r for r in load_records()
+        if str(r.get("mode", "")).lower() == "delivery"
+    ][-100:]
+
     if not records:
-        return pd.DataFrame(), {"status": "NO_DATA"}, {"status": "NO_DATA", "retraining_candidate": False}
+        return pd.DataFrame(), {"status": "NO_DATA"}, {
+            "status": "NO_DATA",
+            "retraining_candidate": False,
+        }
 
-    histories = {}
+    ids = {str(r.get("prediction_id")) for r in records if r.get("prediction_id")}
+    validation_rows = [
+        r for r in load_validation_records()
+        if str(r.get("prediction_id")) in ids
+    ]
 
-    def provider(symbol):
-        root = normalize_symbol(symbol).replace(".NS", "").replace(".BO", "").upper()
+    validated = pd.DataFrame(validation_rows)
+    if validated.empty:
+        return validated, {
+            "status": "NO_DATA",
+            "pending_predictions": len(records),
+        }, {
+            "status": "INSUFFICIENT_HISTORY",
+            "sample_count": 0,
+            "retraining_candidate": False,
+            "reason": "No completed D+1 Delivery validations are available yet.",
+        }
 
-        if root not in histories:
-            end = pd.Timestamp.now(tz="Asia/Kolkata").date()
-            start = end - pd.Timedelta(days=90)
-
-            try:
-                x = nse_fetch_equity_history(
-                    root,
-                    start,
-                    end,
-                    sync_drive=True,
-                )
-
-                if x is None or x.empty:
-                    histories[root] = pd.DataFrame()
-                else:
-                    x = x.copy()
-                    x["date"] = pd.to_datetime(
-                        x["date"],
-                        errors="coerce",
-                    ).dt.normalize()
-
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        if col in x.columns:
-                            x[col] = pd.to_numeric(
-                                x[col],
-                                errors="coerce",
-                            )
-
-                    x = x.dropna(
-                        subset=[
-                            "date",
-                            "close",
-                        ]
-                    )
-
-                    x = (
-                        x.sort_values("date")
-                        .drop_duplicates("date", keep="last")
-                        .set_index("date")
-                    )
-
-                    x = x.rename(
-                        columns={
-                            "open": "Open",
-                            "high": "High",
-                            "low": "Low",
-                            "close": "Close",
-                            "volume": "Volume",
-                        }
-                    )
-
-                    histories[root] = x
-
-            except Exception as exc:
-                histories[root] = pd.DataFrame()
-                st.warning(
-                    f"{root}: official NSE validation history unavailable "
-                    f"({type(exc).__name__}: {exc})"
-                )
-
-        return histories[root]
-
-    validated = validate_ledger(records, provider)
-    if not validated.empty:
-        save_validation_results(validated.to_dict("records"), sync_drive=True)
-    return validated, rolling_7day_scorecard(validated), assess_delivery_health(validated)
+    return (
+        validated,
+        rolling_7day_scorecard(validated),
+        assess_delivery_health(validated),
+    )
 
 # ---------------------------------------------------------------- Production ML
 # Fetch all watchlist inputs first so the model can compute cross-sectional
@@ -1884,10 +1850,11 @@ for rec in live_records:
             d4.metric("Confidence", dlv["confidence"])
             d5.metric("Model inputs", f"{dlv['feature_count']}")
             st.caption(
-    "LIVE ALL-NSE Delivery candidate · 59-feature point-in-time NSE contract · "
-    "2,372 trainable stocks from the 2,593-stock official NSE equity universe. "
-    "Prediction is stored automatically for actual-vs-predicted validation."
-)
+                "LIVE ALL-NSE Delivery candidate · 59-feature point-in-time NSE contract · "
+                f"{int(dlv.get('trainable_symbol_count', 0)):,} trainable stocks from the "
+                f"{int(dlv.get('universe_symbol_count', 0)):,}-stock official NSE equity universe. "
+                "Prediction is stored automatically for actual-vs-predicted validation."
+            )
         elif dlv and dlv.get("prediction_status") == "BLOCKED":
             st.error(
                 f"Delivery prediction blocked: {dlv.get('reason', 'unknown')}"
