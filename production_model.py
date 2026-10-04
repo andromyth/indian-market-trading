@@ -37,6 +37,7 @@ def model_status() -> dict[str, Any]:
         "model_family": _MANIFEST.get("model_family"),
         "target": _MANIFEST.get("target"),
         "feature_count": len(FEATURES),
+        "manifest_feature_count": int(_MANIFEST.get("feature_count", 0) or 0),
         "manifest_sha256_match": MODEL_PATH.exists() and sha == _MANIFEST.get("model_sha256"),
         "model_path": str(MODEL_PATH),
         "training_rows": _MANIFEST.get("training_rows"),
@@ -76,6 +77,15 @@ def model_target_contract() -> dict[str, Any]:
     future 30-minute return > 0, i.e. UP, and class 0 as non-positive/down.
     This check prevents an accidental BUY/SELL inversion in the dashboard layer.
     """
+    if int(_MANIFEST.get("feature_count", 0) or 0) != len(FEATURES):
+        raise RuntimeError(
+            f"Manifest feature_count={_MANIFEST.get('feature_count')!r} "
+            f"does not match the checked-in 137-feature contract."
+        )
+    if _MANIFEST.get("target") != "target_30m":
+        raise RuntimeError(
+            f"Unexpected production target: {_MANIFEST.get('target')!r}; expected target_30m"
+        )
     model = _model()
     classes = list(getattr(model.named_steps.get("model"), "classes_", []))
     if classes != [0, 1]:
@@ -467,6 +477,38 @@ def build_feature_rows(items: list[dict[str, Any]]) -> pd.DataFrame:
     return frame[["_symbol","_decision_ts"] + FEATURES]
 
 
+def audit_input_frame(feature_df: pd.DataFrame) -> dict[str, Any]:
+    """Audit the actual live feature row without changing model inference."""
+    missing_contract = [c for c in FEATURES if c not in feature_df.columns]
+    x = feature_df.reindex(columns=FEATURES).copy()
+    missing_values = [
+        c for c in FEATURES
+        if c not in x.columns or pd.isna(x.iloc[0][c])
+    ] if len(x) else list(FEATURES)
+
+    model_empty_statistics = []
+    try:
+        imp = _model().named_steps.get("imputer")
+        stats = getattr(imp, "statistics_", None)
+        if stats is not None:
+            model_empty_statistics = [
+                FEATURES[i]
+                for i, v in enumerate(stats)
+                if pd.isna(v)
+            ]
+    except Exception:
+        pass
+
+    return {
+        "feature_count": len(FEATURES),
+        "missing_contract_columns": missing_contract,
+        "missing_input_feature_count": len(missing_values),
+        "missing_input_features": missing_values,
+        "model_fit_empty_feature_count": len(model_empty_statistics),
+        "model_fit_empty_features": model_empty_statistics,
+    }
+
+
 def predict(feature_df: pd.DataFrame) -> list[dict[str, Any]]:
     contract = model_target_contract()
     model = _model()
@@ -480,12 +522,23 @@ def predict(feature_df: pd.DataFrame) -> list[dict[str, Any]]:
         p = float(np.clip(p, 0, 1))
         signal = "BUY" if p >= 0.55 else ("SELL" if p <= 0.45 else "HOLD")
         row = feature_df.iloc[i]
+        audit = audit_input_frame(feature_df.iloc[[i]])
+        decision_ts = pd.Timestamp(row["_decision_ts"])
+        if decision_ts.tzinfo is None:
+            decision_ts = decision_ts.tz_localize("Asia/Kolkata")
+        else:
+            decision_ts = decision_ts.tz_convert("Asia/Kolkata")
         out.append({
-            "symbol": row["_symbol"], "decision_timestamp": row["_decision_ts"],
-            "probability_up_30m": p, "signal": signal,
+            "symbol": row["_symbol"], "decision_timestamp": str(decision_ts),
+            "probability_up_30m": p,
+            "probability_down_30m": float(1.0 - p),
+            "signal": signal,
+            "signal_horizon_end": str(decision_ts + pd.Timedelta(minutes=30)),
+            "signal_price_reference": _safe_float(row.get("close", np.nan)),
             "confidence": "HIGH" if abs(p-.5)>=.25 else ("MEDIUM" if abs(p-.5)>=.12 else "LOW"),
             "feature_count": len(FEATURES),
             "data_readiness_score": float(row.get("data_readiness_score", np.nan)),
+            "input_audit": audit,
             "model_family": _MANIFEST.get("model_family"), "target": _MANIFEST.get("target"),
             "positive_class": contract["positive_class"], "positive_class_meaning": contract["positive_class_meaning"],
         })
