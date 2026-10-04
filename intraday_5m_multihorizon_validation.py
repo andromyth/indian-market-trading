@@ -101,8 +101,13 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
             return out
         base_price = float(ref.iloc[-1])
 
-    delta = np.abs((frame.index - target_ts).total_seconds())
-    eligible = delta <= max(1, int(tolerance_seconds))
+    # Actual outcome must be at or after the nominal target. Never validate
+    # a +5m prediction using a pre-target bar merely because it is close in time.
+    delta_seconds=(frame.index-target_ts).total_seconds()
+    eligible=(
+        (delta_seconds>=0)
+        & (delta_seconds<=max(1,int(tolerance_seconds)))
+    )
     if not eligible.any():
         out["validation_reason"] = "Target actual bar is not persisted yet."
         return out
@@ -110,6 +115,7 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
     nearest_position = int(np.argmin(np.where(eligible, delta, np.inf)))
     actual_ts = frame.index[nearest_position]
     actual_price = float(frame["close"].iloc[nearest_position])
+    alignment_seconds=float((actual_ts-target_ts).total_seconds())
     actual_return = actual_price / float(base_price) - 1.0 if base_price else np.nan
     actual_direction = "UP" if actual_return > 0 else "DOWN"
 
@@ -132,6 +138,8 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
     out.update({
         "prediction_price_reference": float(base_price),
         "actual_timestamp": str(actual_ts),
+        "target_alignment_seconds": alignment_seconds,
+        "realized_horizon_seconds": float((actual_ts-ts).total_seconds()),
         "actual_price": actual_price,
         "actual_return": actual_return,
         "actual_direction": actual_direction,
