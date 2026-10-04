@@ -1,0 +1,8 @@
+COLAB HANDOFF A7F3 2026-10-02
+
+This file must appear in the downloaded ZIP.
+
+Expected corrected source:
+- multifactor_data_layer_v2.py -> 59 features including fno_fut_basis
+- colab_build_all_nse_delivery_multifactor_candidate.py -> V2 persistent caches
+- colab_run_multifactor_upgrade.py -> --preflight

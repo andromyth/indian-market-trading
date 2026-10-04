@@ -3,22 +3,43 @@ name: Multi-factor candidate CI
 on:
   push:
     branches:
-      - multifactor-readiness-v2
+      - main
+      - beta_version
   pull_request:
     branches:
-      - multifactor-readiness-v2
+      - main
+      - beta_version
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
-      - name: Compile new Python files
-        run: python -m py_compile multifactor_data_layer_v2.py colab_build_all_nse_delivery_multifactor_candidate.py colab_run_multifactor_upgrade.py build_all_nse_pit_fundamentals.py validate_multifactor_candidate.py
+
+      - name: Compile multi-factor Python files
+        run: >
+          python -m py_compile
+          multifactor_data_layer_v2.py
+          colab_build_all_nse_delivery_multifactor_candidate.py
+          colab_run_multifactor_upgrade.py
+          build_all_nse_pit_fundamentals.py
+          validate_multifactor_candidate.py
+          final_algorithm_data_readiness_v2.py
+          COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
+          nse_fno_udiff_ingest.py
+          nse_fno_applicability_snapshot.py
+          COLAB_RUN_FNO_REPAIR_V2_20261003.py
+
       - name: Run multi-factor tests
-        run: pytest -q tests/test_multifactor_data_layer_v2.py
+        run: >
+          pytest -q
+          tests/test_multifactor_data_layer_v2.py
+          tests/test_final_algorithm_data_readiness_v2.py
+          tests/test_nse_fno_udiff_ingest.py
