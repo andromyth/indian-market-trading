@@ -26,7 +26,9 @@ def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7,
         x = x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").tail(rolling_window)
     else:
         x = x.tail(rolling_window)
-    matches = pd.to_numeric(x.get("direction_match_d1"), errors="coerce").dropna()
+    raw_matches = x.get("direction_match_d1", pd.Series(index=x.index, dtype="object"))
+    matches = raw_matches.astype(str).str.strip().str.lower().map({"true": 1.0, "false": 0.0, "1": 1.0, "0": 0.0})
+    matches = matches.dropna()
     mape = pd.to_numeric(x.get("percentage_error_d1"), errors="coerce").abs().mean()
     if len(matches) < min_samples:
         return {
