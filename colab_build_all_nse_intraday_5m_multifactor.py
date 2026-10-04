@@ -572,7 +572,8 @@ def main():
         pred_hgb=reg_hgb.predict(Xtest)
         pred_ridge=reg_ridge.predict(Xtest)
         raw_ret=reg_weight_hgb*pred_hgb+(1.0-reg_weight_hgb)*pred_ridge
-        expected_ret=return_alpha*raw_ret+return_beta*((2.0*p-1.0)*abs_move)
+        test_direction_ret=p*direction_up_return+(1.0-p)*direction_down_return
+        expected_ret=return_alpha*raw_ret+return_beta*test_direction_ret
 
         pred=(p>=0.5).astype(int)
         base_price=test["reference_close"].astype(float).to_numpy()
@@ -658,7 +659,6 @@ def main():
             model__sample_weight=deploy_weights,
         )
         reg_ridge_final.fit(Xdeploy,deploy["future_return"].astype(float))
-        deployment_abs_move=abs_move
         training_rows_by_horizon[str(h)] = int(len(deploy))
         validation[str(h)]["deployment_train_rows"] = int(len(deploy))
         bundle[str(h)]={
@@ -708,13 +708,15 @@ def main():
         "training_rows_by_horizon":training_rows_by_horizon,
         "validation":validation,
         "verified_horizons":[int(h) for h in HORIZONS] if verified else [],
-        "trained_until":max(validation[str(h)]["trained_until"] for h in HORIZONS),
+        "trained_until":max(str(pd.Timestamp(pd.concat([data[data["horizon"]==h]["decision_ts"]]).max())) for h in HORIZONS),
+        "holdout_evaluation_end":max(validation[str(h)]["holdout_start"] for h in HORIZONS),
         "bundle_sha256":sha,
         "no_auto_orders":True,
         "point_in_time_fno":True,
         "volume_policy":"Source-reported volume only; missing volume stays NaN.",
         "model_version":"2026-5m-step-multihorizon-v2",
         "validation_protocol":"70% chronological fit / 15% calibration / 15% final holdout per horizon; final deployment models refit on the full 85% pre-holdout period after OOS metrics are frozen.",
+        "deployment_training_rows_total":int(sum(training_rows_by_horizon.values())),
         "promotion_rule":"Every horizon must beat the current-price price-MAE baseline on the final untouched chronological holdout and exceed 0.50 ROC-AUC and 0.50 direction accuracy; calibration data is used only for ensemble/blend selection.",
     }
     (out/"ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
