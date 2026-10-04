@@ -191,6 +191,20 @@ def main():
     delivery=load_delivery_history(DELIVERY_LOCAL,symbols=trainable,start=bulk["date"].min(),end=bulk["date"].max())
     panel=make_panel(bulk,trainable,sort_output=False,delivery=delivery)
     panel,source_audit=merge_optional(panel)
+
+    # Distinguish "source is present and this symbol has no applicable item"
+    # from "the source pipeline itself is missing". The former is known state
+    # (0); the latter remains NaN and is blocked by the production gate.
+    source_to_flag = {
+        "news": "ready_news",
+        "events": "ready_events",
+        "fno": "ready_fno",
+        "fundamentals": "ready_fundamentals",
+    }
+    for source, flag in source_to_flag.items():
+        if source_status.get(source) in {"LOCAL", "DOWNLOADED"} and flag in panel.columns:
+            panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
+
     panel=attach_readiness_flags(panel)
     panel["decision_timestamp"]=pd.to_datetime(panel["decision_timestamp"],errors="coerce",utc=True)
     panel=panel.dropna(subset=["symbol","decision_timestamp"]).sort_values(["symbol","decision_timestamp"]).drop_duplicates("symbol",keep="last").reset_index(drop=True)
