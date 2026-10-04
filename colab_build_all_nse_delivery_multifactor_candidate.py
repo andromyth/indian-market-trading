@@ -656,16 +656,23 @@ def market_context_tables(bulk) -> dict[str, pd.DataFrame]:
 
 
 def make_panel(bulk, symbols):
-    # Normalize the bulk symbol column before filtering. The training roster
-    # is built on normalized symbols; filtering against raw symbol text can
-    # silently collapse the panel when archive symbols carry series/suffix
-    # variants such as '-EQ'.
+    # Normalize once, then restrict the canonical research frame to the
+    # trainable universe before any per-symbol feature work. The previous
+    # implementation re-scanned the full multi-million-row frame for every
+    # symbol, which made ALL-NSE panel construction unnecessarily expensive.
     work = bulk.copy()
     work["_symbol_norm"] = work["symbol"].map(normalize_symbol)
+
+    wanted = {normalize_symbol(sym) for sym in symbols}
+    work = work[work["_symbol_norm"].isin(wanted)].copy()
+    if work.empty:
+        return pd.DataFrame()
+
     ctxs = market_context_tables(work)
     parts = []
-    for sym in symbols:
-        z = add_features(work[work["_symbol_norm"].eq(sym)].drop(columns=["_symbol_norm"]).copy())
+    total = len(wanted)
+    for i, (sym, group) in enumerate(work.groupby("_symbol_norm", sort=False), 1):
+        z = add_features(group.drop(columns=["_symbol_norm"]).copy())
         if z.empty:
             continue
         benchmark = benchmark_for_symbol(sym)
@@ -677,7 +684,21 @@ def make_panel(bulk, symbols):
             z[f"relative_ret_{n}"] = z[f"ret_{n}"] - z[f"market_ret_{n}"]
         z["decision_timestamp"] = z["date"] + pd.Timedelta(hours=15, minutes=30)
         parts.append(z)
-    return pd.concat(parts, ignore_index=True).sort_values(["symbol", "decision_timestamp"]).reset_index(drop=True)
+        if i == 1 or i % 100 == 0 or i == total:
+            print(
+                f"base panel progress: {i:,}/{total:,} symbols; "
+                f"rows={sum(len(p) for p in parts):,}",
+                flush=True,
+            )
+
+    if not parts:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(parts, ignore_index=True)
+        .sort_values(["symbol", "decision_timestamp"])
+        .reset_index(drop=True)
+    )
 
 def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """Merge the broad NSE F&O UDiFF layer under an explicit next-trading-day PIT clock.
