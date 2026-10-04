@@ -28,6 +28,7 @@ from all_nse_intraday_5m_model import FEATURES, HORIZONS
 IST = "Asia/Kolkata"
 INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
@@ -214,7 +215,68 @@ def main():
     universe=sorted(set(official_nse_symbols(force_refresh=True)))
     if not universe: raise RuntimeError("Official NSE universe is empty")
     market=load_market(root); fno=load_fno(root)
-    frames=[]; coverage=[]; retained=0
+
+    # Drive-backed per-symbol checkpoints make the long ALL-NSE preparation
+    # resumable. A failure after symbol N only requires reprocessing the
+    # current symbol, not rebuilding the entire prepared dataset.
+    checkpoint_base = out / "training_checkpoints"
+    signature_payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "trainer": "all_nse_intraday_5m_multifactor",
+        "horizons": list(HORIZONS),
+        "features": list(FEATURES),
+        "universe_sha256": hashlib.sha256(
+            json.dumps(universe, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        ).hexdigest(),
+        "min_rows_symbol": int(args.min_rows_symbol),
+        "max_train_rows_per_symbol": int(args.max_train_rows_per_symbol),
+        "global_retained_row_cap": int(args.global_retained_row_cap),
+    }
+    signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    checkpoint_dir = checkpoint_base / f"run_{signature}"
+    symbols_dir = checkpoint_dir / "symbols"
+    symbols_dir.mkdir(parents=True, exist_ok=True)
+    state_path = checkpoint_dir / "progress.json"
+
+    def atomic_write_json(path: Path, obj: dict) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    state = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "signature": signature,
+        "signature_payload": signature_payload,
+        "completed_symbols": [],
+        "coverage": [],
+    }
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if (
+                loaded.get("signature") == signature
+                and loaded.get("checkpoint_schema_version") == CHECKPOINT_SCHEMA_VERSION
+            ):
+                state.update(loaded)
+                print(
+                    f"RESUME_CHECKPOINT: {len(state.get('completed_symbols', []))}/{len(universe)} "
+                    f"symbols already checkpointed in {checkpoint_dir}",
+                    flush=True,
+                )
+            else:
+                print("CHECKPOINT_SIGNATURE_MISMATCH: starting a new isolated checkpoint run.", flush=True)
+        except Exception as exc:
+            print(f"CHECKPOINT_READ_WARNING: {exc}; starting from available symbol checkpoints.", flush=True)
+
+    completed = set(state.get("completed_symbols", []))
+    coverage_map = {
+        str(row[0]): [row[1], row[2]]
+        for row in state.get("coverage", [])
+        if isinstance(row, list) and len(row) >= 3
+    }
+
     # Allocate the global training budget across the full live NSE universe
     # and all six horizons so early symbols cannot consume the whole pool.
     per_symbol_horizon_cap = max(
@@ -224,13 +286,40 @@ def main():
             int(args.global_retained_row_cap // max(1, len(universe) * len(HORIZONS))),
         ),
     )
+
+    # First pass: create/load a Drive checkpoint for every symbol. Trainable
+    # symbol tables are stored individually as parquet, so a mid-run crash
+    # cannot invalidate the work already prepared.
     for i,sym in enumerate(universe,1):
+        checkpoint_path = symbols_dir / f"{sym}.parquet"
+        known_status = coverage_map.get(sym, [None, None])[1]
+        already = sym in completed and (known_status != "TRAINABLE" or checkpoint_path.exists())
+        if already:
+            continue
+
         raw=load_symbol(root,sym)
-        if len(raw)<args.min_rows_symbol:
-            coverage.append((sym,len(raw),"EXCLUDED_INSUFFICIENT_HISTORY")); continue
+        stored_rows=len(raw)
+        if stored_rows < args.min_rows_symbol:
+            status="EXCLUDED_INSUFFICIENT_HISTORY"
+            coverage_map[sym]=[stored_rows,status]
+            completed.add(sym)
+            state["completed_symbols"]=sorted(completed, key=lambda x: universe.index(x))
+            state["coverage"]=[[k,v[0],v[1]] for k,v in coverage_map.items()]
+            atomic_write_json(state_path,state)
+            del raw
+            continue
+
         table=build_label_table(raw,market,fno,sym)
         if table.empty:
-            coverage.append((sym,len(raw),"EXCLUDED_NO_LABELS")); continue
+            status="EXCLUDED_NO_LABELS"
+            coverage_map[sym]=[stored_rows,status]
+            completed.add(sym)
+            state["completed_symbols"]=sorted(completed, key=lambda x: universe.index(x))
+            state["coverage"]=[[k,v[0],v[1]] for k,v in coverage_map.items()]
+            atomic_write_json(state_path,state)
+            del raw,table
+            continue
+
         # Bound each symbol's contribution separately for every horizon.
         pieces=[]
         for h,z in table.groupby("horizon"):
@@ -239,19 +328,59 @@ def main():
                 z=z.iloc[np.unique(pos)]
             pieces.append(z)
         table=pd.concat(pieces,axis=0)
+
+        # Persist the prepared table BEFORE marking the symbol complete.
+        # This ordering guarantees a crash cannot leave a false-complete
+        # checkpoint without its data.
+        tmp_checkpoint = checkpoint_path.with_suffix(".parquet.tmp")
+        table.to_parquet(tmp_checkpoint,index=False)
+        tmp_checkpoint.replace(checkpoint_path)
+
+        coverage_map[sym]=[stored_rows,"TRAINABLE"]
+        completed.add(sym)
+        state["completed_symbols"]=sorted(completed, key=lambda x: universe.index(x))
+        state["coverage"]=[[k,v[0],v[1]] for k,v in coverage_map.items()]
+        state["last_completed_symbol"]=sym
+        state["last_completed_index"]=i
+        atomic_write_json(state_path,state)
+
+        del raw,table
+        if i%25==0:
+            import gc; gc.collect()
+            trainable_done=sum(1 for v in coverage_map.values() if v[1]=="TRAINABLE")
+            print(
+                f"checkpointed {i}/{len(universe)} symbols; "
+                f"trainable_checkpoints={trainable_done}",
+                flush=True,
+            )
+
+    # Reassemble the prepared table from Drive checkpoints in deterministic
+    # universe order. Apply the global retained-row cap here so a resumed run
+    # produces the same bounded training pool as a clean run.
+    frames=[]; coverage=[]; retained=0
+    for sym in universe:
+        stored_rows,status = coverage_map.get(sym, [0,"EXCLUDED_NOT_PROCESSED"])
+        if status != "TRAINABLE":
+            coverage.append((sym,int(stored_rows or 0),status))
+            continue
+        checkpoint_path = symbols_dir / f"{sym}.parquet"
+        if not checkpoint_path.exists():
+            raise RuntimeError(f"TRAINABLE checkpoint missing for {sym}: {checkpoint_path}")
+        table=pd.read_parquet(checkpoint_path)
+        if table.empty:
+            coverage.append((sym,int(stored_rows or 0),"EXCLUDED_EMPTY_CHECKPOINT"))
+            continue
         if retained + len(table) > args.global_retained_row_cap:
             allowed=max(0,args.global_retained_row_cap-retained)
             if allowed<=0:
-                coverage.append((sym,len(raw),"EXCLUDED_GLOBAL_ROW_CAP")); continue
+                coverage.append((sym,int(stored_rows or 0),"EXCLUDED_GLOBAL_ROW_CAP")); continue
             pos=np.linspace(0,len(table)-1,allowed,dtype=int)
             table=table.iloc[np.unique(pos)]
         frames.append(table)
         retained += len(table)
-        coverage.append((sym,len(raw),"TRAINABLE"))
-        del raw,table
-        if i%100==0:
-            import gc; gc.collect()
-            print(f"prepared {i}/{len(universe)} symbols; retained_rows={retained}",flush=True)
+        coverage.append((sym,int(stored_rows or 0),"TRAINABLE"))
+        del table
+
     if not frames: raise RuntimeError("No trainable 5-minute-step symbols found")
     data=pd.concat(frames,ignore_index=False).sort_values("decision_ts")
     del frames
@@ -365,6 +494,22 @@ def main():
     }
     (out/"ALL_NSE_INTRADAY_5M_MULTIHORIZON_2026_MODEL_MANIFEST.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
     pd.DataFrame(coverage,columns=["symbol","stored_rows","status"]).to_csv(out/"INTRADAY_5M_TRAINING_COVERAGE.csv",index=False)
+    atomic_write_json(
+        checkpoint_dir/"ASSEMBLY_STATE.json",
+        {
+            "status":"TRAINING_COMPLETED",
+            "symbols":int(len(universe)),
+            "trainable_symbols":int(len(trainable_symbols)),
+            "retained_rows":int(len(data)),
+            "signature":signature,
+            "production_ready":bool(verified),
+            "bundle":str(bundle_path),
+        },
+    )
+    state["status"]="TRAINING_COMPLETED"
+    state["completed_at"]=pd.Timestamp.now(tz=IST).isoformat()
+    atomic_write_json(state_path,state)
+    print(f"CHECKPOINTS_RETAINED: {checkpoint_dir}",flush=True)
     print(json.dumps(manifest,indent=2))
 
 
