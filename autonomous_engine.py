@@ -73,7 +73,8 @@ def _news_for_prediction(symbol: str, as_of: Any, provided: list[dict[str, Any]]
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
     hit = x[x["symbol"].isin([root, "MARKET"]) & x["published_at"].le(ts)].copy()
     return hit.to_dict("records")
-\ndef delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
+
+def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
     """Run the active ALL-NSE 59-feature Delivery candidate.
 
     The model artifact remains in Google Drive and is verified against the
