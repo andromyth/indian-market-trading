@@ -1,7 +1,11 @@
 """Single entry point for the dashboard's daily/intraday decision flow."""
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from all_nse_delivery_model import (
     predict_symbol as predict_all_nse_delivery,
@@ -12,7 +16,64 @@ from production_model import build_feature_rows as build_certified_intraday_feat
 from prediction_ledger import append_prediction
 
 
-def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
+
+
+
+@lru_cache(maxsize=1)
+def _load_persisted_live_news() -> pd.DataFrame:
+    """Load the latest persisted RSS headline snapshot from Drive."""
+    local = Path(__file__).resolve().parent / "data" / "live_news" / "news_latest.parquet"
+    remote = "processed/live_news/news_latest.parquet"
+    try:
+        if not local.exists() or local.stat().st_size == 0:
+            from persistent_store import GoogleDriveStore
+            from googleapiclient.http import MediaIoBaseDownload
+            store = GoogleDriveStore()
+            parts = remote.split("/")
+            parent = store.root_id
+            for part in parts[:-1]:
+                found = store._find_child(parent, part)
+                if not found:
+                    return pd.DataFrame()
+                parent = found["id"]
+            found = store._find_child(parent, parts[-1])
+            if not found:
+                return pd.DataFrame()
+            local.parent.mkdir(parents=True, exist_ok=True)
+            temp = local.with_suffix(".tmp")
+            with temp.open("wb") as fh:
+                dl = MediaIoBaseDownload(
+                    fh,
+                    store.service.files().get_media(fileId=found["id"]),
+                )
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+            temp.replace(local)
+        x = pd.read_parquet(local)
+        if x.empty:
+            return x
+        x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
+        x["published_at"] = pd.to_datetime(x["published_at"], errors="coerce", utc=True)
+        return x.dropna(subset=["symbol", "published_at"])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _news_for_prediction(symbol: str, as_of: Any, provided: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if provided:
+        return list(provided)
+    x = _load_persisted_live_news()
+    if x.empty:
+        return []
+    ts = pd.Timestamp(as_of)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("Asia/Kolkata")
+    ts = ts.tz_convert("UTC")
+    root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+    hit = x[x["symbol"].isin([root, "MARKET"]) & x["published_at"].le(ts)].copy()
+    return hit.to_dict("records")
+\ndef delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
     """Run the active ALL-NSE 59-feature Delivery candidate.
 
     The model artifact remains in Google Drive and is verified against the
@@ -52,9 +113,10 @@ def delivery_prediction(item: dict[str, Any], sync_drive: bool = True) -> dict[s
                     item.get(
                         "decision_timestamp"
                     ),
-                    news_items=item.get(
-                        "matched_news",
-                        [],
+                    news_items=_news_for_prediction(
+                        symbol,
+                        item.get("decision_timestamp"),
+                        item.get("matched_news"),
                     ),
                     announcements=item.get(
                         "announcements",
