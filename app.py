@@ -613,25 +613,6 @@ if interface_mode == "Live Test":
                 hide_index=True,
             )
 
-            for row in rows:
-                if row.get("status") != "PASS":
-                    continue
-                signal = str(row.get("signal") or "—").upper()
-                p_up = pd.to_numeric(row.get("p_up_30m"), errors="coerce")
-                p_down = pd.to_numeric(row.get("p_down_30m"), errors="coerce")
-                price = pd.to_numeric(row.get("current_price"), errors="coerce")
-                horizon = str(row.get("signal_horizon_end") or "—")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric(f"{row.get('symbol')} action", signal)
-                c2.metric("Current ₹", f"₹{price:,.2f}" if pd.notna(price) else "—")
-                c3.metric("P(UP) / P(DOWN)", f"{p_up:.1%} / {p_down:.1%}" if pd.notna(p_up) and pd.notna(p_down) else "—")
-                c4.metric("30m horizon end", horizon)
-                st.caption(
-                    f"{row.get('symbol')}: {_intraday_action_text(signal)} "
-                    f"Confidence={row.get('confidence','—')} · "
-                    f"missing model inputs={row.get('input_missing','—')}."
-                )
-
             st.caption(
                 "Delivery uses the latest persisted point-in-time 59-feature snapshot. "
                 "During a trading day it does not become an intraday signal; a new Delivery "
@@ -852,6 +833,25 @@ if interface_mode == "Live Test":
                 hide_index=True,
             )
 
+            for row in rows:
+                if row.get("status") != "PASS":
+                    continue
+                signal = str(row.get("signal") or "—").upper()
+                p_up = pd.to_numeric(row.get("p_up_30m"), errors="coerce")
+                p_down = pd.to_numeric(row.get("p_down_30m"), errors="coerce")
+                price = pd.to_numeric(row.get("current_price"), errors="coerce")
+                horizon = str(row.get("signal_horizon_end") or "—")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(f"{row.get('symbol')} action", signal)
+                c2.metric("Current ₹", f"₹{price:,.2f}" if pd.notna(price) else "—")
+                c3.metric("P(UP) / P(DOWN)", f"{p_up:.1%} / {p_down:.1%}" if pd.notna(p_up) and pd.notna(p_down) else "—")
+                c4.metric("30m horizon end", horizon)
+                st.caption(
+                    f"{row.get('symbol')}: {_intraday_action_text(signal)} "
+                    f"Confidence={row.get('confidence','—')} · "
+                    f"missing model inputs={row.get('input_missing','—')}."
+                )
+
             st.caption(
                 "Intraday uses the certified production model against the current NSE 1-minute stream. "
                 "Each refresh creates a new 30-minute directional decision from the latest available bar. "
@@ -861,20 +861,12 @@ if interface_mode == "Live Test":
 
             st.markdown("### How to read the Intraday call")
             st.info(
-                "At each refresh, the model evaluates the latest 1-minute information and estimates the probability "
-                "that the stock's return over the following 30 minutes will be positive. "
-                "Use **Current price** as the live market price at the signal timestamp. "
-                "**Signal price reference** is the exact price fed into the production feature row. "
-                "**Horizon end** is 30 minutes after that decision timestamp. "
-                "The model does not directly predict an OHLC path for each intervening minute."
-            )
-
-            st.markdown("### How to read the Intraday call")
-            st.info(
                 "At each refresh, the production model evaluates the newest available 1-minute information "
                 "and estimates the probability that the stock's return over the following 30 minutes will be positive. "
                 "BUY = P(UP) ≥ 55%; SELL = P(UP) ≤ 45%; otherwise HOLD. "
                 "Current price is the live market price at the signal timestamp. "
+                "Signal price reference is the exact price used by the production feature row. "
+                "Horizon end is 30 minutes after that decision timestamp. "
                 "The model does not directly predict a minute-by-minute OHLC path."
             )
 
