@@ -102,12 +102,26 @@ def _download_recent_delivery(store, lookback_days:int):
         hit=store._find_child(p,part,"application/vnd.google-apps.folder")
         if not hit: return {"files_found":0,"files_downloaded":0}
         p=hit["id"]
-    resp=store.service.files().list(q=f"'{p}' in parents and trashed = false",spaces="drive",
-        fields="files(id,name)",pageSize=1000,includeItemsFromAllDrives=True,supportsAllDrives=True).execute()
+    items=[]
+    page_token=None
+    while True:
+        kwargs={
+            "q": f"'{p}' in parents and trashed = false",
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name)",
+            "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if page_token: kwargs["pageToken"]=page_token
+        resp=store.service.files().list(**kwargs).execute()
+        items.extend(resp.get("files",[]))
+        page_token=resp.get("nextPageToken")
+        if not page_token: break
     rx=re.compile(r"delivery_(\d{8})\.parquet$",re.I)
     cutoff=datetime.now(timezone.utc).date()-timedelta(days=lookback_days)
     chosen=[]
-    for item in resp.get("files",[]):
+    for item in items:
         m=rx.match(str(item.get("name","")))
         if not m: continue
         d=datetime.strptime(m.group(1),"%Y%m%d").date()
