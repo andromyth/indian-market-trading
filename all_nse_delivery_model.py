@@ -197,7 +197,7 @@ def _signal_policy() -> dict[str, Any]:
             buy = float(candidate.get("buy_probability_threshold", BUY_P))
             sell = float(candidate.get("sell_probability_threshold", SELL_P))
             mer = float(candidate.get("min_expected_return", MIN_EXPECTED_RETURN))
-            if samples >= 80 and 0.50 < sell < 0.50 < buy <= 0.90 and -0.05 <= mer <= 0.05:
+            if samples >= 80 and 0.10 <= sell < 0.50 < buy <= 0.90 and -0.05 <= mer <= 0.05:
                 policy.update({
                     "status": candidate.get("status", "ADAPTIVE"),
                     "samples": samples,
@@ -240,7 +240,7 @@ def _dynamic_history_eligibility(symbol: str, as_of_date: date, minimum_history:
             root,
             as_of_date - timedelta(days=370),
             as_of_date,
-            series="EQ",
+            series="ALL",
             sync_drive=True,
         )
     except Exception:
@@ -286,10 +286,10 @@ def _load_manifest() -> dict[str, Any]:
     universe = manifest.get("universe", {})
     universe_symbol_count = int(manifest.get("universe_symbol_count", universe.get("universe_symbol_count", 0)))
     trainable_symbol_count = int(manifest.get("trainable_symbol_count", universe.get("trainable_symbol_count", 0)))
-    if universe_symbol_count != 2593:
-        raise RuntimeError("Unexpected NSE universe size in ALL-NSE replacement manifest.")
-    if trainable_symbol_count != 2372:
-        raise RuntimeError("Unexpected trainable-symbol count in ALL-NSE replacement manifest.")
+    if universe_symbol_count < 1:
+        raise RuntimeError("ALL-NSE replacement manifest has an invalid universe size.")
+    if trainable_symbol_count < 1 or trainable_symbol_count > universe_symbol_count:
+        raise RuntimeError("ALL-NSE replacement manifest has an invalid trainable-symbol count.")
 
     _manifest_cache = manifest
     return manifest
@@ -1704,6 +1704,10 @@ def predict_symbol(
         signal = "SELL"
     else:
         signal = "HOLD"
+
+    # Direct live fallback does not contain the persisted production readiness
+    # state for news, events, F&O, and fundamentals; fail closed to HOLD.
+    signal = "HOLD"
 
     non_missing = int(
         feature_frame.notna()
