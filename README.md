@@ -35,7 +35,17 @@ from official NSE EOD/delivery plus available F&O, news/events and fundamentals.
 Current NSE equities are eligible automatically once they have 60 clean sessions;
 the build-time roster no longer permanently freezes IPO eligibility.
 
-### 4. Continuous seven-prediction validation
+### 4. Automated Delivery data -> production cycle
+
+On NSE trading weekdays, GitHub Actions now fetches official EOD data, official
+Security-wise Delivery MTO data, F&O data and NSE news/events into persistent
+Google Drive. A downstream production cycle rebuilds the current ALL-NSE
+point-in-time Delivery feature snapshot, persists source-readiness/audit state,
+validates completed predictions, and can update an OOS-gated signal policy.
+The active Streamlit engine reads the latest persisted PIT snapshot; no daily
+Colab run is required for normal data refresh.
+
+### 5. Continuous seven-prediction validation
 
 Every production Delivery prediction is written to an idempotent prediction ledger.
 When the next trading-session actual becomes available, the system compares the
@@ -45,7 +55,7 @@ production cycle also performs OOS-gated signal-policy tuning when sufficient
 history exists. Model weights are not replaced merely because a short rolling
 window is weak.
 
-### 5. More evidence, not more certainty
+### 6. More evidence, not more certainty
 The live score now combines:
 
 * price trend, MACD, RSI, volume, breakout and volatility information;
@@ -56,12 +66,12 @@ The live score now combines:
 F&O PCR, Max Pain and OI reads remain contextual because the available live
 snapshot alone is not enough for an honest historical predictive test.
 
-### 6. Better news matching
+### 7. Better news matching
 Common Indian-company aliases are supported. For example, `BHARTIARTL.NS`
 will match `Bharti Airtel`, `Airtel`, and related naming variants rather than
 only looking for the ticker string.
 
-### 7. More honest validation
+### 8. More honest validation
 The dashboard reports:
 
 * net strategy return after configurable cost/slippage assumptions;
