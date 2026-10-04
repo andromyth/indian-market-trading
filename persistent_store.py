@@ -346,17 +346,32 @@ def gdrive_config() -> dict:
         }
 
     if not service_json:
-        return {
-            "configured": False,
-            "reason": (
-                "missing OAuth token JSON and "
-                "service-account JSON"
-            ),
-            "secrets_detected": secrets_seen,
-            "secret_keys": secret_names,
-            "root_folder_id_present": bool(root_id),
-            "root_folder_name": root_name,
-        }
+        # Google Colab exposes Application Default Credentials (ADC) after
+        # google.colab.auth.authenticate_user(). Use those credentials when
+        # explicit OAuth-token/service-account JSON is not configured.
+        try:
+            import google.auth
+            google.auth.default(scopes=DRIVE_SCOPES)
+            return {
+                "configured": True,
+                "auth_method": "adc",
+                "root_folder_id": root_id,
+                "root_folder_name": root_name,
+                "secrets_detected": secrets_seen,
+                "secret_keys": secret_names,
+            }
+        except Exception:
+            return {
+                "configured": False,
+                "reason": (
+                    "missing OAuth token JSON and "
+                    "service-account JSON"
+                ),
+                "secrets_detected": secrets_seen,
+                "secret_keys": secret_names,
+                "root_folder_id_present": bool(root_id),
+                "root_folder_name": root_name,
+            }
 
     try:
         info = json.loads(service_json)
@@ -400,7 +415,16 @@ def gdrive_config() -> dict:
 
 
 def _drive_credentials(cfg: dict):
-    """Build authenticated Drive credentials using OAuth first, then service account."""
+    """Build authenticated Drive credentials using OAuth, Colab ADC, or service account."""
+    if cfg.get("auth_method") == "adc":
+        import google.auth
+        from google.auth.transport.requests import Request
+
+        credentials, _ = google.auth.default(scopes=DRIVE_SCOPES)
+        if not credentials.valid:
+            credentials.refresh(Request())
+        return credentials
+
     if cfg.get("auth_method") == "oauth":
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
