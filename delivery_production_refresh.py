@@ -194,10 +194,25 @@ def main():
     eod_status=_download_recent_eod(store,args.lookback_days)
     delivery_status=_download_recent_delivery(store,args.delivery_lookback_days)
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
-    from delivery_training_universe import training_roster
+    from delivery_training_universe import training_roster,load_official_nse_universe
     from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags
     from nse_delivery_data_layer import load_delivery_history
     today=datetime.now(timezone.utc).date()
+
+    # Persist the current RSS headline snapshot so automated and interactive
+    # Delivery predictions use the same latest-news source rather than relying
+    # on a user's browser session to fetch it first.
+    live_news_path=BASE/"processed/live_news/news_latest.parquet"
+    try:
+        from selfdriving.sd_news_collect import build_alias_map,collect
+        universe_df=load_official_nse_universe(force_refresh=False)
+        alias_map=build_alias_map(universe_df)
+        live_news_result=collect(alias_map,live_news_path)
+        source_status["live_rss_news"]="UPDATED"
+    except Exception as exc:
+        live_news_result={"status":"ERROR","error":f"{type(exc).__name__}: {exc}"}
+        source_status["live_rss_news"]="ERROR"
+
     bulk=_load_eod(EOD_LOCAL_ROOT,today-timedelta(days=args.lookback_days),today)
     roster=training_roster(bulk,min_history=MIN_HISTORY,force_refresh=True)
     trainable=list(roster["trainable_symbols"])
@@ -248,7 +263,7 @@ def main():
         "trainable_symbol_count":int(roster["trainable_symbol_count"]),
         "excluded_symbol_count":int(roster["excluded_symbol_count"]),
         "minimum_history_sessions":MIN_HISTORY,
-        "source_status":source_status,"eod_status":eod_status,"delivery_status":delivery_status,
+        "source_status":source_status,"eod_status":eod_status,"delivery_status":delivery_status,"live_rss_news":live_news_result,
         "source_audit":source_audit,"group_readiness":group_ready,
         "production_data_quality_gate_pct":round(float(panel["production_data_quality_gate"].mean()*100),3),
         "ipo_policy":"Any current official NSE equity becomes eligible automatically after 60 clean sessions.",
@@ -258,6 +273,8 @@ def main():
     report_path.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
     store.upload_or_update(snap,f"features/daily/{snap.name}",mime_type="application/octet-stream")
     store.upload_or_update(report_path,f"features/daily/{report_path.name}",mime_type="application/json")
+    if live_news_path.exists():
+        store.upload_or_update(live_news_path,"processed/live_news/news_latest.parquet",mime_type="application/octet-stream")
     print(json.dumps(report,indent=2,default=str))
 if __name__=="__main__":
     main()
