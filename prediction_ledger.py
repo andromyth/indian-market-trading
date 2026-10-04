@@ -128,6 +128,55 @@ def append_prediction(record: dict[str, Any], sync_drive: bool = True) -> dict[s
     return out
 
 
+def append_predictions(records: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
+    """Append many predictions efficiently and sync the ledger once."""
+    _ensure_local()
+    existing_records = load_records()
+    existing = {str(r.get("prediction_id")) for r in existing_records if r.get("prediction_id")}
+    to_write: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for record in records:
+        x = dict(record)
+        x.setdefault("created_at", _utc())
+        x["prediction_id"] = x.get("prediction_id") or _stable_id(x)
+        pid = str(x["prediction_id"])
+        if pid in existing or pid in seen:
+            continue
+        seen.add(pid)
+        to_write.append(x)
+
+    if to_write:
+        with LOCAL_LEDGER.open("a", encoding="utf-8") as f:
+            for x in to_write:
+                f.write(json.dumps(x, default=str, separators=(",", ":")) + "\n")
+
+    synced = False
+    sync_error = None
+    if sync_drive and to_write:
+        try:
+            from persistent_store import GoogleDriveStore
+            g = GoogleDriveStore()
+            remote = g.upload_or_update(
+                LOCAL_LEDGER,
+                REMOTE_LEDGER,
+                mime_type="application/x-ndjson",
+            )
+            synced = remote.get("status") == "OK"
+        except Exception as exc:
+            sync_error = f"{type(exc).__name__}: {exc}"
+
+    out = {
+        "status": "APPENDED" if to_write else "NO_NEW_PREDICTIONS",
+        "new_rows": len(to_write),
+        "existing_rows_seen": len(existing),
+        "synced": synced,
+    }
+    if sync_error:
+        out["sync_error"] = sync_error
+    return out
+
+
 def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
     """Persist the latest validation result per prediction ID as an append-safe state file."""
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
