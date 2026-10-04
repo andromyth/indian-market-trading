@@ -359,6 +359,7 @@ if interface_mode == "Live Test":
             )
 
         rows = []
+        live_frames = {}
         for sym in symbols:
             if not sym.endswith(".NS"):
                 rows.append({
@@ -367,6 +368,9 @@ if interface_mode == "Live Test":
                     "signal": "—",
                     "probability_up": np.nan,
                     "expected_move": np.nan,
+                    "reference_close": np.nan,
+                    "predicted_close": np.nan,
+                    "predicted_change": np.nan,
                     "data_gate": False,
                     "reference_session": "—",
                     "ledger": "—",
@@ -517,6 +521,10 @@ if interface_mode == "Live Test":
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
+                    "news": "NO",
+                    "events": "NO",
+                    "fno": "NO",
+                    "market": "NO",
                     "ledger": "—",
                 })
                 continue
@@ -530,6 +538,7 @@ if interface_mode == "Live Test":
                 if price_1m is None or price_1m.empty:
                     raise RuntimeError("NSE live 1-minute stream returned no rows")
 
+                live_frames[root] = price_1m.copy()
                 decision_ts = price_1m.index[-1]
                 benchmark_symbol = benchmark_for_symbol(sym)
                 try:
@@ -659,7 +668,9 @@ if interface_mode == "Live Test":
                     continue
                 try:
                     root = sym.replace(".NS", "").upper()
-                    live_px = nse_fetch_intraday_1m_current(root, sync_drive=True)
+                    live_px = live_frames.get(root)
+                    if live_px is None or live_px.empty:
+                        continue
                     env = _intraday_price_envelope(live_px, live_px.index[-1], 30)
                     if env.empty:
                         continue
