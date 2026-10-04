@@ -423,6 +423,9 @@ if interface_mode == "Live Test":
                     "ledger": result.get("prediction_ledger_status", "—"),
                 })
             except Exception as exc:
+                # Keep the compact result schema stable even when one of the
+                # live-data/model inputs fails. The UI table must never raise a
+                # KeyError merely because an optional input was unavailable.
                 rows.append({
                     "symbol": sym,
                     "status": "ERROR",
@@ -431,6 +434,10 @@ if interface_mode == "Live Test":
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
+                    "news": "NO",
+                    "events": "NO",
+                    "fno": "NO",
+                    "market": "NO",
                     "ledger": f"{type(exc).__name__}: {exc}",
                 })
 
