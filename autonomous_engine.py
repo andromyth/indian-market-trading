@@ -8,7 +8,7 @@ from all_nse_delivery_model import (
     _build_latest_features as build_all_nse_features,
 )
 from directional_ensemble import enrich_delivery_prediction
-from all_nse_intraday_model import predict_symbol as predict_all_nse_intraday
+from production_model import build_feature_rows as build_certified_intraday_features, predict as predict_certified_intraday
 from prediction_ledger import append_prediction
 
 
@@ -110,13 +110,24 @@ def intraday_predictions(items: list[dict[str, Any]], sync_drive: bool = True) -
             decision_ts = item.get("decision_timestamp")
             if decision_ts is None and price_df is not None and not price_df.empty:
                 decision_ts = price_df.index[-1]
-            r = predict_all_nse_intraday(
-                item["symbol"],
-                price_df,
-                item.get("market_df"),
-                item.get("fo") or {},
-                decision_ts,
-            )
+            feature_frame = build_certified_intraday_features([{
+                "symbol": item["symbol"],
+                "price_df": price_df,
+                "market_df": item.get("market_df"),
+                "matched_news": item.get("matched_news", []),
+                "announcements": item.get("announcements", []),
+                "event_risk": item.get("event_risk", 0.0),
+                "fo": item.get("fo") or {},
+                "decision_ts": decision_ts,
+            }])
+            predictions = predict_certified_intraday(feature_frame)
+            if not predictions:
+                raise RuntimeError("Certified Intraday model returned no prediction row")
+            r = predictions[0]
+            r["prediction_status"] = "PASS"
+            r["mode"] = "Intraday"
+            r["prediction_horizon"] = "30m"
+            r["model_version"] = "2026-certified-30m-137-feature"
         except Exception as exc:
             r = {
                 "prediction_status": "ERROR",
