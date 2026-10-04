@@ -30,6 +30,8 @@ jobs:
         run: >
           python -m py_compile
           multifactor_data_layer_v2.py
+          nse_data_layer.py
+          validate_canonical_cash_research_view.py
           colab_build_all_nse_delivery_multifactor_candidate.py
           colab_run_multifactor_upgrade.py
           build_all_nse_pit_fundamentals.py
@@ -51,6 +53,7 @@ jobs:
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py
           tests/test_identity_preserved_cash_rebuild.py
+          tests/test_canonical_cash_data_layer.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py

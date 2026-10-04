@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
+import duckdb
 
 NSE_BASE = "https://www.nseindia.com"
 IST = ZoneInfo("Asia/Kolkata")
@@ -914,6 +915,181 @@ NSE_CM_UDIFF_URL_TEMPLATE = (
 )
 BULK_EOD_ROOT = NORMALIZED_ROOT / "bulk_eod"
 BULK_EOD_MANIFEST = BULK_EOD_ROOT / "manifest.json"
+
+CANONICAL_CASH_MASTER = Path(
+    "/content/drive/MyDrive/Indian_Market_Research/"
+    "production_data/nse_official/"
+    "ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
+)
+
+# Research projection policy for the continuous cash-equity model. The raw
+# identity-preserved master retains every historical series, including T0 and
+# non-equity instruments. This projection deliberately excludes T0 and chooses
+# one deterministic research row per symbol/date.
+CANONICAL_RESEARCH_SERIES = ("EQ", "BE", "BZ", "SM", "ST", "SZ")
+CANONICAL_SERIES_PRIORITY = {
+    "EQ": 0,
+    "BE": 1,
+    "BZ": 2,
+    "SM": 3,
+    "ST": 4,
+    "SZ": 5,
+}
+
+
+
+def load_canonical_cash_research_history(
+    master_path: str | Path = CANONICAL_CASH_MASTER,
+    *,
+    symbols: Iterable[str] | None = None,
+    start: date | datetime | None = None,
+    end: date | datetime | None = None,
+) -> pd.DataFrame:
+    """Read the identity-preserved NSE cash master as the model research view.
+
+    The canonical master is never modified. This creates a deterministic
+    symbol/date projection for downstream feature engineering:
+      * only continuous cash-equity series are eligible;
+      * T0 and other historical instruments remain preserved in the master but
+        are excluded from ordinary Delivery OHLC features;
+      * when multiple eligible listings exist for a symbol/date, series
+        precedence EQ > BE > BZ > SM > ST > SZ is applied, then listing_id is
+        used as a deterministic tie-breaker;
+      * no third-party price source is substituted.
+    """
+    path = Path(master_path)
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Canonical NSE cash master not found: {path}")
+
+    conditions = [
+        "UPPER(TRIM(CAST(series AS VARCHAR))) IN ('EQ','BE','BZ','SM','ST','SZ')",
+        "TRY_CAST(date AS DATE) IS NOT NULL",
+    ]
+    params: list[object] = []
+
+    if start is not None:
+        conditions.append("TRY_CAST(date AS DATE) >= ?")
+        params.append(pd.Timestamp(start).date())
+    if end is not None:
+        conditions.append("TRY_CAST(date AS DATE) <= ?")
+        params.append(pd.Timestamp(end).date())
+
+    if symbols is not None:
+        normalized = sorted({
+            root_symbol(str(s)) for s in symbols
+            if str(s).strip()
+        })
+        if not normalized:
+            return pd.DataFrame()
+        placeholders = ",".join("?" for _ in normalized)
+        conditions.append(
+            f"UPPER(TRIM(CAST(symbol AS VARCHAR))) IN ({placeholders})"
+        )
+        params.extend(normalized)
+
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=8")
+
+    master_sql = str(path).replace("'", "''")
+    where_sql = " AND ".join(conditions)
+
+    query = f"""
+        WITH eligible AS (
+            SELECT
+                symbol,
+                CAST(TRY_CAST(date AS DATE) AS DATE) AS date,
+                series,
+                isin,
+                economic_security_id,
+                listing_id,
+                row_identity_key,
+                security_class,
+                instrument_type,
+                source_format,
+                instrument_id,
+                instrument_name,
+                open,
+                high,
+                low,
+                close,
+                last,
+                prev_close,
+                last_price_for_research,
+                research_price,
+                volume,
+                traded_value,
+                num_trades
+            FROM read_parquet('{master_sql}')
+            WHERE {where_sql}
+              AND TRY_CAST(open AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(high AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(low AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(close AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(close AS DOUBLE) > 0
+        ),
+        ranked AS (
+            SELECT
+                *,
+                CASE UPPER(TRIM(CAST(series AS VARCHAR)))
+                    WHEN 'EQ' THEN 0
+                    WHEN 'BE' THEN 1
+                    WHEN 'BZ' THEN 2
+                    WHEN 'SM' THEN 3
+                    WHEN 'ST' THEN 4
+                    WHEN 'SZ' THEN 5
+                    ELSE 99
+                END AS series_priority
+            FROM eligible
+        )
+        SELECT
+            symbol,
+            date,
+            UPPER(TRIM(CAST(series AS VARCHAR))) AS series,
+            isin,
+            economic_security_id,
+            listing_id,
+            row_identity_key,
+            security_class,
+            instrument_type,
+            source_format,
+            instrument_id,
+            instrument_name,
+            open,
+            high,
+            low,
+            close,
+            last,
+            prev_close,
+            last_price_for_research,
+            research_price,
+            volume,
+            traded_value,
+            num_trades
+        FROM ranked
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY UPPER(TRIM(CAST(symbol AS VARCHAR))), date
+            ORDER BY series_priority ASC, CAST(listing_id AS VARCHAR) ASC
+        ) = 1
+        ORDER BY UPPER(TRIM(CAST(symbol AS VARCHAR))), date
+    """
+
+    frame = con.execute(query, params).df()
+    if frame.empty:
+        return frame
+
+    frame["symbol"] = (
+        frame["symbol"].astype(str).str.strip().str.upper().map(root_symbol)
+    )
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    for col in (
+        "open","high","low","close","last","prev_close",
+        "last_price_for_research","research_price",
+        "volume","traded_value","num_trades",
+    ):
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    return frame.reset_index(drop=True)
 
 
 def _parse_nse_csv_bytes(payload: bytes) -> pd.DataFrame:

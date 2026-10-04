@@ -14,10 +14,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from delivery_training_universe import benchmark_for_symbol, training_roster
-from nse_data_layer import fetch_index_history
+from nse_data_layer import fetch_index_history, load_canonical_cash_research_history
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
 DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
+DEFAULT_CASH_MASTER="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
 DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_replacement_2026"
 BASE=Path("/content/drive/MyDrive/Indian_Market_Research")
 
@@ -905,7 +906,7 @@ def fit_models(frame,horizon):
     p=clf.predict_proba(Xte)[:,1]; pr=reg.predict(Xte); y=te[f"target_up_{horizon}"].to_numpy()
     return clf,reg,{"train_rows":int(len(tr)),"holdout_rows":int(len(te)),"holdout_accuracy":float(np.mean((p>=.5)==y)),"mean_abs_return_error":float(np.mean(np.abs(pr-te[f"target_return_{horizon}"].to_numpy()))),"holdout_mean_readiness_pct":float(te["data_readiness_score"].mean()*100)}
 
-def _candidate_input_signature(bulk_root,bulk,trainable,fund_report):
+def _candidate_input_signature(cash_master,bulk,trainable,fund_report):
     optional=[
         BASE/"processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
         BASE/"processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
@@ -916,7 +917,9 @@ def _candidate_input_signature(bulk_root,bulk,trainable,fund_report):
         "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
         "feature_contract_hash":hashlib.sha256(json.dumps(FEATURES_59,separators=(",",":")).encode()).hexdigest(),
         "feature_count":len(FEATURES_59),
-        "bulk_root":str(bulk_root),
+        "cash_master":str(cash_master),
+        "cash_master_size":int(cash_master.stat().st_size) if cash_master.exists() else 0,
+        "cash_master_mtime_ns":int(cash_master.stat().st_mtime_ns) if cash_master.exists() else 0,
         "bulk_rows":int(len(bulk)),
         "bulk_symbols":int(bulk["symbol"].nunique()),
         "bulk_min_date":str(pd.Timestamp(bulk["date"].min()).date()),
@@ -948,7 +951,17 @@ def _candidate_artifacts_complete(out):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("--bulk-root",default=DEFAULT_BULK)
+    ap.add_argument(
+        "--cash-master",
+        default=DEFAULT_CASH_MASTER,
+        help="Canonical identity-preserved NSE cash master. This is the authoritative training input.",
+    )
+    ap.add_argument("--bulk-root",default=DEFAULT_BULK, help="Legacy official bulk-EOD fallback; unused unless --allow-bulk-fallback is set.")
+    ap.add_argument(
+        "--allow-bulk-fallback",
+        action="store_true",
+        help="Explicitly allow the older official bulk-EOD view when the canonical cash master is unavailable.",
+    )
     ap.add_argument("--out",default=DEFAULT_OUT)
     ap.add_argument("--min-history",type=int,default=60)
     ap.add_argument("--refresh-fundamentals",action="store_true")
@@ -959,8 +972,23 @@ def main():
 
     out=Path(args.out)
     out.mkdir(parents=True,exist_ok=True)
-    bulk_root=Path(args.bulk_root)
-    bulk=load_bulk(bulk_root)
+    cash_master=Path(args.cash_master)
+    if cash_master.exists() and cash_master.stat().st_size>0:
+        print(f"Using canonical identity-preserved NSE cash master: {cash_master}",flush=True)
+        bulk=load_canonical_cash_research_history(cash_master)
+        bulk_source="CANONICAL_IDENTITY_PRESERVED_RESEARCH_VIEW"
+    elif args.allow_bulk_fallback:
+        bulk_root=Path(args.bulk_root)
+        print(f"WARNING: canonical cash master unavailable; using explicit official bulk-EOD fallback: {bulk_root}",flush=True)
+        bulk=load_bulk(bulk_root)
+        bulk_source="OFFICIAL_BULK_EOD_FALLBACK"
+    else:
+        raise FileNotFoundError(
+            f"Canonical NSE cash master missing or empty: {cash_master}. "
+            "Use --allow-bulk-fallback only for a deliberate non-canonical run."
+        )
+    if bulk.empty:
+        raise RuntimeError("Canonical NSE cash research view is empty")
     roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
     trainable=list(roster["trainable_symbols"])
 
@@ -980,7 +1008,8 @@ def main():
         "minimum_history_sessions":int(roster["minimum_history_sessions"]),
     }
 
-    input_sig=_candidate_input_signature(bulk_root,bulk,trainable,fund_report)
+    input_sig=_candidate_input_signature(cash_master,bulk,trainable,fund_report)
+    input_sig["cash_source"]=bulk_source
     candidate_meta=out/CANDIDATE_META_NAME
     if not args.force_rebuild_candidate and not args.refresh_fundamentals and candidate_meta.exists() and _candidate_artifacts_complete(out):
         try:
@@ -1035,6 +1064,10 @@ def main():
         "trainable_symbol_count":int(roster["trainable_symbol_count"]),
         "excluded_symbol_count":int(roster["excluded_symbol_count"]),
         "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+        "cash_data_source":bulk_source,
+        "canonical_cash_master":str(cash_master),
+        "research_series_policy":["EQ","BE","BZ","SM","ST","SZ"],
+        "t0_excluded_from_delivery_research":True,
         "trainable_symbols":trainable,
         "feature_count":len(FEATURES_59),
         "features":FEATURES_59,
