@@ -10,7 +10,7 @@ Design:
   point-in-time OHLCV + delivery inputs for the selected symbol.
 - Official NSE NIFTY 50 / NIFTY BANK history supplies market context.
 - Optional information remains explicit and point-in-time; current/future values are not silently substituted.
-- Only the 2,372 trainable symbols in the locked candidate manifest are scored.
+- Any current NSE equity with the required clean history can be scored; the build-time trainable list remains provenance.
 - No order-placement code exists here.
 """
 
@@ -32,6 +32,7 @@ import pandas as pd
 from nse_data_layer import (
     fetch_equity_history,
     fetch_index_history,
+    fetch_nse_equity_universe,
 )
 from delivery_training_universe import benchmark_for_symbol
 
@@ -84,10 +85,15 @@ BANK_SYMBOLS = {
 BUY_P = 0.60
 SELL_P = 0.40
 MIN_EXPECTED_RETURN = 0.0015
+POLICY_REMOTE = f"{DRIVE_MODEL_ROOT}/ACTIVE_SIGNAL_POLICY.json"
+LOCAL_POLICY = CACHE_ROOT / "ACTIVE_SIGNAL_POLICY.json"
 
 _manifest_cache: dict[str, Any] | None = None
 _classifier = None
 _regressor = None
+_signal_policy_cache: dict[str, Any] | None = None
+_current_nse_symbol_cache: set[str] | None = None
+_current_nse_symbol_cache_at: float = 0.0
 
 
 def _sha256(path: Path) -> str:
@@ -169,6 +175,87 @@ def _ensure_artifacts() -> None:
     for remote, local in needed:
         if not local.exists() or local.stat().st_size == 0:
             _drive_download(remote, local)
+
+
+def _signal_policy() -> dict[str, Any]:
+    global _signal_policy_cache
+    if _signal_policy_cache is not None:
+        return _signal_policy_cache
+    policy = {
+        "status": "DEFAULT",
+        "samples": 0,
+        "buy_probability_threshold": BUY_P,
+        "sell_probability_threshold": SELL_P,
+        "min_expected_return": MIN_EXPECTED_RETURN,
+    }
+    try:
+        if not LOCAL_POLICY.exists() or LOCAL_POLICY.stat().st_size == 0:
+            _drive_download(POLICY_REMOTE, LOCAL_POLICY)
+        if LOCAL_POLICY.exists() and LOCAL_POLICY.stat().st_size > 0:
+            candidate = json.loads(LOCAL_POLICY.read_text(encoding="utf-8"))
+            samples = int(candidate.get("samples", 0))
+            buy = float(candidate.get("buy_probability_threshold", BUY_P))
+            sell = float(candidate.get("sell_probability_threshold", SELL_P))
+            mer = float(candidate.get("min_expected_return", MIN_EXPECTED_RETURN))
+            if samples >= 80 and 0.50 < sell < 0.50 < buy <= 0.90 and -0.05 <= mer <= 0.05:
+                policy.update({
+                    "status": candidate.get("status", "ADAPTIVE"),
+                    "samples": samples,
+                    "buy_probability_threshold": buy,
+                    "sell_probability_threshold": sell,
+                    "min_expected_return": mer,
+                    "updated_at": candidate.get("updated_at"),
+                    "method": candidate.get("method"),
+                })
+    except Exception:
+        pass
+    _signal_policy_cache = policy
+    return policy
+
+
+def _current_nse_symbol_set() -> set[str]:
+    global _current_nse_symbol_cache, _current_nse_symbol_cache_at
+    now = datetime.now().timestamp()
+    if _current_nse_symbol_cache is not None and (now - _current_nse_symbol_cache_at) < 900:
+        return _current_nse_symbol_cache
+    try:
+        frame = fetch_nse_equity_universe(force_refresh=False)
+        if frame is None or frame.empty:
+            return set()
+        col = next((c for c in frame.columns if str(c).strip().upper() in {"SYMBOL","CH_SYMBOL","SYMBOL_NAME"}), None)
+        if col is None:
+            return set()
+        values = {_normalize_symbol(v) for v in frame[col].dropna().astype(str) if str(v).strip()}
+        _current_nse_symbol_cache = {x for x in values if x}
+        _current_nse_symbol_cache_at = now
+        return _current_nse_symbol_cache
+    except Exception:
+        return set()
+
+
+def _dynamic_history_eligibility(symbol: str, as_of_date: date, minimum_history: int) -> bool:
+    root = _normalize_symbol(symbol)
+    try:
+        history = fetch_equity_history(
+            root,
+            as_of_date - timedelta(days=370),
+            as_of_date,
+            series="EQ",
+            sync_drive=True,
+        )
+    except Exception:
+        return False
+    if history is None or history.empty:
+        return False
+    x = history.copy()
+    required = ("date","open","high","low","close")
+    if any(c not in x.columns for c in required):
+        return False
+    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+    for c in ("open","high","low","close"):
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=list(required)).sort_values("date").drop_duplicates("date", keep="last")
+    return int(x["date"].nunique()) >= int(minimum_history)
 
 
 def _load_manifest() -> dict[str, Any]:
@@ -342,16 +429,27 @@ def model_status() -> dict[str, Any]:
 def supported_symbol(symbol: str) -> bool:
     root = _normalize_symbol(symbol)
     manifest = _load_manifest()
+    trainable = {_normalize_symbol(x) for x in manifest.get("trainable_symbols", [])}
+    if root in trainable:
+        return True
 
-    trainable = {
-        _normalize_symbol(x)
-        for x in manifest.get(
-            "trainable_symbols",
-            [],
-        )
-    }
+    today = datetime.now().astimezone().date()
+    minimum_history = int(manifest.get("minimum_history_sessions", 60))
 
-    return root in trainable
+    # The daily PIT builder is authoritative for newly eligible IPOs. This
+    # avoids waiting for the next model rebuild after session 60 is reached.
+    try:
+        pit, _ = _latest_drive_pit_features(today)
+        if pit is not None and not pit.empty and "symbol" in pit.columns:
+            hit = pit[pit["symbol"].astype(str).str.upper().eq(root)]
+            if not hit.empty:
+                return True
+    except Exception:
+        pass
+
+    if root not in _current_nse_symbol_set():
+        return False
+    return _dynamic_history_eligibility(root, today, minimum_history)
 
 
 def universe_status() -> dict[str, Any]:
@@ -1359,17 +1457,20 @@ def predict_symbol(
             )[0]
         )
 
-        if (
-            p_up >= BUY_P
-            and expected_return > MIN_EXPECTED_RETURN
-        ):
+        policy = _signal_policy()
+        buy_p = float(policy["buy_probability_threshold"])
+        sell_p = float(policy["sell_probability_threshold"])
+        min_expected_return = float(policy["min_expected_return"])
+
+        if p_up >= buy_p and expected_return > min_expected_return:
             signal = "BUY"
-        elif (
-            p_up <= SELL_P
-            and expected_return < -MIN_EXPECTED_RETURN
-        ):
+        elif p_up <= sell_p and expected_return < -min_expected_return:
             signal = "SELL"
         else:
+            signal = "HOLD"
+
+        data_gate = bool(pit_row.iloc[0].get("production_data_quality_gate", True))
+        if not data_gate and signal in {"BUY", "SELL"}:
             signal = "HOLD"
 
         non_missing = int(
@@ -1450,10 +1551,13 @@ def predict_symbol(
             "feature_source": "PERSISTED_PIT_SNAPSHOT",
             "pit_snapshot_date": pit_date,
             "optional_information_status": {
-                "news": "EXPLICITLY_MISSING_IN_SNAPSHOT",
-                "fno": "EXPLICITLY_MISSING_IN_SNAPSHOT",
-                "fundamentals": "EXPLICITLY_MISSING_IN_SNAPSHOT",
+                "news": "KNOWN" if pd.notna(feature_frame.iloc[0].get("news_available")) else "UNKNOWN",
+                "fno": "KNOWN" if pd.notna(feature_frame.iloc[0].get("fno_available")) else "UNKNOWN",
+                "fundamentals": "KNOWN" if pd.notna(feature_frame.iloc[0].get("fundamental_age_days")) else "UNKNOWN",
             },
+            "production_data_quality_gate": data_gate,
+            "production_data_quality_score": _safe_float(pit_row.iloc[0].get("production_data_quality_score", np.nan)),
+            "signal_policy": policy,
             "auxiliary_model_ensemble": auxiliary_models,
             "auxiliary_multi_horizon_evidence": auxiliary_horizons,
             "auxiliary_model_consensus_p_up": (
@@ -1588,18 +1692,15 @@ def predict_symbol(
         )[0]
     )
 
-    if (
-        p_up >= BUY_P
-        and expected_return > MIN_EXPECTED_RETURN
-    ):
+    policy = _signal_policy()
+    buy_p = float(policy["buy_probability_threshold"])
+    sell_p = float(policy["sell_probability_threshold"])
+    min_expected_return = float(policy["min_expected_return"])
+
+    if p_up >= buy_p and expected_return > min_expected_return:
         signal = "BUY"
-
-    elif (
-        p_up <= SELL_P
-        and expected_return < -MIN_EXPECTED_RETURN
-    ):
+    elif p_up <= sell_p and expected_return < -min_expected_return:
         signal = "SELL"
-
     else:
         signal = "HOLD"
 
@@ -1752,10 +1853,13 @@ def predict_symbol(
             else "UNKNOWN"
         ),
         "optional_information_status": {
-            "news": "UNAVAILABLE_TO_TRAINED_CONTRACT",
-            "fno": "UNAVAILABLE_TO_TRAINED_CONTRACT",
-            "fundamentals": "UNAVAILABLE_TO_TRAINED_CONTRACT",
+            "news": "UNKNOWN_IN_FALLBACK",
+            "fno": "UNKNOWN_IN_FALLBACK",
+            "fundamentals": "UNKNOWN_IN_FALLBACK",
         },
+        "production_data_quality_gate": False,
+        "production_data_quality_score": float(core_readiness),
+        "signal_policy": policy,
         "universe_symbol_count": int(
             manifest.get(
                 "universe_symbol_count",
