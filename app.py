@@ -85,6 +85,27 @@ def certified_intraday_prediction(
     result["mode"] = "Intraday"
     result["prediction_horizon"] = "30m"
     result["model_version"] = "2026-certified-30m-137-feature"
+    try:
+        result["signal_price_reference"] = float(
+            pd.to_numeric(
+                price_df["Close"] if "Close" in price_df.columns else price_df.iloc[:, 0],
+                errors="coerce",
+            ).dropna().iloc[-1]
+        )
+    except Exception:
+        result["signal_price_reference"] = np.nan
+    result["probability_down_30m"] = (
+        float(1.0 - float(result["probability_up_30m"]))
+        if pd.notna(result.get("probability_up_30m"))
+        else np.nan
+    )
+    if decision_ts is not None:
+        ts = pd.Timestamp(decision_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        else:
+            ts = ts.tz_convert("Asia/Kolkata")
+        result["signal_horizon_end"] = str(ts + pd.Timedelta(minutes=30))
     persisted = append_prediction(result, sync_drive=True)
     result["prediction_id"] = persisted.get("prediction_id")
     result["prediction_ledger_status"] = persisted.get("status")
@@ -398,6 +419,48 @@ def _intraday_price_envelope(price_df: pd.DataFrame, decision_ts, minutes: int =
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def _cached_live_news() -> list[dict]:
+    try:
+        return tag_news_items(get_news())
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
+    try:
+        frame = get_historical(benchmark_symbol, period="5d", interval="1m")
+        return frame if frame is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_live_announcements(symbol: str) -> list[dict]:
+    try:
+        return get_corporate_announcements(symbol) or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_live_option_chain(symbol: str):
+    try:
+        raw = get_option_chain(symbol, is_index=False)
+        return fo_summarize(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _intraday_action_text(signal: str) -> str:
+    return {
+        "BUY": "Bullish 30-minute direction: P(UP) is at or above the production BUY threshold.",
+        "SELL": "Bearish 30-minute direction: P(UP) is at or below the production SELL threshold.",
+        "HOLD": "No qualifying 30-minute directional edge at the production probability thresholds.",
+    }.get(str(signal).upper(), "No production decision is available.")
+
+
 if interface_mode == "Live Test":
     st.sidebar.subheader("Live mode")
     live_mode = st.sidebar.radio(
@@ -550,6 +613,25 @@ if interface_mode == "Live Test":
                 hide_index=True,
             )
 
+            for row in rows:
+                if row.get("status") != "PASS":
+                    continue
+                signal = str(row.get("signal") or "—").upper()
+                p_up = pd.to_numeric(row.get("p_up_30m"), errors="coerce")
+                p_down = pd.to_numeric(row.get("p_down_30m"), errors="coerce")
+                price = pd.to_numeric(row.get("current_price"), errors="coerce")
+                horizon = str(row.get("signal_horizon_end") or "—")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(f"{row.get('symbol')} action", signal)
+                c2.metric("Current ₹", f"₹{price:,.2f}" if pd.notna(price) else "—")
+                c3.metric("P(UP) / P(DOWN)", f"{p_up:.1%} / {p_down:.1%}" if pd.notna(p_up) and pd.notna(p_down) else "—")
+                c4.metric("30m horizon end", horizon)
+                st.caption(
+                    f"{row.get('symbol')}: {_intraday_action_text(signal)} "
+                    f"Confidence={row.get('confidence','—')} · "
+                    f"missing model inputs={row.get('input_missing','—')}."
+                )
+
             st.caption(
                 "Delivery uses the latest persisted point-in-time 59-feature snapshot. "
                 "During a trading day it does not become an intraday signal; a new Delivery "
@@ -633,6 +715,7 @@ if interface_mode == "Live Test":
                     "signal_horizon_end": "—",
                     "signal_price_reference": np.nan,
                     "confidence": "—",
+                    "input_missing": np.nan,
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -656,29 +739,15 @@ if interface_mode == "Live Test":
                 live_frames[root] = price_1m.copy()
                 decision_ts = price_1m.index[-1]
                 benchmark_symbol = benchmark_for_symbol(sym)
-                try:
-                    market_df = get_historical(
-                        benchmark_symbol,
-                        period="5d",
-                        interval="1m",
-                    )
-                except Exception:
-                    market_df = pd.DataFrame()
+                market_df = _cached_live_market_context(benchmark_symbol)
 
-                try:
-                    live_news_all = tag_news_items(get_news())
-                except Exception:
-                    live_news_all = []
-
+                live_news_all = _cached_live_news()
                 matched_news = news_for_symbol(
                     stock_news_keywords(sym),
                     live_news_all,
                 )
 
-                try:
-                    announcements = get_corporate_announcements(root) or []
-                except Exception:
-                    announcements = []
+                announcements = _cached_live_announcements(root)
 
                 try:
                     event_news = matched_news + announcement_to_news(announcements)
@@ -689,11 +758,7 @@ if interface_mode == "Live Test":
                 except Exception:
                     event_risk = 0.0
 
-                try:
-                    raw_chain = get_option_chain(root, is_index=False)
-                    fo = fo_summarize(raw_chain) if raw_chain else {}
-                except Exception:
-                    fo = {}
+                fo = _cached_live_option_chain(root)
 
                 result = certified_intraday_prediction(
                     sym,
@@ -715,6 +780,7 @@ if interface_mode == "Live Test":
                     "signal_horizon_end": result.get("signal_horizon_end"),
                     "signal_price_reference": result.get("signal_price_reference"),
                     "confidence": result.get("confidence"),
+                    "input_missing": (result.get("input_audit") or {}).get("missing_input_feature_count"),
                     "readiness": result.get("data_readiness_score"),
                     "live_1m_rows": len(price_1m),
                     "latest_bar": str(decision_ts),
@@ -767,6 +833,9 @@ if interface_mode == "Live Test":
             display_df["readiness"] = pd.to_numeric(
                 display_df["readiness"], errors="coerce"
             ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+            display_df["input_missing"] = pd.to_numeric(
+                display_df["input_missing"], errors="coerce"
+            ).map(lambda x: f"{int(x)}" if pd.notna(x) else "—")
 
             st.subheader("Intraday — next 30-minute production signal")
             st.dataframe(
@@ -774,7 +843,7 @@ if interface_mode == "Live Test":
                     [
                         "symbol", "signal", "current_price",
                         "signal_price_reference", "p_up_30m", "p_down_30m",
-                        "confidence", "readiness", "live_1m_rows",
+                        "confidence", "readiness", "input_missing", "live_1m_rows",
                         "latest_bar", "signal_horizon_end", "news", "events",
                         "fno", "market", "ledger",
                     ]
@@ -798,6 +867,15 @@ if interface_mode == "Live Test":
                 "**Signal price reference** is the exact price fed into the production feature row. "
                 "**Horizon end** is 30 minutes after that decision timestamp. "
                 "The model does not directly predict an OHLC path for each intervening minute."
+            )
+
+            st.markdown("### How to read the Intraday call")
+            st.info(
+                "At each refresh, the production model evaluates the newest available 1-minute information "
+                "and estimates the probability that the stock's return over the following 30 minutes will be positive. "
+                "BUY = P(UP) ≥ 55%; SELL = P(UP) ≤ 45%; otherwise HOLD. "
+                "Current price is the live market price at the signal timestamp. "
+                "The model does not directly predict a minute-by-minute OHLC path."
             )
 
             st.subheader("Intraday — numeric 30-minute price map")
