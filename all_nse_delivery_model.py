@@ -1469,7 +1469,8 @@ def predict_symbol(
         else:
             signal = "HOLD"
 
-        data_gate = bool(pit_row.iloc[0].get("production_data_quality_gate", True))
+        raw_gate = pit_row.iloc[0].get("production_data_quality_gate", np.nan)
+        data_gate = bool(raw_gate) if pd.notna(raw_gate) else False
         if not data_gate and signal in {"BUY", "SELL"}:
             signal = "HOLD"
 
