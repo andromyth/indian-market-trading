@@ -105,6 +105,31 @@ def _rsi(c: pd.Series, n: int = 14) -> float:
     return _safe(100 - 100/(1 + up.iloc[-1]/dn.iloc[-1]))
 
 
+def _regular_session(x: pd.DataFrame) -> pd.DataFrame:
+    """Keep regular NSE cash-market session bars only."""
+    if x is None or x.empty:
+        return pd.DataFrame()
+    idx = pd.DatetimeIndex(x.index)
+    mask = (
+        (idx.time >= pd.Timestamp("09:15").time())
+        & (idx.time < pd.Timestamp("15:30").time())
+    )
+    return x.loc[mask].copy()
+
+
+def _feature_lookback_ok(index: pd.DatetimeIndex, window: int = 50) -> bool:
+    """Require 1-minute continuity inside the recent feature window."""
+    idx = pd.DatetimeIndex(index)
+    if len(idx) < window:
+        return False
+    recent = idx[-window:]
+    diffs = pd.Series(recent).diff()
+    day_change = pd.Series(recent.normalize()).diff().ne(pd.Timedelta(0))
+    link_ok = diffs.eq(pd.Timedelta(minutes=1)) | day_change
+    link_ok.iloc[0] = False
+    return bool(link_ok.iloc[1:].all())
+
+
 def _atr_pct(x: pd.DataFrame, n: int = 14) -> float:
     h, l, c = x["High"], x["Low"], x["Close"]
     pc = c.shift(1)
@@ -122,9 +147,14 @@ def _market_series(market_df: pd.DataFrame | None) -> pd.Series:
 def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = None,
                      fno: dict[str, Any] | None = None,
                      decision_timestamp: Any = None) -> dict[str, float]:
-    x = _norm(price_df)
+    x = _regular_session(_norm(price_df))
     if x.empty or x["Close"].dropna().empty:
-        raise ValueError("No usable intraday OHLC data")
+        raise ValueError("No usable regular-session NSE intraday OHLC data")
+    if not _feature_lookback_ok(x.index, window=50):
+        raise ValueError(
+            "5-minute prediction blocked: recent 1-minute NSE data contains "
+            "an intraday timestamp gap or fewer than 50 contiguous observations"
+        )
 
     c,h,l,o,v=x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
     close=_safe(c.iloc[-1]); open_=_safe(o.iloc[-1])
@@ -143,7 +173,7 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
         ma=c.rolling(n,min_periods=n).mean().iloc[-1]
         vals[f"ma{n}_ratio"]=_safe(close/ma-1) if np.isfinite(close) and np.isfinite(ma) and ma else np.nan
 
-    one_min_ret=c.pct_change()
+    one_min_ret=c.pct_change(fill_method=None)
     vals["volatility_5"]=_safe(one_min_ret.rolling(5,min_periods=5).std().iloc[-1])
     vals["volatility_15"]=_safe(one_min_ret.rolling(15,min_periods=15).std().iloc[-1])
 
@@ -181,13 +211,18 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     vals["tod_cos"]=float(np.cos(2*np.pi*session_minutes/390.0))
 
     mc=_market_series(market_df)
+    if len(mc):
+        mc=mc[mc.index<=ts]
+        aligned_mc=mc.reindex(x.index,method="ffill",tolerance=pd.Timedelta(minutes=2))
+    else:
+        aligned_mc=pd.Series(dtype=float,index=x.index)
     for n in (1,3,5,10,15,30):
-        vals[f"market_ret_{n}"]=_returns(mc,n)
-    vals["market_rsi14"]=_rsi(mc)
-    market_ret_1=mc.pct_change()
-    vals["market_volatility_15"]=_safe(market_ret_1.rolling(15,min_periods=15).std().iloc[-1]) if len(mc) else np.nan
-    market_ma10=mc.rolling(10,min_periods=10).mean().iloc[-1] if len(mc) else np.nan
-    vals["market_ma10_ratio"]=_safe(mc.iloc[-1]/market_ma10-1) if len(mc) and np.isfinite(mc.iloc[-1]) and np.isfinite(market_ma10) and market_ma10 else np.nan
+        vals[f"market_ret_{n}"]=_returns(aligned_mc,n)
+    vals["market_rsi14"]=_rsi(aligned_mc)
+    market_ret_1=aligned_mc.pct_change(fill_method=None)
+    vals["market_volatility_15"]=_safe(market_ret_1.rolling(15,min_periods=15).std().iloc[-1]) if len(aligned_mc) else np.nan
+    market_ma10=aligned_mc.rolling(10,min_periods=10).mean().iloc[-1] if len(aligned_mc) else np.nan
+    vals["market_ma10_ratio"]=_safe(aligned_mc.iloc[-1]/market_ma10-1) if len(aligned_mc) and np.isfinite(aligned_mc.iloc[-1]) and np.isfinite(market_ma10) and market_ma10 else np.nan
     vals["relative_ret_1"]=_safe(vals["ret_1"]-vals["market_ret_1"]) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["market_ret_1"]) else np.nan
     vals["relative_ret_5"]=_safe(vals["ret_5"]-vals["market_ret_5"]) if np.isfinite(vals["ret_5"]) and np.isfinite(vals["market_ret_5"]) else np.nan
     vals["relative_ret_15"]=_safe(vals["ret_15"]-vals["market_ret_15"]) if np.isfinite(vals["ret_15"]) and np.isfinite(vals["market_ret_15"]) else np.nan
