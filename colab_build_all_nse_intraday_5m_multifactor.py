@@ -17,6 +17,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, mean_absolute_error
@@ -480,7 +481,7 @@ def main():
         # stable ensemble members rather than discarded.
         clf_hgb=Pipeline([
             ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
-            ("model",__import__("sklearn.ensemble",fromlist=["HistGradientBoostingClassifier"]).HistGradientBoostingClassifier(
+            ("model",HistGradientBoostingClassifier(
                 max_iter=180,
                 learning_rate=0.05,
                 max_leaf_nodes=31,
@@ -496,7 +497,7 @@ def main():
         ])
         reg_hgb=Pipeline([
             ("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),
-            ("model",__import__("sklearn.ensemble",fromlist=["HistGradientBoostingRegressor"]).HistGradientBoostingRegressor(
+            ("model",HistGradientBoostingRegressor(
                 loss="absolute_error",
                 max_iter=180,
                 learning_rate=0.05,
@@ -573,7 +574,7 @@ def main():
         base_price=test["reference_close"].astype(float).to_numpy()
         pred_price=base_price*(1.0+expected_ret)
         actual_price=test["future_close"].astype(float).to_numpy()
-        model_mae=float(mean_absolute_absolute_error(actual_price,pred_price)) if False else float(mean_absolute_error(actual_price,pred_price))
+        model_mae=float(mean_absolute_error(actual_price,pred_price))
         base_mae=float(mean_absolute_error(actual_price,base_price))
         auc=float(roc_auc_score(ytest,p))
         acc=float(accuracy_score(ytest,pred))
