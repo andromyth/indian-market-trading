@@ -169,14 +169,25 @@ def main() -> int:
             "negative_values": negative,
         }
 
+    # Standard OHLC consistency is a hard gate only for the continuous
+    # equity research universe. NSE T+0 (series T0) is a distinct settlement
+    # cycle and its bhavcopy records remain preserved, but T0 is not silently
+    # treated as an ordinary T+1/EQ OHLC bar.
+    RESEARCH_SERIES = ("EQ", "BE", "BZ", "SM", "ST", "SZ")
     cross_price = {k: None for k in (
+        "high_below_low","close_below_low","close_above_high",
+        "open_below_low","open_above_high"
+    )}
+    t0_cross_price = {k: None for k in (
         "high_below_low","close_below_low","close_above_high",
         "open_below_low","open_above_high"
     )}
     if all(cols.get(k) for k in ("open","high","low","close")):
         oc,hc,lc,cc = (cols[k] for k in ("open","high","low","close"))
         common = (
-            f" FROM {src} WHERE TRY_CAST({qident(hc)} AS DOUBLE) IS NOT NULL "
+            f" FROM {src} WHERE UPPER(TRIM(CAST({qident(sec)} AS VARCHAR))) "
+            f"IN ('EQ','BE','BZ','SM','ST','SZ') "
+            f"AND TRY_CAST({qident(hc)} AS DOUBLE) IS NOT NULL "
             f"AND TRY_CAST({qident(lc)} AS DOUBLE) IS NOT NULL "
             f"AND TRY_CAST({qident(cc)} AS DOUBLE) IS NOT NULL"
         )
@@ -195,6 +206,21 @@ def main() -> int:
         cross_price["open_above_high"] = int(con.execute(
             f"SELECT COUNT(*){common} AND TRY_CAST({qident(oc)} AS DOUBLE) > TRY_CAST({qident(hc)} AS DOUBLE)"
         ).fetchone()[0])
+
+        t0_common = (
+            f" FROM {src} WHERE UPPER(TRIM(CAST({qident(sec)} AS VARCHAR))) = 'T0' "
+            f"AND TRY_CAST({qident(hc)} AS DOUBLE) IS NOT NULL "
+            f"AND TRY_CAST({qident(lc)} AS DOUBLE) IS NOT NULL "
+            f"AND TRY_CAST({qident(cc)} AS DOUBLE) IS NOT NULL"
+        )
+        for key, op in (
+            ("high_below_low", f"TRY_CAST({qident(hc)} AS DOUBLE) < TRY_CAST({qident(lc)} AS DOUBLE)"),
+            ("close_below_low", f"TRY_CAST({qident(cc)} AS DOUBLE) < TRY_CAST({qident(lc)} AS DOUBLE)"),
+            ("close_above_high", f"TRY_CAST({qident(cc)} AS DOUBLE) > TRY_CAST({qident(hc)} AS DOUBLE)"),
+            ("open_below_low", f"TRY_CAST({qident(oc)} AS DOUBLE) < TRY_CAST({qident(lc)} AS DOUBLE)"),
+            ("open_above_high", f"TRY_CAST({qident(oc)} AS DOUBLE) > TRY_CAST({qident(hc)} AS DOUBLE)"),
+        ):
+            t0_cross_price[key] = int(con.execute(f"SELECT COUNT(*){t0_common} AND {op}").fetchone()[0])
 
     na_rows = int(con.execute(
         f"SELECT COUNT(*) FROM {src} WHERE UPPER(TRIM(CAST({qident(sec)} AS VARCHAR)))='NA'"
@@ -290,7 +316,9 @@ def main() -> int:
         },
         "symbol_date_multirow_groups":symbol_date_multi,
         "numeric_checks":numeric_checks,
+        "research_ohlc_hard_gate_series": list(RESEARCH_SERIES),
         "cross_price_checks":cross_price,
+        "t0_ohlc_diagnostics":t0_cross_price,
         "ohlc_anomaly_sample":str(anomaly_path) if anomaly_path.exists() else None,
         "fno_context":fno,
         "hard_failures":hard_failures,
