@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -58,7 +58,7 @@ def append_status(
                 status,
                 int(rows),
                 message,
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
             ]
         )
 
