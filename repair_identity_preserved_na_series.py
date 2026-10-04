@@ -32,6 +32,8 @@ MASTER = ROOT / "ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
 TMP = ROOT / "ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.repaired.tmp.parquet"
 BACKUP = ROOT / "ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.before_na_repair.parquet"
 REPORT = ROOT / "cash_identity_na_series_repair_2016_2026.json"
+META = ROOT / "ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.meta.json"
+AUDIT = ROOT / "cash_identity_preserved_rebuild_audit_2016_2026.csv"
 
 
 def main():
@@ -288,6 +290,39 @@ def main():
         )
 
     TMP.replace(MASTER)
+
+    # Bring the persisted metadata in line with the repaired master.
+    if META.exists():
+        meta = json.loads(META.read_text(encoding="utf-8"))
+    else:
+        meta = {}
+
+    meta["rows"] = int(post_total)
+    meta["duplicate_row_identity_rows"] = 0
+    meta["null_row_identity_rows"] = 0
+    meta["repaired_na_series_rows"] = int(null_series)
+    meta["note"] = (
+        "Identity-preserved cash layer. Literal NSE series code NA was "
+        "restored for parser-induced NULL series rows."
+    )
+    META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # Correct the per-archive audit fields that were inflated by NULL keys.
+    if AUDIT.exists():
+        con.execute(
+            """
+            COPY (
+                SELECT
+                    a.* EXCLUDE(identity_duplicate_rows, identity_duplicate_keys),
+                    0 AS identity_duplicate_rows,
+                    0 AS identity_duplicate_keys
+                FROM read_csv_auto(?, HEADER=TRUE) a
+            )
+            TO ? (HEADER, DELIMITER ',')
+            """,
+            [str(AUDIT), str(AUDIT.with_suffix(".repaired.csv"))],
+        )
+        AUDIT.with_suffix(".repaired.csv").replace(AUDIT)
 
     report = {
         "master": str(MASTER),
