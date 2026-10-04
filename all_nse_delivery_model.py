@@ -1480,37 +1480,20 @@ def predict_symbol(
             .iloc[0]
         )
 
-        # Register compatible auxiliary model evidence without altering
-        # the locked ALL-NSE probability.
-        try:
-            from directional_ensemble import (
-                model_ensemble_direction,
-                multi_horizon_model_evidence,
-            )
-
-            auxiliary_models = model_ensemble_direction(
-                root,
-                feature_frame,
-                horizon="next_session",
-                fno_available=False,
-            )
-
-            auxiliary_horizons = multi_horizon_model_evidence(
-                root,
-                feature_frame,
-                fno_available=False,
-            )
-
-        except Exception as exc:
-            auxiliary_models = {
-                "status": "ERROR",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            auxiliary_horizons = {
-                "status": "ERROR",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-
+        # The locked ALL-NSE model is the production prediction path.
+        # Auxiliary legacy-model ensemble scoring is intentionally excluded from
+        # the live path so unrelated joblib artifacts and additional sklearn
+        # pipelines are not loaded during production prediction.
+        # This does not alter the 59-feature production classifier/regressor,
+        # signal policy, data-quality gate, or prediction itself.
+        auxiliary_models = {
+            "status": "NOT_RUN",
+            "reason": "production_path_primary_model_only",
+        }
+        auxiliary_horizons = {
+            "status": "NOT_RUN",
+            "reason": "production_path_primary_model_only",
+        }
         return {
             "symbol": root,
             "prediction_status": "PASS",
