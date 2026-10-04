@@ -1477,7 +1477,8 @@ def enrich_delivery_prediction(
     sell_threshold = float(policy.get("sell_probability_threshold", 0.40))
     min_expected_return = float(policy.get("min_expected_return", 0.0015))
 
-    data_quality_gate = result.get("production_data_quality_gate", True)
+    raw_gate = result.get("production_data_quality_gate", np.nan)
+    data_quality_gate = bool(raw_gate) if pd.notna(raw_gate) else False
 
     if (
         data_quality_gate
