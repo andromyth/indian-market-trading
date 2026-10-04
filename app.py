@@ -131,6 +131,56 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS"
 st.sidebar.header("Watchlist")
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _searchable_nse_universe() -> pd.DataFrame:
+    """Load the official NSE securities list for symbol/company search."""
+    frame = fetch_nse_equity_universe(force_refresh=False)
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    x = frame.copy()
+    x.columns = [str(col).strip() for col in x.columns]
+    symbol_col = next(
+        (col for col in x.columns if str(col).strip().upper() in {"SYMBOL", "CH_SYMBOL"}),
+        None,
+    )
+    if symbol_col is None:
+        return pd.DataFrame()
+    company_col = next(
+        (
+            col for col in x.columns
+            if str(col).strip().upper() in {
+                "NAME OF COMPANY", "COMPANY NAME", "NAME", "COMPANYNAME"
+            }
+        ),
+        None,
+    )
+    series_col = next(
+        (col for col in x.columns if str(col).strip().upper() in {"SERIES", "CH_SERIES"}),
+        None,
+    )
+    out = pd.DataFrame({
+        "symbol": x[symbol_col].astype(str).str.strip().str.upper(),
+        "company": (
+            x[company_col].astype(str).str.strip()
+            if company_col is not None
+            else ""
+        ),
+    })
+    if series_col is not None:
+        series = x[series_col].astype(str).str.strip().str.upper()
+        # Prefer ordinary equity listings in search results while retaining
+        # other current NSE securities if the source does not expose SERIES.
+        out["series"] = series
+        eq = out[out["series"].eq("EQ")].copy()
+        if not eq.empty:
+            out = eq
+    out = out[
+        out["symbol"].ne("")
+        & ~out["symbol"].isin({"NAN", "NONE", "SYMBOL"})
+    ].drop_duplicates("symbol", keep="first")
+    return out.sort_values(["company", "symbol"], na_position="last").reset_index(drop=True)
+
+
 if "watchlist_revision" not in st.session_state:
     st.session_state["watchlist_revision"] = 0
 
@@ -140,6 +190,59 @@ if "watchlist_revision" not in st.session_state:
 # where the text area was not inside a Streamlit form.
 if "active_watchlist" not in st.session_state:
     st.session_state["active_watchlist"] = default_watchlist
+
+st.sidebar.caption("Find a stock by NSE symbol or company name")
+try:
+    _search_df = _searchable_nse_universe()
+except Exception:
+    _search_df = pd.DataFrame()
+
+if not _search_df.empty:
+    search_text = st.sidebar.text_input(
+        "Search NSE stock",
+        key="nse_stock_search",
+        placeholder="e.g. Tata Motors, Reliance, TCS",
+        help="Search the official NSE securities list by symbol or company name.",
+    ).strip().lower()
+
+    search_results = _search_df
+    if search_text:
+        mask = (
+            search_results["symbol"].str.lower().str.contains(search_text, regex=False, na=False)
+            | search_results["company"].str.lower().str.contains(search_text, regex=False, na=False)
+        )
+        search_results = search_results.loc[mask].head(40)
+
+    if search_results.empty:
+        st.sidebar.caption("No NSE stock matched that search.")
+    else:
+        options = [
+            f"{row.symbol} — {row.company}" if row.company and row.company.lower() != "nan"
+            else row.symbol
+            for row in search_results.itertuples()
+        ]
+        selected_search = st.sidebar.selectbox(
+            "Matching stocks",
+            options,
+            key="nse_stock_search_result",
+        )
+        selected_symbol = selected_search.split(" — ", 1)[0].strip().upper()
+        if st.sidebar.button("Add to watchlist", width="stretch"):
+            current = [
+                normalize_symbol(item)
+                for item in st.session_state.get("active_watchlist", default_watchlist).split(",")
+                if item.strip()
+            ]
+            selected_ns = f"{selected_symbol}.NS"
+            if selected_ns not in current:
+                current.append(selected_ns)
+            new_watchlist = ", ".join(current)
+            st.session_state["active_watchlist"] = new_watchlist
+            st.session_state["watchlist_input"] = new_watchlist
+            st.session_state["watchlist_revision"] = int(st.session_state.get("watchlist_revision", 0)) + 1
+            st.rerun()
+else:
+    st.sidebar.caption("NSE stock search is temporarily unavailable; symbol entry remains available below.")
 
 with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
     watchlist_input = st.text_area(
