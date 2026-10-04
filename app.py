@@ -174,6 +174,124 @@ def normalize_symbol(value: str) -> str:
 
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: float) -> dict:
+    """Statistical opening estimate for display; never modifies the ML model."""
+    try:
+        end = pd.Timestamp(reference_date).date()
+        start = end - pd.Timedelta(days=450)
+        hist = nse_fetch_equity_history(
+            symbol,
+            start,
+            end,
+            sync_drive=True,
+        )
+        if hist is None or hist.empty:
+            return {"status": "NO_DATA"}
+
+        x = hist.copy()
+        x.columns = [str(col).strip().lower() for col in x.columns]
+        required = {"date", "open", "close"}
+        if not required.issubset(x.columns):
+            return {"status": "NO_DATA"}
+
+        x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+        x["open"] = pd.to_numeric(x["open"], errors="coerce")
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = (
+            x.dropna(subset=["date", "open", "close"])
+            .sort_values("date")
+            .drop_duplicates("date", keep="last")
+        )
+        if len(x) < 20:
+            return {"status": "INSUFFICIENT_HISTORY"}
+
+        x["prev_close"] = x["close"].shift(1)
+        x["gap"] = x["open"] / x["prev_close"] - 1.0
+        gaps = x.loc[x["date"] < pd.Timestamp(reference_date), "gap"].dropna().tail(60)
+        if gaps.empty or not np.isfinite(reference_close):
+            return {"status": "NO_DATA"}
+
+        median_gap = float(gaps.median())
+        mean_gap = float(gaps.mean())
+        gap_std = float(gaps.std(ddof=1)) if len(gaps) >= 2 else np.nan
+        expected_open = reference_close * (1.0 + median_gap)
+        open_low = (
+            reference_close * (1.0 + median_gap - gap_std)
+            if np.isfinite(gap_std) else np.nan
+        )
+        open_high = (
+            reference_close * (1.0 + median_gap + gap_std)
+            if np.isfinite(gap_std) else np.nan
+        )
+        return {
+            "status": "PASS",
+            "samples": int(len(gaps)),
+            "median_gap": median_gap,
+            "mean_gap": mean_gap,
+            "gap_std": gap_std,
+            "expected_open": float(expected_open),
+            "open_low": float(open_low) if np.isfinite(open_low) else np.nan,
+            "open_high": float(open_high) if np.isfinite(open_high) else np.nan,
+        }
+    except Exception as exc:
+        return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _intraday_price_envelope(price_df: pd.DataFrame, decision_ts, minutes: int = 30) -> pd.DataFrame:
+    """Create a numeric realized-volatility envelope, not an invented ML price path."""
+    if price_df is None or price_df.empty:
+        return pd.DataFrame()
+
+    x = price_df.copy()
+    x.columns = [str(col).strip().lower() for col in x.columns]
+    aliases = {"ltp": "close", "adj close": "close", "adj_close": "close", "vol": "volume"}
+    x = x.rename(columns=aliases)
+    for col in ("high", "low", "close"):
+        if col not in x.columns:
+            return pd.DataFrame()
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = x.dropna(subset=["high", "low", "close"])
+    if x.empty:
+        return pd.DataFrame()
+
+    prev_close = x["close"].shift(1)
+    tr = pd.concat(
+        [
+            x["high"] - x["low"],
+            (x["high"] - prev_close).abs(),
+            (x["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_1m = float(
+        tr.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=14).mean().iloc[-1]
+    ) if len(tr) >= 14 else np.nan
+    last_price = float(x["close"].iloc[-1])
+
+    if not np.isfinite(atr_1m) or atr_1m <= 0 or not np.isfinite(last_price):
+        return pd.DataFrame()
+
+    ts = pd.Timestamp(decision_ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("Asia/Kolkata")
+    else:
+        ts = ts.tz_convert("Asia/Kolkata")
+
+    rows = []
+    for minute in range(1, minutes + 1):
+        distance = atr_1m * np.sqrt(minute)
+        rows.append({
+            "minute_ahead": minute,
+            "time_IST": (ts + pd.Timedelta(minutes=minute)).strftime("%H:%M"),
+            "current_price_reference": last_price,
+            "lower_price": max(0.0, last_price - distance),
+            "upper_price": last_price + distance,
+        })
+    return pd.DataFrame(rows)
+
+
 if interface_mode == "Live Test":
     st.sidebar.subheader("Live mode")
     live_mode = st.sidebar.radio(
@@ -269,6 +387,9 @@ if interface_mode == "Live Test":
                     "signal": result.get("signal", "—"),
                     "probability_up": result.get("probability_up_next_session"),
                     "expected_move": result.get("predicted_return_next_session"),
+                    "reference_close": result.get("reference_close"),
+                    "predicted_close": result.get("predicted_price_next_session"),
+                    "predicted_change": result.get("predicted_price_change_next_session"),
                     "data_gate": result.get("production_data_quality_gate"),
                     "reference_session": result.get("reference_session"),
                     "ledger": result.get("prediction_ledger_status", "—"),
@@ -280,6 +401,9 @@ if interface_mode == "Live Test":
                     "signal": "—",
                     "probability_up": np.nan,
                     "expected_move": np.nan,
+                    "reference_close": np.nan,
+                    "predicted_close": np.nan,
+                    "predicted_change": np.nan,
                     "data_gate": False,
                     "reference_session": "—",
                     "ledger": f"{type(exc).__name__}: {exc}",
@@ -294,6 +418,10 @@ if interface_mode == "Live Test":
             display_df["expected_move"] = pd.to_numeric(
                 display_df["expected_move"], errors="coerce"
             ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+            for price_col in ["reference_close", "predicted_close", "predicted_change"]:
+                display_df[price_col] = pd.to_numeric(
+                    display_df[price_col], errors="coerce"
+                ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
             display_df["data_gate"] = display_df["data_gate"].map(
                 lambda x: "PASS" if bool(x) else "BLOCKED"
             )
@@ -303,7 +431,8 @@ if interface_mode == "Live Test":
                 display_df[
                     [
                         "symbol", "signal", "probability_up",
-                        "expected_move", "data_gate",
+                        "reference_close", "predicted_close",
+                        "predicted_change", "expected_move", "data_gate",
                         "reference_session", "ledger",
                     ]
                 ],
@@ -316,6 +445,49 @@ if interface_mode == "Live Test":
                 "During a trading day it does not become an intraday signal; a new Delivery "
                 "forecast is generated after the next completed NSE session."
             )
+
+            st.subheader("Delivery price view")
+            st.caption(
+                "Predicted close is the production model's predicted next-session return applied to the "
+                "reference close. Expected open is a separate 60-session median opening-gap estimate; "
+                "it is not an output of the locked 59-feature ML model."
+            )
+            for row in rows:
+                if row.get("status") != "PASS":
+                    continue
+                ref_close = row.get("reference_close")
+                ref_date = row.get("reference_session")
+                if not np.isfinite(pd.to_numeric(ref_close, errors="coerce")) or not ref_date:
+                    continue
+                root = str(row["symbol"]).replace(".NS", "").upper()
+                opening = _delivery_opening_stats(
+                    root,
+                    str(ref_date),
+                    float(ref_close),
+                )
+                if opening.get("status") == "PASS":
+                    o1, o2, o3, o4 = st.columns(4)
+                    o1.metric("Previous/reference close", f"₹{float(ref_close):,.2f}")
+                    o2.metric("Statistical expected open", f"₹{opening['expected_open']:,.2f}")
+                    o3.metric(
+                        "Model-implied next close",
+                        f"₹{float(row['predicted_close']):,.2f}"
+                        if pd.notna(row.get("predicted_close")) else "—",
+                    )
+                    o4.metric(
+                        "Model price change",
+                        f"₹{float(row['predicted_change']):+,.2f}"
+                        if pd.notna(row.get("predicted_change")) else "—",
+                    )
+                    st.caption(
+                        f"{root}: opening-gap median {opening['median_gap']:+.2%} "
+                        f"from {opening['samples']} prior sessions."
+                    )
+                else:
+                    st.info(
+                        f"{root}: opening estimate unavailable; the production model still provides "
+                        "the next-session close projection when its predicted return and reference close are available."
+                    )
 
     else:
         try:
@@ -341,6 +513,7 @@ if interface_mode == "Live Test":
                     "status": "BLOCKED",
                     "signal": "—",
                     "p_up_30m": np.nan,
+                    "current_price": np.nan,
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -413,6 +586,7 @@ if interface_mode == "Live Test":
                     "status": result.get("prediction_status"),
                     "signal": result.get("signal", "—"),
                     "p_up_30m": result.get("probability_up_30m"),
+                    "current_price": float(pd.to_numeric(price_1m["Close"] if "Close" in price_1m.columns else price_1m.iloc[:, 0], errors="coerce").dropna().iloc[-1]),
                     "readiness": result.get("data_readiness_score"),
                     "live_1m_rows": len(price_1m),
                     "latest_bar": str(decision_ts),
@@ -431,6 +605,7 @@ if interface_mode == "Live Test":
                     "status": "ERROR",
                     "signal": "—",
                     "p_up_30m": np.nan,
+                    "current_price": np.nan,
                     "readiness": np.nan,
                     "live_1m_rows": 0,
                     "latest_bar": "—",
@@ -447,6 +622,9 @@ if interface_mode == "Live Test":
             display_df["p_up_30m"] = pd.to_numeric(
                 display_df["p_up_30m"], errors="coerce"
             ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+            display_df["current_price"] = pd.to_numeric(
+                display_df["current_price"], errors="coerce"
+            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
             display_df["readiness"] = pd.to_numeric(
                 display_df["readiness"], errors="coerce"
             ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
@@ -455,8 +633,8 @@ if interface_mode == "Live Test":
             st.dataframe(
                 display_df[
                     [
-                        "symbol", "signal", "p_up_30m",
-                        "readiness", "live_1m_rows",
+                        "symbol", "signal", "current_price",
+                        "p_up_30m", "readiness", "live_1m_rows",
                         "latest_bar", "news", "events",
                         "fno", "market", "ledger",
                     ]
@@ -469,6 +647,30 @@ if interface_mode == "Live Test":
                 "Intraday uses the certified production model against the current NSE 1-minute stream. "
                 "Refresh manually during the first live test so each observed prediction can be tied to a specific timestamp."
             )
+
+            st.subheader("Intraday — numeric 30-minute price map")
+            st.caption(
+                "The BUY/SELL/HOLD call and probability come from the locked 137-feature production model. "
+                "The minute-by-minute prices below are a realized-volatility envelope from the current 1-minute stream, "
+                "not fabricated ML prices. They show the numeric range that the current volatility implies around the live price."
+            )
+            for sym in symbols:
+                if not sym.endswith(".NS"):
+                    continue
+                try:
+                    root = sym.replace(".NS", "").upper()
+                    live_px = nse_fetch_intraday_1m_current(root, sync_drive=True)
+                    env = _intraday_price_envelope(live_px, live_px.index[-1], 30)
+                    if env.empty:
+                        continue
+                    st.write(f"**{sym}**")
+                    st.dataframe(
+                        env,
+                        width="stretch",
+                        hide_index=True,
+                    )
+                except Exception as exc:
+                    st.caption(f"{sym}: numeric price map unavailable — {type(exc).__name__}: {exc}")
 
     st.divider()
     st.subheader("What to watch tomorrow")
