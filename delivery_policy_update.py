@@ -47,7 +47,7 @@ def _join():
     p=pd.DataFrame(load_records()); v=pd.DataFrame(load_validation_records())
     if p.empty or v.empty or "prediction_id" not in p.columns or "prediction_id" not in v.columns: return pd.DataFrame()
     p=p[p["mode"].astype(str).str.lower().eq("delivery")].copy()
-    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","decision_engine_version"]
+    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","production_data_quality_gate","production_data_quality_score","decision_engine_version"]
     p=p[[c for c in keep if c in p.columns]]
     keepv=["prediction_id","actual_direction_d1","validation_status","actual_d1_return"]
     v=v[[c for c in keepv if c in v.columns]]
