@@ -51,6 +51,7 @@ jobs:
           repair_identity_preserved_na_series.py
           validate_identity_preserved_cash_master.py
           deployment_smoke_test.py
+          app.py
           COLAB_RUN_FNO_REPAIR_V2_20261003.py
 
       - name: Run multi-factor tests
