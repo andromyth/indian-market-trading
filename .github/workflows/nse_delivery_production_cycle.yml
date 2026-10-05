@@ -21,6 +21,12 @@ on:
     - cron: '15 19-23 * * 1-5'
     - cron: '15 0-1 * * 2-6'
 
+# Prevent overlapping production refreshes while never cancelling a scheduled
+# retry. A normal run is ~5-6 minutes, well below the hourly cadence.
+concurrency:
+  group: nse-delivery-production-cycle
+  cancel-in-progress: false
+
 jobs:
   production-cycle:
     runs-on: ubuntu-latest
@@ -100,16 +106,16 @@ jobs:
         if: steps.target.outputs.target_date != ''
         run: |
           set -u
-          python -u nse_bulk_eod_ingest.py             --auto             --repair-days 14             --sync-drive || EOD_EXIT=$?
+          python -u nse_bulk_eod_ingest.py --auto --repair-days 14 --sync-drive || EOD_EXIT=$?
           echo "EOD ingestion exit: ${EOD_EXIT:-0}"
 
-          python -u nse_delivery_daily_sync.py             --lookback-days 14             --sleep-seconds 1             --retries 3
+          python -u nse_delivery_daily_sync.py --lookback-days 14 --sleep-seconds 1 --retries 3
 
       - name: Verify target NSE session is fully persisted
         if: steps.target.outputs.target_date != ''
         run: |
           set -euo pipefail
-          python -u production_data_freshness_gate.py             --target-date "${{ steps.target.outputs.target_date }}"
+          python -u production_data_freshness_gate.py --target-date "${{ steps.target.outputs.target_date }}"
 
       - name: Check whether target PIT snapshot already exists
         id: snapshot
@@ -141,7 +147,7 @@ jobs:
       - name: Build target production PIT snapshot
         if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
         run: |
-          python -u delivery_production_refresh.py             --lookback-days 150             --delivery-lookback-days 150             --expected-date "${{ steps.target.outputs.target_date }}"
+          python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150 --expected-date "${{ steps.target.outputs.target_date }}"
 
       - name: Validate completed Delivery predictions
         if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
@@ -182,4 +188,3 @@ jobs:
       - name: Syntax check
         if: steps.target.outputs.target_date != ''
         run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
-
