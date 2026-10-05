@@ -2,20 +2,29 @@ name: NSE Delivery production cycle
 
 on:
   workflow_dispatch:
-  # Start one autonomous production cycle after the market closes. The job
-  # itself retries NSE EOD/Delivery ingestion until today's session is
-  # persisted, then compiles the current PIT snapshot automatically.
+    inputs:
+      target_date:
+        description: 'Optional NSE production session date YYYY-MM-DD'
+        required: false
+        default: ''
+  # Eleven independent hourly opportunities. Each run is short and exits once
+  # the target session is already persisted; no GitHub runner sleeps overnight.
+  #
+  # 15:45-18:45 UTC = 21:15-00:15 IST
+  # 19:45-23:45 UTC = 01:15-05:15 IST
+  # 00:45-01:45 UTC (Tue-Sat) = 06:15-07:15 IST
+  #
+  # The target session is pinned by production_data_freshness_gate.py so
+  # after midnight the retries remain attached to the previous NSE session.
   schedule:
-    - cron: '15 15 * * 1-5'
-
-concurrency:
-  group: nse-delivery-production-cycle
-  cancel-in-progress: false
+    - cron: '45 15-18 * * 1-5'
+    - cron: '45 19-23 * * 1-5'
+    - cron: '45 0-1 * * 2-6'
 
 jobs:
   production-cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 60
     env:
       INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -24,73 +33,153 @@ jobs:
       GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Prepare Colab-compatible persistent path
         run: |
+          set -euo pipefail
           mkdir -p /content/drive/MyDrive
           if [ -e /content/drive/MyDrive/Indian_Market_Research ] && [ ! -L /content/drive/MyDrive/Indian_Market_Research ]; then
             rm -rf /content/drive/MyDrive/Indian_Market_Research
           fi
           ln -sfn "$GITHUB_WORKSPACE/.market_data" /content/drive/MyDrive/Indian_Market_Research
 
-      # Fully autonomous late-publication handling. Do not require a second
-      # workflow run when NSE publishes the day's archives after the first fetch.
-      - name: Fetch NSE data and wait for current session
+      - name: Resolve target NSE session
+        id: target
+        env:
+          MANUAL_TARGET_DATE: ${{ inputs.target_date }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$MANUAL_TARGET_DATE" ]; then
+            TARGET_DATE="$MANUAL_TARGET_DATE"
+          else
+            TARGET_DATE="$(python - <<'PY'
+          from production_data_freshness_gate import expected_session_date
+          target = expected_session_date()
+          print(target.isoformat() if target else "")
+          PY
+            )"
+          fi
+
+          if [ -z "$TARGET_DATE" ]; then
+            echo "No NSE production session expected in this retry window."
+            echo "target_date=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python - <<PY
+          from datetime import date
+          d=date.fromisoformat("$TARGET_DATE")
+          if d.weekday() >= 5:
+              raise SystemExit("Target date is a weekend: " + d.isoformat())
+          PY
+
+          echo "Target NSE session: $TARGET_DATE"
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Google Drive authentication
+        if: steps.target.outputs.target_date != ''
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status()
+          print(status)
+          if not status.get("configured") or status.get("reachable") is False:
+              raise SystemExit("Google Drive authentication check failed")
+          print(f"Google Drive auth method: {status.get('auth_method')}")
+          PY
+
+      - name: Fetch NSE data for target session
+        if: steps.target.outputs.target_date != ''
         run: |
           set -u
-          MAX_ATTEMPTS=11
-          SLEEP_SECONDS=3600
+          python -u nse_bulk_eod_ingest.py             --auto             --repair-days 14             --sync-drive || EOD_EXIT=$?
+          echo "EOD ingestion exit: ${EOD_EXIT:-0}"
 
-          for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
-            echo "================================================================"
-            echo "AUTONOMOUS NSE PRODUCTION ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS}"
-            echo "================================================================"
+          python -u nse_delivery_daily_sync.py             --lookback-days 14             --sleep-seconds 1             --retries 3
 
-            EOD_EXIT=0
-            python -u nse_bulk_eod_ingest.py \
-              --auto \
-              --repair-days 14 \
-              --sync-drive || EOD_EXIT=$?
+      - name: Verify target NSE session is fully persisted
+        if: steps.target.outputs.target_date != ''
+        run: |
+          set -euo pipefail
+          python -u production_data_freshness_gate.py             --target-date "${{ steps.target.outputs.target_date }}"
 
-            DELIVERY_EXIT=0
-            python -u nse_delivery_daily_sync.py \
-              --lookback-days 14 \
-              --sleep-seconds 1 \
-              --retries 3 || DELIVERY_EXIT=$?
+      - name: Check whether target PIT snapshot already exists
+        id: snapshot
+        if: steps.target.outputs.target_date != ''
+        env:
+          TARGET_DATE: ${{ steps.target.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          EXISTS="$(python - <<'PY'
+          import os
+          from persistent_store import GoogleDriveStore
+          target=os.environ["TARGET_DATE"]
+          remote=f"features/daily/DELIVERY_PIT_FEATURES_{target}.parquet"
+          store=GoogleDriveStore()
+          parts=remote.split("/")
+          parent=store.root_id
+          for part in parts[:-1]:
+              hit=store._find_child(parent, part)
+              if not hit:
+                  print("NO")
+                  raise SystemExit(0)
+              parent=hit["id"]
+          print("YES" if store._find_child(parent, parts[-1]) else "NO")
+          PY
+          )"
+          echo "Target PIT snapshot exists: $EXISTS"
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
 
-            GATE_LOG="$(mktemp)"
-            if python -u production_data_freshness_gate.py 2>&1 | tee "$GATE_LOG"; then
-              echo "CURRENT NSE SESSION IS READY."
-              rm -f "$GATE_LOG"
-              break
-            fi
+      - name: Build target production PIT snapshot
+        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
+        run: |
+          python -u delivery_production_refresh.py             --lookback-days 150             --delivery-lookback-days 150             --expected-date "${{ steps.target.outputs.target_date }}"
 
-            if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
-              echo "CURRENT NSE SESSION STILL NOT READY AFTER ${MAX_ATTEMPTS} ATTEMPTS."
-              echo "EOD exit=${EOD_EXIT}, Delivery exit=${DELIVERY_EXIT}"
-              cat "$GATE_LOG"
-              rm -f "$GATE_LOG"
-              exit 1
-            fi
-
-            echo "Today's NSE archive is not ready yet."
-            echo "Waiting 1 hour before the next automatic attempt..."
-            rm -f "$GATE_LOG"
-            sleep "$SLEEP_SECONDS"
-          done
-
-      - name: Build latest production PIT snapshot
-        run: python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150
       - name: Validate completed Delivery predictions
+        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
         run: python -u validate_prediction_ledger.py
+
       - name: Generate Delivery OOS diagnostics
+        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
         run: python -u delivery_validation_diagnostics.py
+
       - name: Update OOS-gated adaptive Delivery policy
+        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
         run: python -u delivery_policy_update.py --min-samples 80
 
+      - name: Confirm target snapshot
+        if: steps.target.outputs.target_date != ''
+        env:
+          TARGET_DATE: ${{ steps.target.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from persistent_store import GoogleDriveStore
+          target=os.environ["TARGET_DATE"]
+          remote=f"features/daily/DELIVERY_PIT_FEATURES_{target}.parquet"
+          store=GoogleDriveStore()
+          parts=remote.split("/")
+          parent=store.root_id
+          for part in parts[:-1]:
+              hit=store._find_child(parent, part)
+              if not hit:
+                  raise SystemExit(f"Missing Drive folder: {part}")
+              parent=hit["id"]
+          if not store._find_child(parent, parts[-1]):
+              raise SystemExit(f"Target PIT snapshot missing: {remote}")
+          print(f"TARGET_PIT_SNAPSHOT_PRESENT: {remote}")
+          PY
+
       - name: Syntax check
+        if: steps.target.outputs.target_date != ''
         run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
+
