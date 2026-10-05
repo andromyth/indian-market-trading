@@ -46,25 +46,59 @@ def _resolve(store: GoogleDriveStore, path: str) -> str:
     return parent
 
 
-def _names(store: GoogleDriveStore, folder_id: str) -> list[str]:
-    out: list[str] = []
-    token = None
-    while True:
-        kwargs = {
-            "q": f"'{folder_id}' in parents and trashed = false",
-            "spaces": "drive",
-            "fields": "nextPageToken,files(name,mimeType)",
-            "pageSize": 1000,
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-        }
-        if token:
-            kwargs["pageToken"] = token
-        resp = store.service.files().list(**kwargs).execute()
-        out.extend(str(x.get("name", "")) for x in resp.get("files", []))
-        token = resp.get("nextPageToken")
-        if not token:
-            return out
+def _names(store: GoogleDriveStore, folder_id: str, *, recursive: bool = False, max_depth: int = 5) -> list[str]:
+    """Return names below a Drive folder; EOD archives are nested by date."""
+    if not recursive:
+        out: list[str] = []
+        token = None
+        while True:
+            kwargs = {
+                "q": f"'{folder_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if token:
+                kwargs["pageToken"] = token
+            resp = store.service.files().list(**kwargs).execute()
+            out.extend(str(x.get("name", "")) for x in resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return out
+
+    found: list[str] = []
+    queue: list[tuple[str, int]] = [(folder_id, 0)]
+    while queue:
+        current_id, depth = queue.pop()
+        if depth > max_depth:
+            continue
+        token = None
+        while True:
+            kwargs = {
+                "q": f"'{current_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(name,mimeType,id)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if token:
+                kwargs["pageToken"] = token
+            resp = store.service.files().list(**kwargs).execute()
+            for item in resp.get("files", []):
+                name = str(item.get("name", ""))
+                found.append(name)
+                if (
+                    item.get("mimeType") == FOLDER_MIME
+                    and depth < max_depth
+                ):
+                    queue.append((item["id"], depth + 1))
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+    return found
 
 
 def _dates(names: list[str], pattern: re.Pattern[str]) -> set[date]:
@@ -91,7 +125,7 @@ def main() -> None:
     eod_folder = _resolve(store, "production_data/nse_official/bulk_eod")
     delivery_folder = _resolve(store, "production_data/nse_official/delivery_full")
 
-    eod_dates = _dates(_names(store, eod_folder), EOD_RE)
+    eod_dates = _dates(_names(store, eod_folder, recursive=True, max_depth=5), EOD_RE)
     delivery_dates = _dates(_names(store, delivery_folder), DELIVERY_RE)
 
     eod_ok = today in eod_dates
