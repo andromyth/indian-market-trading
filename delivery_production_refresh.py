@@ -212,8 +212,12 @@ def main():
         print(f"Waiting for upstream source files: {', '.join(missing)}",flush=True)
         import time as _time
         _time.sleep(60)
+    _stage("EOD PHASE: scanning Drive archive and downloading missing recent files")
     eod_status=_download_recent_eod(store,args.lookback_days)
+    _stage(f"EOD PHASE DONE: {eod_status}")
+    _stage("DELIVERY PHASE: scanning Drive archive and downloading missing recent files")
     delivery_status=_download_recent_delivery(store,args.delivery_lookback_days)
+    _stage(f"DELIVERY PHASE DONE: {delivery_status}")
     _stage("IMPORT PHASE: loading panel/model builder modules")
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
     from delivery_training_universe import training_roster,load_official_nse_universe
@@ -235,15 +239,15 @@ def main():
     except Exception as exc:
         live_news_result={"status":"ERROR","error":f"{type(exc).__name__}: {exc}"}
         source_status["live_rss_news"]="ERROR"
-    _stage(f"NEWS PHASE DONE: {live_news_result.get(chr(39)+chr(115)+chr(116)+chr(97)+chr(116)+chr(117)+chr(115)+chr(39), chr(39)+chr(117)+chr(110)+chr(107)+chr(110)+chr(111)+chr(119)+chr(110)+chr(39)}")
+    _stage(f"NEWS PHASE DONE: {live_news_result.get('status', 'unknown')}")
 
     _stage("BULK EOD PHASE: loading recent NSE history from local cache")
     bulk=_load_eod(EOD_LOCAL_ROOT,today-timedelta(days=args.lookback_days),today)
-    _stage(f"BULK EOD LOADED: rows={len(bulk):,}, symbols={bulk[chr(39)+chr(115)+chr(121)+chr(109)+chr(98)+chr(111)+chr(108)+chr(39)].nunique():,}")
+    _stage(f"BULK EOD LOADED: rows={len(bulk):,}, symbols={bulk['symbol'].nunique():,}")
     _stage("ROSTER PHASE: computing current 60-session clean-history universe")
     roster=training_roster(bulk,min_history=MIN_HISTORY,force_refresh=True)
     trainable=list(roster["trainable_symbols"])
-    _stage(f"ROSTER DONE: universe={roster[chr(39)+chr(117)+chr(110)+chr(105)+chr(118)+chr(101)+chr(114)+chr(115)+chr(101)+chr(95)+chr(115)+chr(121)+chr(109)+chr(98)+chr(111)+chr(108)+chr(95)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116)+chr(39)]}, trainable={len(trainable):,}")
+    _stage(f"ROSTER DONE: universe={roster['universe_symbol_count']}, trainable={len(trainable):,}")
     if not trainable: raise RuntimeError("No current NSE symbols meet the 60-session clean-history gate")
     _stage("DELIVERY HISTORY PHASE: loading local Delivery parquet files")
     delivery=load_delivery_history(DELIVERY_LOCAL,symbols=trainable,start=bulk["date"].min(),end=bulk["date"].max())
