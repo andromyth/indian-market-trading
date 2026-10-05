@@ -529,7 +529,7 @@ def _cached_live_news() -> list[dict]:
 
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def _cached_persisted_delivery_news() -> pd.DataFrame:
     """Load the newest persisted production RSS snapshot for advisory context."""
     try:
