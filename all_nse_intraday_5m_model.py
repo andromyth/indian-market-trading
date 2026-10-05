@@ -245,8 +245,11 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
-        for b in iter(lambda: f.read(1024*1024), b):
-            h.update(b)
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
     return h.hexdigest()
 
 
