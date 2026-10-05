@@ -188,7 +188,17 @@ def main():
     ap.add_argument("--lookback-days",type=int,default=150)
     ap.add_argument("--delivery-lookback-days",type=int,default=150)
     ap.add_argument("--source-wait-minutes",type=int,default=10)
+    ap.add_argument(
+        "--expected-date",
+        default="",
+        help="Expected NSE production session date (YYYY-MM-DD).",
+    )
     args=ap.parse_args()
+    expected_date = (
+        date.fromisoformat(args.expected_date.strip())
+        if args.expected_date.strip()
+        else None
+    )
     _stage("START: creating Google Drive store")
     store=_store()
     _stage("Drive store ready")
@@ -242,7 +252,11 @@ def main():
     _stage(f"NEWS PHASE DONE: {live_news_result.get('status', 'unknown')}")
 
     _stage("BULK EOD PHASE: loading recent NSE history from local cache")
-    bulk=_load_eod(EOD_LOCAL_ROOT,today-timedelta(days=args.lookback_days),today)
+    bulk=_load_eod(
+        EOD_LOCAL_ROOT,
+        reference_date-timedelta(days=args.lookback_days),
+        reference_date,
+    )
     _stage(f"BULK EOD LOADED: rows={len(bulk):,}, symbols={bulk['symbol'].nunique():,}")
     _stage("ROSTER PHASE: computing current 60-session clean-history universe")
     roster=training_roster(bulk,min_history=MIN_HISTORY,force_refresh=True)
@@ -296,6 +310,12 @@ def main():
     panel["production_optional_state_known"]=panel[["ready_news","ready_events","ready_fno","ready_fundamentals"]].apply(pd.to_numeric,errors="coerce").notna().all(axis=1)
     panel["production_data_quality_gate"]=panel["production_core_ready"]&panel["production_optional_state_known"]
     latest_date=pd.to_datetime(panel["decision_timestamp"],utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
+    if expected_date is not None and latest_date != expected_date:
+        raise RuntimeError(
+            f"Production refresh resolved latest session {latest_date}, "
+            f"but expected target session is {expected_date}. "
+            "Refusing to publish an older PIT snapshot."
+        )
     snap=FEATURE_DIR/f"DELIVERY_PIT_FEATURES_{latest_date}.parquet"
     snap.parent.mkdir(parents=True,exist_ok=True)
     _stage(f"SNAPSHOT WRITE: {snap.name}")
