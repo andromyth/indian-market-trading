@@ -528,6 +528,80 @@ def _cached_live_news() -> list[dict]:
         return []
 
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_persisted_delivery_news() -> pd.DataFrame:
+    """Load the newest persisted production RSS snapshot for advisory context."""
+    try:
+        from autonomous_engine import _load_persisted_live_news
+        frame = _load_persisted_live_news()
+        return frame if frame is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _delivery_live_news_context(symbol: str, as_of) -> dict:
+    """Summarize persisted news without changing the locked Delivery ML model."""
+    try:
+        x = _cached_persisted_delivery_news()
+        if x is None or x.empty:
+            return {"count_24h": 0, "high_impact": 0, "score": 0.0, "fresh_hours": None, "state": "NO LIVE NEWS SNAPSHOT"}
+        ts = pd.Timestamp(as_of)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        ts = ts.tz_convert("UTC")
+        root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+        x = x.copy()
+        x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
+        x["published_at"] = pd.to_datetime(x["published_at"], errors="coerce", utc=True)
+        x = x[
+            x["symbol"].isin([root, "MARKET"])
+            & x["published_at"].notna()
+            & x["published_at"].le(ts)
+            & x["published_at"].ge(ts - pd.Timedelta(hours=24))
+        ].copy()
+        metrics = news_metrics(x.to_dict("records"), now=ts.to_pydatetime())
+        return {
+            "count_24h": int(metrics.get("count", 0) or 0),
+            "high_impact": int(metrics.get("high_impact", 0) or 0),
+            "score": float(metrics.get("score", 0.0) or 0.0),
+            "fresh_hours": metrics.get("fresh_hours"),
+            "state": "LIVE PERSISTED NEWS",
+        }
+    except Exception as exc:
+        return {
+            "count_24h": 0,
+            "high_impact": 0,
+            "score": 0.0,
+            "fresh_hours": None,
+            "state": f"NEWS CONTEXT ERROR: {type(exc).__name__}",
+        }
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_live_benchmark_summary(benchmark_symbol: str) -> dict:
+    """Display-only live benchmark context; it does not alter the locked model."""
+    try:
+        frame = _cached_live_market_context(benchmark_symbol)
+        if frame is None or frame.empty:
+            return {"status": "NO_DATA"}
+        x = frame.copy()
+        x.columns = [str(col).strip().lower() for col in x.columns]
+        if "close" not in x.columns:
+            return {"status": "NO_DATA"}
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = x.dropna(subset=["close"])
+        if x.empty:
+            return {"status": "NO_DATA"}
+        last = float(x["close"].iloc[-1])
+        baseline = float(x["close"].iloc[max(0, len(x) - 31)])
+        return {
+            "status": "PASS",
+            "last": last,
+            "change_30m": last / baseline - 1.0 if baseline else np.nan,
+            "benchmark": benchmark_symbol,
+        }
+    except Exception:
+        return {"status": "ERROR"}
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
     try:
@@ -648,6 +722,20 @@ if interface_mode == "Live Test":
                     "live_ltp": np.nan,
                     "live_ltp_change": np.nan,
                     "data_gate": False,
+                     "data_gate_reason": f"ERROR: {type(exc).__name__}",
+                     "pit_news_state": "UNKNOWN",
+                     "live_news_count_24h": np.nan,
+                     "live_news_score": np.nan,
+                     "live_high_impact_news": np.nan,
+                     "live_news_fresh_hours": np.nan,
+                     "live_news_state": "UNKNOWN",
+                     "live_event_count": np.nan,
+                     "live_fno_pcr": np.nan,
+                     "live_fno_max_pain": np.nan,
+                     "live_fno_expiry": "—",
+                     "benchmark_symbol": "—",
+                     "benchmark_last": np.nan,
+                     "benchmark_change_30m": np.nan,
                     "reference_session": "—",
                     "ledger": "—",
                 })
@@ -661,6 +749,11 @@ if interface_mode == "Live Test":
                     },
                     sync_drive=True,
                 )
+                 live_news = _delivery_live_news_context(sym, now_ist)
+                 live_fo = _cached_live_option_chain(sym) or {}
+                 live_events = _cached_live_announcements(sym) or []
+                 benchmark_symbol = benchmark_for_symbol(sym)
+                 benchmark_live = _cached_live_benchmark_summary(benchmark_symbol)
                 predicted_close = result.get("predicted_price_next_session")
                 reference_close = result.get("reference_close")
                 ref_date = result.get("reference_session")
@@ -695,6 +788,20 @@ if interface_mode == "Live Test":
                     "live_ltp": live_ltp if live_ltp is not None else np.nan,
                     "live_ltp_change": live_change,
                     "data_gate": result.get("production_data_quality_gate"),
+                     "data_gate_reason": result.get("data_gate_reason", "UNKNOWN"),
+                     "pit_news_state": (result.get("optional_information_status") or {}).get("news", "UNKNOWN"),
+                     "live_news_count_24h": live_news.get("count_24h", 0),
+                     "live_news_score": live_news.get("score", 0.0),
+                     "live_high_impact_news": live_news.get("high_impact", 0),
+                     "live_news_fresh_hours": live_news.get("fresh_hours", np.nan),
+                     "live_news_state": live_news.get("state", "UNKNOWN"),
+                     "live_event_count": int(len(live_events)),
+                     "live_fno_pcr": live_fo.get("pcr", np.nan),
+                     "live_fno_max_pain": live_fo.get("max_pain", np.nan),
+                     "live_fno_expiry": live_fo.get("expiry", "—"),
+                     "benchmark_symbol": benchmark_live.get("benchmark", benchmark_symbol),
+                     "benchmark_last": benchmark_live.get("last", np.nan),
+                     "benchmark_change_30m": benchmark_live.get("change_30m", np.nan),
                     "reference_session": result.get("reference_session"),
                     "ledger": result.get("prediction_ledger_status", "—"),
                 })
@@ -747,6 +854,18 @@ if interface_mode == "Live Test":
                 lambda x: "PASS" if bool(x) else "BLOCKED"
             )
 
+             display_df["live_news_score"] = pd.to_numeric(display_df["live_news_score"], errors="coerce").map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
+             display_df["live_fno_pcr"] = pd.to_numeric(display_df["live_fno_pcr"], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+             display_df["live_fno_max_pain"] = pd.to_numeric(display_df["live_fno_max_pain"], errors="coerce").map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+             display_df["benchmark_last"] = pd.to_numeric(display_df["benchmark_last"], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+             display_df["benchmark_change_30m"] = pd.to_numeric(display_df["benchmark_change_30m"], errors="coerce").map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+             blocked = display_df.loc[display_df["data_gate"].eq("BLOCKED")]
+             if not blocked.empty:
+                 reasons = sorted(set(str(x) for x in blocked["data_gate_reason"].dropna() if str(x).strip()))
+                 st.warning("Delivery data gate is BLOCKED. Numeric forecasts may still be calculated, but BUY/SELL is forced to HOLD until the production data gate passes.")
+                 if reasons:
+                     st.caption("Gate reason(s): " + " · ".join(reasons))
+
             st.subheader("Delivery — next-session production signal")
             st.dataframe(
                 display_df[
@@ -755,7 +874,11 @@ if interface_mode == "Live Test":
                         "reference_close", "predicted_open",
                         "predicted_high", "predicted_low", "predicted_close",
                         "predicted_change", "expected_move",
-                        "live_ltp", "live_ltp_change", "data_gate",
+                         "live_ltp", "live_ltp_change",
+                         "live_news_count_24h", "live_news_score", "live_high_impact_news",
+                         "live_event_count", "live_fno_pcr", "live_fno_max_pain",
+                         "benchmark_symbol", "benchmark_last", "benchmark_change_30m",
+                         "pit_news_state", "data_gate", "data_gate_reason",
                         "reference_session", "ledger",
                     ]
                 ],
@@ -763,14 +886,44 @@ if interface_mode == "Live Test":
                 hide_index=True,
             )
 
-            st.caption(
-                "Delivery uses the latest persisted point-in-time 59-feature snapshot. "
-                "During a trading day it does not become an intraday signal; a new Delivery "
-                "forecast is generated after the next completed NSE session."
-            )
+             st.caption(
+                 "ML predicted close comes from the locked 59-feature Delivery model. "
+                 "Projected open/high/low are statistical next-session estimates from prior completed sessions, "
+                 "not separately trained ML outputs. Live news, F&O, announcements and benchmark fields are "
+                 "displayed as advisory context and do not silently alter the locked model score."
+             )
 
-            st.subheader("Delivery — projected next-session OHLC")
-            st.caption(
+             st.subheader("Delivery — live decision context")
+             context_rows = []
+             for row in rows:
+                 if row.get("status") not in {"PASS", "ERROR"}:
+                     continue
+                 context_rows.append({
+                     "symbol": row.get("symbol"),
+                     "PIT news": row.get("pit_news_state", "UNKNOWN"),
+                     "Live news / 24h": row.get("live_news_count_24h", np.nan),
+                     "News score": row.get("live_news_score", np.nan),
+                     "High-impact news": row.get("live_high_impact_news", np.nan),
+                     "Announcements": row.get("live_event_count", np.nan),
+                     "F&O PCR": row.get("live_fno_pcr", np.nan),
+                     "F&O max pain": row.get("live_fno_max_pain", np.nan),
+                     "Benchmark": row.get("benchmark_symbol", "—"),
+                     "Benchmark 30m": row.get("benchmark_change_30m", np.nan),
+                     "Gate": "PASS" if bool(row.get("data_gate")) else "BLOCKED",
+                 })
+             if context_rows:
+                 context_df = pd.DataFrame(context_rows)
+                 context_df["News score"] = pd.to_numeric(context_df["News score"], errors="coerce").map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
+                 context_df["F&O PCR"] = pd.to_numeric(context_df["F&O PCR"], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                 context_df["F&O max pain"] = pd.to_numeric(context_df["F&O max pain"], errors="coerce").map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+                 context_df["Benchmark 30m"] = pd.to_numeric(context_df["Benchmark 30m"], errors="coerce").map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+                 st.dataframe(context_df, width="stretch", hide_index=True)
+
+             st.caption(
+                 "The locked 59-feature model includes point-in-time news availability. Live headline sentiment is shown separately because it is not a feature in the locked contract; the unvalidated contextual-fusion engine is not allowed to silently replace the production probability."
+             )
+
+             st.subheader("Delivery — projected next-session OHLC")
                 "Predicted close is the locked 59-feature ML model's predicted return applied to the "
                 "latest persisted reference close. Open, high and low are statistical projections derived "
                 "from the latest 60 completed sessions; they are explicitly NOT separate ML outputs."
