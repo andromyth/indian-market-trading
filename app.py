@@ -722,25 +722,27 @@ if interface_mode == "Live Test":
                     "live_ltp": np.nan,
                     "live_ltp_change": np.nan,
                     "data_gate": False,
-                     "data_gate_reason": f"ERROR: {type(exc).__name__}",
-                     "pit_news_state": "UNKNOWN",
+                    "data_gate_reason": "NON_NSE_SYMBOL",
+                    "pit_news_state": "UNKNOWN",
                      "live_news_count_24h": np.nan,
                      "live_news_score": np.nan,
                      "live_high_impact_news": np.nan,
                      "live_news_fresh_hours": np.nan,
-                     "live_news_state": "UNKNOWN",
+                     "live_news_state": "NOT APPLICABLE",
                      "live_event_count": np.nan,
                      "live_fno_pcr": np.nan,
                      "live_fno_max_pain": np.nan,
                      "live_fno_expiry": "—",
-                     "benchmark_symbol": "—",
-                     "benchmark_last": np.nan,
-                     "benchmark_change_30m": np.nan,
+                    "benchmark_symbol": "—",
+                    "benchmark_last": np.nan,
+                    "benchmark_change_30m": np.nan,
+                     "data_gate_reason": f"ERROR: {type(exc).__name__}",
                     "reference_session": "—",
                     "ledger": "—",
                 })
                 continue
 
+                     "live_news_state": "UNKNOWN",
             try:
                 result = delivery_prediction(
                     {
@@ -2565,7 +2567,7 @@ for symbol in symbols:
         "news_freshness": news_freshness,
         "announcements": announcements,
         "event_risk": event_risk,
-        "live_news_score": live_news_score,
+                     "live_news_score": live_news_score,
         "fo": fo,
         "t_score": t_score,
         "m_score": m_score,
