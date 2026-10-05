@@ -10,16 +10,16 @@ on:
   # Eleven independent hourly opportunities. Each run is short and exits once
   # the target session is already persisted; no GitHub runner sleeps overnight.
   #
-  # 15:45-18:45 UTC = 21:15-00:15 IST
-  # 19:45-23:45 UTC = 01:15-05:15 IST
-  # 00:45-01:45 UTC (Tue-Sat) = 06:15-07:15 IST
+  # 15:15-18:15 UTC = 20:45-23:45 IST
+  # 19:15-23:15 UTC = 00:45-04:45 IST
+  # 00:15-01:15 UTC (Tue-Sat) = 05:45-06:45 IST
   #
   # The target session is pinned by production_data_freshness_gate.py so
   # after midnight the retries remain attached to the previous NSE session.
   schedule:
-    - cron: '45 15-18 * * 1-5'
-    - cron: '45 19-23 * * 1-5'
-    - cron: '45 0-1 * * 2-6'
+    - cron: '15 15-18 * * 1-5'
+    - cron: '15 19-23 * * 1-5'
+    - cron: '15 0-1 * * 2-6'
 
 jobs:
   production-cycle:
