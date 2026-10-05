@@ -921,11 +921,7 @@ if interface_mode == "Live Test":
                     "reference_close", "predicted_open", "predicted_high",
                     "predicted_low", "predicted_close", "predicted_change",
                     "expected_move", "live_ltp", "live_ltp_change",
-                    "live_news_count_24h", "live_news_score", "live_high_impact_news",
-                    "live_event_count", "live_fno_pcr", "live_fno_max_pain",
-                    "benchmark_symbol", "benchmark_last", "benchmark_change_30m",
-                    "pit_news_state", "data_gate", "data_gate_reason",
-                    "reference_session", "ledger",
+                    "data_gate", "data_gate_reason", "reference_session",
                 ]
             ].rename(
                 columns={
@@ -941,20 +937,9 @@ if interface_mode == "Live Test":
                     "expected_move": "Expected move",
                     "live_ltp": "Live LTP",
                     "live_ltp_change": "Live LTP vs ref",
-                    "live_news_count_24h": "News / 24h",
-                    "live_news_score": "News score",
-                    "live_high_impact_news": "High-impact news",
-                    "live_event_count": "Announcements",
-                    "live_fno_pcr": "F&O PCR",
-                    "live_fno_max_pain": "F&O max pain",
-                    "benchmark_symbol": "Benchmark",
-                    "benchmark_last": "Benchmark LTP",
-                    "benchmark_change_30m": "Benchmark 30m",
-                    "pit_news_state": "PIT news input",
                     "data_gate": "Data gate",
                     "data_gate_reason": "Gate reason",
                     "reference_session": "Reference session",
-                    "ledger": "Ledger",
                 }
             )
             st.dataframe(table_df, width="stretch", hide_index=True)
