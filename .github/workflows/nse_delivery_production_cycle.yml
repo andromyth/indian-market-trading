@@ -1,12 +1,11 @@
 name: NSE Delivery production cycle
 
 on:
-  workflow_run:
-    workflows: ["NSE ALL-universe Delivery daily sync"]
-    types: [completed]
   workflow_dispatch:
+  # Run after the late EOD/MTO retry windows. The production job also performs
+  # a last-mile ingestion attempt immediately before the freshness gate.
   schedule:
-    - cron: '15 15 * * 1-5'
+    - cron: '15 15,16,17 * * 1-5'
 
 concurrency:
   group: nse-delivery-production-cycle
@@ -14,7 +13,6 @@ concurrency:
 
 jobs:
   production-cycle:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -37,15 +35,28 @@ jobs:
             rm -rf /content/drive/MyDrive/Indian_Market_Research
           fi
           ln -sfn "$GITHUB_WORKSPACE/.market_data" /content/drive/MyDrive/Indian_Market_Research
+
+      # Last-mile retries make the compilation workflow self-healing when the
+      # earlier scheduled ingestion run hit a transient NSE publication 404.
+      - name: Last-mile NSE EOD catch-up
+        run: python -u nse_bulk_eod_ingest.py --auto --repair-days 14 --sync-drive
+
+      - name: Last-mile NSE Delivery catch-up
+        run: python -u nse_delivery_daily_sync.py --lookback-days 14 --sleep-seconds 1 --retries 3
+
+      # Fail closed: never create/overwrite a production PIT snapshot from an
+      # older session just because today's upstream archive was late.
+      - name: Require current NSE session before production refresh
+        run: python -u production_data_freshness_gate.py
+
       - name: Build latest production PIT snapshot
         run: python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150
       - name: Validate completed Delivery predictions
         run: python -u validate_prediction_ledger.py
       - name: Generate Delivery OOS diagnostics
         run: python -u delivery_validation_diagnostics.py
-
       - name: Update OOS-gated adaptive Delivery policy
         run: python -u delivery_policy_update.py --min-samples 80
 
       - name: Syntax check
-        run: python -m py_compile delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
+        run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
