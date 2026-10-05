@@ -42,8 +42,8 @@ jobs:
       - name: Fetch NSE data and wait for current session
         run: |
           set -u
-          MAX_ATTEMPTS=24
-          SLEEP_SECONDS=600
+          MAX_ATTEMPTS=11
+          SLEEP_SECONDS=3600
 
           for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
             echo "================================================================"
@@ -78,7 +78,7 @@ jobs:
             fi
 
             echo "Today's NSE archive is not ready yet."
-            echo "Waiting ${SLEEP_SECONDS}s before the next automatic attempt..."
+            echo "Waiting 1 hour before the next automatic attempt..."
             rm -f "$GATE_LOG"
             sleep "$SLEEP_SECONDS"
           done
