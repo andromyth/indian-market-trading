@@ -21,6 +21,7 @@ from data_fetcher import (
     news_for_symbol,
     stock_news_keywords,
     source_diagnostics,
+    get_latest_price,
 )
 from signals import (
     add_indicators,
@@ -349,8 +350,13 @@ symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: float) -> dict:
-    """Statistical opening estimate for display; never modifies the ML model."""
+def _delivery_opening_stats(
+    symbol: str,
+    reference_date: str,
+    reference_close: float,
+    predicted_close: float = np.nan,
+) -> dict:
+    """Statistical next-session OHLC projection for display; never modifies the ML model."""
     try:
         end = pd.Timestamp(reference_date).date()
         start = end - pd.Timedelta(days=450)
@@ -365,15 +371,15 @@ def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: f
 
         x = hist.copy()
         x.columns = [str(col).strip().lower() for col in x.columns]
-        required = {"date", "open", "close"}
+        required = {"date", "open", "high", "low", "close"}
         if not required.issubset(x.columns):
             return {"status": "NO_DATA"}
 
         x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
-        x["open"] = pd.to_numeric(x["open"], errors="coerce")
-        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        for col in ("open", "high", "low", "close"):
+            x[col] = pd.to_numeric(x[col], errors="coerce")
         x = (
-            x.dropna(subset=["date", "open", "close"])
+            x.dropna(subset=["date", "open", "high", "low", "close"])
             .sort_values("date")
             .drop_duplicates("date", keep="last")
         )
@@ -382,7 +388,10 @@ def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: f
 
         x["prev_close"] = x["close"].shift(1)
         x["gap"] = x["open"] / x["prev_close"] - 1.0
-        gaps = x.loc[x["date"] < pd.Timestamp(reference_date), "gap"].dropna().tail(60)
+
+        ref_ts = pd.Timestamp(reference_date)
+        recent = x.loc[x["date"] < ref_ts].copy().tail(60)
+        gaps = recent["gap"].dropna()
         if gaps.empty or not np.isfinite(reference_close):
             return {"status": "NO_DATA"}
 
@@ -390,6 +399,7 @@ def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: f
         mean_gap = float(gaps.mean())
         gap_std = float(gaps.std(ddof=1)) if len(gaps) >= 2 else np.nan
         expected_open = reference_close * (1.0 + median_gap)
+
         open_low = (
             reference_close * (1.0 + median_gap - gap_std)
             if np.isfinite(gap_std) else np.nan
@@ -398,18 +408,63 @@ def _delivery_opening_stats(symbol: str, reference_date: str, reference_close: f
             reference_close * (1.0 + median_gap + gap_std)
             if np.isfinite(gap_std) else np.nan
         )
+
+        # Empirical daily excursion from the greater/lesser of the actual
+        # session open and close. This produces a statistical range around the
+        # model's projected close without pretending that high/low are separate
+        # outputs of the locked 59-feature ML model.
+        upper_base = recent[["open", "close"]].max(axis=1)
+        lower_base = recent[["open", "close"]].min(axis=1)
+        up_excursion = (recent["high"] / upper_base - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
+        down_excursion = (1.0 - recent["low"] / lower_base).replace([np.inf, -np.inf], np.nan).dropna()
+
+        median_up_excursion = float(up_excursion.median()) if not up_excursion.empty else np.nan
+        median_down_excursion = float(down_excursion.median()) if not down_excursion.empty else np.nan
+
+        pc = float(predicted_close) if np.isfinite(pd.to_numeric(predicted_close, errors="coerce")) else np.nan
+        anchor_high = max(expected_open, pc) if np.isfinite(pc) else expected_open
+        anchor_low = min(expected_open, pc) if np.isfinite(pc) else expected_open
+
+        expected_high = (
+            anchor_high * (1.0 + median_up_excursion)
+            if np.isfinite(median_up_excursion) else np.nan
+        )
+        expected_low = (
+            anchor_low * (1.0 - median_down_excursion)
+            if np.isfinite(median_down_excursion) else np.nan
+        )
+
+        if np.isfinite(expected_high):
+            expected_high = max(expected_high, expected_open, pc if np.isfinite(pc) else expected_open)
+        if np.isfinite(expected_low):
+            expected_low = min(expected_low, expected_open, pc if np.isfinite(pc) else expected_open)
+
         return {
             "status": "PASS",
-            "samples": int(len(gaps)),
+            "samples": int(len(recent)),
             "median_gap": median_gap,
             "mean_gap": mean_gap,
             "gap_std": gap_std,
             "expected_open": float(expected_open),
             "open_low": float(open_low) if np.isfinite(open_low) else np.nan,
             "open_high": float(open_high) if np.isfinite(open_high) else np.nan,
+            "expected_high": float(expected_high) if np.isfinite(expected_high) else np.nan,
+            "expected_low": float(expected_low) if np.isfinite(expected_low) else np.nan,
+            "median_up_excursion": median_up_excursion,
+            "median_down_excursion": median_down_excursion,
+            "method": "60-session median gap + empirical daily high/low excursion around model close",
         }
     except Exception as exc:
         return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_nse_ltp(symbol: str):
+    """Fresh official NSE quote snapshot for display only; never feeds the locked Delivery model."""
+    try:
+        return get_latest_price(symbol)
+    except Exception:
+        return None
 
 
 def _intraday_price_envelope(price_df: pd.DataFrame, decision_ts, minutes: int = 30) -> pd.DataFrame:
@@ -584,8 +639,14 @@ if interface_mode == "Live Test":
                     "probability_up": np.nan,
                     "expected_move": np.nan,
                     "reference_close": np.nan,
+                    "predicted_open": np.nan,
+                    "predicted_high": np.nan,
+                    "predicted_low": np.nan,
                     "predicted_close": np.nan,
                     "predicted_change": np.nan,
+                    "ohlc_method": "—",
+                    "live_ltp": np.nan,
+                    "live_ltp_change": np.nan,
                     "data_gate": False,
                     "reference_session": "—",
                     "ledger": "—",
@@ -600,15 +661,39 @@ if interface_mode == "Live Test":
                     },
                     sync_drive=True,
                 )
+                predicted_close = result.get("predicted_price_next_session")
+                reference_close = result.get("reference_close")
+                ref_date = result.get("reference_session")
+                ohlc = _delivery_opening_stats(
+                    sym.replace(".NS", "").upper(),
+                    str(ref_date) if ref_date else "",
+                    float(reference_close) if pd.notna(reference_close) else np.nan,
+                    float(predicted_close) if pd.notna(predicted_close) else np.nan,
+                ) if ref_date else {"status": "NO_DATA"}
+                live_ltp = _cached_nse_ltp(sym)
+                live_change = (
+                    (float(live_ltp) / float(reference_close) - 1.0)
+                    if live_ltp is not None
+                    and pd.notna(reference_close)
+                    and np.isfinite(float(reference_close))
+                    and float(reference_close) != 0
+                    else np.nan
+                )
                 rows.append({
                     "symbol": sym,
                     "status": result.get("prediction_status"),
                     "signal": result.get("signal", "—"),
                     "probability_up": result.get("probability_up_next_session"),
                     "expected_move": result.get("predicted_return_next_session"),
-                    "reference_close": result.get("reference_close"),
-                    "predicted_close": result.get("predicted_price_next_session"),
+                    "reference_close": reference_close,
+                    "predicted_open": ohlc.get("expected_open", np.nan),
+                    "predicted_high": ohlc.get("expected_high", np.nan),
+                    "predicted_low": ohlc.get("expected_low", np.nan),
+                    "predicted_close": predicted_close,
                     "predicted_change": result.get("predicted_price_change_next_session"),
+                    "ohlc_method": ohlc.get("method", "—"),
+                    "live_ltp": live_ltp if live_ltp is not None else np.nan,
+                    "live_ltp_change": live_change,
                     "data_gate": result.get("production_data_quality_gate"),
                     "reference_session": result.get("reference_session"),
                     "ledger": result.get("prediction_ledger_status", "—"),
@@ -621,8 +706,14 @@ if interface_mode == "Live Test":
                     "probability_up": np.nan,
                     "expected_move": np.nan,
                     "reference_close": np.nan,
+                    "predicted_open": np.nan,
+                    "predicted_high": np.nan,
+                    "predicted_low": np.nan,
                     "predicted_close": np.nan,
                     "predicted_change": np.nan,
+                    "ohlc_method": "—",
+                    "live_ltp": np.nan,
+                    "live_ltp_change": np.nan,
                     "data_gate": False,
                     "reference_session": "—",
                     "ledger": f"{type(exc).__name__}: {exc}",
@@ -637,10 +728,21 @@ if interface_mode == "Live Test":
             display_df["expected_move"] = pd.to_numeric(
                 display_df["expected_move"], errors="coerce"
             ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-            for price_col in ["reference_close", "predicted_close", "predicted_change"]:
+            for price_col in [
+                "reference_close",
+                "predicted_open",
+                "predicted_high",
+                "predicted_low",
+                "predicted_close",
+                "predicted_change",
+                "live_ltp",
+            ]:
                 display_df[price_col] = pd.to_numeric(
                     display_df[price_col], errors="coerce"
                 ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+            display_df["live_ltp_change"] = pd.to_numeric(
+                display_df["live_ltp_change"], errors="coerce"
+            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
             display_df["data_gate"] = display_df["data_gate"].map(
                 lambda x: "PASS" if bool(x) else "BLOCKED"
             )
@@ -650,8 +752,10 @@ if interface_mode == "Live Test":
                 display_df[
                     [
                         "symbol", "signal", "probability_up",
-                        "reference_close", "predicted_close",
-                        "predicted_change", "expected_move", "data_gate",
+                        "reference_close", "predicted_open",
+                        "predicted_high", "predicted_low", "predicted_close",
+                        "predicted_change", "expected_move",
+                        "live_ltp", "live_ltp_change", "data_gate",
                         "reference_session", "ledger",
                     ]
                 ],
@@ -665,48 +769,64 @@ if interface_mode == "Live Test":
                 "forecast is generated after the next completed NSE session."
             )
 
-            st.subheader("Delivery price view")
+            st.subheader("Delivery — projected next-session OHLC")
             st.caption(
-                "Predicted close is the production model's predicted next-session return applied to the "
-                "reference close. Expected open is a separate 60-session median opening-gap estimate; "
-                "it is not an output of the locked 59-feature ML model."
+                "Predicted close is the locked 59-feature ML model's predicted return applied to the "
+                "latest persisted reference close. Open, high and low are statistical projections derived "
+                "from the latest 60 completed sessions; they are explicitly NOT separate ML outputs."
             )
             for row in rows:
                 if row.get("status") != "PASS":
                     continue
-                ref_close = row.get("reference_close")
+                ref_close = pd.to_numeric(row.get("reference_close"), errors="coerce")
                 ref_date = row.get("reference_session")
-                if not np.isfinite(pd.to_numeric(ref_close, errors="coerce")) or not ref_date:
+                if not np.isfinite(ref_close) or not ref_date:
                     continue
                 root = str(row["symbol"]).replace(".NS", "").upper()
-                opening = _delivery_opening_stats(
+                ohlc = _delivery_opening_stats(
                     root,
                     str(ref_date),
                     float(ref_close),
+                    float(row.get("predicted_close")) if pd.notna(row.get("predicted_close")) else np.nan,
                 )
-                if opening.get("status") == "PASS":
-                    o1, o2, o3, o4 = st.columns(4)
-                    o1.metric("Previous/reference close", f"₹{float(ref_close):,.2f}")
-                    o2.metric("Statistical expected open", f"₹{opening['expected_open']:,.2f}")
+                live_ltp = row.get("live_ltp")
+                live_change = row.get("live_ltp_change")
+                if ohlc.get("status") == "PASS":
+                    o1, o2, o3, o4, o5 = st.columns(5)
+                    o1.metric("Reference close", f"₹{float(ref_close):,.2f}")
+                    o2.metric("Projected open", f"₹{ohlc['expected_open']:,.2f}")
                     o3.metric(
-                        "Model-implied next close",
+                        "Projected high",
+                        f"₹{ohlc['expected_high']:,.2f}"
+                        if pd.notna(ohlc.get("expected_high")) else "—",
+                    )
+                    o4.metric(
+                        "Projected low",
+                        f"₹{ohlc['expected_low']:,.2f}"
+                        if pd.notna(ohlc.get("expected_low")) else "—",
+                    )
+                    o5.metric(
+                        "ML predicted close",
                         f"₹{float(row['predicted_close']):,.2f}"
                         if pd.notna(row.get("predicted_close")) else "—",
                     )
-                    o4.metric(
-                        "Model price change",
-                        f"₹{float(row['predicted_change']):+,.2f}"
-                        if pd.notna(row.get("predicted_change")) else "—",
+                    live_text = (
+                        f"Official NSE LTP ₹{float(live_ltp):,.2f} ({float(live_change):+.2%} vs reference)"
+                        if live_ltp is not None and pd.notna(live_change)
+                        else "Official NSE LTP unavailable"
                     )
                     st.caption(
-                        f"{root}: opening-gap median {opening['median_gap']:+.2%} "
-                        f"from {opening['samples']} prior sessions."
+                        f"{root}: {live_text} · opening-gap median {ohlc['median_gap']:+.2%} "
+                        f"from {ohlc['samples']} prior sessions. "
+                        "Projected high/low use empirical daily excursion around the projected open/close."
                     )
                 else:
                     st.info(
-                        f"{root}: opening estimate unavailable; the production model still provides "
-                        "the next-session close projection when its predicted return and reference close are available."
+                        f"{root}: OHLC statistical projection unavailable; the locked production model still "
+                        "provides the next-session close projection when its predicted return and reference close are available."
                     )
+
+
 
     elif live_mode == "Intraday 5-minute":
         try:
