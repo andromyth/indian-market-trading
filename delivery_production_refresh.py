@@ -19,6 +19,10 @@ REMOTE_SOURCES = {
 }
 MIN_HISTORY = 60
 
+
+def _stage(message: str) -> None:
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {message}", flush=True)
+
 def _store():
     from persistent_store import GoogleDriveStore
     return GoogleDriveStore()
@@ -185,12 +189,15 @@ def main():
     ap.add_argument("--delivery-lookback-days",type=int,default=150)
     ap.add_argument("--source-wait-minutes",type=int,default=10)
     args=ap.parse_args()
+    _stage("START: creating Google Drive store")
     store=_store()
+    _stage("Drive store ready")
 
     # Upstream F&O/news workflows can finish a little later than the Delivery
     # archive job. Poll missing upstream files briefly rather than producing a
     # falsely data-limited production snapshot during normal workflow overlap.
     deadline=datetime.now(timezone.utc)+timedelta(minutes=max(0,args.source_wait_minutes))
+    _stage("SOURCE PHASE: checking F&O/news/events/fundamentals")
     source_status={}
     while True:
         source_status={}
@@ -207,12 +214,14 @@ def main():
         _time.sleep(60)
     eod_status=_download_recent_eod(store,args.lookback_days)
     delivery_status=_download_recent_delivery(store,args.delivery_lookback_days)
+    _stage("IMPORT PHASE: loading panel/model builder modules")
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
     from delivery_training_universe import training_roster,load_official_nse_universe
     from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags
     from nse_delivery_data_layer import load_delivery_history
     today=datetime.now(timezone.utc).date()
 
+    _stage("NEWS PHASE: collecting live RSS snapshot")
     # Persist the current RSS headline snapshot so automated and interactive
     # Delivery predictions use the same latest-news source rather than relying
     # on a user's browser session to fetch it first.
@@ -226,14 +235,25 @@ def main():
     except Exception as exc:
         live_news_result={"status":"ERROR","error":f"{type(exc).__name__}: {exc}"}
         source_status["live_rss_news"]="ERROR"
+    _stage(f"NEWS PHASE DONE: {live_news_result.get(chr(39)+chr(115)+chr(116)+chr(97)+chr(116)+chr(117)+chr(115)+chr(39), chr(39)+chr(117)+chr(110)+chr(107)+chr(110)+chr(111)+chr(119)+chr(110)+chr(39)}")
 
+    _stage("BULK EOD PHASE: loading recent NSE history from local cache")
     bulk=_load_eod(EOD_LOCAL_ROOT,today-timedelta(days=args.lookback_days),today)
+    _stage(f"BULK EOD LOADED: rows={len(bulk):,}, symbols={bulk[chr(39)+chr(115)+chr(121)+chr(109)+chr(98)+chr(111)+chr(108)+chr(39)].nunique():,}")
+    _stage("ROSTER PHASE: computing current 60-session clean-history universe")
     roster=training_roster(bulk,min_history=MIN_HISTORY,force_refresh=True)
     trainable=list(roster["trainable_symbols"])
+    _stage(f"ROSTER DONE: universe={roster[chr(39)+chr(117)+chr(110)+chr(105)+chr(118)+chr(101)+chr(114)+chr(115)+chr(101)+chr(95)+chr(115)+chr(121)+chr(109)+chr(98)+chr(111)+chr(108)+chr(95)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116)+chr(39)]}, trainable={len(trainable):,}")
     if not trainable: raise RuntimeError("No current NSE symbols meet the 60-session clean-history gate")
+    _stage("DELIVERY HISTORY PHASE: loading local Delivery parquet files")
     delivery=load_delivery_history(DELIVERY_LOCAL,symbols=trainable,start=bulk["date"].min(),end=bulk["date"].max())
+    _stage(f"DELIVERY HISTORY LOADED: rows={len(delivery):,}")
+    _stage("PANEL PHASE: building multifactor production panel")
     panel=make_panel(bulk,trainable,sort_output=False,delivery=delivery)
+    _stage(f"PANEL BUILT: rows={len(panel):,}, cols={len(panel.columns):,}")
+    _stage("OPTIONAL SOURCES PHASE: merging F&O/news/events/fundamentals")
     panel,source_audit=merge_optional(panel)
+    _stage(f"OPTIONAL SOURCES MERGED: rows={len(panel):,}, cols={len(panel.columns):,}")
 
     # Distinguish "source is present and this symbol has no applicable item"
     # from "the source pipeline itself is missing". The former is known state
@@ -248,7 +268,9 @@ def main():
         if source_status.get(source) in {"LOCAL", "DOWNLOADED"} and flag in panel.columns:
             panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
 
+    _stage("READINESS PHASE: attaching production data-quality flags")
     panel=attach_readiness_flags(panel)
+    _stage("READINESS PHASE DONE")
 
     # A present source pipeline means missing per-symbol observations are a
     # known no-data/not-applicable state. Apply this after readiness columns
@@ -272,7 +294,9 @@ def main():
     latest_date=pd.to_datetime(panel["decision_timestamp"],utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
     snap=FEATURE_DIR/f"DELIVERY_PIT_FEATURES_{latest_date}.parquet"
     snap.parent.mkdir(parents=True,exist_ok=True)
+    _stage(f"SNAPSHOT WRITE: {snap.name}")
     panel.to_parquet(snap,index=False)
+    _stage("SNAPSHOT WRITE DONE")
     group_ready={}
     for c in readiness_cols:
         s=pd.to_numeric(panel[c],errors="coerce")
@@ -293,10 +317,12 @@ def main():
     }
     report_path=FEATURE_DIR/f"DELIVERY_PIT_READINESS_{latest_date}.json"
     report_path.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
+    _stage("DRIVE UPLOAD: snapshot + readiness report")
     store.upload_or_update(snap,f"features/daily/{snap.name}",mime_type="application/octet-stream")
     store.upload_or_update(report_path,f"features/daily/{report_path.name}",mime_type="application/json")
     if live_news_path.exists():
         store.upload_or_update(live_news_path,"processed/live_news/news_latest.parquet",mime_type="application/octet-stream")
+    _stage("DONE: Delivery PIT production refresh completed")
     print(json.dumps(report,indent=2,default=str))
 if __name__=="__main__":
     main()
