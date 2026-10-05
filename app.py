@@ -696,14 +696,14 @@ if interface_mode == "Live Test":
             st.error(f"Delivery model status failed: {type(exc).__name__}: {exc}")
             model = {}
 
-        if now_ist.date() in [pd.Timestamp("2026-10-04").date()]:
+        if 9 <= now_ist.hour < 10:
             st.info(
-                "October 4, 2026 is Sunday. The latest completed NSE session is October 1; "
-                "the Delivery signal currently represents the next-session forecast from the latest persisted PIT snapshot."
+                "NSE pre-open is active. The projected open below is the model/display estimate; "
+                "the exchange's pre-open equilibrium price is determined during the pre-open auction. "
+                "Refresh live data during pre-open and again after 09:15 IST for current-market context."
             )
 
         rows = []
-        live_frames = {}
         for sym in symbols:
             if not sym.endswith(".NS"):
                 rows.append({
@@ -724,47 +724,54 @@ if interface_mode == "Live Test":
                     "data_gate": False,
                     "data_gate_reason": "NON_NSE_SYMBOL",
                     "pit_news_state": "UNKNOWN",
-                     "live_news_count_24h": np.nan,
-                     "live_news_score": np.nan,
-                     "live_high_impact_news": np.nan,
-                     "live_news_fresh_hours": np.nan,
-                     "live_news_state": "NOT APPLICABLE",
-                     "live_event_count": np.nan,
-                     "live_fno_pcr": np.nan,
-                     "live_fno_max_pain": np.nan,
-                     "live_fno_expiry": "—",
+                    "live_news_count_24h": np.nan,
+                    "live_news_score": np.nan,
+                    "live_high_impact_news": np.nan,
+                    "live_news_fresh_hours": np.nan,
+                    "live_news_state": "NOT APPLICABLE",
+                    "live_event_count": np.nan,
+                    "live_fno_pcr": np.nan,
+                    "live_fno_max_pain": np.nan,
+                    "live_fno_expiry": "—",
                     "benchmark_symbol": "—",
                     "benchmark_last": np.nan,
                     "benchmark_change_30m": np.nan,
-                     "data_gate_reason": f"ERROR: {type(exc).__name__}",
                     "reference_session": "—",
                     "ledger": "—",
                 })
                 continue
 
-                     "live_news_state": "UNKNOWN",
             try:
+                root = sym.replace(".NS", "").upper()
                 result = delivery_prediction(
                     {
-                        "symbol": sym.replace(".NS", "").upper(),
+                        "symbol": root,
                         "decision_timestamp": now_ist,
                     },
                     sync_drive=True,
                 )
-                 live_news = _delivery_live_news_context(sym, now_ist)
-                 live_fo = _cached_live_option_chain(sym) or {}
-                 live_events = _cached_live_announcements(sym) or []
-                 benchmark_symbol = benchmark_for_symbol(sym)
-                 benchmark_live = _cached_live_benchmark_summary(benchmark_symbol)
+
+                live_news = _delivery_live_news_context(sym, now_ist)
+                live_fo = _cached_live_option_chain(sym) or {}
+                live_events = _cached_live_announcements(sym) or []
+                benchmark_symbol = benchmark_for_symbol(sym)
+                benchmark_live = _cached_live_benchmark_summary(benchmark_symbol)
+
                 predicted_close = result.get("predicted_price_next_session")
                 reference_close = result.get("reference_close")
                 ref_date = result.get("reference_session")
-                ohlc = _delivery_opening_stats(
-                    sym.replace(".NS", "").upper(),
-                    str(ref_date) if ref_date else "",
-                    float(reference_close) if pd.notna(reference_close) else np.nan,
-                    float(predicted_close) if pd.notna(predicted_close) else np.nan,
-                ) if ref_date else {"status": "NO_DATA"}
+
+                ohlc = (
+                    _delivery_opening_stats(
+                        root,
+                        str(ref_date),
+                        float(reference_close) if pd.notna(reference_close) else np.nan,
+                        float(predicted_close) if pd.notna(predicted_close) else np.nan,
+                    )
+                    if ref_date
+                    else {"status": "NO_DATA"}
+                )
+
                 live_ltp = _cached_nse_ltp(sym)
                 live_change = (
                     (float(live_ltp) / float(reference_close) - 1.0)
@@ -774,6 +781,7 @@ if interface_mode == "Live Test":
                     and float(reference_close) != 0
                     else np.nan
                 )
+
                 rows.append({
                     "symbol": sym,
                     "status": result.get("prediction_status"),
@@ -790,20 +798,20 @@ if interface_mode == "Live Test":
                     "live_ltp": live_ltp if live_ltp is not None else np.nan,
                     "live_ltp_change": live_change,
                     "data_gate": result.get("production_data_quality_gate"),
-                     "data_gate_reason": result.get("data_gate_reason", "UNKNOWN"),
-                     "pit_news_state": (result.get("optional_information_status") or {}).get("news", "UNKNOWN"),
-                     "live_news_count_24h": live_news.get("count_24h", 0),
-                     "live_news_score": live_news.get("score", 0.0),
-                     "live_high_impact_news": live_news.get("high_impact", 0),
-                     "live_news_fresh_hours": live_news.get("fresh_hours", np.nan),
-                     "live_news_state": live_news.get("state", "UNKNOWN"),
-                     "live_event_count": int(len(live_events)),
-                     "live_fno_pcr": live_fo.get("pcr", np.nan),
-                     "live_fno_max_pain": live_fo.get("max_pain", np.nan),
-                     "live_fno_expiry": live_fo.get("expiry", "—"),
-                     "benchmark_symbol": benchmark_live.get("benchmark", benchmark_symbol),
-                     "benchmark_last": benchmark_live.get("last", np.nan),
-                     "benchmark_change_30m": benchmark_live.get("change_30m", np.nan),
+                    "data_gate_reason": result.get("data_gate_reason", "UNKNOWN"),
+                    "pit_news_state": (result.get("optional_information_status") or {}).get("news", "UNKNOWN"),
+                    "live_news_count_24h": live_news.get("count_24h", 0),
+                    "live_news_score": live_news.get("score", 0.0),
+                    "live_high_impact_news": live_news.get("high_impact", 0),
+                    "live_news_fresh_hours": live_news.get("fresh_hours", np.nan),
+                    "live_news_state": live_news.get("state", "UNKNOWN"),
+                    "live_event_count": int(len(live_events)),
+                    "live_fno_pcr": live_fo.get("pcr", np.nan),
+                    "live_fno_max_pain": live_fo.get("max_pain", np.nan),
+                    "live_fno_expiry": live_fo.get("expiry", "—"),
+                    "benchmark_symbol": benchmark_live.get("benchmark", benchmark_symbol),
+                    "benchmark_last": benchmark_live.get("last", np.nan),
+                    "benchmark_change_30m": benchmark_live.get("change_30m", np.nan),
                     "reference_session": result.get("reference_session"),
                     "ledger": result.get("prediction_ledger_status", "—"),
                 })
@@ -824,6 +832,20 @@ if interface_mode == "Live Test":
                     "live_ltp": np.nan,
                     "live_ltp_change": np.nan,
                     "data_gate": False,
+                    "data_gate_reason": f"ERROR: {type(exc).__name__}",
+                    "pit_news_state": "UNKNOWN",
+                    "live_news_count_24h": np.nan,
+                    "live_news_score": np.nan,
+                    "live_high_impact_news": np.nan,
+                    "live_news_fresh_hours": np.nan,
+                    "live_news_state": "UNKNOWN",
+                    "live_event_count": np.nan,
+                    "live_fno_pcr": np.nan,
+                    "live_fno_max_pain": np.nan,
+                    "live_fno_expiry": "—",
+                    "benchmark_symbol": "—",
+                    "benchmark_last": np.nan,
+                    "benchmark_change_30m": np.nan,
                     "reference_session": "—",
                     "ledger": f"{type(exc).__name__}: {exc}",
                 })
@@ -837,6 +859,7 @@ if interface_mode == "Live Test":
             display_df["expected_move"] = pd.to_numeric(
                 display_df["expected_move"], errors="coerce"
             ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+
             for price_col in [
                 "reference_close",
                 "predicted_open",
@@ -849,87 +872,142 @@ if interface_mode == "Live Test":
                 display_df[price_col] = pd.to_numeric(
                     display_df[price_col], errors="coerce"
                 ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+
             display_df["live_ltp_change"] = pd.to_numeric(
                 display_df["live_ltp_change"], errors="coerce"
+            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+            display_df["live_news_score"] = pd.to_numeric(
+                display_df["live_news_score"], errors="coerce"
+            ).map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
+            display_df["live_news_fresh_hours"] = pd.to_numeric(
+                display_df["live_news_fresh_hours"], errors="coerce"
+            ).map(lambda x: f"{x:.1f}h" if pd.notna(x) else "—")
+            display_df["live_fno_pcr"] = pd.to_numeric(
+                display_df["live_fno_pcr"], errors="coerce"
+            ).map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+            display_df["live_fno_max_pain"] = pd.to_numeric(
+                display_df["live_fno_max_pain"], errors="coerce"
+            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+            display_df["benchmark_last"] = pd.to_numeric(
+                display_df["benchmark_last"], errors="coerce"
+            ).map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+            display_df["benchmark_change_30m"] = pd.to_numeric(
+                display_df["benchmark_change_30m"], errors="coerce"
             ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
             display_df["data_gate"] = display_df["data_gate"].map(
                 lambda x: "PASS" if bool(x) else "BLOCKED"
             )
 
-             display_df["live_news_score"] = pd.to_numeric(display_df["live_news_score"], errors="coerce").map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
-             display_df["live_fno_pcr"] = pd.to_numeric(display_df["live_fno_pcr"], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-             display_df["live_fno_max_pain"] = pd.to_numeric(display_df["live_fno_max_pain"], errors="coerce").map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-             display_df["benchmark_last"] = pd.to_numeric(display_df["benchmark_last"], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
-             display_df["benchmark_change_30m"] = pd.to_numeric(display_df["benchmark_change_30m"], errors="coerce").map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-             blocked = display_df.loc[display_df["data_gate"].eq("BLOCKED")]
-             if not blocked.empty:
-                 reasons = sorted(set(str(x) for x in blocked["data_gate_reason"].dropna() if str(x).strip()))
-                 st.warning("Delivery data gate is BLOCKED. Numeric forecasts may still be calculated, but BUY/SELL is forced to HOLD until the production data gate passes.")
-                 if reasons:
-                     st.caption("Gate reason(s): " + " · ".join(reasons))
+            blocked = display_df.loc[display_df["data_gate"].eq("BLOCKED")]
+            if not blocked.empty:
+                reasons = sorted(
+                    set(
+                        str(x)
+                        for x in blocked["data_gate_reason"].dropna()
+                        if str(x).strip()
+                    )
+                )
+                st.warning(
+                    "Delivery data gate is BLOCKED. The numeric forecast can still be displayed, "
+                    "but BUY/SELL is forced to HOLD until the production data-quality gate passes."
+                )
+                if reasons:
+                    st.caption("Gate reason(s): " + " · ".join(reasons))
 
             st.subheader("Delivery — next-session production signal")
-            st.dataframe(
-                display_df[
-                    [
-                        "symbol", "signal", "probability_up",
-                        "reference_close", "predicted_open",
-                        "predicted_high", "predicted_low", "predicted_close",
-                        "predicted_change", "expected_move",
-                         "live_ltp", "live_ltp_change",
-                         "live_news_count_24h", "live_news_score", "live_high_impact_news",
-                         "live_event_count", "live_fno_pcr", "live_fno_max_pain",
-                         "benchmark_symbol", "benchmark_last", "benchmark_change_30m",
-                         "pit_news_state", "data_gate", "data_gate_reason",
-                        "reference_session", "ledger",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
+            table_df = display_df[
+                [
+                    "symbol", "signal", "probability_up",
+                    "reference_close", "predicted_open", "predicted_high",
+                    "predicted_low", "predicted_close", "predicted_change",
+                    "expected_move", "live_ltp", "live_ltp_change",
+                    "live_news_count_24h", "live_news_score", "live_high_impact_news",
+                    "live_event_count", "live_fno_pcr", "live_fno_max_pain",
+                    "benchmark_symbol", "benchmark_last", "benchmark_change_30m",
+                    "pit_news_state", "data_gate", "data_gate_reason",
+                    "reference_session", "ledger",
+                ]
+            ].rename(
+                columns={
+                    "symbol": "Symbol",
+                    "signal": "Signal",
+                    "probability_up": "P(Up)",
+                    "reference_close": "Reference close",
+                    "predicted_open": "Projected open",
+                    "predicted_high": "Projected high",
+                    "predicted_low": "Projected low",
+                    "predicted_close": "ML predicted close",
+                    "predicted_change": "Close change",
+                    "expected_move": "Expected move",
+                    "live_ltp": "Live LTP",
+                    "live_ltp_change": "Live LTP vs ref",
+                    "live_news_count_24h": "News / 24h",
+                    "live_news_score": "News score",
+                    "live_high_impact_news": "High-impact news",
+                    "live_event_count": "Announcements",
+                    "live_fno_pcr": "F&O PCR",
+                    "live_fno_max_pain": "F&O max pain",
+                    "benchmark_symbol": "Benchmark",
+                    "benchmark_last": "Benchmark LTP",
+                    "benchmark_change_30m": "Benchmark 30m",
+                    "pit_news_state": "PIT news input",
+                    "data_gate": "Data gate",
+                    "data_gate_reason": "Gate reason",
+                    "reference_session": "Reference session",
+                    "ledger": "Ledger",
+                }
+            )
+            st.dataframe(table_df, width="stretch", hide_index=True)
+
+            st.caption(
+                "ML predicted close is the locked 59-feature Production Delivery output. "
+                "Projected open/high/low are statistical next-session estimates from prior completed sessions; "
+                "they are not separate trained ML outputs. Live news, F&O, announcements and benchmark values "
+                "are displayed as current advisory context."
             )
 
-             st.caption(
-                 "ML predicted close comes from the locked 59-feature Delivery model. "
-                 "Projected open/high/low are statistical next-session estimates from prior completed sessions, "
-                 "not separately trained ML outputs. Live news, F&O, announcements and benchmark fields are "
-                 "displayed as advisory context and do not silently alter the locked model score."
-             )
+            st.subheader("Delivery — live decision context")
+            context_rows = []
+            for row in rows:
+                if row.get("status") not in {"PASS", "ERROR"}:
+                    continue
+                context_rows.append({
+                    "Symbol": row.get("symbol"),
+                    "PIT news input": row.get("pit_news_state", "UNKNOWN"),
+                    "Live news / 24h": row.get("live_news_count_24h", np.nan),
+                    "News score": row.get("live_news_score", np.nan),
+                    "High-impact": row.get("live_high_impact_news", np.nan),
+                    "Announcements": row.get("live_event_count", np.nan),
+                    "F&O PCR": row.get("live_fno_pcr", np.nan),
+                    "F&O max pain": row.get("live_fno_max_pain", np.nan),
+                    "Benchmark": row.get("benchmark_symbol", "—"),
+                    "Benchmark 30m": row.get("benchmark_change_30m", np.nan),
+                    "Gate": "PASS" if bool(row.get("data_gate")) else "BLOCKED",
+                })
+            if context_rows:
+                context_df = pd.DataFrame(context_rows)
+                context_df["News score"] = pd.to_numeric(
+                    context_df["News score"], errors="coerce"
+                ).map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
+                context_df["F&O PCR"] = pd.to_numeric(
+                    context_df["F&O PCR"], errors="coerce"
+                ).map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                context_df["F&O max pain"] = pd.to_numeric(
+                    context_df["F&O max pain"], errors="coerce"
+                ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+                context_df["Benchmark 30m"] = pd.to_numeric(
+                    context_df["Benchmark 30m"], errors="coerce"
+                ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
+                st.dataframe(context_df, width="stretch", hide_index=True)
 
-             st.subheader("Delivery — live decision context")
-             context_rows = []
-             for row in rows:
-                 if row.get("status") not in {"PASS", "ERROR"}:
-                     continue
-                 context_rows.append({
-                     "symbol": row.get("symbol"),
-                     "PIT news": row.get("pit_news_state", "UNKNOWN"),
-                     "Live news / 24h": row.get("live_news_count_24h", np.nan),
-                     "News score": row.get("live_news_score", np.nan),
-                     "High-impact news": row.get("live_high_impact_news", np.nan),
-                     "Announcements": row.get("live_event_count", np.nan),
-                     "F&O PCR": row.get("live_fno_pcr", np.nan),
-                     "F&O max pain": row.get("live_fno_max_pain", np.nan),
-                     "Benchmark": row.get("benchmark_symbol", "—"),
-                     "Benchmark 30m": row.get("benchmark_change_30m", np.nan),
-                     "Gate": "PASS" if bool(row.get("data_gate")) else "BLOCKED",
-                 })
-             if context_rows:
-                 context_df = pd.DataFrame(context_rows)
-                 context_df["News score"] = pd.to_numeric(context_df["News score"], errors="coerce").map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
-                 context_df["F&O PCR"] = pd.to_numeric(context_df["F&O PCR"], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-                 context_df["F&O max pain"] = pd.to_numeric(context_df["F&O max pain"], errors="coerce").map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-                 context_df["Benchmark 30m"] = pd.to_numeric(context_df["Benchmark 30m"], errors="coerce").map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-                 st.dataframe(context_df, width="stretch", hide_index=True)
-
-             st.caption(
-                 "The locked 59-feature model includes point-in-time news availability. Live headline sentiment is shown separately because it is not a feature in the locked contract; the unvalidated contextual-fusion engine is not allowed to silently replace the production probability."
-             )
-
-             st.subheader("Delivery — projected next-session OHLC")
-                "Predicted close is the locked 59-feature ML model's predicted return applied to the "
-                "latest persisted reference close. Open, high and low are statistical projections derived "
-                "from the latest 60 completed sessions; they are explicitly NOT separate ML outputs."
+            st.caption(
+                "The locked 59-feature contract includes point-in-time news availability. "
+                "Live headline sentiment is shown separately because live headline sentiment is not a feature "
+                "of the locked model; the unvalidated contextual-fusion engine is not permitted to replace "
+                "the production probability."
             )
+
+            st.subheader("Delivery — projected next-session OHLC")
             for row in rows:
                 if row.get("status") != "PASS":
                     continue
