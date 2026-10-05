@@ -19,26 +19,56 @@ from prediction_ledger import append_prediction
 
 
 
-@lru_cache(maxsize=1)
 def _load_persisted_live_news() -> pd.DataFrame:
-    """Load the latest persisted RSS headline snapshot from Drive."""
+    """Load the newest persisted RSS snapshot and normalize its text schema.
+
+    The Streamlit process may stay alive across a daily Drive snapshot rollover,
+    so this function must not retain an unbounded one-shot cache. When the Drive
+    file is newer than the local copy, refresh it before scoring live context.
+    """
     local = Path(__file__).resolve().parent / "data" / "live_news" / "news_latest.parquet"
     remote = "processed/live_news/news_latest.parquet"
+
     try:
-        if not local.exists() or local.stat().st_size == 0:
-            from persistent_store import GoogleDriveStore
-            from googleapiclient.http import MediaIoBaseDownload
-            store = GoogleDriveStore()
-            parts = remote.split("/")
-            parent = store.root_id
-            for part in parts[:-1]:
-                found = store._find_child(parent, part)
-                if not found:
-                    return pd.DataFrame()
-                parent = found["id"]
-            found = store._find_child(parent, parts[-1])
+        from persistent_store import GoogleDriveStore
+        from googleapiclient.http import MediaIoBaseDownload
+
+        store = GoogleDriveStore()
+        parts = remote.split("/")
+        parent = store.root_id
+        for part in parts[:-1]:
+            found = store._find_child(parent, part)
             if not found:
-                return pd.DataFrame()
+                return pd.read_parquet(local) if local.exists() and local.stat().st_size else pd.DataFrame()
+            parent = found["id"]
+
+        found = store._find_child(parent, parts[-1])
+        if not found:
+            return pd.read_parquet(local) if local.exists() and local.stat().st_size else pd.DataFrame()
+
+        remote_meta = store.service.files().get(
+            fileId=found["id"],
+            fields="id,name,modifiedTime,size",
+        ).execute()
+        remote_mtime = pd.to_datetime(
+            remote_meta.get("modifiedTime"),
+            utc=True,
+            errors="coerce",
+        )
+        local_mtime = pd.Timestamp.fromtimestamp(local.stat().st_mtime, tz="UTC") if (
+            local.exists() and local.stat().st_size
+        ) else pd.NaT
+
+        needs_download = (
+            not local.exists()
+            or local.stat().st_size == 0
+            or (
+                pd.notna(remote_mtime)
+                and (pd.isna(local_mtime) or remote_mtime > local_mtime)
+            )
+        )
+
+        if needs_download:
             local.parent.mkdir(parents=True, exist_ok=True)
             temp = local.with_suffix(".tmp")
             with temp.open("wb") as fh:
@@ -50,16 +80,43 @@ def _load_persisted_live_news() -> pd.DataFrame:
                 while not done:
                     _, done = dl.next_chunk()
             temp.replace(local)
-        x = pd.read_parquet(local)
+
+        x = pd.read_parquet(local) if local.exists() and local.stat().st_size else pd.DataFrame()
         if x.empty:
             return x
+
+        x.columns = [str(col).strip().lower() for col in x.columns]
         x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
-        x["published_at"] = pd.to_datetime(x["published_at"], errors="coerce", utc=True)
+        x["published_at"] = pd.to_datetime(
+            x["published_at"], errors="coerce", utc=True
+        )
+
+        # sd_news_collect persists the headline+summary in the text column;
+        # the directional context expects title/summary fields.
+        if "title" not in x.columns:
+            x["title"] = x["text"] if "text" in x.columns else ""
+        if "summary" not in x.columns:
+            x["summary"] = ""
+
         return x.dropna(subset=["symbol", "published_at"])
+
     except Exception:
-        return pd.DataFrame()
-
-
+        try:
+            x = pd.read_parquet(local) if local.exists() and local.stat().st_size else pd.DataFrame()
+            if x.empty:
+                return x
+            x.columns = [str(col).strip().lower() for col in x.columns]
+            x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
+            x["published_at"] = pd.to_datetime(
+                x["published_at"], errors="coerce", utc=True
+            )
+            if "title" not in x.columns:
+                x["title"] = x["text"] if "text" in x.columns else ""
+            if "summary" not in x.columns:
+                x["summary"] = ""
+            return x.dropna(subset=["symbol", "published_at"])
+        except Exception:
+            return pd.DataFrame()
 def _news_for_prediction(symbol: str, as_of: Any, provided: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if provided:
         return list(provided)
