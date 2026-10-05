@@ -1602,6 +1602,7 @@ def predict_symbol(
                 "fundamentals": "KNOWN" if pd.notna(feature_frame.iloc[0].get("fundamental_age_days")) else "UNKNOWN",
             },
             "production_data_quality_gate": data_gate,
+            "data_gate_reason": data_gate_reason,
             "production_data_quality_score": _safe_float(pit_row.iloc[0].get("production_data_quality_score", np.nan)),
             "signal_policy": policy,
             "auxiliary_model_ensemble": auxiliary_models,
