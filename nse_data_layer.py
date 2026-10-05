@@ -858,7 +858,32 @@ def fetch_index_history(
     start_d = pd.Timestamp(start).date()
     end_d = pd.Timestamp(end).date()
 
-    # 1) Prefer already-persisted official NSE benchmark history.
+    def _drive_coverage_ok(frame: pd.DataFrame) -> bool:
+        """Accept Drive benchmark data only when it covers the requested window."""
+        if frame is None or frame.empty or "date" not in frame.columns:
+            return False
+        dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+        if dates.empty:
+            return False
+        first = dates.min().date()
+        last = dates.max().date()
+        start_slack = 10
+        end_slack = 10
+        if first > start_d + timedelta(days=start_slack):
+            return False
+        if last < end_d - timedelta(days=end_slack):
+            return False
+        span_days = max(1, (end_d - start_d).days)
+        if span_days >= 90:
+            expected_weekdays = int(span_days * 5 / 7)
+            if len(dates) < max(30, int(expected_weekdays * 0.50)):
+                return False
+        return True
+
+    # 1) Prefer already-persisted official NSE benchmark history, but only when
+    # the persisted files cover the requested window. Previously a recent but
+    # partial Drive slice could be accepted solely because its latest date was
+    # fresh, leaving most stock rows without benchmark features.
     try:
         drive_frame = _drive_index_history(
             root,
@@ -866,24 +891,8 @@ def fetch_index_history(
             end_d,
         )
 
-        if (
-            drive_frame is not None
-            and not drive_frame.empty
-        ):
-            drive_dates = pd.to_datetime(
-                drive_frame["date"], errors="coerce"
-            ).dropna()
-            latest_drive_date = (
-                drive_dates.max().date()
-                if not drive_dates.empty
-                else None
-            )
-            # Do not silently accept materially stale benchmark data.
-            if (
-                latest_drive_date is not None
-                and latest_drive_date >= end_d - timedelta(days=4)
-            ):
-                return drive_frame
+        if _drive_coverage_ok(drive_frame):
+            return drive_frame
 
     except Exception:
         pass
@@ -908,10 +917,7 @@ def fetch_index_history(
                 end_d,
             )
 
-            if (
-                drive_frame is not None
-                and not drive_frame.empty
-            ):
+            if _drive_coverage_ok(drive_frame):
                 return drive_frame
 
         except Exception:
