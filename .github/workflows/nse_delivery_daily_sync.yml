@@ -7,8 +7,11 @@ on:
         description: 'Recent calendar days to gap-check'
         required: false
         default: '14'
+  # Security-wise MTO delivery archives can appear later than the first
+  # post-close fetch. Retry in the evening so the current session is available
+  # before the Delivery production compilation window.
   schedule:
-    - cron: '15 14 * * 1-5'
+    - cron: '15 14,15 * * 1-5'
 
 concurrency:
   group: nse-delivery-daily-sync
