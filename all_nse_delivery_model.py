@@ -1501,6 +1501,32 @@ def predict_symbol(
 
         raw_gate = pit_row.iloc[0].get("production_data_quality_gate", np.nan)
         data_gate = bool(raw_gate) if pd.notna(raw_gate) else False
+
+        # Explain a blocked signal instead of exposing only a generic BLOCKED
+        # label. Optional source flags use 0 to mean a known no-data/not-
+        # applicable state; only NaN means that the source state itself is unknown.
+        gate_reasons = []
+        market_price_ready = pit_row.iloc[0].get("ready_market_price", np.nan)
+        market_context_ready = pit_row.iloc[0].get("ready_market_context", np.nan)
+        if pd.isna(market_price_ready) or not bool(pd.to_numeric(market_price_ready, errors="coerce") == 1):
+            gate_reasons.append("MARKET_PRICE_NOT_READY")
+        if pd.isna(market_context_ready) or not bool(pd.to_numeric(market_context_ready, errors="coerce") == 1):
+            gate_reasons.append("MARKET_CONTEXT_NOT_READY")
+        for label, flag in (
+            ("NEWS_STATE_UNKNOWN", "ready_news"),
+            ("EVENT_STATE_UNKNOWN", "ready_events"),
+            ("FNO_STATE_UNKNOWN", "ready_fno"),
+            ("FUNDAMENTALS_STATE_UNKNOWN", "ready_fundamentals"),
+        ):
+            value = pit_row.iloc[0].get(flag, np.nan)
+            if pd.isna(value):
+                gate_reasons.append(label)
+
+        data_gate_reason = "PASS" if data_gate else (
+            "BLOCKED: " + ", ".join(gate_reasons)
+            if gate_reasons else "BLOCKED: production_data_quality_gate=false"
+        )
+
         if not data_gate and signal in {"BUY", "SELL"}:
             signal = "HOLD"
 
