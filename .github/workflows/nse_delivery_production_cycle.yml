@@ -2,19 +2,20 @@ name: NSE Delivery production cycle
 
 on:
   workflow_dispatch:
-  # Run after the late EOD/MTO retry windows. The production job also performs
-  # a last-mile ingestion attempt immediately before the freshness gate.
+  # Start one autonomous production cycle after the market closes. The job
+  # itself retries NSE EOD/Delivery ingestion until today's session is
+  # persisted, then compiles the current PIT snapshot automatically.
   schedule:
-    - cron: '15 15,16,17 * * 1-5'
+    - cron: '15 15 * * 1-5'
 
 concurrency:
   group: nse-delivery-production-cycle
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   production-cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     env:
       INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -36,18 +37,51 @@ jobs:
           fi
           ln -sfn "$GITHUB_WORKSPACE/.market_data" /content/drive/MyDrive/Indian_Market_Research
 
-      # Last-mile retries make the compilation workflow self-healing when the
-      # earlier scheduled ingestion run hit a transient NSE publication 404.
-      - name: Last-mile NSE EOD catch-up
-        run: python -u nse_bulk_eod_ingest.py --auto --repair-days 14 --sync-drive
+      # Fully autonomous late-publication handling. Do not require a second
+      # workflow run when NSE publishes the day's archives after the first fetch.
+      - name: Fetch NSE data and wait for current session
+        run: |
+          set -u
+          MAX_ATTEMPTS=24
+          SLEEP_SECONDS=600
 
-      - name: Last-mile NSE Delivery catch-up
-        run: python -u nse_delivery_daily_sync.py --lookback-days 14 --sleep-seconds 1 --retries 3
+          for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
+            echo "================================================================"
+            echo "AUTONOMOUS NSE PRODUCTION ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS}"
+            echo "================================================================"
 
-      # Fail closed: never create/overwrite a production PIT snapshot from an
-      # older session just because today's upstream archive was late.
-      - name: Require current NSE session before production refresh
-        run: python -u production_data_freshness_gate.py
+            EOD_EXIT=0
+            python -u nse_bulk_eod_ingest.py \
+              --auto \
+              --repair-days 14 \
+              --sync-drive || EOD_EXIT=$?
+
+            DELIVERY_EXIT=0
+            python -u nse_delivery_daily_sync.py \
+              --lookback-days 14 \
+              --sleep-seconds 1 \
+              --retries 3 || DELIVERY_EXIT=$?
+
+            GATE_LOG="$(mktemp)"
+            if python -u production_data_freshness_gate.py 2>&1 | tee "$GATE_LOG"; then
+              echo "CURRENT NSE SESSION IS READY."
+              rm -f "$GATE_LOG"
+              break
+            fi
+
+            if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
+              echo "CURRENT NSE SESSION STILL NOT READY AFTER ${MAX_ATTEMPTS} ATTEMPTS."
+              echo "EOD exit=${EOD_EXIT}, Delivery exit=${DELIVERY_EXIT}"
+              cat "$GATE_LOG"
+              rm -f "$GATE_LOG"
+              exit 1
+            fi
+
+            echo "Today's NSE archive is not ready yet."
+            echo "Waiting ${SLEEP_SECONDS}s before the next automatic attempt..."
+            rm -f "$GATE_LOG"
+            sleep "$SLEEP_SECONDS"
+          done
 
       - name: Build latest production PIT snapshot
         run: python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150
