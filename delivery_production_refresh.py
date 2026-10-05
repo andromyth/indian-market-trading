@@ -233,9 +233,14 @@ def main():
     from delivery_training_universe import training_roster,load_official_nse_universe
     from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags
     from nse_delivery_data_layer import load_delivery_history
-    today=datetime.now(timezone.utc).date()
+    reference_date = (
+        expected_date
+        if expected_date is not None
+        else pd.Timestamp.now(tz="Asia/Kolkata").date()
+    )
+    today=reference_date
 
-    _stage("NEWS PHASE: collecting live RSS snapshot")
+    _stage(f"TARGET PHASE: production reference date={reference_date}")
     # Persist the current RSS headline snapshot so automated and interactive
     # Delivery predictions use the same latest-news source rather than relying
     # on a user's browser session to fetch it first.
