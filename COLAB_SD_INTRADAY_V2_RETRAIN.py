@@ -451,10 +451,12 @@ def main() -> int:
     if not full_universe:
         raise RuntimeError("Official NSE universe is empty")
 
-    universe = [
-        sym for pos, sym in enumerate(full_universe)
+    universe_items = [
+        (pos + 1, sym)
+        for pos, sym in enumerate(full_universe)
         if pos % args.num_shards == args.shard_id
     ]
+    universe = [sym for _, sym in universe_items]
     print(
         f"PREPARATION_SHARD: id={args.shard_id + 1}/{args.num_shards}; "
         f"symbols={len(universe):,}; full_universe={len(full_universe):,}",
@@ -476,6 +478,9 @@ def main() -> int:
 
     coverage = []
     batch_size = 100
+    coverage_progress_path = prep_dir / (
+        f"COVERAGE_PROGRESS_SHARD_{args.shard_id + 1}of{args.num_shards}.parquet"
+    )
 
     # Warm immutable market state once before worker threads start.
     warm_market_cache(market)
@@ -566,28 +571,22 @@ def main() -> int:
         finally:
             del raw
 
-    for batch_start in range(0, len(universe), batch_size):
-        batch_end = min(len(universe), batch_start + batch_size)
+    for batch_start in range(0, len(universe_items), batch_size):
+        batch_end = min(len(universe_items), batch_start + batch_size)
         part_no = batch_start // batch_size + 1
-
-        symbol_paths = [
-            symbol_parts_dir / f"{i:04d}_{sym}.parquet"
-            for i, sym in enumerate(
-                universe[batch_start:batch_end], batch_start + 1
-            )
-        ]
+        batch_items = universe_items[batch_start:batch_end]
 
         pending: list[tuple[int, str, Path]] = []
-        for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
-            symbol_path = symbol_parts_dir / f"{i:04d}_{sym}.parquet"
+        for global_i, sym in batch_items:
+            symbol_path = symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
             if symbol_path.exists() and symbol_path.stat().st_size > 0:
                 print(
-                    f"symbol {i:,}/{len(universe):,} {sym}: "
+                    f"symbol {global_i:,}/{len(full_universe):,} {sym}: "
                     "reused compact symbol checkpoint",
                     flush=True,
                 )
                 continue
-            pending.append((i, sym, symbol_path))
+            pending.append((global_i, sym, symbol_path))
 
         if not pending:
             print(
@@ -613,7 +612,7 @@ def main() -> int:
                     result = future.result()
                 except Exception as exc:
                     result = {
-                        "index": i,
+                        "index": global_i,
                         "symbol": sym,
                         "status": "ERROR",
                         "raw_rows": 0,
@@ -637,13 +636,13 @@ def main() -> int:
 
                 if result.get("status") == "ERROR":
                     print(
-                        f"symbol {i:,}/{len(universe):,} {sym}: ERROR "
+                        f"symbol {global_i:,}/{len(full_universe):,} {sym}: ERROR "
                         f"{result.get('error', 'unknown error')}",
                         flush=True,
                     )
                 else:
                     print(
-                        f"symbol {i:,}/{len(universe):,} {sym}: "
+                        f"symbol {global_i:,}/{len(full_universe):,} {sym}: "
                         f"history_sessions={result['sessions']:,}; "
                         f"compact_rows={result['rows']:,}",
                         flush=True,
@@ -652,7 +651,7 @@ def main() -> int:
                 del compact
 
         pd.DataFrame(coverage).to_parquet(
-            prep_dir / "COVERAGE_PROGRESS.parquet",
+            coverage_progress_path,
             index=False,
         )
 
@@ -661,6 +660,24 @@ def main() -> int:
             f"{batch_start+1:,}-{batch_end:,}; workers={args.workers}",
             flush=True,
         )
+
+    if args.prep_only:
+        prepared = sum(
+            1
+            for global_i, sym in universe_items
+            if (
+                symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
+            ).exists()
+            and (
+                symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
+            ).stat().st_size > 0
+        )
+        print(
+            f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
+            f"shard_checkpoints={prepared:,}/{len(universe_items):,}",
+            flush=True,
+        )
+        return 0
 
     # Fail early rather than wasting hours training on a short-history archive.
     all_symbol_paths = sorted(symbol_parts_dir.glob("*.parquet"))
@@ -705,19 +722,6 @@ def main() -> int:
         )
 
     symbol_paths = sorted(symbol_parts_dir.glob("*.parquet"))
-
-    if args.prep_only:
-        shard_count = 0
-        for sym in universe:
-            p = symbol_parts_dir / f"{full_universe.index(sym) + 1:04d}_{sym}.parquet"
-            if p.exists() and p.stat().st_size > 0:
-                shard_count += 1
-        print(
-            f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
-            f"shard_checkpoints={shard_count:,}/{len(universe):,}",
-            flush=True,
-        )
-        return 0
 
     results = {}
     registry_root = out / "models"
