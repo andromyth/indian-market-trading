@@ -1146,9 +1146,10 @@ def _build_latest_features(
     return frame
 
 
-# Intentionally not cached at function level: Streamlit may remain alive across
-# the daily Drive snapshot rollover. Each prediction must re-check Drive for the
-# newest persisted PIT snapshot on/before the requested IST date.
+# Cache the downloaded PIT snapshot by as-of date. Individual symbol
+# predictions reuse the same in-memory frame instead of repeatedly listing and
+# downloading the same Google Drive object during one Streamlit interaction.
+@lru_cache(maxsize=3)
 def _latest_drive_pit_features(as_of_date: date) -> tuple[pd.DataFrame, str | None]:
     """Load the latest persisted ALL-NSE Delivery PIT snapshot on/before date."""
     cache_dir = CACHE_ROOT / "pit"
