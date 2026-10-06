@@ -32,6 +32,7 @@ import pandas as pd
 from nse_data_layer import (
     fetch_equity_history,
     fetch_index_history,
+    fetch_nse_drive_bulk_symbol_history,
     fetch_nse_equity_universe,
 )
 from delivery_training_universe import benchmark_for_symbol
@@ -1306,15 +1307,39 @@ def _official_history(
     end_iso: str,
 ) -> pd.DataFrame:
 
-    end = pd.Timestamp(
-        end_iso
-    ).date()
+    end = pd.Timestamp(end_iso).date()
 
-    start = (
-        end
-        - timedelta(days=365)
-    )
+    # Fast path: the project already maintains official NSE CM-UDiFF day files
+    # in Google Drive. Read those persisted official rows first so an
+    # interactive prediction does not spend minutes making repeated hosted-NSE
+    # historical HTTP requests.
+    fast_start = end - timedelta(days=180)
+    try:
+        history = fetch_nse_drive_bulk_symbol_history(
+            symbol,
+            fast_start,
+            end,
+            max_calendar_days=180,
+        )
+        if history is not None and not history.empty:
+            clean = history.copy()
+            if "date" in clean.columns:
+                clean["date"] = pd.to_datetime(
+                    clean["date"], errors="coerce"
+                ).dt.normalize()
+                clean = (
+                    clean.dropna(subset=["date"])
+                    .sort_values("date")
+                    .drop_duplicates("date", keep="last")
+                )
+            if len(clean) >= 60:
+                return clean.reset_index(drop=True)
+    except Exception:
+        pass
 
+    # Fallback to the official security-wise NSE history endpoint only when
+    # the persisted official archive does not contain enough sessions.
+    start = end - timedelta(days=365)
     history = fetch_equity_history(
         symbol,
         start,
@@ -1325,7 +1350,8 @@ def _official_history(
 
     if history is None or history.empty:
         raise RuntimeError(
-            f"NSE official EOD history unavailable for {symbol}."
+            f"NSE official EOD history unavailable for {symbol}; "
+            "persisted official Drive archive also lacked the required history."
         )
 
     return history
