@@ -1162,7 +1162,7 @@ if analysis_view == "Historical Replay":
                             "historical_news_available": bool(hist_news),
                             "historical_announcements_available": bool(hist_ann),
                         })
-                except Exception as exc:
+                    except Exception as exc:
                         st.error(f"Historical {replay_mode} replay failed: {type(exc).__name__}: {exc}")
 
     if "replay_ledger" in st.session_state and st.session_state["replay_ledger"]:
