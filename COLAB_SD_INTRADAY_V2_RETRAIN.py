@@ -298,10 +298,11 @@ def main() -> int:
                 frame = raw.reset_index()
                 frame["symbol"] = sym
                 frame = frame.rename(columns={frame.columns[0]: "ts"})
-                generated = _session_rows(frame, market, HORIZONS)
-                generated = cap_symbol_rows(
-                    generated,
-                    args.max_decisions_per_symbol,
+                generated = _session_rows(
+                    frame,
+                    market,
+                    HORIZONS,
+                    max_decisions=args.max_decisions_per_symbol,
                 )
 
                 # Persist the symbol BEFORE moving on. A crash after this
