@@ -18,10 +18,11 @@ from nse_data_layer import fetch_index_history, load_canonical_cash_research_his
 from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
 from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
 
-DEFAULT_BULK="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/bulk_eod"
-DEFAULT_CASH_MASTER="/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
-DEFAULT_OUT="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_delivery_multifactor_replacement_2026"
-BASE=Path("/content/drive/MyDrive/Indian_Market_Research")
+DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
+DEFAULT_BULK=str(BASE/"production_data/nse_official/bulk_eod")
+DEFAULT_CASH_MASTER=str(BASE/"production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet")
+DEFAULT_OUT=str(BASE/"models/all_nse_delivery_multifactor_replacement_2026")
 
 FUND_PARSER_VERSION="2026-10-02-period-context-v3"
 FUND_CATALOG_CACHE=BASE/"corporate/nse_integrated_filing_catalog_2025_2026.json"
