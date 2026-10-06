@@ -28,10 +28,10 @@ BASE_FEATURES = [
     "relative_ret_5m", "relative_ret_15m", "relative_ret_30m",
 ]
 
-RANK_FEATURE_SOURCES = [
-    "ret_5m", "ret_15m", "ret_30m", "ret_60m",
-    "rsi14", "atr14_pct", "session_return", "pos_in_range",
-]
+# Cross-sectional targets are used for training labels, but cross-sectional
+# feature ranks are not part of the live contract because a single-symbol
+# Streamlit request cannot truthfully know the full universe at that instant.
+RANK_FEATURE_SOURCES: list[str] = []
 
 
 def _dedupe_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -90,7 +90,13 @@ def _lookup_return(logc_by_min: pd.Series, mins: pd.Series, lag: int) -> np.ndar
     return logc_by_min.reindex(mins.to_numpy()).to_numpy() - values
 
 
-def _session_rows(g: pd.DataFrame, market: pd.DataFrame | None, horizons: Iterable[int]) -> list[dict]:
+def _session_rows(
+    g: pd.DataFrame,
+    market: pd.DataFrame | None,
+    horizons: Iterable[int],
+    *,
+    include_future: bool = True,
+) -> list[dict]:
     z = _norm(g)
     if z.empty:
         return []
@@ -279,17 +285,30 @@ def _session_rows(g: pd.DataFrame, market: pd.DataFrame | None, horizons: Iterab
             for hmin in horizons:
                 target_min = int(minutes[pos] + int(hmin))
                 future = close_by_min.get(target_min, np.nan)
-                if not np.isfinite(future):
+
+                if include_future and not np.isfinite(future):
                     continue
+
                 row2 = row.copy()
                 row2["horizon_min"] = int(hmin)
                 row2["reference_close"] = current
-                row2["future_close"] = float(future)
-                row2["fwd_ret"] = float(future / current - 1.0) if current else np.nan
-                future_idx = minute_to_position = np.where(minutes == target_min)[0]
-                row2["target_timestamp"] = (
-                    pd.Timestamp(idx[future_idx[0]]) if len(future_idx) else pd.NaT
-                )
+
+                if np.isfinite(future):
+                    row2["future_close"] = float(future)
+                    row2["fwd_ret"] = (
+                        float(future / current - 1.0) if current else np.nan
+                    )
+                    future_idx = np.where(minutes == target_min)[0]
+                    row2["target_timestamp"] = (
+                        pd.Timestamp(idx[future_idx[0]])
+                        if len(future_idx)
+                        else pd.NaT
+                    )
+                else:
+                    row2["future_close"] = np.nan
+                    row2["fwd_ret"] = np.nan
+                    row2["target_timestamp"] = pd.NaT
+
                 rows.append(row2)
 
     return rows
@@ -313,4 +332,4 @@ def add_cross_sectional_targets(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_columns() -> list[str]:
-    return BASE_FEATURES + [c + "_xs_rank" for c in RANK_FEATURE_SOURCES]
+    return list(BASE_FEATURES)
