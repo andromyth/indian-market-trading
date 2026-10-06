@@ -13,6 +13,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from delivery_training_universe import training_roster
+from nse_data_layer import load_canonical_cash_research_history
+from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
+from colab_build_all_nse_delivery_multifactor_candidate import make_panel
 from selfdriving.sd_cycle import train_stage
 from selfdriving.sd_global_cues import attach_global_features
 from selfdriving.sd_v2_panel import build_beta_delivery_panel, split_training_inference
@@ -24,6 +28,7 @@ DEFAULT_PANEL = (
     / "models/all_nse_delivery_multifactor_replacement_2026"
     / "ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
 )
+MIN_WALKFORWARD_SESSIONS = 422
 
 
 def load_optional(path: Path) -> pd.DataFrame:
@@ -44,6 +49,57 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     panel = pd.read_parquet(args.panel)
+    panel_sessions = int(pd.to_datetime(panel.get("date"), errors="coerce").dt.normalize().nunique()) if "date" in panel.columns else 0
+
+    # The original candidate panel is a 2026-only research artifact in some
+    # Drive snapshots. Eight purged walk-forward folds require at least 422
+    # distinct sessions with the current FoldSpec (252 train + 8*21 test +
+    # purge/embargo). Never silently shrink the validation design just to make
+    # a short panel train. Rebuild the Beta V2 source panel from the canonical
+    # identity-preserved NSE cash master when the supplied panel is too short.
+    if panel_sessions < MIN_WALKFORWARD_SESSIONS:
+        master = base / "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
+        if not master.exists() or master.stat().st_size == 0:
+            raise RuntimeError(
+                f"Input panel has only {panel_sessions} sessions; Beta V2 requires "
+                f">= {MIN_WALKFORWARD_SESSIONS}. Canonical NSE cash master is "
+                f"missing: {master}. Build the full-history canonical cash master first."
+            )
+
+        print(
+            f"Input panel has only {panel_sessions} sessions. Rebuilding the Beta V2 "
+            f"base panel from the canonical NSE cash master for full-history walk-forward training.",
+            flush=True,
+        )
+        bulk = load_canonical_cash_research_history(master)
+        roster = training_roster(bulk, min_history=60, force_refresh=False)
+        trainable = list(roster["trainable_symbols"])
+        delivery = load_delivery_history(
+            DEFAULT_DELIVERY_ROOT,
+            symbols=trainable,
+            start=bulk["date"].min(),
+            end=bulk["date"].max(),
+        )
+        rebuilt = make_panel(bulk, trainable, delivery=delivery)
+        if rebuilt.empty:
+            raise RuntimeError("Full-history Beta V2 base-panel rebuild produced no rows")
+
+        rebuilt_sessions = int(pd.to_datetime(rebuilt["date"], errors="coerce").dt.normalize().nunique())
+        if rebuilt_sessions < MIN_WALKFORWARD_SESSIONS:
+            raise RuntimeError(
+                f"Canonical source rebuild produced only {rebuilt_sessions} sessions; "
+                f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}. "
+                "The available historical source is not yet sufficient for the configured OOS design."
+            )
+        panel = rebuilt
+        source_copy = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
+        panel.to_parquet(source_copy, index=False)
+        print(
+            f"Full-history base panel ready: rows={len(panel):,}, "
+            f"symbols={panel['symbol'].nunique():,}, sessions={rebuilt_sessions:,}; "
+            f"saved={source_copy}",
+            flush=True,
+        )
 
     global_path = base / "selfdriving/global_cues.parquet"
     news_path = base / "selfdriving/raw_news.parquet"
