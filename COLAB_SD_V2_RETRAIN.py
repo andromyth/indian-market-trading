@@ -30,7 +30,7 @@ DEFAULT_PANEL = (
     / "ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
 )
 MIN_WALKFORWARD_SESSIONS = 422
-DEFAULT_LOOKBACK_SESSIONS = 800
+DEFAULT_LOOKBACK_SESSIONS = 600
 CHUNK_SIZE = 100
 
 
@@ -118,6 +118,8 @@ def build_beta_panel_chunked(
     global_cues: pd.DataFrame,
     raw_news: pd.DataFrame,
     fno_daily: pd.DataFrame,
+    *,
+    lookback_sessions: int,
 ) -> Path:
     """Enrich the already checkpointed base panel without loading 4M rows."""
     beta_parts = out / "beta_panel_parts"
@@ -126,6 +128,39 @@ def build_beta_panel_chunked(
     base_parts = sorted(base_parts_dir.glob("part_*.parquet"))
     if not base_parts:
         raise FileNotFoundError(f"No base panel checkpoints found under {base_parts_dir}")
+
+    # Determine the cutoff once from the complete checkpoint set. Only the
+    # configured recent training window is enriched; the full base history
+    # remains preserved separately on Drive.
+    glob = str(base_parts_dir / "part_*.parquet").replace("'", "''")
+    con = duckdb.connect()
+    try:
+        cutoff_row = con.execute(
+            f"""
+            WITH dates AS (
+                SELECT DISTINCT CAST(date AS DATE) AS date
+                FROM read_parquet('{glob}')
+            )
+            SELECT MIN(date)
+            FROM (
+                SELECT date
+                FROM dates
+                ORDER BY date DESC
+                LIMIT {int(lookback_sessions)}
+            )
+            """
+        ).fetchone()
+    finally:
+        con.close()
+    cutoff_date = cutoff_row[0]
+    if cutoff_date is None:
+        raise RuntimeError("Unable to determine Beta V2 training-window cutoff")
+
+    print(
+        f"Enriching only the latest {lookback_sessions} sessions "
+        f"(cutoff={cutoff_date}) from the preserved full-history checkpoints.",
+        flush=True,
+    )
 
     total = len(base_parts)
     for idx, base_part in enumerate(base_parts, 1):
@@ -142,22 +177,31 @@ def build_beta_panel_chunked(
             f"beta panel chunk {idx}/{total}: enriching {base_part.name}",
             flush=True,
         )
-        chunk = pd.read_parquet(base_part)
 
-        # y_return is causal within each symbol chunk because every symbol has
-        # its complete historical date sequence in exactly one base checkpoint.
+        part_sql = str(base_part).replace("'", "''")
+        con = duckdb.connect()
+        try:
+            chunk = con.execute(
+                f"""
+                SELECT *
+                FROM read_parquet('{part_sql}')
+                WHERE CAST(date AS DATE) >= DATE '{cutoff_date}'
+                ORDER BY symbol, date
+                """
+            ).df()
+        finally:
+            con.close()
+
+        if chunk.empty:
+            # Keep an explicit empty checkpoint so future runs know this part
+            # was processed for the chosen window.
+            pd.DataFrame().to_parquet(beta_part, index=False)
+            continue
+
         x = add_delivery_targets(chunk)
-
-        audit_parts = {
-            "base_rows": int(len(x)),
-            "base_symbols": int(x["symbol"].nunique()),
-        }
 
         if global_cues is not None and not global_cues.empty:
             x = attach_global_features(x, global_cues)
-            audit_parts["global"] = "PASS"
-        else:
-            audit_parts["global"] = "NO_DATA"
 
         x, news_audit = merge_beta_news(x, raw_news)
         x, fno_audit = merge_beta_fno(x, fno_daily)
@@ -173,7 +217,7 @@ def build_beta_panel_chunked(
         )
         del chunk, x
 
-    combined = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet"
+    combined = out / f"BETA_V2_DELIVERY_PANEL_{lookback_sessions}S_FULL.parquet"
     if not combined.exists() or combined.stat().st_size == 0:
         glob = str(beta_parts / "beta_part_*.parquet").replace("'", "''")
         tmp = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet.tmp"
@@ -297,7 +341,7 @@ def main() -> int:
     raw_news = load_optional(news_path)
     fno_daily = load_optional(fno_path)
 
-    beta_full = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet"
+    beta_full = out / f"BETA_V2_DELIVERY_PANEL_{args.lookback_sessions}S_FULL.parquet"
     beta_parts = out / "beta_panel_parts"
 
     if beta_full.exists() and beta_full.stat().st_size > 0:
@@ -333,6 +377,7 @@ def main() -> int:
             global_cues,
             raw_news,
             fno_daily,
+            lookback_sessions=args.lookback_sessions,
         )
 
     # Do not load the entire multi-million-row Beta panel for model fitting.
