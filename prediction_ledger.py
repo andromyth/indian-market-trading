@@ -249,3 +249,10 @@ def summary(records: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
         "intraday_predictions": sum(str(r.get("mode", "")).lower() == "intraday" for r in rows),
         "last_prediction_at": max((str(r.get("created_at", "")) for r in rows), default=None),
     }
+
+
+
+def sync_delivery_prediction_csv_ledger() -> dict[str, Any]:
+    """Build and sync the daywise Delivery prediction-vs-actual CSV ledger."""
+    from delivery_prediction_csv_ledger import sync_delivery_csv_ledger
+    return sync_delivery_csv_ledger()
