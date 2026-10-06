@@ -143,6 +143,30 @@ def pull_sources(store) -> dict:
             "OK" if download_file(store, remote, local) else "MISSING"
         )
 
+    # The registry points to the actual champion bundle filename. Pull that
+    # bundle too; Registry.champion_bundle() will otherwise fail at inference
+    # even though registry.json itself is present.
+    registry_path = ROOT / "models" / "registry.json"
+    if registry_path.exists():
+        try:
+            state = json.loads(registry_path.read_text(encoding="utf-8"))
+            champion = state.get("champion") or {}
+            bundle_name = str(champion.get("file", "")).strip()
+            if bundle_name:
+                result["champion_bundle"] = (
+                    "OK"
+                    if download_file(
+                        store,
+                        f"{REMOTE_BASE}/models/{bundle_name}",
+                        ROOT / "models" / bundle_name,
+                    )
+                    else "MISSING"
+                )
+            else:
+                result["champion_bundle"] = "NO_CHAMPION"
+        except Exception as exc:
+            result["champion_bundle"] = f"ERROR:{type(exc).__name__}"
+
     latest_pit = pull_latest_pit_snapshot(store)
     result["current_pit"] = "OK" if latest_pit else "MISSING"
     return result, latest_pit
