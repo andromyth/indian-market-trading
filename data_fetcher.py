@@ -332,6 +332,58 @@ def _yahoo_chart_history(symbol: str, period: str, interval: str):
     return pd.DataFrame()
 
 
+def fetch_live_intraday_1m(symbol: str, days: int = 3) -> tuple[pd.DataFrame, str]:
+    """Return the fastest available live 1-minute NSE-equity frame and provenance.
+
+    Dhan is tried first when configured, then Yahoo Finance. NSE is handled
+    separately by the primary caller so its provenance remains distinct.
+    """
+    ticker = str(symbol).strip().upper()
+    if not ticker.endswith(".NS"):
+        ticker = f"{ticker}.NS"
+
+    if _dhan_configured() and DhanConfig is not None and historical_intraday is not None:
+        try:
+            cfg = DhanConfig.from_env()
+            info = resolve_equity_symbol(ticker)
+            end_dt = dt.datetime.now(IST)
+            start_dt = end_dt - dt.timedelta(days=max(1, min(int(days), 7)))
+            df = historical_intraday(
+                cfg,
+                info["security_id"],
+                1,
+                start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            normalized = _normalize_historical_frame(df)
+            if not normalized.empty:
+                return normalized, "DHAN"
+        except Exception:
+            pass
+
+    normalized = fetch_yahoo_intraday_1m(ticker, days=days)
+    if normalized is not None and not normalized.empty:
+        return normalized, "YAHOO_FINANCE"
+
+    try:
+        import yfinance as yf
+        frame = yf.download(
+            ticker,
+            period=f"{max(1, min(int(days), 7))}d",
+            interval="1m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=10,
+        )
+        normalized = _normalize_historical_frame(frame)
+        if not normalized.empty:
+            return normalized, "YFINANCE"
+    except Exception:
+        pass
+
+    return pd.DataFrame(), "NO_LIVE_1M_DATA"
+
 def fetch_yahoo_intraday_1m(symbol: str, days: int = 3) -> pd.DataFrame:
     """Public non-NSE fallback for current 1-minute NSE-equity data."""
     try:
@@ -342,7 +394,6 @@ def fetch_yahoo_intraday_1m(symbol: str, days: int = 3) -> pd.DataFrame:
     if not ticker.endswith(".NS"):
         ticker = f"{ticker}.NS"
     return _yahoo_chart_history(ticker, f"{days}d", "1m")
-
 def _yahoo_history(symbol: str, period: str, interval: str):
     """Yahoo reference fallback without yfinance."""
     return _yahoo_chart_history(symbol, period, interval)
