@@ -118,7 +118,7 @@ jobs:
         id: snapshot
         if: steps.target.outputs.target_date != ''
         env:
-          TARGET_DATE: \${{ steps.target.outputs.target_date }}
+          TARGET_DATE: ${{ steps.target.outputs.target_date }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -204,7 +204,7 @@ jobs:
       - name: Build target production PIT snapshot
         if: steps.target.outputs.target_date != ''
         run: |
-          if [ "\${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
+          if [ "${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
             echo "Target PIT snapshot is current and production-ready; skipping rebuild."
           else
             echo "Target PIT snapshot is missing or stale/blocked; rebuilding."
@@ -212,14 +212,14 @@ jobs:
               --lookback-days 150 \
               --delivery-lookback-days 150 \
               --source-wait-minutes 0 \
-              --expected-date "\${{ steps.target.outputs.target_date }}"
+              --expected-date "${{ steps.target.outputs.target_date }}"
           fi
 
       - name: Generate target Delivery predictions
         if: steps.target.outputs.target_date != ''
         run: |
           python -u delivery_all_nse_prediction_cycle.py \
-            --snapshot-date "\${{ steps.target.outputs.target_date }}"
+            --snapshot-date "${{ steps.target.outputs.target_date }}"
 
       - name: Validate completed Delivery predictions
         if: steps.target.outputs.target_date != ''
