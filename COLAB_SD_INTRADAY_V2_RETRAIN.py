@@ -207,6 +207,12 @@ def main() -> int:
     parts_dir = out / "prepared_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fine-grained resume layer: one checkpoint per symbol. This is separate
+    # from the historical batch checkpoints so an interrupted batch can resume
+    # from the last completed symbol without repeating earlier work.
+    symbol_parts_dir = parts_dir / "symbols"
+    symbol_parts_dir.mkdir(parents=True, exist_ok=True)
+
     rows = []
     coverage = []
 
@@ -214,6 +220,14 @@ def main() -> int:
     # every generated row for the entire NSE universe in one Python list,
     # creating unnecessary RAM pressure on 12-GB Colab runtimes.
     batch_size = 100
+
+    def parquet_rows(path: Path) -> int:
+        try:
+            import pyarrow.parquet as pq
+            return int(pq.ParquetFile(path).metadata.num_rows)
+        except Exception:
+            return 0
+
     for batch_start in range(0, len(universe), batch_size):
         batch_end = min(len(universe), batch_start + batch_size)
         part_no = batch_start // batch_size + 1
@@ -247,11 +261,38 @@ def main() -> int:
                 pass
 
         batch_rows = []
+        batch_checkpoint_paths = []
+
         for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
+            symbol_part_path = symbol_parts_dir / f"{i:04d}_{sym}.parquet"
+
+            # Reuse a completed symbol checkpoint, including a valid zero-row
+            # checkpoint for a symbol that genuinely has insufficient data.
+            if symbol_part_path.exists() and symbol_part_path.stat().st_size > 0:
+                print(
+                    f"symbol {i:,}/{len(universe):,} {sym}: reused symbol checkpoint",
+                    flush=True,
+                )
+                batch_checkpoint_paths.append(symbol_part_path)
+                continue
+
             try:
                 raw = load_symbol(root, sym)
                 if raw is None or raw.empty:
-                    coverage.append({"symbol": sym, "status": "NO_DATA"})
+                    generated = []
+                    coverage.append({
+                        "symbol": sym,
+                        "status": "NO_DATA",
+                        "decision_rows": 0,
+                        "output_rows": 0,
+                    })
+                    pd.DataFrame().to_parquet(symbol_part_path, index=False)
+                    batch_checkpoint_paths.append(symbol_part_path)
+                    print(
+                        f"symbol {i:,}/{len(universe):,} {sym}: "
+                        "generated=0; status=NO_DATA",
+                        flush=True,
+                    )
                     continue
 
                 frame = raw.reset_index()
@@ -263,10 +304,17 @@ def main() -> int:
                     args.max_decisions_per_symbol,
                 )
 
-                batch_rows.extend(generated)
+                # Persist the symbol BEFORE moving on. A crash after this
+                # point cannot force the symbol to be recomputed.
+                symbol_panel = pd.DataFrame(generated)
+                tmp_symbol = symbol_part_path.with_suffix(".parquet.tmp")
+                symbol_panel.to_parquet(tmp_symbol, index=False)
+                tmp_symbol.replace(symbol_part_path)
+                batch_checkpoint_paths.append(symbol_part_path)
+
                 coverage.append({
                     "symbol": sym,
-                    "status": "OK",
+                    "status": "OK" if generated else "NO_FEATURE_ROWS",
                     "decision_rows": int(
                         len(set(
                             pd.to_datetime(
@@ -278,6 +326,16 @@ def main() -> int:
                     ),
                     "output_rows": int(len(generated)),
                 })
+
+                batch_rows.extend(generated)
+                print(
+                    f"symbol {i:,}/{len(universe):,} {sym}: "
+                    f"generated={len(generated):,}; batch_rows={len(batch_rows):,}",
+                    flush=True,
+                )
+
+                del raw, frame, generated, symbol_panel
+
             except Exception as exc:
                 coverage.append({
                     "symbol": sym,
@@ -289,37 +347,42 @@ def main() -> int:
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-            else:
-                print(
-                    f"symbol {i:,}/{len(universe):,} {sym}: "
-                    f"generated={len(generated):,}; batch_rows={len(batch_rows):,}",
-                    flush=True,
-                )
 
-            if i == batch_end:
-                print(
-                    f"prepared batch {part_no}: completed symbols "
-                    f"{batch_start+1:,}-{batch_end:,}; batch_rows={len(batch_rows):,}",
-                    flush=True,
-                )
+        # Build the batch checkpoint from the fine-grained symbol checkpoints.
+        # This works both for a clean batch and after resuming mid-batch.
+        batch_tables = []
+        for symbol_part_path in batch_checkpoint_paths:
+            if parquet_rows(symbol_part_path) > 0:
+                batch_tables.append(pd.read_parquet(symbol_part_path))
 
-        batch_panel = pd.DataFrame(batch_rows)
-        if batch_panel.empty:
-            # Keep an explicit marker so a completed no-data batch is resumable.
-            pd.DataFrame(
+        if batch_tables:
+            batch_panel = pd.concat(batch_tables, ignore_index=True)
+        else:
+            batch_panel = pd.DataFrame(
                 columns=[
                     "symbol", "decision_timestamp", "date",
                     "horizon_min", "reference_close", "future_close", "fwd_ret",
                 ]
-            ).to_parquet(part_path, index=False)
-        else:
-            batch_panel.to_parquet(part_path, index=False)
-            print(
-                f"prepared batch {part_no}: saved rows={len(batch_panel):,} "
-                f"symbols={batch_panel['symbol'].nunique():,}",
-                flush=True,
             )
-        del batch_rows, batch_panel
+
+        tmp_batch = part_path.with_suffix(".parquet.tmp")
+        batch_panel.to_parquet(tmp_batch, index=False)
+        tmp_batch.replace(part_path)
+
+        print(
+            f"prepared batch {part_no}: saved rows={len(batch_panel):,} "
+            f"symbols={batch_end-batch_start:,}",
+            flush=True,
+        )
+
+        del batch_rows, batch_panel, batch_tables, batch_checkpoint_paths
+
+        # Persist batch-level coverage after every completed batch.
+        pd.DataFrame(coverage).to_parquet(
+            out / "BETA_V2_INTRADAY_COVERAGE_PROGRESS.parquet",
+            index=False,
+        )
+
 
     part_files = sorted(parts_dir.glob("part_*.parquet"))
     if len(part_files) != int(np.ceil(len(universe) / batch_size)):
