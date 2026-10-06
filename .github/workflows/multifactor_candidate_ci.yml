@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - beta_version
+      - beta_version2
   pull_request:
     branches:
       - main
@@ -53,6 +54,14 @@ jobs:
           deployment_smoke_test.py
           app.py
           COLAB_RUN_FNO_REPAIR_V2_20261003.py
+          selfdriving/sd_v2_panel.py
+          selfdriving/sd_intraday_v2.py
+          selfdriving/sd_v2_runtime.py
+          selfdriving/sd_cycle.py
+          selfdriving/sd_registry.py
+          selfdriving/sd_github_job_v2.py
+          COLAB_SD_V2_RETRAIN.py
+          COLAB_SD_INTRADAY_V2_RETRAIN.py
 
       - name: Run multi-factor tests
         run: >
@@ -63,6 +72,7 @@ jobs:
           tests/test_production_model_adapter.py
           tests/test_identity_preserved_cash_rebuild.py
           tests/test_canonical_cash_data_layer.py
+          tests/test_selfdriving_v2.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py

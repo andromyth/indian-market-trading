@@ -31,12 +31,44 @@ PRICE_BASE = ["ret_1", "ret_3", "ret_6", "ret_12", "ret_24", "ret_48", "rsi14", 
 RANK_SOURCE = ["ret_1", "ret_3", "ret_6", "ret_12", "ret_24", "volume_ratio", "delivery_pct_z20", "rsi14", "atr14"]
 
 
+def ensure_delivery_targets(panel: pd.DataFrame) -> pd.DataFrame:
+    """Create causal next-session return labels from symbol/date/close when absent."""
+    x = panel.copy()
+    if "symbol" not in x.columns or "date" not in x.columns or "close" not in x.columns:
+        raise ValueError("Delivery panel requires symbol, date and close")
+
+    x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+    x["close"] = pd.to_numeric(x["close"], errors="coerce")
+    x = (
+        x.dropna(subset=["symbol", "date", "close"])
+         .sort_values(["symbol", "date"])
+         .drop_duplicates(["symbol", "date"], keep="last")
+         .reset_index(drop=True)
+    )
+
+    # If a trusted upstream y_return exists, retain it; otherwise derive it
+    # strictly from the next observed trading session for the same symbol.
+    if "y_return" not in x.columns:
+        x["y_return"] = (
+            x.groupby("symbol", sort=False)["close"].shift(-1) / x["close"] - 1.0
+        )
+    x["y_return"] = pd.to_numeric(x["y_return"], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    # The final session per symbol has no realised next-session label yet and
+    # must never enter training.
+    return x
+
+
 def feature_groups(df: pd.DataFrame) -> Dict[str, List[str]]:
     cols = list(df.columns)
     return {
         "price": [c for c in PRICE_BASE if c in cols] + [c for c in cols if c.endswith("_csr")],
         "global": [c for c in cols if c.startswith("g_") and not c.endswith("_age_h")],
         "news": [c for c in cols if c.startswith(("news_", "mkt_news_"))],
+        "events": [c for c in cols if c.startswith("event_")],
         "fno": [c for c in cols if c.startswith("fno_")],
         "fundamental": [c for c in cols if c.startswith(("fundamental_", "fund_"))],
     }
@@ -49,7 +81,7 @@ def select_groups(df: pd.DataFrame, min_cov: float = 0.6, min_dates: Dict[str, i
     This is what stops an empty or thin source (e.g. a news archive that started last week)
     from adding noise, and lets it switch itself on automatically once coverage is real.
     """
-    min_dates = min_dates or {"news": 120, "global": 120, "fno": 60}
+    min_dates = min_dates or {"news": 120, "global": 120, "events": 30, "fno": 60}
     d = pd.to_datetime(df["date"]).dt.normalize()
     recent = df[d >= d.max() - pd.Timedelta(days=recent_days * 1.5)]
     chosen, report = [], {}
@@ -71,7 +103,12 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
                 rules: GateRules = GateRules(), cost_bps: float = 30.0, target_precision: float = 0.56,
                 cfg: Optional[ModelConfig] = None) -> Dict:
     spec = spec or FoldSpec()
-    p = add_targets(panel)
+    p = ensure_delivery_targets(panel)
+    p = p.dropna(subset=["y_return"]).copy()
+    if "cross_section_n" in p.columns:
+        p = p[p["cross_section_n"] >= 20].copy()
+    p = add_targets(p)
+    p = p.dropna(subset=["y_up_excess"]).copy()
     p = add_cross_sectional_ranks(p, RANK_SOURCE)
     sel = select_groups(p)
     if not sel["features"]:
@@ -92,9 +129,20 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
             champ_m = evaluate(champ_pred, cost_bps)
             paired = paired_logloss_gain(champ_pred, pred_c)
         except Exception as e:  # champion features no longer in panel, etc.
-            champ_m, paired = None, None
+            champ_m = None
+            paired = {
+                "status": "UNAVAILABLE",
+                "reason": f"{type(e).__name__}: {e}",
+            }
 
-    decision = gate(champ_m, m_c, paired, rules)
+    decision = gate(champ_m, m_c, paired if champ_m is not None else None, rules)
+    if thr.get("abstain_all", True):
+        decision = {
+            "promote": False,
+            "reasons": list(decision.get("reasons", [])) + [
+                "no validated BUY/SELL action band; challenger must ABSTAIN"
+            ],
+        }
     if decision["promote"]:
         from .sd_walkforward import fit_bundle
         final = fit_bundle(p.dropna(subset=["y_up_excess"]), sel["features"], "y_up_excess", cfg or ModelConfig())
@@ -128,8 +176,13 @@ def predict_stage(inference_rows: pd.DataFrame, registry_dir: str | Path, market
     out["signal"] = [to_signal(v, thr, market_p) for v in out["p"]]
     out["model_file"] = reg.state["champion"]["file"]
     out["feature_coverage"] = x[b.features].notna().mean(axis=1).to_numpy()
-    # never act on a row whose inputs are mostly missing
-    out.loc[out["feature_coverage"] < 0.6, "signal"] = "ABSTAIN"
+    out["signal_reason"] = "VALIDATED_THRESHOLD"
+    low_cov = out["feature_coverage"] < 0.6
+    out.loc[low_cov, "signal"] = "ABSTAIN"
+    out.loc[low_cov, "signal_reason"] = "INSUFFICIENT_FEATURE_COVERAGE"
+    if thr.get("abstain_all", True):
+        out["signal"] = "ABSTAIN"
+        out["signal_reason"] = "NO_VALIDATED_ACTION_BAND"
     return out
 
 

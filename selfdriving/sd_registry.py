@@ -42,17 +42,19 @@ def gate(champion_metrics: Optional[Dict], challenger_metrics: Dict, paired: Opt
     if not (m["ic_t"] >= rules.min_ic_t):
         reasons.append(f"IC t-stat {m['ic_t']:.2f} < {rules.min_ic_t}")
     folds = m.get("fold_auc", [])
-    if folds and np.mean(np.array(folds) > 0.5) < rules.min_pos_fold_frac:
+    if not folds:
+        reasons.append("no valid out-of-fold AUC folds")
+    elif np.mean(np.array(folds) > 0.5) < rules.min_pos_fold_frac:
         reasons.append("too few folds above AUC 0.5")
     if champion_metrics is not None:
         if m["brier"] > champion_metrics["brier"] + rules.max_brier_worsen:
             reasons.append("Brier worse than champion")
-        if paired is not None:
+        if paired is not None and paired.get("status") != "UNAVAILABLE":
             lo = paired["ci95"][0]
             if rules.require_ci_excludes_zero and not lo > 0:
                 reasons.append(f"paired log-loss gain CI [{paired['ci95'][0]:.5f}, {paired['ci95'][1]:.5f}] includes 0")
         else:
-            reasons.append("no paired comparison against champion")
+            reasons.append("no valid paired comparison against champion")
     return {"promote": len(reasons) == 0, "reasons": reasons or ["all gates passed"]}
 
 
