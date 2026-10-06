@@ -97,6 +97,91 @@ def pull_latest_pit(store) -> Path | None:
     return local
 
 
+def pull_recent_pit_snapshots(store, limit: int = 100) -> tuple[pd.DataFrame, Path | None]:
+    """Pull recent persisted official NSE PIT snapshots for live inference and realised returns."""
+    parent = store.root_id
+    for part in ("features", "daily"):
+        hit = store._find_child(parent, part, "application/vnd.google-apps.folder")
+        if not hit:
+            return pd.DataFrame(), None
+        parent = hit["id"]
+
+    resp = store.service.files().list(
+        q=(
+            f"'{parent}' in parents and "
+            "name contains 'DELIVERY_PIT_FEATURES_' and trashed = false"
+        ),
+        spaces="drive",
+        fields="files(id,name)",
+        pageSize=1000,
+        orderBy="name desc",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    files = [
+        x for x in resp.get("files", [])
+        if str(x.get("name", "")).endswith(".parquet")
+    ][: int(limit)]
+
+    frames = []
+    latest_path = None
+    from googleapiclient.http import MediaIoBaseDownload
+
+    for i, item in enumerate(files):
+        local = ROOT / "pit_history" / str(item["name"])
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if not local.exists() or local.stat().st_size == 0:
+            with local.open("wb") as fh:
+                dl = MediaIoBaseDownload(
+                    fh,
+                    store.service.files().get_media(fileId=item["id"]),
+                )
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+
+        try:
+            x = pd.read_parquet(local)
+            if {"symbol", "close"}.issubset(x.columns):
+                if "date" not in x.columns:
+                    name = str(item["name"])
+                    m = name.replace("DELIVERY_PIT_FEATURES_", "").replace(".parquet", "")
+                    x["date"] = pd.Timestamp(m)
+                x = x[["symbol", "date", "close"]].copy()
+                x["symbol"] = (
+                    x["symbol"].astype(str).str.upper().str.strip()
+                    .str.replace(".NS", "", regex=False)
+                )
+                x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+                x["close"] = pd.to_numeric(x["close"], errors="coerce")
+                frames.append(x.dropna(subset=["symbol", "date", "close"]))
+                if i == 0:
+                    latest_path = local
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(), latest_path
+
+    hist = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .sort_values(["symbol", "date"])
+        .reset_index(drop=True)
+    )
+    hist["y_return"] = (
+        hist.groupby("symbol", sort=False)["close"].shift(-1) / hist["close"] - 1.0
+    )
+    realised = (
+        hist.dropna(subset=["y_return"])[["symbol", "date", "y_return"]]
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .sort_values(["date", "symbol"])
+        .reset_index(drop=True)
+    )
+    realised.to_parquet(ROOT / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet", index=False)
+    return realised, latest_path
+
+
 def pull_sources(store) -> dict:
     sources = {
         "global_cues": (f"{REMOTE_BASE}/global_cues.parquet", ROOT / "global_cues.parquet"),
@@ -116,6 +201,10 @@ def pull_sources(store) -> dict:
         "registry": (
             f"{REMOTE_BASE}/models/registry.json",
             ROOT / "models/registry.json",
+        ),
+        "ledger": (
+            f"{REMOTE_BASE}/ledger/predictions.parquet",
+            ROOT / "ledger/predictions.parquet",
         ),
     }
     result = {}
@@ -138,6 +227,12 @@ def main() -> int:
 
     store = drive()
     status["stages"]["pull"] = pull_sources(store)
+    realised, latest_pit = pull_recent_pit_snapshots(store, limit=100)
+    status["stages"]["pit_history"] = {
+        "status": "PASS" if len(realised) else "NO_DATA",
+        "realised_rows": int(len(realised)),
+        "latest_pit": str(latest_pit) if latest_pit else None,
+    }
 
     # Refresh global cues and headlines incrementally. Both layers are explicitly
     # point-in-time; failures remain visible rather than being imputed.
@@ -176,6 +271,11 @@ def main() -> int:
         status["stages"]["news"] = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
     pit_path = ROOT / "current_pit.parquet"
+    # Prefer the latest snapshot pulled above. If it was not separately
+    # materialised, use the newest local PIT file.
+    if latest_pit is not None:
+        pit_path = latest_pit
+
     if not pit_path.exists():
         status["stages"]["inference"] = {
             "status": "BLOCKED",
@@ -185,8 +285,16 @@ def main() -> int:
         from selfdriving.sd_v2_panel import build_beta_delivery_panel, split_training_inference
         pit = pd.read_parquet(pit_path)
         global_cues = pd.read_parquet(gp) if gp.exists() else pd.DataFrame()
-        news = pd.read_parquet(ROOT / "raw_news.parquet") if (ROOT / "raw_news.parquet").exists() else pd.DataFrame()
-        fno = pd.read_parquet(ROOT / "fno_daily_features_2026.parquet") if (ROOT / "fno_daily_features_2026.parquet").exists() else pd.DataFrame()
+        news = (
+            pd.read_parquet(ROOT / "raw_news.parquet")
+            if (ROOT / "raw_news.parquet").exists()
+            else pd.DataFrame()
+        )
+        fno = (
+            pd.read_parquet(ROOT / "fno_daily_features_2026.parquet")
+            if (ROOT / "fno_daily_features_2026.parquet").exists()
+            else pd.DataFrame()
+        )
 
         inference_panel, audit = build_beta_delivery_panel(
             pit,
@@ -195,61 +303,71 @@ def main() -> int:
             fno_daily=fno,
         )
         _, inference, _ = split_training_inference(inference_panel)
-        inference.to_parquet(ROOT / "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet", index=False)
+        inference.to_parquet(
+            ROOT / "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet",
+            index=False,
+        )
 
         from selfdriving.sd_cycle import predict_stage, validate_stage
         registry_path = ROOT / "models"
         reg_file = registry_path / "registry.json"
 
-        if reg_file.exists() and inference_path := (ROOT / "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet"):
+        if reg_file.exists():
             try:
                 predictions = predict_stage(inference, registry_path)
-                predictions.to_parquet(
-                    ROOT / "predictions_latest.parquet", index=False
-                )
+                ledger_path = ROOT / "ledger" / "predictions.parquet"
+                ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                if ledger_path.exists():
+                    old = pd.read_parquet(ledger_path)
+                    predictions = (
+                        pd.concat([old, predictions], ignore_index=True)
+                        .drop_duplicates(["symbol", "date"], keep="last")
+                        .sort_values(["date", "symbol"])
+                    )
+                predictions.to_parquet(ledger_path, index=False)
+
+                latest = predictions[predictions["date"].eq(predictions["date"].max())].copy()
                 status["stages"]["inference"] = {
                     "status": "PASS",
                     "audit": audit,
-                    "rows": int(len(predictions)),
-                    "signals": predictions["signal"].value_counts().to_dict(),
-                    "prediction_date": str(inference["date"].max()) if len(inference) else None,
+                    "rows_latest": int(len(latest)),
+                    "rows_ledger": int(len(predictions)),
+                    "signals_latest": latest["signal"].value_counts().to_dict(),
+                    "prediction_date": str(predictions["date"].max()) if len(predictions) else None,
                 }
+
+                realised_path = ROOT / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet"
+                if realised_path.exists() and not realised.empty:
+                    validation = validate_stage(
+                        predictions,
+                        realised,
+                        registry_path,
+                    )
+                    (ROOT / "status_validate.json").write_text(
+                        json.dumps(validation, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    status["stages"]["validation"] = validation
+                else:
+                    status["stages"]["validation"] = {
+                        "status": "WAITING_FOR_REALISED_RETURNS"
+                    }
             except Exception as exc:
                 status["stages"]["inference"] = {
                     "status": "ERROR",
                     "error": f"{type(exc).__name__}: {exc}",
+                }
+                status["stages"]["validation"] = {
+                    "status": "BLOCKED_BY_INFERENCE"
                 }
         else:
             status["stages"]["inference"] = {
                 "status": "NO_CHAMPION",
                 "reason": "Run COLAB_SD_V2_RETRAIN.py successfully before live beta predictions",
             }
-
-    realised_path = ROOT / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet"
-    pred_path = ROOT / "predictions_latest.parquet"
-    if pred_path.exists() and realised_path.exists() and (ROOT / "models/registry.json").exists():
-        try:
-            ledger = pd.read_parquet(pred_path)
-            realised = pd.read_parquet(realised_path)
-            validation = validate_stage(
-                ledger,
-                realised,
-                ROOT / "models",
-            )
-            (ROOT / "status_validate.json").write_text(
-                json.dumps(validation, indent=2, default=str),
-                encoding="utf-8",
-            )
-            status["stages"]["validation"] = validation
-        except Exception as exc:
             status["stages"]["validation"] = {
-                "status": "ERROR",
-                "error": f"{type(exc).__name__}: {exc}",
+                "status": "NO_CHAMPION"
             }
-    else:
-        status["stages"]["validation"] = {
-            "status": "WAITING_FOR_LEDGER_OR_REALISED_DATA",
-        }
 
     status["finished"] = datetime.now(timezone.utc).isoformat()
     status_path = ROOT / "status_cycle.json"
@@ -262,7 +380,10 @@ def main() -> int:
     upload(store, gp, f"{REMOTE_BASE}/global_cues.parquet")
     if (ROOT / "raw_news.parquet").exists():
         upload(store, ROOT / "raw_news.parquet", f"{REMOTE_BASE}/raw_news.parquet")
-    for name in ("predictions_latest.parquet", "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet", "status_validate.json", "status_cycle.json"):
+    ledger_local = ROOT / "ledger" / "predictions.parquet"
+    if ledger_local.exists():
+        upload(store, ledger_local, f"{REMOTE_BASE}/ledger/predictions.parquet")
+    for name in ("BETA_V2_DELIVERY_INFERENCE_PANEL.parquet", "status_validate.json", "status_cycle.json"):
         p = ROOT / name
         if p.exists():
             upload(store, p, f"{REMOTE_BASE}/{name}")
