@@ -220,6 +220,9 @@ def _session_rows(
             mret30 = pd.Series(mret30_vals, index=idx)
 
         ret1_arr = ret1.to_numpy()
+        mret5_arr = np.asarray(mret5, dtype=float)
+        mret15_arr = np.asarray(mret15, dtype=float)
+        mret30_arr = np.asarray(mret30, dtype=float)
         r5 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 5)
         r15 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 15)
         r30 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 30)
