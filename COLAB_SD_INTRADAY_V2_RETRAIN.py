@@ -43,10 +43,15 @@ def cap_symbol_rows(rows: list[dict], max_decisions: int) -> list[dict]:
     if len(rows) <= max_decisions * len(HORIZONS):
         return rows
     df = pd.DataFrame(rows)
-    timestamps = sorted(pd.to_datetime(df["decision_timestamp"], utc=True).unique())
+    # sorted() returns a Python list; NumPy integer-array indexing into
+    # that list raises "only integer scalar arrays can be converted to a
+    # scalar index". Convert to a NumPy array before positional selection.
+    timestamps = np.asarray(
+        sorted(pd.to_datetime(df["decision_timestamp"], utc=True).unique())
+    )
     keep_n = min(int(max_decisions), len(timestamps))
     idx = np.linspace(0, len(timestamps) - 1, keep_n).round().astype(int)
-    wanted = set(timestamps[idx])
+    wanted = set(timestamps[idx].tolist())
     return df[df["decision_timestamp"].isin(wanted)].to_dict("records")
 
 
