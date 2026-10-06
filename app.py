@@ -378,12 +378,27 @@ def _delivery_opening_stats(
             )
         if hist is None or hist.empty:
             return {"status": "NO_DATA"}
+
+        x = hist.copy()
+        if "date" not in x.columns:
+            x["date"] = pd.to_datetime(x.index, errors="coerce")
+        x.columns = [str(col).strip().lower() for col in x.columns]
+        required = {"date", "open", "high", "low", "close"}
+        if not required.issubset(x.columns):
+            return {"status": "NO_DATA"}
+        x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+        for col in ("open", "high", "low", "close"):
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+        x = (
+            x.dropna(subset=["date", "open", "high", "low", "close"])
+             .sort_values("date")
+             .drop_duplicates("date", keep="last")
+        )
         if len(x) < 20:
             return {"status": "INSUFFICIENT_HISTORY"}
 
         x["prev_close"] = x["close"].shift(1)
         x["gap"] = x["open"] / x["prev_close"] - 1.0
-
         ref_ts = pd.Timestamp(reference_date)
         recent = x.loc[x["date"] < ref_ts].copy().tail(60)
         gaps = recent["gap"].dropna()
@@ -394,7 +409,6 @@ def _delivery_opening_stats(
         mean_gap = float(gaps.mean())
         gap_std = float(gaps.std(ddof=1)) if len(gaps) >= 2 else np.nan
         expected_open = reference_close * (1.0 + median_gap)
-
         open_low = (
             reference_close * (1.0 + median_gap - gap_std)
             if np.isfinite(gap_std) else np.nan
@@ -404,19 +418,24 @@ def _delivery_opening_stats(
             if np.isfinite(gap_std) else np.nan
         )
 
-        # Empirical daily excursion from the greater/lesser of the actual
-        # session open and close. This produces a statistical range around the
-        # model's projected close without pretending that high/low are separate
-        # outputs of the locked 59-feature ML model.
         upper_base = recent[["open", "close"]].max(axis=1)
         lower_base = recent[["open", "close"]].min(axis=1)
-        up_excursion = (recent["high"] / upper_base - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
-        down_excursion = (1.0 - recent["low"] / lower_base).replace([np.inf, -np.inf], np.nan).dropna()
+        up_excursion = (
+            recent["high"] / upper_base - 1.0
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        down_excursion = (
+            1.0 - recent["low"] / lower_base
+        ).replace([np.inf, -np.inf], np.nan).dropna()
 
-        median_up_excursion = float(up_excursion.median()) if not up_excursion.empty else np.nan
-        median_down_excursion = float(down_excursion.median()) if not down_excursion.empty else np.nan
+        median_up_excursion = (
+            float(up_excursion.median()) if not up_excursion.empty else np.nan
+        )
+        median_down_excursion = (
+            float(down_excursion.median()) if not down_excursion.empty else np.nan
+        )
 
-        pc = float(predicted_close) if np.isfinite(pd.to_numeric(predicted_close, errors="coerce")) else np.nan
+        pc_num = pd.to_numeric(predicted_close, errors="coerce")
+        pc = float(predicted_close) if np.isfinite(pc_num) else np.nan
         anchor_high = max(expected_open, pc) if np.isfinite(pc) else expected_open
         anchor_low = min(expected_open, pc) if np.isfinite(pc) else expected_open
 
@@ -430,9 +449,17 @@ def _delivery_opening_stats(
         )
 
         if np.isfinite(expected_high):
-            expected_high = max(expected_high, expected_open, pc if np.isfinite(pc) else expected_open)
+            expected_high = max(
+                expected_high,
+                expected_open,
+                pc if np.isfinite(pc) else expected_open,
+            )
         if np.isfinite(expected_low):
-            expected_low = min(expected_low, expected_open, pc if np.isfinite(pc) else expected_open)
+            expected_low = min(
+                expected_low,
+                expected_open,
+                pc if np.isfinite(pc) else expected_open,
+            )
 
         return {
             "status": "PASS",
@@ -445,8 +472,6 @@ def _delivery_opening_stats(
             "open_high": float(open_high) if np.isfinite(open_high) else np.nan,
             "expected_high": float(expected_high) if np.isfinite(expected_high) else np.nan,
             "expected_low": float(expected_low) if np.isfinite(expected_low) else np.nan,
-            "median_up_excursion": median_up_excursion,
-            "median_down_excursion": median_down_excursion,
             "method": "60-session median gap + empirical daily high/low excursion around model close",
         }
     except Exception as exc:
