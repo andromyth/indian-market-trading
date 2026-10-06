@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,24 @@ def _latest_snapshot_path(snapshot_date: str | None) -> tuple[Path, str]:
     return path, d.isoformat()
 
 
+def _next_trading_day(value: date) -> date:
+    # Keep the target-date calculation aligned with the existing 2026 NSE
+    # holiday calendar used by the ingestion/freshness layer.
+    from production_data_freshness_gate import HOLIDAYS
+    candidate = value + timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate in HOLIDAYS:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _previous_trading_day(value: date) -> date:
+    from production_data_freshness_gate import HOLIDAYS
+    candidate = value - timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate in HOLIDAYS:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 def _as_bool_gate(value: Any) -> bool:
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
@@ -70,10 +88,27 @@ def _as_bool_gate(value: Any) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot-date", default=None)
+    ap.add_argument(
+        "--prediction-date",
+        default=None,
+        help="NSE session the prediction is for (YYYY-MM-DD). "
+             "When supplied, the prior trading session snapshot is used.",
+    )
     ap.add_argument("--no-sync-drive", action="store_true")
     args = ap.parse_args()
 
-    snapshot_path, snapshot_date = _latest_snapshot_path(args.snapshot_date)
+    if args.prediction_date:
+        target_date = date.fromisoformat(args.prediction_date)
+        inferred_snapshot = _previous_trading_day(target_date)
+        snapshot_path, snapshot_date = _latest_snapshot_path(
+            args.snapshot_date or inferred_snapshot.isoformat()
+        )
+        prediction_for_date = target_date.isoformat()
+    else:
+        snapshot_path, snapshot_date = _latest_snapshot_path(args.snapshot_date)
+        prediction_for_date = _next_trading_day(
+            date.fromisoformat(snapshot_date)
+        ).isoformat()
     pit = pd.read_parquet(snapshot_path)
     if pit.empty:
         raise RuntimeError(f"PIT snapshot is empty: {snapshot_path}")
@@ -133,6 +168,7 @@ def main() -> int:
                 "symbol": symbol,
                 "mode": "Delivery",
                 "prediction_horizon": "next_session",
+                "prediction_for_date": prediction_for_date,
                 "model_version": model_version,
                 "engine_version": model_version,
                 "decision_engine_version": model_version,
@@ -206,6 +242,7 @@ def main() -> int:
     signal_counts = pd.Series(signals).value_counts().to_dict()
     print("ALL-NSE DELIVERY PREDICTION CYCLE")
     print("snapshot_date:", snapshot_date)
+    print("prediction_for_date:", prediction_for_date)
     print("snapshot_path:", snapshot_path)
     print("symbols_scored:", len(records))
     print("production_quality_gate_true:", int(gate.sum()))
