@@ -7,15 +7,14 @@ on:
         description: 'Optional NSE production session date YYYY-MM-DD'
         required: false
         default: ''
-  # Eleven independent hourly opportunities. Each run is short and exits once
-  # the target session is already persisted; no GitHub runner sleeps overnight.
+  # Post-market hourly retries. Each run fetches/repairs the completed NSE
+  # session, builds that session's PIT snapshot for the next trading day,
+  # validates the prior day's prediction against today's actual, and refreshes
+  # the CSV audit ledger.
   #
-  # 15:15-18:15 UTC = 20:45-23:45 IST
-  # 19:15-23:15 UTC = 00:45-04:45 IST
-  # 00:15-01:15 UTC (Tue-Sat) = 05:45-06:45 IST
-  #
-  # The target session is pinned by production_data_freshness_gate.py so
-  # after midnight the retries remain attached to the previous NSE session.
+  # 20:45-23:45 IST, 00:45-04:45 IST, 05:45-06:45 IST.
+  # The target session is the latest completed NSE session for the retry
+  # window; no prediction is generated here.
   schedule:
     - cron: '15 15-18 * * 1-5'
     - cron: '15 19-23 * * 1-5'
