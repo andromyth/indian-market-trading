@@ -645,7 +645,16 @@ def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
             end=now,
         )
         if cached is not None and not cached.empty:
-            return cached, "PERSISTENT_LOCAL_CACHE"
+            latest_cached = pd.Timestamp(cached.index.max())
+            if latest_cached.tzinfo is None:
+                latest_cached = latest_cached.tz_localize("Asia/Kolkata")
+            else:
+                latest_cached = latest_cached.tz_convert("Asia/Kolkata")
+            # Only use the local cache as a live source when it is today's data
+            # and is recent enough to represent the current session.
+            age_minutes = (now - latest_cached).total_seconds() / 60.0
+            if latest_cached.date() == now.date() and age_minutes <= 5.0:
+                return cached, "PERSISTENT_LOCAL_CACHE"
     except Exception:
         pass
 
