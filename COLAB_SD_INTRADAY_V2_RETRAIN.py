@@ -570,6 +570,16 @@ def main() -> int:
         flush=True,
     )
 
+    seed_daily_dir = root / "production_data/nse_official/intraday_seed/olo_minute_archive/daily"
+    seed_session_files = sorted(seed_daily_dir.glob("*.parquet"))
+    if len(seed_session_files) < MIN_USABLE_SESSIONS:
+        raise RuntimeError(
+            f"Historical minute seed currently contains {len(seed_session_files)} daily archives. "
+            f"Beta V2 now requires at least {MIN_USABLE_SESSIONS} sessions and prefers "
+            f"{MIN_PREFERRED_SESSIONS}-{PREFERRED_SESSIONS}. "
+            "Run seed_nse_intraday_history.py with the expanded history first."
+        )
+
     if max_sessions < MIN_USABLE_SESSIONS:
         raise RuntimeError(
             f"Intraday archive has only {max_sessions} sessions at best. "
@@ -601,8 +611,14 @@ def main() -> int:
             }
             continue
 
+        # train_horizon uses the common long-format contract.
+        training_frame = horizon_data.rename(
+            columns={f"fwd_ret_{horizon}m": "fwd_ret"}
+        ).copy()
+        training_frame["horizon_min"] = int(horizon)
+
         horizon_dir = registry_root / f"h{horizon}"
-        result = train_horizon(horizon_data, horizon, horizon_dir)
+        result = train_horizon(training_frame, horizon, horizon_dir)
         result["history_policy"] = {
             "preferred_sessions": PREFERRED_SESSIONS,
             "minimum_preferred_sessions": MIN_PREFERRED_SESSIONS,
