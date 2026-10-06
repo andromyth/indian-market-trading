@@ -33,6 +33,12 @@ BASE_FEATURES = [
 # Streamlit request cannot truthfully know the full universe at that instant.
 RANK_FEATURE_SOURCES: list[str] = []
 
+# The same normalized NIFTY market DataFrame is reused for thousands of symbols
+# during training. Cache it by object identity so _norm() does not copy and
+# normalize the full market history for every symbol.
+_MARKET_NORM_CACHE: dict[int, pd.DataFrame] = {}
+_MARKET_SESSION_CACHE: dict[int, dict[object, pd.DataFrame]] = {}
+
 
 def _dedupe_columns(frame: pd.DataFrame) -> pd.DataFrame:
     x = frame.copy()
@@ -104,7 +110,28 @@ def _session_rows(
 
     z["ist"] = z["ts"].dt.tz_convert(IST)
     z["session"] = z["ist"].dt.date
-    market_n = _norm(market) if market is not None else pd.DataFrame()
+    if market is None:
+        market_n = pd.DataFrame()
+    else:
+        market_key = id(market)
+        market_n = _MARKET_NORM_CACHE.get(market_key)
+        if market_n is None:
+            market_n = _norm(market)
+            _MARKET_NORM_CACHE[market_key] = market_n
+
+    market_sessions = _MARKET_SESSION_CACHE.get(id(market)) if not market_n.empty else None
+    if market_sessions is None and not market_n.empty:
+        market_with_ist = market_n.assign(
+            ist=market_n["ts"].dt.tz_convert(IST)
+        )
+        market_sessions = {
+            session: part.sort_values("ts")
+            for session, part in market_with_ist.groupby(
+                market_with_ist["ist"].dt.date,
+                sort=False,
+            )
+        }
+        _MARKET_SESSION_CACHE[id(market)] = market_sessions
 
     # For training we only retain a small, evenly spaced set of decision
     # timestamps per symbol. Discover those timestamps before constructing
@@ -247,12 +274,9 @@ def _session_rows(
         dmask = pd.Series(decision_mask, index=idx)
 
         market_aligned = pd.Series(np.nan, index=idx, dtype=float)
-        if not market_n.empty:
-            mn = market_n.copy()
-            mn["ist"] = mn["ts"].dt.tz_convert(IST)
-            mn["session"] = mn["ist"].dt.date
-            mn = mn[mn["session"].eq(session)].sort_values("ts")
-            if not mn.empty:
+        if market_sessions:
+            mn = market_sessions.get(session)
+            if mn is not None and not mn.empty:
                 ms = pd.Series(
                     pd.to_numeric(mn["close"], errors="coerce").to_numpy(),
                     index=pd.DatetimeIndex(mn["ts"]),
