@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from all_nse_delivery_model import _load_models, _signal_policy, _safe_float
+from delivery_prediction_csv_ledger import project_next_session_ohlc
 from prediction_ledger import append_predictions
 
 
@@ -159,6 +160,7 @@ def main() -> int:
                     and np.isfinite(_safe_float(expected_return[i]))
                     else np.nan
                 ),
+
                 "signal": str(signals[i]),
                 "confidence": (
                     "HIGH" if abs(p_up[i] - 0.5) >= 0.25
@@ -179,6 +181,24 @@ def main() -> int:
                 "minimum_history_sessions": int(manifest.get("minimum_history_sessions", 60)),
             }
         )
+        # The statistical OHLC projection is persisted with the prediction so
+        # the daily CSV ledger and Streamlit display use the same forecast.
+        records[-1]["predicted_open"] = np.nan
+        records[-1]["predicted_high"] = np.nan
+        records[-1]["predicted_low"] = np.nan
+        records[-1]["ohlc_prediction_method"] = ""
+        ohlc = project_next_session_ohlc(
+            symbol,
+            snapshot_date,
+            row.get("close", np.nan),
+            records[-1]["predicted_price_next_session"],
+        )
+        if ohlc.get("status") == "PASS":
+            records[-1]["predicted_open"] = _safe_float(ohlc.get("predicted_open"))
+            records[-1]["predicted_high"] = _safe_float(ohlc.get("predicted_high"))
+            records[-1]["predicted_low"] = _safe_float(ohlc.get("predicted_low"))
+            records[-1]["ohlc_prediction_method"] = str(ohlc.get("ohlc_prediction_method", ""))
+
 
     sync_drive = not args.no_sync_drive
     result = append_predictions(records, sync_drive=sync_drive)
