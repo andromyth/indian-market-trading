@@ -214,11 +214,25 @@ def main() -> int:
     if panel.empty:
         raise RuntimeError("No Beta V2 intraday feature rows were built")
 
-    panel = add_cross_sectional_targets(panel)
+    # Apply any global memory cap by whole decision-timestamp blocks.
+    # Never delete arbitrary rows before the cross-sectional median is formed;
+    # that would change the market-neutral target distribution.
     if len(panel) > args.global_row_cap:
-        idx = np.linspace(0, len(panel) - 1, int(args.global_row_cap)).round().astype(int)
-        panel = panel.iloc[np.unique(idx)].copy()
+        ts_values = np.array(sorted(pd.to_datetime(
+            panel["decision_timestamp"], utc=True
+        ).unique()))
+        rows_per_ts = max(1, int(np.ceil(len(panel) / max(len(ts_values), 1))))
+        keep_n = max(1, min(
+            len(ts_values),
+            int(args.global_row_cap // rows_per_ts),
+        ))
+        keep_idx = np.linspace(0, len(ts_values) - 1, keep_n).round().astype(int)
+        keep_ts = set(ts_values[np.unique(keep_idx)])
+        panel = panel[
+            pd.to_datetime(panel["decision_timestamp"], utc=True).isin(keep_ts)
+        ].copy()
 
+    panel = add_cross_sectional_targets(panel)
     panel.to_parquet(out / "BETA_V2_INTRADAY_PANEL.parquet", index=False)
     pd.DataFrame(coverage).to_parquet(out / "BETA_V2_INTRADAY_COVERAGE.parquet", index=False)
 
