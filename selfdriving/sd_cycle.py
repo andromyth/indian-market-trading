@@ -105,6 +105,21 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
     spec = spec or FoldSpec()
     p = ensure_delivery_targets(panel)
     p = p.dropna(subset=["y_return"]).copy()
+
+    # Treat non-finite and non-float32-representable feature values as unknown.
+    # These can arise from PIT ratios/divisions with zero denominators. Do not
+    # clip them to artificial values; convert them to NaN so the model's
+    # imputers can handle them explicitly.
+    float32_max = float(np.finfo(np.float32).max)
+    feature_candidates = [
+        c for c in p.columns
+        if c not in {"symbol", "date", "y_return"}
+    ]
+    for col in feature_candidates:
+        if pd.api.types.is_numeric_dtype(p[col]):
+            v = pd.to_numeric(p[col], errors="coerce")
+            p[col] = v.mask(~np.isfinite(v) | (v.abs() > float32_max))
+
     if "cross_section_n" in p.columns:
         p = p[p["cross_section_n"] >= 20].copy()
     p = add_targets(p)
