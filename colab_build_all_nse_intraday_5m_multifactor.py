@@ -231,7 +231,9 @@ def load_symbol(root:Path,sym:str)->pd.DataFrame:
     parts=[]
     seed=root/SEED_REL/f"symbol={sym}"
     if seed.exists():
-        for p in sorted(seed.glob("*.parquet")):
+        # Historical seed partitions may be nested (DuckDB partition export)
+        # rather than a single flat Parquet file.
+        for p in sorted(seed.rglob("*.parquet")):
             try:
                 z=pd.read_parquet(p)
                 if not z.empty: parts.append(_norm(z))
