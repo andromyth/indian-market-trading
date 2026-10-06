@@ -96,6 +96,7 @@ def _session_rows(
     horizons: Iterable[int],
     *,
     include_future: bool = True,
+    max_decisions: int | None = None,
 ) -> list[dict]:
     z = _norm(g)
     if z.empty:
@@ -104,6 +105,52 @@ def _session_rows(
     z["ist"] = z["ts"].dt.tz_convert(IST)
     z["session"] = z["ist"].dt.date
     market_n = _norm(market) if market is not None else pd.DataFrame()
+
+    # For training we only retain a small, evenly spaced set of decision
+    # timestamps per symbol. Discover those timestamps before constructing
+    # row dictionaries so the expensive Python row-building loop is bounded.
+    selected_timestamps: set[pd.Timestamp] | None = None
+    if max_decisions is not None and int(max_decisions) > 0:
+        candidates: list[pd.Timestamp] = []
+        horizon_list = tuple(int(h) for h in horizons)
+
+        for _, d0 in z.groupby("session", sort=False):
+            d0 = d0.sort_values("ts").copy()
+            minutes0 = (
+                d0["ist"].dt.hour.to_numpy(dtype=int) * 60
+                + d0["ist"].dt.minute.to_numpy(dtype=int)
+            )
+            mask0 = (minutes0 >= OPEN_MIN) & (minutes0 < CLOSE_MIN)
+            d0 = d0.loc[mask0].copy()
+            minutes0 = minutes0[mask0]
+            if len(d0) < 80:
+                continue
+
+            if len(pd.Index(minutes0).unique()) != len(minutes0):
+                keep0 = ~pd.Index(minutes0).duplicated(keep="last")
+                d0 = d0.iloc[np.flatnonzero(keep0)]
+                minutes0 = minutes0[keep0]
+
+            decision_positions = np.flatnonzero(
+                (minutes0 >= OPEN_MIN + 15)
+                & (((minutes0 - OPEN_MIN) % 5) == 0)
+            )
+            if len(decision_positions) == 0:
+                continue
+
+            minute_set = set(int(m) for m in minutes0)
+            for pos0 in decision_positions:
+                base_minute = int(minutes0[pos0])
+                if any(base_minute + h in minute_set for h in horizon_list):
+                    candidates.append(pd.Timestamp(d0["ts"].iloc[pos0]))
+
+        candidates = sorted(set(candidates))
+        if len(candidates) > int(max_decisions):
+            idx0 = np.linspace(
+                0, len(candidates) - 1, int(max_decisions)
+            ).round().astype(int)
+            candidates = [candidates[int(i)] for i in idx0]
+        selected_timestamps = set(candidates)
 
     rows: list[dict] = []
     for session, d in z.groupby("session", sort=False):
@@ -143,6 +190,17 @@ def _session_rows(
         )
         if not bool(decision_mask.any()):
             continue
+
+        if selected_timestamps is not None:
+            decision_mask = np.asarray(
+                [
+                    bool(v) and pd.Timestamp(ts) in selected_timestamps
+                    for v, ts in zip(decision_mask, d["ts"])
+                ],
+                dtype=bool,
+            )
+            if not bool(decision_mask.any()):
+                continue
 
         idx = pd.DatetimeIndex(d["ts"])
         close_s = pd.Series(c, index=idx)
