@@ -52,6 +52,11 @@ def cap_symbol_rows(rows: list[dict], max_decisions: int) -> list[dict]:
 def train_horizon(frame: pd.DataFrame, horizon: int, registry_root: Path) -> dict:
     h = frame[frame["horizon_min"].eq(horizon)].copy()
     h = add_cross_sectional_targets(h)
+    h = h[
+        h["fwd_ret"].notna()
+        & h["y_up_excess"].notna()
+        & (pd.to_numeric(h["cross_section_n"], errors="coerce") >= 20)
+    ].copy()
 
     features = feature_columns()
     missing = [c for c in features if c not in h.columns]
@@ -240,7 +245,8 @@ def main() -> int:
     registry_root = out / "models"
     for horizon in HORIZONS:
         print(f"TRAINING HORIZON +{horizon}M", flush=True)
-        results[str(horizon)] = train_horizon(panel, horizon, registry_root)
+        horizon_dir = registry_root / f"h{horizon}"
+        results[str(horizon)] = train_horizon(panel, horizon, horizon_dir)
 
     manifest = {
         "version": "2026-10-06-beta-v2-intraday",
