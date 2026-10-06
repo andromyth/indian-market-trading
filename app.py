@@ -478,6 +478,13 @@ def _delivery_opening_stats(
         return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_all_nse_delivery_prediction(symbol: str, as_of_date: str) -> dict:
+    """Cache the authoritative Delivery inference for the current trading date."""
+    ts = pd.Timestamp(as_of_date).tz_localize("Asia/Kolkata") + pd.Timedelta(hours=15, minutes=30)
+    return all_nse_delivery_predict(symbol, ts)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_nse_ltp(symbol: str):
     """Fresh official NSE quote snapshot for display only; never feeds the locked Delivery model."""
@@ -2372,11 +2379,9 @@ if interface_mode == "Live Test" and live_mode == "Delivery":
             continue
 
         try:
-            result = all_nse_delivery_predict(
+            result = _cached_all_nse_delivery_prediction(
                 requested_symbol,
-                pd.Timestamp.now(
-                    tz="Asia/Kolkata"
-                ),
+                pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat(),
             )
             direct_delivery_results[requested_symbol] = result
 
