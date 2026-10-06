@@ -389,7 +389,35 @@ def main() -> int:
         type=int,
         default=DEFAULT_GLOBAL_ROW_CAP,
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Concurrent symbol-preparation workers; 2 is recommended on Colab free tier.",
+    )
+    ap.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Colab free-tier profile: 2,000 decision rows/symbol and "
+            "300 training rows/symbol with a 900,000-row horizon cap."
+        ),
+    )
     args = ap.parse_args()
+
+    if args.fast:
+        args.max_decisions_per_symbol = min(int(args.max_decisions_per_symbol), 2000)
+        args.train_rows_per_symbol = min(int(args.train_rows_per_symbol), 300)
+        args.global_row_cap = min(int(args.global_row_cap), 900_000)
+
+    args.workers = max(1, min(int(args.workers), 2))
+
+    if args.fast:
+        print(
+            "SPEED_PROFILE: FAST_FREE_COLAB "
+            "(vectorized preparation + 2 workers + 300 rows/symbol + 900k/global horizon)",
+            flush=True,
+        )
 
     root = Path(args.drive_root)
     out = Path(args.out)
