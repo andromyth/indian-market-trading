@@ -12,6 +12,7 @@ by the production refresh. It deliberately does not bootstrap per-symbol
 from __future__ import annotations
 
 from datetime import date, timedelta
+import os
 import re
 from pathlib import Path
 
@@ -21,7 +22,8 @@ from prediction_ledger import load_records, load_validation_records, save_valida
 from prediction_validation import ValidationConfig, validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
 
-BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
+DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
 EOD_LOCAL_ROOT = BASE / "production_data" / "nse_official" / "bulk_eod"
 
 
