@@ -337,6 +337,9 @@ if analyze_watchlist:
 
 raw_symbols = st.session_state.get("active_watchlist", default_watchlist)
 
+if interface_mode == "Live Test":
+    st.sidebar.caption(f"Active analysis watchlist: {raw_symbols}")
+
 def normalize_symbol(value: str) -> str:
     """Normalize user input for Yahoo Finance. Bare Indian symbols default to NSE."""
     s = value.strip().upper()
@@ -907,7 +910,9 @@ if interface_mode == "Live Test":
                     "live_ltp": np.nan,
                     "live_ltp_change": np.nan,
                     "data_gate": False,
-                    "data_gate_reason": f"ERROR: {type(exc).__name__}",
+                    "data_gate_reason": (
+                        f"ERROR: {type(exc).__name__}: {exc}"
+                    ),
                     "pit_news_state": "UNKNOWN",
                     "live_news_count_24h": np.nan,
                     "live_news_score": np.nan,
