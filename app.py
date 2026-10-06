@@ -22,6 +22,7 @@ from data_fetcher import (
     stock_news_keywords,
     source_diagnostics,
     get_latest_price,
+    fetch_yahoo_intraday_1m,
 )
 from signals import (
     add_indicators,
@@ -629,17 +630,12 @@ def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
         pass
 
     # Hosted Streamlit deployments can be temporarily blocked by NSE's
-    # public chart endpoint. Fall back to the existing provider chain, which
-    # can use Dhan/Yahoo without changing the locked 5-minute model.
+    # public chart endpoint. Use Yahoo Finance's 1-minute chart as the
+    # explicit non-NSE fallback; the locked model is unchanged.
     try:
-        fallback = get_historical(
-            f"{root}.NS",
-            period="7d",
-            interval="1m",
-            force_refresh=True,
-        )
+        fallback = fetch_yahoo_intraday_1m(root, days=3)
         if fallback is not None and not fallback.empty:
-            return fallback, "FALLBACK_PROVIDER"
+            return fallback, "YAHOO_FINANCE"
     except Exception:
         pass
 
