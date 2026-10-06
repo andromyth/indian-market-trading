@@ -23,6 +23,7 @@ from data_fetcher import (
     source_diagnostics,
     get_latest_price,
     fetch_yahoo_intraday_1m,
+    fetch_live_intraday_1m,
 )
 from signals import (
     add_indicators,
@@ -177,6 +178,7 @@ from persistent_store import (
     scan_coverage as persistent_scan_coverage,
     storage_summary as persistent_storage_summary,
     sync_pending as persistent_sync_pending,
+    load_persistent_1m,
 )
 
 st.set_page_config(page_title="Indian Market Trading", layout="wide")
@@ -361,29 +363,21 @@ def _delivery_opening_stats(
     try:
         end = pd.Timestamp(reference_date).date()
         start = end - pd.Timedelta(days=450)
-        hist = nse_fetch_equity_history(
-            symbol,
-            start,
-            end,
-            sync_drive=True,
+        hist = get_historical(
+            f"{symbol}.NS",
+            period="450d",
+            interval="1d",
+            force_refresh=False,
         )
         if hist is None or hist.empty:
+            hist = nse_fetch_equity_history(
+                symbol,
+                start,
+                end,
+                sync_drive=False,
+            )
+        if hist is None or hist.empty:
             return {"status": "NO_DATA"}
-
-        x = hist.copy()
-        x.columns = [str(col).strip().lower() for col in x.columns]
-        required = {"date", "open", "high", "low", "close"}
-        if not required.issubset(x.columns):
-            return {"status": "NO_DATA"}
-
-        x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
-        for col in ("open", "high", "low", "close"):
-            x[col] = pd.to_numeric(x[col], errors="coerce")
-        x = (
-            x.dropna(subset=["date", "open", "high", "low", "close"])
-            .sort_values("date")
-            .drop_duplicates("date", keep="last")
-        )
         if len(x) < 20:
             return {"status": "INSUFFICIENT_HISTORY"}
 
@@ -615,32 +609,40 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=20, show_spinner=False)
 def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
-    """Get live 1-minute bars with NSE-first provenance and a bounded fallback."""
+    """Get live 1-minute bars with an ordered, fail-fast provider chain."""
     root = str(symbol).replace(".NS", "").replace(".BO", "").upper()
 
-    # Primary: official NSE quote-chart stream.
+    try:
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        cached = load_persistent_1m(
+            root,
+            start=(now - pd.Timedelta(days=3)),
+            end=now,
+        )
+        if cached is not None and not cached.empty:
+            return cached, "PERSISTENT_LOCAL_CACHE"
+    except Exception:
+        pass
+
     try:
         frame = nse_fetch_intraday_1m_current(
             root,
-            sync_drive=True,
+            sync_drive=False,
+            retries=1,
         )
         if frame is not None and not frame.empty:
             return frame, "NSE_OFFICIAL_CHART"
     except Exception:
         pass
 
-    # Hosted Streamlit deployments can be temporarily blocked by NSE's
-    # public chart endpoint. Use Yahoo Finance's 1-minute chart as the
-    # explicit non-NSE fallback; the locked model is unchanged.
     try:
-        fallback = fetch_yahoo_intraday_1m(root, days=3)
+        fallback, source = fetch_live_intraday_1m(root, days=3)
         if fallback is not None and not fallback.empty:
-            return fallback, "YAHOO_FINANCE"
+            return fallback, source
     except Exception:
         pass
 
     return pd.DataFrame(), "NO_LIVE_1M_DATA"
-
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_live_announcements(symbol: str) -> list[dict]:
     try:
@@ -1164,7 +1166,7 @@ if interface_mode == "Live Test":
                         st.info("Waiting for the first completed 1-minute NSE bar.")
                         return
                     latest_ts = completed.index[-1]
-                    source_label = "NSE official" if live_source == "NSE_OFFICIAL_CHART" else "fallback provider"
+                    source_label = {"NSE_OFFICIAL_CHART": "NSE official", "PERSISTENT_LOCAL_CACHE": "persistent local cache", "DHAN": "Dhan", "YAHOO_FINANCE": "Yahoo Finance", "YFINANCE": "yfinance"}.get(live_source, "fallback provider")
                     state_key = f"live_5m_last_ts::{root}"
                     result_key = f"live_5m_result::{root}"
                     previous_ts = st.session_state.get(state_key)
