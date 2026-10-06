@@ -283,7 +283,7 @@ def _session_rows(
                 "market_ret_30m": float(mret30_arr[pos]) if np.isfinite(mret30_arr[pos]) else np.nan,
                 "relative_ret_5m": float(r5[pos] - mret5_arr[pos]) if np.isfinite(r5[pos]) and np.isfinite(mret5_arr[pos]) else np.nan,
                 "relative_ret_15m": float(r15[pos] - mret15_arr[pos]) if np.isfinite(r15[pos]) and np.isfinite(mret15_arr[pos]) else np.nan,
-                "relative_ret_30m": float(r30[pos] - mret30_arr[pos]) if np.isfinite(r30.iloc[pos]) and np.isfinite(mret30_arr[pos]) else np.nan,
+                "relative_ret_30m": float(r30[pos] - mret30_arr[pos]) if np.isfinite(r30[pos]) and np.isfinite(mret30_arr[pos]) else np.nan,
             }
 
             for hmin in horizons:
