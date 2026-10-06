@@ -68,6 +68,21 @@ def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
         "timestamp":"Timestamp","datetime":"Timestamp","date":"Timestamp","time":"Timestamp",
     }
     x = x.rename(columns={c: aliases.get(str(c).strip().lower(), c) for c in x.columns})
+
+    # NSE/fallback adapters can occasionally expose duplicate OHLC/Timestamp
+    # columns. Collapse them to one deterministic 1-D column before any
+    # pd.to_datetime/pd.to_numeric operation.
+    if x.columns.duplicated().any():
+        unique_columns = list(dict.fromkeys(str(c) for c in x.columns))
+        deduped = pd.DataFrame(index=x.index)
+        for col in unique_columns:
+            subset = x.loc[:, x.columns.astype(str) == col]
+            if isinstance(subset, pd.Series):
+                deduped[col] = subset
+            else:
+                deduped[col] = subset.bfill(axis=1).iloc[:, 0]
+        x = deduped
+
     if "Timestamp" in x.columns:
         raw_idx = x.pop("Timestamp")
     else:
