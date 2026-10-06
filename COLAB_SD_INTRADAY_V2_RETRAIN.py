@@ -451,14 +451,22 @@ def main() -> int:
     if not full_universe:
         raise RuntimeError("Official NSE universe is empty")
 
+    shard_size = (
+        len(full_universe) + args.num_shards - 1
+    ) // args.num_shards
+    shard_start = args.shard_id * shard_size
+    shard_end = min(
+        len(full_universe),
+        shard_start + shard_size,
+    )
     universe_items = [
-        (pos + 1, sym)
-        for pos, sym in enumerate(full_universe)
-        if pos % args.num_shards == args.shard_id
+        (pos + 1, full_universe[pos])
+        for pos in range(shard_start, shard_end)
     ]
     universe = [sym for _, sym in universe_items]
     print(
         f"PREPARATION_SHARD: id={args.shard_id + 1}/{args.num_shards}; "
+        f"global_range={shard_start + 1:,}-{shard_end:,}; "
         f"symbols={len(universe):,}; full_universe={len(full_universe):,}",
         flush=True,
     )
@@ -675,6 +683,25 @@ def main() -> int:
         print(
             f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
             f"shard_checkpoints={prepared:,}/{len(universe_items):,}",
+            flush=True,
+        )
+        return 0
+
+    if args.prep_only:
+        prepared = sum(
+            1
+            for global_i, sym in universe_items
+            if (
+                symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
+            ).exists()
+            and (
+                symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
+            ).stat().st_size > 0
+        )
+        print(
+            f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
+            f"global_range={shard_start + 1:,}-{shard_end:,}; "
+            f"checkpoints={prepared:,}/{len(universe_items):,}",
             flush=True,
         )
         return 0
