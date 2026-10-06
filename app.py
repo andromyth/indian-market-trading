@@ -611,6 +611,40 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
+    """Get live 1-minute bars with NSE-first provenance and a bounded fallback."""
+    root = str(symbol).replace(".NS", "").replace(".BO", "").upper()
+
+    # Primary: official NSE quote-chart stream.
+    try:
+        frame = nse_fetch_intraday_1m_current(
+            root,
+            sync_drive=True,
+        )
+        if frame is not None and not frame.empty:
+            return frame, "NSE_OFFICIAL_CHART"
+    except Exception:
+        pass
+
+    # Hosted Streamlit deployments can be temporarily blocked by NSE's
+    # public chart endpoint. Fall back to the existing provider chain, which
+    # can use Dhan/Yahoo without changing the locked 5-minute model.
+    try:
+        fallback = get_historical(
+            f"{root}.NS",
+            period="7d",
+            interval="1m",
+            force_refresh=True,
+        )
+        if fallback is not None and not fallback.empty:
+            return fallback, "FALLBACK_PROVIDER"
+    except Exception:
+        pass
+
+    return pd.DataFrame(), "NO_LIVE_1M_DATA"
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_live_announcements(symbol: str) -> list[dict]:
     try:
@@ -1118,9 +1152,9 @@ if interface_mode == "Live Test":
                     return
 
                 try:
-                    raw = nse_fetch_intraday_1m_current(root, sync_drive=True)
+                    raw, live_source = _live_5m_price_frame(selected_symbol)
                     if raw is None or raw.empty:
-                        st.warning("Waiting for NSE 1-minute data.")
+                        st.error("Live 1-minute market data is currently unavailable from NSE and the configured fallback providers.")
                         return
                     cutoff = now.floor("min")
                     completed = raw.loc[raw.index < cutoff].copy()
@@ -1128,6 +1162,7 @@ if interface_mode == "Live Test":
                         st.info("Waiting for the first completed 1-minute NSE bar.")
                         return
                     latest_ts = completed.index[-1]
+                    source_label = "NSE official" if live_source == "NSE_OFFICIAL_CHART" else "fallback provider"
                     state_key = f"live_5m_last_ts::{root}"
                     result_key = f"live_5m_result::{root}"
                     previous_ts = st.session_state.get(state_key)
@@ -1169,9 +1204,9 @@ if interface_mode == "Live Test":
                         })
 
                     if recalculated:
-                        st.success(f"Recalculated from new completed NSE bar · {latest_ts.strftime('%H:%M:%S')} IST")
+                        st.success(f"Recalculated from new completed 1-minute bar · {latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}")
                     else:
-                        st.info(f"Showing latest forecast from {latest_ts.strftime('%H:%M:%S')} IST")
+                        st.info(f"Showing latest forecast from {latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}")
 
                     h0 = hrows[0] if hrows else {}
                     a, b, d, e = st.columns(4)
@@ -1195,7 +1230,7 @@ if interface_mode == "Live Test":
                     st.line_chart(plot_df, height=360)
                     ledger = result.get("ledger") or {}
                     st.caption(
-                        f"Signal source: direct 5-minute-step model · latest completed bar {latest_ts.strftime('%H:%M:%S')} IST · "
+                        f"Signal source: direct 5-minute-step model · live data source: {source_label} · latest completed bar {latest_ts.strftime('%H:%M:%S')} IST · "
                         f"ledger {ledger.get('status','—')} · new rows {ledger.get('new_rows','—')} · "
                         f"Drive sync {'YES' if ledger.get('synced') else 'NO'}."
                     )
