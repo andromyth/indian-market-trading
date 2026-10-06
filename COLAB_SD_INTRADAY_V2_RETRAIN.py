@@ -214,11 +214,31 @@ def main() -> int:
         part_path = parts_dir / f"part_{part_no:04d}_{batch_start+1:04d}_{batch_end:04d}.parquet"
 
         if part_path.exists() and part_path.stat().st_size > 0:
+            # A prior failed implementation wrote empty schema-only parquet
+            # files as "completed" batches. Those are NOT reusable work.
+            # Reuse only checkpoints that actually contain feature rows.
+            try:
+                checkpoint_rows = int(__import__("pyarrow.parquet", fromlist=[""]).ParquetFile(part_path).metadata.num_rows)
+            except Exception:
+                checkpoint_rows = 0
+
+            if checkpoint_rows > 0:
+                print(
+                    f"prepared batch {part_no}: reused symbols {batch_start+1:,}-{batch_end:,} "
+                    f"(rows={checkpoint_rows:,})",
+                    flush=True,
+                )
+                continue
+
             print(
-                f"prepared batch {part_no}: reused symbols {batch_start+1:,}-{batch_end:,}",
+                f"prepared batch {part_no}: empty checkpoint detected; rebuilding "
+                f"symbols {batch_start+1:,}-{batch_end:,}",
                 flush=True,
             )
-            continue
+            try:
+                part_path.unlink()
+            except FileNotFoundError:
+                pass
 
         batch_rows = []
         for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
