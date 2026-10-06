@@ -179,6 +179,26 @@ def _project_ohlc(symbol: str, reference_date: str, reference_close: Any,
         return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
 
+
+def project_next_session_ohlc(
+    symbol: str,
+    reference_date: str,
+    reference_close: Any,
+    predicted_close: Any,
+) -> dict[str, Any]:
+    """Public wrapper used by the Delivery prediction cycle and CSV ledger.
+
+    It uses the same statistical OHLC methodology as the Streamlit Delivery
+    display, based only on completed sessions before the reference date.
+    """
+    return _project_ohlc(
+        symbol,
+        reference_date,
+        reference_close,
+        predicted_close,
+        _load_eod(),
+    )
+
 def _error_pct(actual: Any, predicted: Any) -> float:
     a = _safe_float(actual)
     p = _safe_float(predicted)
