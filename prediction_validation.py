@@ -69,6 +69,11 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
 
     predicted_return = float(record.get("predicted_return_next_session", np.nan))
     predicted_price = ref_close * (1.0 + predicted_return) if np.isfinite(predicted_return) else np.nan
+    first_future = future.iloc[0]
+    actual_d1_date = str(future.index[0])
+    actual_d1_open = float(pd.to_numeric(first_future.get("Open", np.nan), errors="coerce"))
+    actual_d1_high = float(pd.to_numeric(first_future.get("High", np.nan), errors="coerce"))
+    actual_d1_low = float(pd.to_numeric(first_future.get("Low", np.nan), errors="coerce"))
     actual_d1_close = float(future["Close"].iloc[0])
     actual_d1_return = actual_d1_close / ref_close - 1.0
     signal = str(record.get("signal", "HOLD")).upper()
@@ -95,6 +100,10 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
         "production_data_quality_score": production_quality,
         "decision_engine_version": record.get("decision_engine_version"),
         "model_version": record.get("model_version"),
+        "actual_d1_date": actual_d1_date,
+        "actual_d1_open": actual_d1_open,
+        "actual_d1_high": actual_d1_high,
+        "actual_d1_low": actual_d1_low,
         "actual_d1_close": actual_d1_close,
         "actual_d1_return": actual_d1_return,
         "absolute_price_error_d1": actual_d1_close - predicted_price if np.isfinite(predicted_price) else np.nan,
