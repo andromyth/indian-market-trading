@@ -318,9 +318,15 @@ def add_cross_sectional_targets(panel: pd.DataFrame) -> pd.DataFrame:
     x = panel.copy()
     x["decision_timestamp"] = pd.to_datetime(x["decision_timestamp"], utc=True)
     x["fwd_ret"] = pd.to_numeric(x["fwd_ret"], errors="coerce")
-    med = x.groupby(["decision_timestamp", "horizon_min"])["fwd_ret"].transform("median")
+    grp = x.groupby(["decision_timestamp", "horizon_min"])["fwd_ret"]
+    x["cross_section_n"] = grp.transform("count")
+    med = grp.transform("median")
     x["fwd_ret_excess"] = x["fwd_ret"] - med
-    x["y_up_excess"] = (x["fwd_ret_excess"] > 0).astype("int8")
+    x["y_up_excess"] = np.where(
+        x["fwd_ret_excess"].notna(),
+        (x["fwd_ret_excess"] > 0).astype("int8"),
+        np.nan,
+    )
 
     for c in RANK_FEATURE_SOURCES:
         if c in x:
