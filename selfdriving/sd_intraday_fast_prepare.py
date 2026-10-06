@@ -132,9 +132,20 @@ def _compact_one_session(
     r30 = lag_return(30)
     r60 = lag_return(60)
 
-    rsi_delta = pd.Series(c, index=idx).diff()
-    rsi7 = _rsi(pd.Series(c, index=idx), 7)
-    rsi14 = _rsi(pd.Series(c, index=idx), 14)
+    close_for_rsi = pd.Series(c, index=idx)
+    rsi_delta = close_for_rsi.diff()
+    rsi7_up = rsi_delta.clip(lower=0).ewm(
+        alpha=1 / 7, adjust=False, min_periods=7
+    ).mean()
+    rsi7_down = (-rsi_delta.clip(upper=0)).ewm(
+        alpha=1 / 7, adjust=False, min_periods=7
+    ).mean()
+    # Preserve the existing Beta V2 rsi7 semantics exactly: zero downside
+    # remains NaN for rsi7, while rsi14 below keeps the existing 100 fallback.
+    rsi7 = (
+        100.0 - 100.0 / (1.0 + rsi7_up / rsi7_down.replace(0, np.nan))
+    )
+    rsi14 = _rsi(close_for_rsi, 14)
 
     prev_close = close_s.shift(1)
     tr = pd.concat(
