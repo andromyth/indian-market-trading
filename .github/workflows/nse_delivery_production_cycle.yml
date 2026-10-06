@@ -47,14 +47,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Prepare Colab-compatible persistent path
+      - name: Prepare persistent data path
         run: |
           set -euo pipefail
-          mkdir -p /content/drive/MyDrive
-          if [ -e /content/drive/MyDrive/Indian_Market_Research ] && [ ! -L /content/drive/MyDrive/Indian_Market_Research ]; then
-            rm -rf /content/drive/MyDrive/Indian_Market_Research
-          fi
-          ln -sfn "$GITHUB_WORKSPACE/.market_data" /content/drive/MyDrive/Indian_Market_Research
+          mkdir -p "$GITHUB_WORKSPACE/.market_data"
+          echo "Persistent data root: $GITHUB_WORKSPACE/.market_data"
 
       - name: Resolve target NSE session
         id: target
