@@ -2347,7 +2347,7 @@ direct_delivery_results = {}
 direct_delivery_errors = {}
 direct_delivery_runtime = None
 
-if style == "Delivery":
+if interface_mode == "Live Test" and live_mode == "Delivery":
 
     try:
         direct_delivery_runtime = all_nse_delivery_model_status()
@@ -2397,7 +2397,7 @@ delivery_results = {}
 # inference path. Do not fetch the legacy 420-day chart/context stack or run
 # the legacy delivery_prediction engine during a Delivery request; those calls
 # duplicate work and can turn a single-symbol prediction into a long wait.
-if style != "Delivery" and live_mode != "Intraday 5-minute":
+if interface_mode != "Live Test":
     # The legacy/30-minute Intraday path uses news context; the dedicated
     # 5-minute stream does not. This is intentionally lazy and remains outside
     # the critical 5-minute forecast function.
@@ -2903,7 +2903,7 @@ if style != "Delivery" and live_mode != "Intraday 5-minute":
             )
 
 
-    if style == "Delivery" and direct_delivery_runtime is not None:
+    if live_mode == "Delivery" and direct_delivery_runtime is not None:
         with st.expander("ALL-NSE Delivery runtime diagnostic", expanded=True):
             st.json(direct_delivery_runtime)
 
@@ -2959,7 +2959,7 @@ if style != "Delivery" and live_mode != "Intraday 5-minute":
 
 # Render direct ALL-NSE Delivery model results even when the generic
 # dashboard context history is unavailable.
-if style == "Delivery" and direct_delivery_results and not live_records:
+if live_mode == "Delivery" and direct_delivery_results and not live_records:
 
     for symbol, dlv in direct_delivery_results.items():
 
@@ -3060,7 +3060,7 @@ if style == "Delivery" and direct_delivery_results and not live_records:
                 hide_index=True,
             )
 
-if style == "Delivery" and direct_delivery_results:
+if live_mode == "Delivery" and direct_delivery_results:
     render_delivery_forecast(direct_delivery_results)
 
 for rec in live_records:
