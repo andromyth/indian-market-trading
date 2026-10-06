@@ -164,6 +164,11 @@ def main():
     )
     ap.add_argument("--end-date",default="")
     ap.add_argument("--force",action="store_true")
+    ap.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="List available/selected archives and exit without downloading or repartitioning.",
+    )
     args=ap.parse_args()
 
     from delivery_training_universe import official_nse_symbols
@@ -179,6 +184,19 @@ def main():
     start=end-timedelta(days=max(1,args.lookback_calendar_days))
     available=[x for x in list_archives() if start <= x[0] <= end]
     available=available[-max(1,args.max_archives):]
+
+    print(
+        f"INTRADAY HISTORICAL SEED PLAN: available_in_window={len([x for x in list_archives() if start <= x[0] <= end]):,}; "
+        f"selected={len(available):,}; start={start}; end={end}",
+        flush=True,
+    )
+    if args.plan_only:
+        if available:
+            print(
+                f"SELECTED DATE RANGE: {available[0][0]} -> {available[-1][0]}",
+                flush=True,
+            )
+        return
 
     manifest={
         "source":"olo-labs/olo-testdata-nse-min-candle",
