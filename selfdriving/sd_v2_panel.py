@@ -71,12 +71,22 @@ def add_delivery_targets(panel: pd.DataFrame) -> pd.DataFrame:
         x.groupby("symbol", sort=False)["close"].shift(-1) / x["close"] - 1.0
     )
     x["y_return"] = x["y_return"].replace([np.inf, -np.inf], np.nan)
-    x["y_excess"] = (
-        x["y_return"]
-        - x.groupby("date", sort=False)["y_return"].transform("median")
+
+    # Market-neutral targets are meaningful only when a sufficient number of
+    # symbols have a realised next-session return on the same date.
+    x["cross_section_n"] = x.groupby("date", sort=False)["y_return"].transform("count")
+    median = x.groupby("date", sort=False)["y_return"].transform("median")
+    x["y_excess"] = x["y_return"] - median
+    x["y_up_excess"] = np.where(
+        x["y_excess"].notna(),
+        (x["y_excess"] > 0).astype("int8"),
+        np.nan,
     )
-    x["y_up_excess"] = (x["y_excess"] > 0).astype("int8")
-    x["y_up_abs"] = (x["y_return"] > 0).astype("int8")
+    x["y_up_abs"] = np.where(
+        x["y_return"].notna(),
+        (x["y_return"] > 0).astype("int8"),
+        np.nan,
+    )
     return x
 
 
