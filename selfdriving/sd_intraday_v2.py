@@ -235,8 +235,9 @@ def _session_rows(
             mins_since = int(minutes[pos] - OPEN_MIN)
             dt = pd.Timestamp(idx[pos])
 
-            def v(series: pd.Series) -> float:
-                value = series.iloc[pos]
+            def v(series) -> float:
+                values = np.asarray(series)
+                value = values[pos]
                 return float(value) if np.isfinite(value) else np.nan
 
             current = float(c[pos])
@@ -270,7 +271,7 @@ def _session_rows(
                 "or_dist": (current - (or_hi + or_lo) / 2.0) / max(or_hi - or_lo, 1e-9),
                 "range_pct": (float(h[pos] - lo[pos]) / current) if current else np.nan,
                 "body_pct": (current - prev) / prev if prev else np.nan,
-                "ret_accel_1_5": float(r5[pos] - r1_arr[pos]) if np.isfinite(r5[pos]) and np.isfinite(r1_arr[pos]) else np.nan,
+                "ret_accel_1_5": float(r5[pos] - ret1_arr[pos]) if np.isfinite(r5[pos]) and np.isfinite(ret1_arr[pos]) else np.nan,
                 "tod_sin": np.sin(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
                 "tod_cos": np.cos(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
                 "mins_since_open": float(mins_since),
