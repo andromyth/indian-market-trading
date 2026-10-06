@@ -1019,8 +1019,8 @@ if interface_mode == "Live Test":
                     )
                 )
                 st.warning(
-                    "Delivery data gate is BLOCKED. The numeric forecast can still be displayed, "
-                    "but BUY/SELL is forced to HOLD until the production data-quality gate passes."
+                    "Delivery prediction is blocked for the active symbol. "
+                    "Check the exact NSE symbol below before treating this as a model/data-quality failure."
                 )
                 if reasons:
                     st.caption("Gate reason(s): " + " · ".join(reasons))
@@ -2429,7 +2429,21 @@ if interface_mode == "Live Test" and live_mode == "Delivery":
                 requested_symbol,
                 pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat(),
             )
-            direct_delivery_results[requested_symbol] = result
+
+            if result.get("prediction_status") == "BLOCKED":
+                # Preserve an input-validation block as such. Do not turn an
+                # invalid/non-trainable symbol into a generic RuntimeError.
+                direct_delivery_results[requested_symbol] = result
+                direct_delivery_errors[requested_symbol] = {
+                    "stage": "INPUT_VALIDATION",
+                    "error_type": "SYMBOL_NOT_SUPPORTED",
+                    "error": str(
+                        result.get("reason")
+                        or "symbol_not_in_current_all_nse_trainable_roster"
+                    ),
+                }
+            else:
+                direct_delivery_results[requested_symbol] = result
 
         except Exception as exc:
             direct_delivery_errors[requested_symbol] = {
