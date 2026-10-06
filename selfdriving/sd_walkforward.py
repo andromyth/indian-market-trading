@@ -122,8 +122,10 @@ def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: Mode
     cut = d[int(len(d) * (1 - cfg.val_frac))]
     dd = pd.to_datetime(df[date_col]).dt.normalize()
     tr, va = df[dd < cut], df[dd >= cut]
-    Xtr = tr[features].apply(pd.to_numeric, errors="coerce"); ytr = tr[target].astype(int)
-    Xva = va[features].apply(pd.to_numeric, errors="coerce"); yva = va[target].astype(int)
+    Xtr = tr[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    ytr = tr[target].astype(int)
+    Xva = va[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    yva = va[target].astype(int)
     hgb = HistGradientBoostingClassifier(**cfg.hgb_params).fit(Xtr, ytr)
     lg = _logit_pipe(cfg.logit_C).fit(Xtr, ytr)
     ph, pl = hgb.predict_proba(Xva)[:, 1], lg.predict_proba(Xva)[:, 1]
@@ -135,7 +137,8 @@ def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: Mode
     pv = best_w * ph + (1 - best_w) * pl
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.001, y_max=0.999).fit(pv, yva) if cfg.calibrate else None
     # refit base learners on the full window (calibration map stays from the held-out tail)
-    Xall = df[features].apply(pd.to_numeric, errors="coerce"); yall = df[target].astype(int)
+    Xall = df[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    yall = df[target].astype(int)
     hgb = HistGradientBoostingClassifier(**cfg.hgb_params).fit(Xall, yall)
     lg = _logit_pipe(cfg.logit_C).fit(Xall, yall)
     meta = {"config": cfg.name, "target": target, "n_rows": int(len(df)), "val_logloss": float(best_ll),
