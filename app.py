@@ -773,13 +773,19 @@ if interface_mode == "Live Test":
 
             try:
                 root = sym.replace(".NS", "").upper()
-                result = delivery_prediction(
-                    {
-                        "symbol": root,
-                        "decision_timestamp": now_ist,
-                    },
-                    sync_drive=True,
-                )
+                # The locked ALL-NSE production result is authoritative for
+                # the interactive Delivery display. Do not depend on the legacy
+                # wrapper's ledger append/auxiliary context path merely to render
+                # a production prediction.
+                result = direct_delivery_results.get(sym)
+                if not result or result.get("prediction_status") != "PASS":
+                    result = delivery_prediction(
+                        {
+                            "symbol": root,
+                            "decision_timestamp": now_ist,
+                        },
+                        sync_drive=False,
+                    )
 
                 live_news = _delivery_live_news_context(sym, now_ist)
                 live_fo = _cached_live_option_chain(sym) or {}
