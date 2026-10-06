@@ -282,6 +282,14 @@ def beta_intraday_predict(
             )
             bundle_obj = joblib.load(registry_root / bundle)
             X = h[features].apply(pd.to_numeric, errors="coerce")
+            float32_max = float(__import__("numpy").finfo(__import__("numpy").float32).max)
+            X = X.replace([float("inf"), float("-inf")], __import__("numpy").nan)
+            for c in X.columns:
+                X[c] = X[c].mask(
+                    ~__import__("numpy").isfinite(X[c])
+                    | (X[c].abs() > float32_max),
+                    __import__("numpy").nan,
+                ).astype("float32")
             p = float(bundle_obj.predict_proba_up(X)[0])
             thr = state["champion"].get("thresholds", {"abstain_all": True})
             from .sd_walkforward import to_signal
