@@ -222,6 +222,12 @@ jobs:
         if: steps.target.outputs.target_date != ''
         run: python -u validate_prediction_ledger.py
 
+      - name: Update daywise Delivery prediction-vs-actual CSV ledger
+        if: steps.target.outputs.target_date != ''
+        run: |
+          python -u delivery_prediction_csv_ledger.py
+          echo "Daily Delivery prediction-vs-actual CSV ledger synchronized to Google Drive."
+
       - name: Generate Delivery OOS diagnostics
         if: steps.target.outputs.target_date != ''
         run: python -u delivery_validation_diagnostics.py
@@ -256,4 +262,4 @@ jobs:
 
       - name: Syntax check
         if: steps.target.outputs.target_date != ''
-        run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py delivery_all_nse_prediction_cycle.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
+        run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py delivery_all_nse_prediction_cycle.py delivery_prediction_csv_ledger.py prediction_ledger.py prediction_validation.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
