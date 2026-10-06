@@ -109,10 +109,32 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
         p = p[p["cross_section_n"] >= 20].copy()
     p = add_targets(p)
     p = p.dropna(subset=["y_up_excess"]).copy()
-    p = add_cross_sectional_ranks(p, RANK_SOURCE)
     sel = select_groups(p)
     if not sel["features"]:
         return {"status": "NO_FEATURES", "groups": sel["groups"]}
+
+    # Reduce the training frame before walk-forward fitting. The previous code
+    # kept every panel column plus a full set of cross-sectional rank columns,
+    # even when none of those ranks were selected as model features. On CPU
+    # Colab this unnecessarily multiplies peak RAM. Keep only the target,
+    # identifiers and actually selected features, and add rank columns only
+    # when a selected feature requires one.
+    rank_needed = [
+        c for c in RANK_SOURCE
+        if c + "_csr" in sel["features"]
+    ]
+    keep = ["symbol", "date", "y_return", "y_up_excess"] + list(sel["features"])
+    keep += [c for c in rank_needed if c not in keep]
+    keep = list(dict.fromkeys(c for c in keep if c in p.columns))
+    p = p[keep].copy()
+    if rank_needed:
+        p = add_cross_sectional_ranks(p, rank_needed)
+
+    for col in p.columns:
+        if pd.api.types.is_float_dtype(p[col]):
+            p[col] = pd.to_numeric(p[col], errors="coerce").astype("float32")
+        elif pd.api.types.is_integer_dtype(p[col]):
+            p[col] = pd.to_numeric(p[col], errors="coerce", downcast="integer")
     reg = Registry(registry_dir)
 
     pred_c = run_walkforward(p, sel["features"], "y_up_excess", "y_return", cfg, spec)
