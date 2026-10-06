@@ -1,9 +1,7 @@
 """Colab trainer for the isolated Beta V2 Delivery challenger.
 
-This script does NOT touch the current production Delivery artifacts.
-It consumes the existing ALL-NSE PIT panel, enriches it with point-in-time
-global/news/F&O features, derives a causal next-session excess-return target,
-and trains through the self-driving champion/challenger registry.
+This trainer is designed for the full NSE universe while remaining resumable on
+CPU-only Colab runtimes. It never changes production model artefacts.
 """
 from __future__ import annotations
 
@@ -12,16 +10,17 @@ import json
 from pathlib import Path
 
 import duckdb
-
 import pandas as pd
 
-from delivery_training_universe import training_roster
-from nse_data_layer import load_canonical_cash_research_history
-from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
-from colab_build_all_nse_delivery_multifactor_candidate import make_panel
 from selfdriving.sd_cycle import train_stage
 from selfdriving.sd_global_cues import attach_global_features
-from selfdriving.sd_v2_panel import build_beta_delivery_panel, split_training_inference
+from selfdriving.sd_v2_panel import (
+    add_delivery_targets,
+    merge_beta_fno,
+    merge_beta_news,
+    split_training_inference,
+)
+from selfdriving.sd_global_cues import attach_global_features
 
 
 DEFAULT_BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
@@ -31,6 +30,8 @@ DEFAULT_PANEL = (
     / "ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
 )
 MIN_WALKFORWARD_SESSIONS = 422
+DEFAULT_LOOKBACK_SESSIONS = 800
+CHUNK_SIZE = 100
 
 
 def load_optional(path: Path) -> pd.DataFrame:
@@ -39,144 +40,143 @@ def load_optional(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def build_full_history_panel_chunked(
-    base: Path,
-    out: Path,
-    master: Path,
-    *,
-    chunk_size: int = 100,
-) -> pd.DataFrame:
-    """Build the full-history Beta V2 base panel in resumable symbol chunks.
+def parquet_stats(path: Path) -> dict:
+    con = duckdb.connect()
+    try:
+        p = str(path).replace("'", "''")
+        row = con.execute(
+            f"""
+            SELECT
+                COUNT(*) AS rows,
+                COUNT(DISTINCT symbol) AS symbols,
+                COUNT(DISTINCT CAST(date AS DATE)) AS sessions,
+                MIN(CAST(date AS DATE)) AS min_date,
+                MAX(CAST(date AS DATE)) AS max_date
+            FROM read_parquet('{p}')
+            """
+        ).fetchone()
+        return {
+            "rows": int(row[0]),
+            "symbols": int(row[1]),
+            "sessions": int(row[2]),
+            "min_date": str(row[3]),
+            "max_date": str(row[4]),
+        }
+    finally:
+        con.close()
 
-    The previous implementation held 2,382 per-symbol DataFrames in memory and
-    then performed one large concat. On Colab this can be interrupted after the
-    final progress message during the peak-memory concat. This version writes
-    each completed symbol chunk to Drive, resumes existing chunks, and uses
-    DuckDB to assemble the completed Parquet parts without creating another
-    giant Python-side concat.
-    """
-    parts_dir = out / "base_panel_parts"
-    parts_dir.mkdir(parents=True, exist_ok=True)
-    combined = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
 
-    # Fast resume path: if the combined parquet already exists, do not reload
-    # the canonical 4M+ row source just to discover that the work is complete.
-    if combined.exists() and combined.stat().st_size > 0:
-        print(
-            f"Full-history base panel already assembled: {combined} "
-            f"({combined.stat().st_size / 1024 / 1024:.1f} MB); loading it.",
-            flush=True,
-        )
-        panel = pd.read_parquet(combined)
-        sessions = int(
-            pd.to_datetime(panel["date"], errors="coerce").dt.normalize().nunique()
-        )
-        if sessions < MIN_WALKFORWARD_SESSIONS:
-            raise RuntimeError(
-                f"Cached full-history base panel has only {sessions} sessions; "
-                f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
+def sql_recent_panel(path: Path, lookback_sessions: int) -> pd.DataFrame:
+    """Load only the most recent N sessions from a Parquet panel."""
+    p = str(path).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        return con.execute(
+            f"""
+            WITH sessions AS (
+                SELECT CAST(date AS DATE) AS date
+                FROM read_parquet('{p}')
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT {int(lookback_sessions)}
             )
-        print(
-            f"Cached full-history base panel loaded: rows={len(panel):,}, "
-            f"symbols={panel['symbol'].nunique():,}, sessions={sessions:,}",
-            flush=True,
-        )
-        return panel
+            SELECT p.*
+            FROM read_parquet('{p}') p
+            INNER JOIN sessions s
+                ON CAST(p.date AS DATE) = s.date
+            ORDER BY p.symbol, p.date
+            """
+        ).df()
+    finally:
+        con.close()
 
-    # Second fast resume path: when every symbol chunk is already present,
-    # assemble directly. No canonical source or Delivery reread is needed.
-    final_part = parts_dir / "part_0024_2301_2382.parquet"
-    existing_parts = sorted(parts_dir.glob("part_*.parquet"))
-    if final_part.exists() and len(existing_parts) >= 24:
-        print(
-            f"All {len(existing_parts)} checkpoint files are present; "
-            "assembling cached chunks directly.",
-            flush=True,
-        )
-    else:
-        existing_parts = []
 
-    bulk = None
-    trainable = None
-    delivery = None
-    if not existing_parts:
-        bulk = load_canonical_cash_research_history(master)
-        if bulk.empty:
-            raise RuntimeError("Canonical NSE cash research view is empty")
+def latest_rows(path: Path) -> pd.DataFrame:
+    p = str(path).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        return con.execute(
+            f"""
+            WITH latest AS (
+                SELECT MAX(CAST(date AS DATE)) AS date
+                FROM read_parquet('{p}')
+            )
+            SELECT p.*
+            FROM read_parquet('{p}') p
+            INNER JOIN latest l
+                ON CAST(p.date AS DATE) = l.date
+            ORDER BY p.symbol
+            """
+        ).df()
+    finally:
+        con.close()
 
-        roster = training_roster(bulk, min_history=60, force_refresh=False)
-        trainable = list(roster["trainable_symbols"])
-        if not trainable:
-            raise RuntimeError("No trainable NSE symbols found in canonical cash history")
 
-        delivery = load_delivery_history(
-            DEFAULT_DELIVERY_ROOT,
-            symbols=trainable,
-            start=bulk["date"].min(),
-            end=bulk["date"].max(),
-        )
+def build_beta_panel_chunked(
+    out: Path,
+    base_parts_dir: Path,
+    global_cues: pd.DataFrame,
+    raw_news: pd.DataFrame,
+    fno_daily: pd.DataFrame,
+) -> Path:
+    """Enrich the already checkpointed base panel without loading 4M rows."""
+    beta_parts = out / "beta_panel_parts"
+    beta_parts.mkdir(parents=True, exist_ok=True)
 
-        # Prepare a cheap symbol lookup so each batch filters the large source
-    # once, rather than copying the complete 4M+ row frame.
-    bulk["symbol"] = bulk["symbol"].astype(str).str.upper().str.strip()
-    delivery = delivery.copy()
-    if not delivery.empty and "symbol" in delivery.columns:
-        delivery["symbol"] = delivery["symbol"].astype(str).str.upper().str.strip()
+    base_parts = sorted(base_parts_dir.glob("part_*.parquet"))
+    if not base_parts:
+        raise FileNotFoundError(f"No base panel checkpoints found under {base_parts_dir}")
 
-    if not existing_parts:
-        total = len(trainable)
-        for start in range(0, total, chunk_size):
-        end = min(total, start + chunk_size)
-        chunk_index = start // chunk_size + 1
-        part = parts_dir / f"part_{chunk_index:04d}_{start+1:04d}_{end:04d}.parquet"
+    total = len(base_parts)
+    for idx, base_part in enumerate(base_parts, 1):
+        beta_part = beta_parts / base_part.name.replace("part_", "beta_part_")
 
-        if part.exists() and part.stat().st_size > 0:
+        if beta_part.exists() and beta_part.stat().st_size > 0:
             print(
-                f"base panel chunk {chunk_index}: reused symbols {start+1:,}-{end:,}; "
-                f"file={part.name}",
+                f"beta panel chunk {idx}/{total}: reused {beta_part.name}",
                 flush=True,
             )
             continue
 
-        symbols = trainable[start:end]
-        symbol_set = set(str(x).upper().strip() for x in symbols)
-        bulk_chunk = bulk[bulk["symbol"].isin(symbol_set)].copy()
-        delivery_chunk = (
-            delivery[delivery["symbol"].isin(symbol_set)].copy()
-            if not delivery.empty and "symbol" in delivery.columns
-            else delivery
-        )
-
         print(
-            f"base panel chunk {chunk_index}: building symbols {start+1:,}-{end:,} "
-            f"({len(symbols):,} symbols)",
+            f"beta panel chunk {idx}/{total}: enriching {base_part.name}",
             flush=True,
         )
-        chunk_panel = make_panel(
-            bulk_chunk,
-            symbols,
-            sort_output=False,
-            delivery=delivery_chunk,
-        )
-        if chunk_panel.empty:
-            raise RuntimeError(
-                f"Base panel chunk {chunk_index} produced no rows "
-                f"for symbols {start+1}-{end}"
-            )
-        chunk_panel.to_parquet(part, index=False)
+        chunk = pd.read_parquet(base_part)
+
+        # y_return is causal within each symbol chunk because every symbol has
+        # its complete historical date sequence in exactly one base checkpoint.
+        x = add_delivery_targets(chunk)
+
+        audit_parts = {
+            "base_rows": int(len(x)),
+            "base_symbols": int(x["symbol"].nunique()),
+        }
+
+        if global_cues is not None and not global_cues.empty:
+            x = attach_global_features(x, global_cues)
+            audit_parts["global"] = "PASS"
+        else:
+            audit_parts["global"] = "NO_DATA"
+
+        x, news_audit = merge_beta_news(x, raw_news)
+        x, fno_audit = merge_beta_fno(x, fno_daily)
+
+        x["beta_v2_panel_version"] = "2026-10-06-beta-v2"
+        x.to_parquet(beta_part, index=False)
+
         print(
-            f"base panel chunk {chunk_index}: saved rows={len(chunk_panel):,} "
-            f"symbols={chunk_panel['symbol'].nunique():,}",
+            f"beta panel chunk {idx}/{total}: saved rows={len(x):,} "
+            f"symbols={x['symbol'].nunique():,}; "
+            f"news={news_audit.get('status')} fno={fno_audit.get('status')}",
             flush=True,
         )
-        del bulk_chunk, delivery_chunk, chunk_panel
+        del chunk, x
 
-    # Assemble via DuckDB directly into one Parquet file. This avoids the
-    # peak-memory pandas concat that repeatedly interrupted the Colab run.
-    combined = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
-    glob = str(parts_dir / "part_*.parquet").replace("'", "''")
-    tmp = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet.tmp"
+    combined = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet"
     if not combined.exists() or combined.stat().st_size == 0:
+        glob = str(beta_parts / "beta_part_*.parquet").replace("'", "''")
+        tmp = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet.tmp"
         con = duckdb.connect()
         try:
             con.execute(
@@ -193,22 +193,14 @@ def build_full_history_panel_chunked(
             con.close()
         tmp.replace(combined)
 
-    panel = pd.read_parquet(combined)
-    sessions = int(
-        pd.to_datetime(panel["date"], errors="coerce").dt.normalize().nunique()
-    )
-    if sessions < MIN_WALKFORWARD_SESSIONS:
-        raise RuntimeError(
-            f"Chunked canonical source build produced only {sessions} sessions; "
-            f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
-        )
+    stats = parquet_stats(combined)
     print(
-        f"Full-history base panel ready: rows={len(panel):,}, "
-        f"symbols={panel['symbol'].nunique():,}, sessions={sessions:,}; "
+        f"Beta V2 full panel ready: rows={stats['rows']:,}, "
+        f"symbols={stats['symbols']:,}, sessions={stats['sessions']:,}, "
         f"saved={combined}",
         flush=True,
     )
-    return panel
+    return combined
 
 
 def main() -> int:
@@ -217,64 +209,85 @@ def main() -> int:
     ap.add_argument("--panel", default=str(DEFAULT_PANEL))
     ap.add_argument("--out", default="")
     ap.add_argument(
-        "--force-rebuild-base",
-        action="store_true",
-        help="Force rebuilding the full-history Beta V2 base panel instead of reusing its Drive cache.",
+        "--lookback-sessions",
+        type=int,
+        default=DEFAULT_LOOKBACK_SESSIONS,
+        help="Recent sessions used for OOS training. Must be >= 422; all symbols remain included.",
     )
     args = ap.parse_args()
+
+    if args.lookback_sessions < MIN_WALKFORWARD_SESSIONS:
+        raise ValueError(
+            f"--lookback-sessions must be >= {MIN_WALKFORWARD_SESSIONS}; "
+            f"received {args.lookback_sessions}"
+        )
 
     base = Path(args.base)
     out = Path(args.out) if args.out else base / "selfdriving/beta_version2"
     out.mkdir(parents=True, exist_ok=True)
 
-    panel = pd.read_parquet(args.panel)
-    panel_sessions = int(pd.to_datetime(panel.get("date"), errors="coerce").dt.normalize().nunique()) if "date" in panel.columns else 0
+    source_panel = Path(args.panel)
+    source_stats = parquet_stats(source_panel)
+    print(
+        f"Input panel: rows={source_stats['rows']:,}, "
+        f"symbols={source_stats['symbols']:,}, sessions={source_stats['sessions']:,}",
+        flush=True,
+    )
 
-    # The original candidate panel is a 2026-only research artifact in some
-    # Drive snapshots. Eight purged walk-forward folds require at least 422
-    # distinct sessions with the current FoldSpec (252 train + 8*21 test +
-    # purge/embargo). Never silently shrink the validation design just to make
-    # a short panel train. Rebuild the Beta V2 source panel from the canonical
-    # identity-preserved NSE cash master when the supplied panel is too short.
-    if panel_sessions < MIN_WALKFORWARD_SESSIONS:
-        master = base / "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
-        if not master.exists() or master.stat().st_size == 0:
-            raise RuntimeError(
-                f"Input panel has only {panel_sessions} sessions; Beta V2 requires "
-                f">= {MIN_WALKFORWARD_SESSIONS}. Canonical NSE cash master is "
-                f"missing: {master}. Build the full-history canonical cash master first."
-            )
+    if source_stats["sessions"] < MIN_WALKFORWARD_SESSIONS:
+        full_base = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
+        base_parts = out / "base_panel_parts"
 
-        source_copy = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
-        if (
-            not args.force_rebuild_base
-            and source_copy.exists()
-            and source_copy.stat().st_size > 0
-        ):
-            panel = pd.read_parquet(source_copy)
-            rebuilt_sessions = int(
-                pd.to_datetime(panel["date"], errors="coerce")
-                .dt.normalize()
-                .nunique()
-            )
+        if full_base.exists() and full_base.stat().st_size > 0:
+            base_stats = parquet_stats(full_base)
             print(
-                f"Reusing cached full-history Beta V2 base panel: "
-                f"rows={len(panel):,}, symbols={panel['symbol'].nunique():,}, "
-                f"sessions={rebuilt_sessions:,}; cached={source_copy}",
+                f"Using cached full-history base panel: rows={base_stats['rows']:,}, "
+                f"symbols={base_stats['symbols']:,}, sessions={base_stats['sessions']:,}; "
+                f"cached={full_base}",
+                flush=True,
+            )
+        elif len(list(base_parts.glob("part_*.parquet"))) >= 24:
+            print(
+                "Using completed base-panel checkpoints; assembling them without "
+                "rebuilding the canonical NSE source.",
+                flush=True,
+            )
+            glob = str(base_parts / "part_*.parquet").replace("'", "''")
+            tmp = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet.tmp"
+            con = duckdb.connect()
+            try:
+                con.execute(
+                    f"""
+                    COPY (
+                        SELECT *
+                        FROM read_parquet('{glob}')
+                    )
+                    TO '{str(tmp).replace("'", "''")}'
+                    (FORMAT PARQUET, COMPRESSION ZSTD);
+                    """
+                )
+            finally:
+                con.close()
+            tmp.replace(full_base)
+            base_stats = parquet_stats(full_base)
+            print(
+                f"Full-history base assembled: rows={base_stats['rows']:,}, "
+                f"symbols={base_stats['symbols']:,}, sessions={base_stats['sessions']:,}",
                 flush=True,
             )
         else:
-            print(
-                f"Input panel has only {panel_sessions} sessions. Rebuilding the Beta V2 "
-                f"base panel from the canonical NSE cash master for full-history walk-forward training.",
-                flush=True,
+            raise RuntimeError(
+                "The 2026 panel is too short and the full-history checkpoint set is incomplete. "
+                "Rebuild the base panel before training."
             )
-            panel = build_full_history_panel_chunked(
-                base,
-                out,
-                master,
-                chunk_size=100,
+
+        if base_stats["sessions"] < MIN_WALKFORWARD_SESSIONS:
+            raise RuntimeError(
+                f"Full-history base has only {base_stats['sessions']} sessions; "
+                f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
             )
+    else:
+        full_base = source_panel
 
     global_path = base / "selfdriving/global_cues.parquet"
     news_path = base / "selfdriving/raw_news.parquet"
@@ -284,16 +297,74 @@ def main() -> int:
     raw_news = load_optional(news_path)
     fno_daily = load_optional(fno_path)
 
-    beta_panel, audit = build_beta_delivery_panel(
-        panel,
-        global_cues=global_cues,
-        raw_news=raw_news,
-        fno_daily=fno_daily,
+    beta_full = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet"
+    beta_parts = out / "beta_panel_parts"
+
+    if beta_full.exists() and beta_full.stat().st_size > 0:
+        beta_stats = parquet_stats(beta_full)
+        print(
+            f"Reusing cached Beta V2 full panel: rows={beta_stats['rows']:,}, "
+            f"symbols={beta_stats['symbols']:,}, sessions={beta_stats['sessions']:,}",
+            flush=True,
+        )
+    elif beta_parts.exists() and len(list(beta_parts.glob("beta_part_*.parquet"))) >= 24:
+        print("All Beta V2 enrichment checkpoints exist; assembling them.", flush=True)
+        glob = str(beta_parts / "beta_part_*.parquet").replace("'", "''")
+        tmp = out / "BETA_V2_DELIVERY_PANEL_FULL_HISTORY.parquet.tmp"
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"""
+                COPY (
+                    SELECT *
+                    FROM read_parquet('{glob}')
+                )
+                TO '{str(tmp).replace("'", "''")}'
+                (FORMAT PARQUET, COMPRESSION ZSTD);
+                """
+            )
+        finally:
+            con.close()
+        tmp.replace(beta_full)
+    else:
+        beta_full = build_beta_panel_chunked(
+            out,
+            out / "base_panel_parts",
+            global_cues,
+            raw_news,
+            fno_daily,
+        )
+
+    # Do not load the entire multi-million-row Beta panel for model fitting.
+    # Keep all NSE symbols but use a recent, contiguous session window for
+    # walk-forward training. This preserves the required 8 folds while keeping
+    # memory bounded on CPU-only Colab. The full panel remains persisted.
+    train_panel = sql_recent_panel(beta_full, args.lookback_sessions)
+
+    train_dates = pd.to_datetime(train_panel["date"], errors="coerce").dt.normalize()
+    n_sessions = int(train_dates.nunique())
+    if n_sessions < MIN_WALKFORWARD_SESSIONS:
+        raise RuntimeError(
+            f"Training window has only {n_sessions} sessions; "
+            f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
+        )
+
+    # Recompute cross-sectional availability globally in the selected training
+    # window. This prevents chunk-local counts from becoming a training gate.
+    train_panel["cross_section_n"] = (
+        train_panel.groupby("date")["y_return"].transform("count")
     )
 
-    beta_panel.to_parquet(out / "BETA_V2_DELIVERY_PANEL.parquet", index=False)
+    training, _, realised = split_training_inference(train_panel)
+    latest = latest_rows(beta_full)
+    inference = latest.copy()
 
-    training, inference, realised = split_training_inference(beta_panel)
+    print(
+        f"Training window ready: rows={len(training):,}, "
+        f"symbols={training['symbol'].nunique():,}, sessions={training['date'].nunique():,}",
+        flush=True,
+    )
+
     training.to_parquet(out / "BETA_V2_DELIVERY_TRAINING_PANEL.parquet", index=False)
     inference.to_parquet(out / "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet", index=False)
     realised.to_parquet(out / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet", index=False)
@@ -306,7 +377,8 @@ def main() -> int:
     status = {
         "version": "2026-10-06-beta-v2-delivery",
         "status": result.get("status"),
-        "audit": audit,
+        "lookback_sessions": int(args.lookback_sessions),
+        "full_panel": parquet_stats(beta_full),
         "training_rows": int(len(training)),
         "inference_rows": int(len(inference)),
         "realised_rows": int(len(realised)),
