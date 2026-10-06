@@ -115,22 +115,22 @@ def _history_sessions(frame: pd.DataFrame) -> int:
     return int(dates.nunique())
 
 
-def _make_horizon_training_rows(
+def _make_all_horizon_training_rows(
     symbol_paths: list[Path],
-    horizon: int,
     per_symbol_rows: int,
     global_row_cap: int,
-) -> tuple[pd.DataFrame, dict]:
-    target_col = f"fwd_ret_{horizon}m"
+) -> tuple[dict[int, pd.DataFrame], dict[int, dict]]:
+    """Read each compact symbol checkpoint once, then fan out all six horizons."""
+    target_cols = [f"fwd_ret_{h}m" for h in HORIZONS]
     cols = (
-        ["symbol", "decision_timestamp", "date", target_col]
+        ["symbol", "decision_timestamp", "date"]
         + feature_columns()
+        + target_cols
     )
 
-    frames = []
-    history = []
-    eligible = []
-    retained = 0
+    frames: dict[int, list[pd.DataFrame]] = {h: [] for h in HORIZONS}
+    retained: dict[int, int] = {h: 0 for h in HORIZONS}
+    history: list[dict] = []
 
     for path in symbol_paths:
         try:
@@ -148,76 +148,92 @@ def _make_horizon_training_rows(
 
         sym = str(frame["symbol"].iloc[0]).strip().upper()
         sessions = _history_sessions(frame)
+        status = (
+            "EXCLUDED_INSUFFICIENT_HISTORY"
+            if sessions < MIN_USABLE_SESSIONS
+            else (
+                "LIMITED_HISTORY"
+                if sessions < MIN_PREFERRED_SESSIONS
+                else "PREFERRED_HISTORY"
+            )
+        )
+
         row = {
             "symbol": sym,
             "sessions": sessions,
+            "status": status,
         }
 
         if sessions < MIN_USABLE_SESSIONS:
-            row["status"] = "EXCLUDED_INSUFFICIENT_HISTORY"
             history.append(row)
             continue
 
-        if sessions < MIN_PREFERRED_SESSIONS:
-            row["status"] = "LIMITED_HISTORY"
-        else:
-            row["status"] = "PREFERRED_HISTORY"
+        row["horizon_rows"] = {}
 
-        frame = frame.dropna(subset=[target_col]).sort_values("decision_timestamp")
-        if frame.empty:
-            row["status"] = "EXCLUDED_NO_LABELS"
-            history.append(row)
-            continue
+        for horizon in HORIZONS:
+            target_col = f"fwd_ret_{horizon}m"
+            part = frame.dropna(subset=[target_col]).sort_values("decision_timestamp")
+            if part.empty:
+                row["horizon_rows"][str(horizon)] = 0
+                continue
 
-        frame = _even_sample_frame(frame, per_symbol_rows)
+            part = _even_sample_frame(part, per_symbol_rows)
 
-        remaining = int(global_row_cap) - int(retained)
-        if remaining <= 0:
-            row["status"] = "EXCLUDED_GLOBAL_TRAINING_CAP"
-            history.append(row)
-            continue
+            remaining = int(global_row_cap) - int(retained[horizon])
+            if remaining <= 0:
+                row["horizon_rows"][str(horizon)] = 0
+                continue
 
-        if len(frame) > remaining:
-            frame = _even_sample_frame(frame, remaining)
+            if len(part) > remaining:
+                part = _even_sample_frame(part, remaining)
 
-        frames.append(frame)
-        retained += len(frame)
-        row["training_rows"] = int(len(frame))
+            frames[horizon].append(part)
+            retained[horizon] += len(part)
+            row["horizon_rows"][str(horizon)] = int(len(part))
+
         history.append(row)
-        eligible.append(sym)
 
-    if not frames:
-        return pd.DataFrame(), {
-            "eligible_symbols": 0,
-            "preferred_symbols": 0,
-            "limited_symbols": 0,
-            "retained_rows": 0,
+    data_by_horizon: dict[int, pd.DataFrame] = {}
+    metas: dict[int, dict] = {}
+
+    preferred = sum(1 for r in history if r.get("status") == "PREFERRED_HISTORY")
+    limited = sum(1 for r in history if r.get("status") == "LIMITED_HISTORY")
+
+    for horizon in HORIZONS:
+        if not frames[horizon]:
+            data_by_horizon[horizon] = pd.DataFrame()
+            metas[horizon] = {
+                "eligible_symbols": 0,
+                "preferred_symbols": preferred,
+                "limited_symbols": limited,
+                "retained_rows": 0,
+                "history": history,
+            }
+            continue
+
+        target_col = f"fwd_ret_{horizon}m"
+        data = pd.concat(frames[horizon], ignore_index=True)
+        data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+        data["symbol"] = data["symbol"].astype(str).str.upper().str.strip()
+        data["decision_timestamp"] = pd.to_datetime(
+            data["decision_timestamp"], utc=True, errors="coerce"
+        )
+        data[target_col] = pd.to_numeric(data[target_col], errors="coerce")
+        data = data.replace([np.inf, -np.inf], np.nan)
+        data = data.dropna(
+            subset=["date", "symbol", "decision_timestamp", target_col]
+        )
+
+        data_by_horizon[horizon] = data
+        metas[horizon] = {
+            "eligible_symbols": int(data["symbol"].nunique()),
+            "preferred_symbols": preferred,
+            "limited_symbols": limited,
+            "retained_rows": int(len(data)),
             "history": history,
         }
 
-    data = pd.concat(frames, ignore_index=True)
-    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
-    data["symbol"] = data["symbol"].astype(str).str.upper().str.strip()
-    data["decision_timestamp"] = pd.to_datetime(
-        data["decision_timestamp"], utc=True, errors="coerce"
-    )
-    data[target_col] = pd.to_numeric(data[target_col], errors="coerce")
-    data = data.replace([np.inf, -np.inf], np.nan)
-    data = data.dropna(subset=["date", "symbol", "decision_timestamp", target_col])
-
-    meta = {
-        "eligible_symbols": int(len(eligible)),
-        "preferred_symbols": int(
-            sum(1 for r in history if r.get("status") == "PREFERRED_HISTORY")
-        ),
-        "limited_symbols": int(
-            sum(1 for r in history if r.get("status") == "LIMITED_HISTORY")
-        ),
-        "retained_rows": int(len(data)),
-        "history": history,
-    }
-    return data, meta
-
+    return data_by_horizon, metas
 
 def train_horizon(frame: pd.DataFrame, horizon: int, registry_root: Path) -> dict:
     h = frame[frame["horizon_min"].eq(horizon)].copy()
