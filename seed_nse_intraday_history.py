@@ -88,46 +88,80 @@ def build_symbol_partitions(seed_root: Path) -> dict:
     if not daily_files:
         raise RuntimeError("No filtered daily seed files were produced.")
 
-    # Avoid DuckDB/COPY glob quoting entirely: concatenate the already-filtered
-    # daily parquet files with pandas, then split by symbol. This is slower than
-    # DuckDB but robust for Colab and keeps the seed deterministic.
-    frames = []
-    for p in daily_files:
-        try:
-            z = pd.read_parquet(p)
-            if not z.empty:
-                frames.append(z)
-        except Exception as exc:
-            print(f"WARNING: cannot read seed file {p.name}: {type(exc).__name__}: {exc}", flush=True)
-    if not frames:
-        raise RuntimeError("Filtered seed files exist but none could be read.")
-
-    data = pd.concat(frames, ignore_index=True)
-    data = data.sort_values(["symbol", "timestamp"])
-    data = data.drop_duplicates(["symbol", "timestamp"], keep="last")
+    # Use DuckDB's streaming Parquet scan for the broad history. The previous
+    # implementation concatenated every day into one pandas DataFrame, which
+    # becomes impractical at 500-750 sessions across the full NSE universe.
+    import duckdb
 
     for p in symbol_dir.glob("symbol=*"):
         if p.is_dir():
             shutil.rmtree(p)
 
-    symbols_written = 0
-    for sym, group in data.groupby("symbol", sort=True):
-        out_dir = symbol_dir / f"symbol={sym}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        group.to_parquet(out_dir / "part-000.parquet", index=False)
-        symbols_written += 1
+    glob = str(daily_dir / "*.parquet").replace("'", "''")
+    conn = duckdb.connect()
+    try:
+        conn.execute(
+            f"""
+            COPY (
+                SELECT
+                    symbol,
+                    timestamp,
+                    Open,
+                    High,
+                    Low,
+                    Close,
+                    Volume,
+                    source,
+                    source_file
+                FROM read_parquet('{glob}')
+                WHERE symbol IS NOT NULL
+                  AND timestamp IS NOT NULL
+            )
+            TO '{str(symbol_dir).replace("'", "''")}'
+            (
+                FORMAT PARQUET,
+                PARTITION_BY (symbol),
+                COMPRESSION ZSTD,
+                OVERWRITE_OR_IGNORE
+            );
+            """
+        )
+
+        row_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{glob}')"
+            ).fetchone()[0]
+        )
+        symbol_count = int(
+            conn.execute(
+                f"SELECT COUNT(DISTINCT symbol) FROM read_parquet('{glob}')"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
 
     return {
-        "partition_files": symbols_written,
-        "partition_symbols": symbols_written,
-        "seed_rows": int(len(data)),
+        "partition_files": len(list(symbol_dir.rglob("*.parquet"))),
+        "partition_symbols": symbol_count,
+        "seed_rows": row_count,
     }
+
 
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--drive-root",default="/content/drive/MyDrive/Indian_Market_Research")
-    ap.add_argument("--lookback-calendar-days",type=int,default=120)
-    ap.add_argument("--max-archives",type=int,default=60)
+    ap.add_argument(
+        "--lookback-calendar-days",
+        type=int,
+        default=1200,
+        help="Calendar-day window used to collect the historical minute seed.",
+    )
+    ap.add_argument(
+        "--max-archives",
+        type=int,
+        default=750,
+        help="Maximum daily archives to retain; 750 is the preferred ~3-year target.",
+    )
     ap.add_argument("--end-date",default="")
     ap.add_argument("--force",action="store_true")
     args=ap.parse_args()
@@ -146,9 +180,17 @@ def main():
     available=[x for x in list_archives() if start <= x[0] <= end]
     available=available[-max(1,args.max_archives):]
 
-    manifest={"source":"olo-labs/olo-testdata-nse-min-candle","source_url":"https://github.com/olo-labs/olo-testdata-nse-min-candle",
-              "historical_training_only":True,"official_live_source":"NSE_OFFICIAL_CHART",
-              "universe_size":len(universe),"selected_archives":[],"updated_at":datetime.now(timezone.utc).isoformat()}
+    manifest={
+        "source":"olo-labs/olo-testdata-nse-min-candle",
+        "source_url":"https://github.com/olo-labs/olo-testdata-nse-min-candle",
+        "historical_training_only":True,
+        "official_live_source":"NSE_OFFICIAL_CHART",
+        "preferred_training_history_sessions": 750,
+        "minimum_preferred_training_history_sessions": 500,
+        "universe_size":len(universe),
+        "selected_archives":[],
+        "updated_at":datetime.now(timezone.utc).isoformat(),
+    }
     print(f"INTRADAY HISTORICAL SEED: official_universe={len(universe):,} selected_archives={len(available):,}",flush=True)
 
     s=requests.Session()
