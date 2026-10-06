@@ -175,7 +175,15 @@ from historical_replay import (
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
 from prediction_history_ui import render_delivery_forecast, render_prediction_history
-from nse_data_layer import fetch_equity_history as nse_fetch_equity_history, fetch_intraday_1m_current as nse_fetch_intraday_1m_current, fetch_corporate_actions as nse_fetch_corporate_actions, fetch_nse_equity_universe, nse_equity_symbols, nse_last_diagnostic
+from nse_data_layer import (
+    fetch_equity_history as nse_fetch_equity_history,
+    fetch_intraday_1m_current as nse_fetch_intraday_1m_current,
+    fetch_corporate_actions as nse_fetch_corporate_actions,
+    fetch_nse_drive_bulk_symbol_history,
+    fetch_nse_equity_universe,
+    nse_equity_symbols,
+    nse_last_diagnostic,
+)
 from persistent_store import (
     drive_status as persistent_drive_status,
     persist_1m_frame,
@@ -370,12 +378,22 @@ def _delivery_opening_stats(
     try:
         end = pd.Timestamp(reference_date).date()
         start = end - pd.Timedelta(days=450)
-        hist = get_historical(
-            f"{symbol}.NS",
-            period="450d",
-            interval="1d",
-            force_refresh=False,
+        # Use the persistent official NSE CM-UDiFF archive first.
+        # This keeps the OHLC projection fast and avoids a second burst of
+        # hosted NSE HTTP requests.
+        hist = fetch_nse_drive_bulk_symbol_history(
+            symbol,
+            max(start, end - pd.Timedelta(days=180)),
+            end,
+            max_calendar_days=180,
         )
+        if hist is None or hist.empty:
+            hist = get_historical(
+                f"{symbol}.NS",
+                period="450d",
+                interval="1d",
+                force_refresh=False,
+            )
         if hist is None or hist.empty:
             hist = nse_fetch_equity_history(
                 symbol,
@@ -850,10 +868,19 @@ if interface_mode == "Live Test":
                 reference_close = result.get("reference_close")
                 ref_date = result.get("reference_session")
 
-                # Do not block the primary Delivery prediction on a
-                # secondary statistical OHLC projection or a live quote request.
-                # Those are display-only diagnostics.
-                ohlc = {"status": "NOT LOADED", "method": "display-only projection deferred"}
+                # Calculate projected open/high/low after the authoritative
+                # ML result. These are statistical display estimates, not extra
+                # ML predictions, and the helper is cached/Drive-first.
+                ohlc = (
+                    _delivery_opening_stats(
+                        root,
+                        str(ref_date),
+                        float(reference_close) if pd.notna(reference_close) else np.nan,
+                        float(predicted_close) if pd.notna(predicted_close) else np.nan,
+                    )
+                    if ref_date
+                    else {"status": "NO_DATA"}
+                )
                 live_ltp = None
                 live_change = (
                     (float(live_ltp) / float(reference_close) - 1.0)
