@@ -2292,7 +2292,9 @@ def load_option_chain(nse_symbol, is_index):
 def load_announcements(symbol):
     return get_corporate_announcements(symbol)
 
-news_items = tag_news_items(load_news())
+# News is not part of the live 5-minute model path. Keep it lazy so a
+# Delivery or Intraday-5-minute page load does not wait on RSS/network I/O.
+news_items = []
 
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_delivery_validation():
@@ -2396,6 +2398,10 @@ delivery_results = {}
 # the legacy delivery_prediction engine during a Delivery request; those calls
 # duplicate work and can turn a single-symbol prediction into a long wait.
 if style != "Delivery":
+    # The legacy/30-minute Intraday path uses news context; the dedicated
+    # 5-minute stream does not. This is intentionally lazy and remains outside
+    # the critical 5-minute forecast function.
+    news_items = tag_news_items(load_news())
 
 
     # Delivery ML uses the official NSE daily layer directly. The generic
