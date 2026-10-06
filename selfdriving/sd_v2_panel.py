@@ -36,6 +36,8 @@ def normalize_delivery_panel(panel: pd.DataFrame) -> pd.DataFrame:
         x["symbol"].astype(str).str.strip().str.upper()
         .str.replace(".NS", "", regex=False)
         .str.replace(".BO", "", regex=False)
+        .str.replace("-EQ", "", regex=False)
+        .str.replace(".EQ", "", regex=False)
     )
     x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
 
