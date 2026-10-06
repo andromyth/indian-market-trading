@@ -8,6 +8,7 @@ retrain, promote, or modify model artifacts. A prediction is persisted once per
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -21,7 +22,8 @@ from all_nse_delivery_model import _load_models, _signal_policy, _safe_float
 from prediction_ledger import append_predictions
 
 
-BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
+DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
 FEATURE_DIR = BASE / "features" / "daily"
 
 
