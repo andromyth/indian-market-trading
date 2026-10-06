@@ -364,44 +364,83 @@ def main() -> int:
                 "status": "BLOCKED_BY_INFERENCE"
             }
 
+    persistence_errors = []
+
+    def safe_upload(path: Path, remote: str, mime: str = "application/octet-stream") -> None:
+        if not path.exists():
+            return
+        try:
+            upload(store, path, remote, mime)
+        except Exception as exc:
+            persistence_errors.append(
+                f"{remote}: {type(exc).__name__}: {exc}"
+            )
+
+    safe_upload(
+        ROOT / "global_cues.parquet",
+        f"{REMOTE_BASE}/global_cues.parquet",
+    )
+    safe_upload(
+        ROOT / "raw_news.parquet",
+        f"{REMOTE_BASE}/raw_news.parquet",
+    )
+
+    ledger = ROOT / "ledger" / "predictions.parquet"
+    safe_upload(
+        ledger,
+        f"{REMOTE_BASE}/ledger/predictions.parquet",
+    )
+
+    for name in (
+        "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet",
+        "status_validate.json",
+    ):
+        safe_upload(
+            ROOT / name,
+            f"{REMOTE_BASE}/{name}",
+        )
+
+    runtime_errors = []
+    for stage_name, stage in status["stages"].items():
+        if isinstance(stage, dict) and stage.get("status") == "ERROR":
+            runtime_errors.append(
+                f"{stage_name}: {stage.get('error', '')}"
+            )
+    runtime_errors.extend(persistence_errors)
+
+    status["runtime_errors"] = runtime_errors
+    status["persistence_errors"] = persistence_errors
     status["finished"] = datetime.now(timezone.utc).isoformat()
+
     status_path = ROOT / "status_cycle.json"
     status_path.write_text(
         json.dumps(status, indent=2, default=str),
         encoding="utf-8",
     )
-
-    upload(
-        store,
-        ROOT / "global_cues.parquet",
-        f"{REMOTE_BASE}/global_cues.parquet",
-    )
-    if (ROOT / "raw_news.parquet").exists():
+    try:
         upload(
             store,
-            ROOT / "raw_news.parquet",
-            f"{REMOTE_BASE}/raw_news.parquet",
+            status_path,
+            f"{REMOTE_BASE}/status_cycle.json",
+            "application/json",
         )
-
-    ledger = ROOT / "ledger" / "predictions.parquet"
-    if ledger.exists():
-        upload(
-            store,
-            ledger,
-            f"{REMOTE_BASE}/ledger/predictions.parquet",
+    except Exception as exc:
+        persistence_errors.append(
+            f"{REMOTE_BASE}/status_cycle.json: "
+            f"{type(exc).__name__}: {exc}"
         )
-
-    for name in (
-        "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet",
-        "status_validate.json",
-        "status_cycle.json",
-    ):
-        path = ROOT / name
-        if path.exists():
-            upload(store, path, f"{REMOTE_BASE}/{name}")
+        status["persistence_errors"] = persistence_errors
+        status["runtime_errors"] = runtime_errors + [
+            persistence_errors[-1]
+        ]
 
     print(json.dumps(status, indent=2, default=str))
-    return 0
+
+    # Expected states such as NO_CHAMPION are not runtime errors. Actual stage
+    # failures and persistence failures must fail the Action so they cannot be
+    # mistaken for a healthy autonomous cycle.
+    return 1 if status["runtime_errors"] else 0
+
 
 
 if __name__ == "__main__":
