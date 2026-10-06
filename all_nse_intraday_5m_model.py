@@ -69,9 +69,26 @@ def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
     }
     x = x.rename(columns={c: aliases.get(str(c).strip().lower(), c) for c in x.columns})
     if "Timestamp" in x.columns:
-        idx = pd.to_datetime(x.pop("Timestamp"), errors="coerce")
+        raw_idx = x.pop("Timestamp")
     else:
-        idx = pd.to_datetime(x.index, errors="coerce")
+        raw_idx = x.index
+
+    if isinstance(raw_idx, pd.MultiIndex):
+        parsed_levels = []
+        for level_no in range(raw_idx.nlevels):
+            candidate = pd.to_datetime(
+                raw_idx.get_level_values(level_no),
+                errors="coerce",
+            )
+            valid = int(candidate.notna().sum())
+            parsed_levels.append((valid, candidate))
+        if parsed_levels:
+            idx = max(parsed_levels, key=lambda item: item[0])[1]
+        else:
+            idx = pd.DatetimeIndex([])
+    else:
+        idx = pd.to_datetime(raw_idx, errors="coerce")
+
     idx = pd.DatetimeIndex(idx)
     if idx.tz is None:
         idx = idx.tz_localize(IST)
@@ -125,12 +142,13 @@ def _feature_lookback_ok(index: pd.DatetimeIndex, window: int = 50) -> bool:
     idx = pd.DatetimeIndex(index)
     if len(idx) < window:
         return False
-    recent = idx[-window:]
-    diffs = pd.Series(recent).diff()
-    day_change = pd.Series(recent.normalize()).diff().ne(pd.Timedelta(0))
-    link_ok = diffs.eq(pd.Timedelta(minutes=1)) | day_change
-    link_ok.iloc[0] = False
-    return bool(link_ok.iloc[1:].all())
+    recent = pd.DatetimeIndex(idx[-window:])
+    if len(recent) < window:
+        return False
+    diffs = recent[1:] - recent[:-1]
+    day_change = recent[1:].normalize() != recent[:-1].normalize()
+    link_ok = (diffs == pd.Timedelta(minutes=1)) | day_change
+    return bool(np.asarray(link_ok, dtype=bool).all())
 
 
 def _atr_pct(x: pd.DataFrame, n: int = 14) -> float:
@@ -180,7 +198,7 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     vals["volatility_5"]=_safe(one_min_ret.rolling(5,min_periods=5).std().iloc[-1])
     vals["volatility_15"]=_safe(one_min_ret.rolling(15,min_periods=15).std().iloc[-1])
 
-    session_key=pd.Series(x.index.normalize(),index=x.index)
+    session_key=x.index.normalize()
     session_open=o.groupby(session_key).transform("first").iloc[-1]
     session_high=h.groupby(session_key).cummax().iloc[-1]
     session_low=l.groupby(session_key).cummin().iloc[-1]
@@ -386,9 +404,16 @@ def predict_multihorizon(symbol: str, price_df: pd.DataFrame, market_df: pd.Data
 
     bundle = _bundle_models()
     pit_fno = _load_pit_fno(symbol, ts)
-    row = _latest_features(price_df, market_df, pit_fno, ts)
+    normalized_price = _norm(price_df)
+    row = _latest_features(normalized_price, market_df, pit_fno, ts)
     frame = pd.DataFrame([row], columns=FEATURES)
-    current_price = _safe(pd.to_numeric(price_df["Close"], errors="coerce").dropna().iloc[-1])
+    close_series = normalized_price["Close"]
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, -1]
+    close_series = pd.to_numeric(close_series, errors="coerce").dropna()
+    if close_series.empty:
+        raise ValueError("No usable intraday Close price")
+    current_price = _safe(close_series.iloc[-1])
     predictions=[]
 
     for horizon in HORIZONS:
