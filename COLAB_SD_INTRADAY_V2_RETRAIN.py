@@ -443,18 +443,85 @@ def main() -> int:
     coverage = []
     batch_size = 100
 
+    # Warm immutable market state once before worker threads start.
+    warm_market_cache(market)
+
+    try:
+        from colab_build_all_nse_intraday_5m_multifactor import _official_intraday_file_index
+        _official_intraday_file_index(root)
+    except Exception as exc:
+        print(
+            f"OFFICIAL_INTRADAY_INDEX_WARNING: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    def prepare_one_symbol(i: int, sym: str) -> dict:
+        raw = load_symbol(root, sym)
+        if raw is None or raw.empty:
+            return {
+                "index": i,
+                "symbol": sym,
+                "status": "NO_DATA",
+                "raw_rows": 0,
+                "sessions": 0,
+                "rows": 0,
+                "compact": pd.DataFrame(),
+            }
+
+        try:
+            compact = build_compact_symbol(
+                raw,
+                market,
+                HORIZONS,
+                max_decisions=args.max_decisions_per_symbol,
+            )
+            sessions = _history_sessions(compact)
+            status = (
+                "PREFERRED_HISTORY"
+                if sessions >= MIN_PREFERRED_SESSIONS
+                else (
+                    "LIMITED_HISTORY"
+                    if sessions >= MIN_USABLE_SESSIONS
+                    else (
+                        "EXCLUDED_INSUFFICIENT_HISTORY"
+                        if sessions > 0
+                        else "NO_FEATURE_ROWS"
+                    )
+                )
+            )
+            return {
+                "index": i,
+                "symbol": sym,
+                "status": status,
+                "raw_rows": int(len(raw)),
+                "sessions": int(sessions),
+                "rows": int(len(compact)),
+                "compact": compact,
+            }
+        except Exception as exc:
+            return {
+                "index": i,
+                "symbol": sym,
+                "status": "ERROR",
+                "raw_rows": int(len(raw)),
+                "sessions": 0,
+                "rows": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+                "compact": pd.DataFrame(),
+            }
+        finally:
+            del raw
+
     for batch_start in range(0, len(universe), batch_size):
         batch_end = min(len(universe), batch_start + batch_size)
         part_no = batch_start // batch_size + 1
         batch_path = batch_dir / f"part_{part_no:04d}_{batch_start+1:04d}_{batch_end:04d}.parquet"
 
-        # A non-empty batch checkpoint is reusable only when every symbol
-        # checkpoint in its range also exists. This avoids accepting a stale
-        # aggregate from a shorter-history run.
         symbol_paths = [
             symbol_parts_dir / f"{i:04d}_{sym}.parquet"
             for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1)
         ]
+
         if batch_path.exists() and all(
             p.exists() and p.stat().st_size > 0 for p in symbol_paths
         ):
@@ -465,111 +532,102 @@ def main() -> int:
             )
             continue
 
-        # If a previous batch marker is stale, recreate it from symbol files.
         if batch_path.exists():
             batch_path.unlink()
 
-        batch_tables = []
+        batch_tables: list[pd.DataFrame] = []
+        pending: list[tuple[int, str, Path]] = []
+
+        # Reuse any symbol checkpoint already produced by the interrupted run.
         for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
             symbol_path = symbol_parts_dir / f"{i:04d}_{sym}.parquet"
-
             if symbol_path.exists() and symbol_path.stat().st_size > 0:
-                print(
-                    f"symbol {i:,}/{len(universe):,} {sym}: "
-                    "reused compact symbol checkpoint",
-                    flush=True,
-                )
-                continue
-
-            raw = load_symbol(root, sym)
-            if raw is None or raw.empty:
-                coverage.append({
-                    "symbol": sym,
-                    "status": "NO_DATA",
-                    "raw_rows": 0,
-                    "sessions": 0,
-                    "rows": 0,
-                })
-                continue
-
-            try:
-                frame = raw.reset_index()
-                frame["symbol"] = sym
-                frame = frame.rename(columns={frame.columns[0]: "ts"})
-
-                generated = _session_rows(
-                    frame,
-                    market,
-                    HORIZONS,
-                    max_decisions=args.max_decisions_per_symbol,
-                )
-                compact = _compact_generated_rows(generated)
-
-                sessions = _history_sessions(compact)
-                status = (
-                    "PREFERRED_HISTORY"
-                    if sessions >= MIN_PREFERRED_SESSIONS
-                    else (
-                        "LIMITED_HISTORY"
-                        if sessions >= MIN_USABLE_SESSIONS
-                        else (
-                            "EXCLUDED_INSUFFICIENT_HISTORY"
-                            if sessions > 0
-                            else "NO_FEATURE_ROWS"
-                        )
-                    )
-                )
-
-                tmp = symbol_path.with_suffix(".parquet.tmp")
-                compact.to_parquet(tmp, index=False)
-                tmp.replace(symbol_path)
-
-                coverage.append({
-                    "symbol": sym,
-                    "status": status,
-                    "raw_rows": int(len(raw)),
-                    "sessions": int(sessions),
-                    "rows": int(len(compact)),
-                })
-
-                print(
-                    f"symbol {i:,}/{len(universe):,} {sym}: "
-                    f"history_sessions={sessions:,}; "
-                    f"compact_rows={len(compact):,}",
-                    flush=True,
-                )
-
-                del raw, frame, generated, compact
-
-            except Exception as exc:
-                coverage.append({
-                    "symbol": sym,
-                    "status": "ERROR",
-                    "raw_rows": int(len(raw)),
-                    "sessions": 0,
-                    "rows": 0,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                print(
-                    f"symbol {i:,}/{len(universe):,} {sym}: ERROR "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-
-        # Rebuild aggregate batch from symbol checkpoints. This is intentionally
-        # compact wide format and is used only as a resumable artifact.
-        for p in symbol_paths:
-            if p.exists() and p.stat().st_size > 0:
                 try:
-                    z = pd.read_parquet(p)
+                    z = pd.read_parquet(symbol_path)
                     if not z.empty:
                         batch_tables.append(z)
-                except Exception as exc:
+                        sessions = _history_sessions(z)
+                        status = (
+                            "PREFERRED_HISTORY"
+                            if sessions >= MIN_PREFERRED_SESSIONS
+                            else (
+                                "LIMITED_HISTORY"
+                                if sessions >= MIN_USABLE_SESSIONS
+                                else "EXCLUDED_INSUFFICIENT_HISTORY"
+                            )
+                        )
+                        coverage.append({
+                            "symbol": sym,
+                            "status": status,
+                            "raw_rows": 0,
+                            "sessions": int(sessions),
+                            "rows": int(len(z)),
+                        })
                     print(
-                        f"WARNING: cannot read symbol checkpoint {p.name}: "
-                        f"{type(exc).__name__}: {exc}",
+                        f"symbol {i:,}/{len(universe):,} {sym}: "
+                        "reused compact symbol checkpoint",
                         flush=True,
                     )
+                    continue
+                except Exception as exc:
+                    print(
+                        f"CHECKPOINT_REBUILD: {sym}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+            pending.append((i, sym, symbol_path))
+
+        # Two workers are deliberate for Colab free tier: enough overlap to
+        # hide Drive read/decompression latency while keeping RAM controlled.
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(prepare_one_symbol, i, sym): (i, sym, symbol_path)
+                for i, sym, symbol_path in pending
+            }
+
+            for future in as_completed(futures):
+                i, sym, symbol_path = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "index": i,
+                        "symbol": sym,
+                        "status": "ERROR",
+                        "raw_rows": 0,
+                        "sessions": 0,
+                        "rows": 0,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "compact": pd.DataFrame(),
+                    }
+
+                compact = result.pop("compact", pd.DataFrame())
+                if not compact.empty:
+                    tmp = symbol_path.with_suffix(".parquet.tmp")
+                    compact.to_parquet(tmp, index=False)
+                    tmp.replace(symbol_path)
+                    batch_tables.append(compact)
+
+                coverage.append({
+                    k: result[k]
+                    for k in ("symbol", "status", "raw_rows", "sessions", "rows")
+                    if k in result
+                })
+
+                if result.get("status") == "ERROR":
+                    print(
+                        f"symbol {i:,}/{len(universe):,} {sym}: ERROR "
+                        f"{result.get('error', 'unknown error')}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"symbol {i:,}/{len(universe):,} {sym}: "
+                        f"history_sessions={result['sessions']:,}; "
+                        f"compact_rows={result['rows']:,}",
+                        flush=True,
+                    )
+
+                del compact
 
         if batch_tables:
             batch = pd.concat(batch_tables, ignore_index=True)
@@ -587,7 +645,7 @@ def main() -> int:
 
         print(
             f"prepared batch {part_no}: saved compact rows={len(batch):,}; "
-            f"symbols={batch_end-batch_start:,}",
+            f"symbols={batch_end-batch_start:,}; workers={args.workers}",
             flush=True,
         )
 
