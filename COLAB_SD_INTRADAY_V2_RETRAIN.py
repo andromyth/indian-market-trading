@@ -403,7 +403,31 @@ def main() -> int:
             "300 training rows/symbol with a 900,000-row horizon cap."
         ),
     )
+    ap.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Zero-based preparation shard id.",
+    )
+    ap.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of parallel preparation shards.",
+    )
+    ap.add_argument(
+        "--prep-only",
+        action="store_true",
+        help="Prepare/checkpoint this shard only; do not run model training.",
+    )
     args = ap.parse_args()
+
+    args.num_shards = int(args.num_shards)
+    args.shard_id = int(args.shard_id)
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise ValueError("--shard-id must satisfy 0 <= shard_id < num_shards")
 
     if args.fast:
         args.max_decisions_per_symbol = min(int(args.max_decisions_per_symbol), 2000)
@@ -423,9 +447,19 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    universe = sorted(set(official_nse_symbols(force_refresh=True)))
-    if not universe:
+    full_universe = sorted(set(official_nse_symbols(force_refresh=True)))
+    if not full_universe:
         raise RuntimeError("Official NSE universe is empty")
+
+    universe = [
+        sym for pos, sym in enumerate(full_universe)
+        if pos % args.num_shards == args.shard_id
+    ]
+    print(
+        f"PREPARATION_SHARD: id={args.shard_id + 1}/{args.num_shards}; "
+        f"symbols={len(universe):,}; full_universe={len(full_universe):,}",
+        flush=True,
+    )
 
     market = load_market(root)
     if market is None or market.empty:
@@ -672,6 +706,19 @@ def main() -> int:
 
     symbol_paths = sorted(symbol_parts_dir.glob("*.parquet"))
 
+    if args.prep_only:
+        shard_count = 0
+        for sym in universe:
+            p = symbol_parts_dir / f"{full_universe.index(sym) + 1:04d}_{sym}.parquet"
+            if p.exists() and p.stat().st_size > 0:
+                shard_count += 1
+        print(
+            f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
+            f"shard_checkpoints={shard_count:,}/{len(universe):,}",
+            flush=True,
+        )
+        return 0
+
     results = {}
     registry_root = out / "models"
 
@@ -755,6 +802,9 @@ def main() -> int:
         "global_row_cap_per_horizon": args.global_row_cap,
         "workers": args.workers,
         "fast_profile": bool(args.fast),
+        "shard_id": args.shard_id,
+        "num_shards": args.num_shards,
+        "prep_only": bool(args.prep_only),
         "checkpoint_format": "one_decision_row_with_six_future_horizon_returns",
         "features": feature_columns(),
         "feature_count": len(feature_columns()),
