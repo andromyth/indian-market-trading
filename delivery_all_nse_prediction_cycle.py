@@ -8,6 +8,7 @@ retrain, promote, or modify model artifacts. A prediction is persisted once per
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 from datetime import date, timedelta
@@ -163,8 +164,20 @@ def main() -> int:
     for i, row in x.iterrows():
         symbol = str(row["symbol"])
         non_missing = int(matrix.iloc[i].notna().sum())
+        prediction_id = hashlib.sha256(
+            "|".join(
+                [
+                    symbol,
+                    "Delivery",
+                    "next_session",
+                    prediction_for_date,
+                    model_version,
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:24]
         records.append(
             {
+                "prediction_id": prediction_id,
                 "symbol": symbol,
                 "mode": "Delivery",
                 "prediction_horizon": "next_session",
