@@ -469,6 +469,26 @@ def main() -> int:
             }
 
         try:
+            # Cheap eligibility gate before the expensive feature engine.
+            # Symbols below the hard 200-session requirement are still
+            # represented in coverage, but never spend CPU building features.
+            raw_idx = pd.DatetimeIndex(raw.index)
+            if raw_idx.tz is None:
+                raw_idx = raw_idx.tz_localize(IST)
+            else:
+                raw_idx = raw_idx.tz_convert(IST)
+            raw_sessions = int(pd.Series(raw_idx.date).nunique())
+            if raw_sessions < MIN_USABLE_SESSIONS:
+                return {
+                    "index": i,
+                    "symbol": sym,
+                    "status": "EXCLUDED_INSUFFICIENT_HISTORY",
+                    "raw_rows": int(len(raw)),
+                    "sessions": raw_sessions,
+                    "rows": 0,
+                    "compact": pd.DataFrame(),
+                }
+
             compact = build_compact_symbol(
                 raw,
                 market,
@@ -515,69 +535,38 @@ def main() -> int:
     for batch_start in range(0, len(universe), batch_size):
         batch_end = min(len(universe), batch_start + batch_size)
         part_no = batch_start // batch_size + 1
-        batch_path = batch_dir / f"part_{part_no:04d}_{batch_start+1:04d}_{batch_end:04d}.parquet"
 
         symbol_paths = [
             symbol_parts_dir / f"{i:04d}_{sym}.parquet"
-            for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1)
+            for i, sym in enumerate(
+                universe[batch_start:batch_end], batch_start + 1
+            )
         ]
 
-        if batch_path.exists() and all(
-            p.exists() and p.stat().st_size > 0 for p in symbol_paths
-        ):
+        pending: list[tuple[int, str, Path]] = []
+        for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
+            symbol_path = symbol_parts_dir / f"{i:04d}_{sym}.parquet"
+            if symbol_path.exists() and symbol_path.stat().st_size > 0:
+                print(
+                    f"symbol {i:,}/{len(universe):,} {sym}: "
+                    "reused compact symbol checkpoint",
+                    flush=True,
+                )
+                continue
+            pending.append((i, sym, symbol_path))
+
+        if not pending:
             print(
-                f"prepared batch {part_no}: reused compact checkpoints "
-                f"symbols {batch_start+1:,}-{batch_end:,}",
+                f"prepared batch {part_no}: all checkpoints already present "
+                f"for symbols {batch_start+1:,}-{batch_end:,}",
                 flush=True,
             )
             continue
 
-        if batch_path.exists():
-            batch_path.unlink()
-
-        batch_tables: list[pd.DataFrame] = []
-        pending: list[tuple[int, str, Path]] = []
-
-        # Reuse any symbol checkpoint already produced by the interrupted run.
-        for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
-            symbol_path = symbol_parts_dir / f"{i:04d}_{sym}.parquet"
-            if symbol_path.exists() and symbol_path.stat().st_size > 0:
-                try:
-                    z = pd.read_parquet(symbol_path)
-                    if not z.empty:
-                        batch_tables.append(z)
-                        sessions = _history_sessions(z)
-                        status = (
-                            "PREFERRED_HISTORY"
-                            if sessions >= MIN_PREFERRED_SESSIONS
-                            else (
-                                "LIMITED_HISTORY"
-                                if sessions >= MIN_USABLE_SESSIONS
-                                else "EXCLUDED_INSUFFICIENT_HISTORY"
-                            )
-                        )
-                        coverage.append({
-                            "symbol": sym,
-                            "status": status,
-                            "raw_rows": 0,
-                            "sessions": int(sessions),
-                            "rows": int(len(z)),
-                        })
-                    print(
-                        f"symbol {i:,}/{len(universe):,} {sym}: "
-                        "reused compact symbol checkpoint",
-                        flush=True,
-                    )
-                    continue
-                except Exception as exc:
-                    print(
-                        f"CHECKPOINT_REBUILD: {sym}: {type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-            pending.append((i, sym, symbol_path))
-
-        # Two workers are deliberate for Colab free tier: enough overlap to
-        # hide Drive read/decompression latency while keeping RAM controlled.
+        # Two workers are deliberate for Colab free tier: overlap Drive
+        # decompression/reads with NumPy/Pandas work without spawning large
+        # processes. Symbol checkpoints are written independently, so a
+        # disconnect loses at most the symbol currently being prepared.
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
                 executor.submit(prepare_one_symbol, i, sym): (i, sym, symbol_path)
@@ -605,7 +594,6 @@ def main() -> int:
                     tmp = symbol_path.with_suffix(".parquet.tmp")
                     compact.to_parquet(tmp, index=False)
                     tmp.replace(symbol_path)
-                    batch_tables.append(compact)
 
                 coverage.append({
                     k: result[k]
@@ -629,27 +617,16 @@ def main() -> int:
 
                 del compact
 
-        if batch_tables:
-            batch = pd.concat(batch_tables, ignore_index=True)
-        else:
-            batch = pd.DataFrame()
-
-        tmp_batch = batch_path.with_suffix(".parquet.tmp")
-        batch.to_parquet(tmp_batch, index=False)
-        tmp_batch.replace(batch_path)
-
         pd.DataFrame(coverage).to_parquet(
             prep_dir / "COVERAGE_PROGRESS.parquet",
             index=False,
         )
 
         print(
-            f"prepared batch {part_no}: saved compact rows={len(batch):,}; "
-            f"symbols={batch_end-batch_start:,}; workers={args.workers}",
+            f"prepared batch {part_no}: completed symbols "
+            f"{batch_start+1:,}-{batch_end:,}; workers={args.workers}",
             flush=True,
         )
-
-        del batch_tables, batch
 
     # Fail early rather than wasting hours training on a short-history archive.
     all_symbol_paths = sorted(symbol_parts_dir.glob("*.parquet"))
