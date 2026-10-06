@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import joblib
@@ -21,8 +22,10 @@ from delivery_training_universe import official_nse_symbols
 from selfdriving.sd_intraday_v2 import (
     add_cross_sectional_targets,
     feature_columns,
-    _norm,
-    _session_rows,
+)
+from selfdriving.sd_intraday_fast_prepare import (
+    build_compact_symbol,
+    warm_market_cache,
 )
 from selfdriving.sd_registry import GateRules, Registry, gate
 from selfdriving.sd_walkforward import (
