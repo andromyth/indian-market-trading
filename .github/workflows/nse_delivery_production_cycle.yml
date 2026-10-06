@@ -114,45 +114,112 @@ jobs:
           set -euo pipefail
           python -u production_data_freshness_gate.py --target-date "${{ steps.target.outputs.target_date }}"
 
-      - name: Check whether target PIT snapshot already exists
+      - name: Check whether target PIT snapshot is current and production-ready
         id: snapshot
         if: steps.target.outputs.target_date != ''
         env:
-          TARGET_DATE: ${{ steps.target.outputs.target_date }}
+          TARGET_DATE: \${{ steps.target.outputs.target_date }}
         run: |
           set -euo pipefail
-          EXISTS="$(python - <<'PY'
-          import os
+          python - <<'PY'
+          import io, os
+          import pandas as pd
           from persistent_store import GoogleDriveStore
-          target=os.environ["TARGET_DATE"]
-          remote=f"features/daily/DELIVERY_PIT_FEATURES_{target}.parquet"
-          store=GoogleDriveStore()
-          parts=remote.split("/")
-          parent=store.root_id
+          from googleapiclient.http import MediaIoBaseDownload
+
+          target = os.environ["TARGET_DATE"]
+          remote = f"features/daily/DELIVERY_PIT_FEATURES_{target}.parquet"
+          store = GoogleDriveStore()
+
+          parts = remote.split("/")
+          parent = store.root_id
           for part in parts[:-1]:
-              hit=store._find_child(parent, part)
+              hit = store._find_child(parent, part)
               if not hit:
-                  print("NO")
+                  print("snapshot_exists=NO")
+                  print("snapshot_ready=NO")
                   raise SystemExit(0)
-              parent=hit["id"]
-          print("YES" if store._find_child(parent, parts[-1]) else "NO")
+              parent = hit["id"]
+
+          hit = store._find_child(parent, parts[-1])
+          if not hit:
+              print("snapshot_exists=NO")
+              print("snapshot_ready=NO")
+              raise SystemExit(0)
+
+          buf = io.BytesIO()
+          dl = MediaIoBaseDownload(buf, store.service.files().get_media(fileId=hit["id"]))
+          done = False
+          while not done:
+              _, done = dl.next_chunk()
+
+          tmp = "/tmp/target_delivery_snapshot.parquet"
+          with open(tmp, "wb") as fh:
+              fh.write(buf.getvalue())
+
+          df = pd.read_parquet(tmp)
+          ready = True
+
+          if df.empty or "symbol" not in df.columns:
+              ready = False
+          else:
+              ts = pd.to_datetime(df.get("decision_timestamp"), errors="coerce", utc=True)
+              target_rows = int(
+                  ts.dt.tz_convert("Asia/Kolkata").dt.date.eq(pd.Timestamp(target).date()).sum()
+              ) if ts.notna().any() else 0
+              unique_dates = sorted({
+                  str(d) for d in ts.dt.tz_convert("Asia/Kolkata").dt.date.dropna().unique()
+              })
+              gate = (
+                  pd.to_numeric(df.get("production_data_quality_gate"), errors="coerce")
+                  if "production_data_quality_gate" in df.columns
+                  else pd.Series(dtype="float64")
+              )
+              market = (
+                  pd.to_numeric(df.get("ready_market_context"), errors="coerce")
+                  if "ready_market_context" in df.columns
+                  else pd.Series(dtype="float64")
+              )
+
+              ready = (
+                  target_rows == len(df)
+                  and len(df) == int(df["symbol"].astype(str).str.upper().nunique())
+                  and set(unique_dates) == {target}
+                  and len(gate) == len(df)
+                  and float(gate.mean()) >= 0.999
+                  and len(market) == len(df)
+                  and float(market.mean()) >= 0.999
+              )
+              print(f"rows={len(df)} symbols={df['symbol'].astype(str).str.upper().nunique()} target_rows={target_rows}")
+              print(f"decision_dates={unique_dates}")
+              print(f"production_gate_pct={100*float(gate.mean()) if len(gate) else 0.0:.3f}")
+              print(f"market_context_ready_pct={100*float(market.mean()) if len(market) else 0.0:.3f}")
+
+          print("snapshot_exists=YES")
+          print(f"snapshot_ready={'YES' if ready else 'NO'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"exists={'YES' if ready else 'NO'}\n")
           PY
-          )"
-          echo "Target PIT snapshot exists: $EXISTS"
-          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
 
       - name: Build target production PIT snapshot
         if: steps.target.outputs.target_date != ''
         run: |
-          if [ "${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
-            echo "Target PIT snapshot already exists; skipping rebuild."
+          if [ "\${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
+            echo "Target PIT snapshot is current and production-ready; skipping rebuild."
           else
+            echo "Target PIT snapshot is missing or stale/blocked; rebuilding."
             python -u delivery_production_refresh.py \
               --lookback-days 150 \
               --delivery-lookback-days 150 \
               --source-wait-minutes 0 \
-              --expected-date "${{ steps.target.outputs.target_date }}"
+              --expected-date "\${{ steps.target.outputs.target_date }}"
           fi
+
+      - name: Generate target Delivery predictions
+        if: steps.target.outputs.target_date != ''
+        run: |
+          python -u delivery_all_nse_prediction_cycle.py \
+            --snapshot-date "\${{ steps.target.outputs.target_date }}"
 
       - name: Validate completed Delivery predictions
         if: steps.target.outputs.target_date != ''
