@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, io, json, re
+import argparse, io, json, os, re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import pandas as pd
 
-BASE = Path("/content/drive/MyDrive/Indian_Market_Research")
+DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
+BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
 FEATURE_DIR = BASE / "features" / "daily"
 DELIVERY_LOCAL = BASE / "production_data" / "nse_official" / "delivery_full"
 DELIVERY_REMOTE = "production_data/nse_official/delivery_full"
