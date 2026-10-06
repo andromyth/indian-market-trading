@@ -721,14 +721,13 @@ def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end:
             return False
         first = dates.min().date()
         last = dates.max().date()
-        # Allow weekends/holidays around the requested boundaries, but reject
-        # materially truncated history such as a one-month response to a
-        # one-year request.
+        # Allow weekends/holidays only at the start boundary. The requested
+        # end date is the PIT session boundary for production, so stale
+        # benchmark history must never qualify as current coverage.
         start_slack = 10
-        end_slack = 10
         if first > requested_start + timedelta(days=start_slack):
             return False
-        if last < requested_end - timedelta(days=end_slack):
+        if last < requested_end:
             return False
         span_days = max(1, (requested_end - requested_start).days)
         if span_days >= 90:
@@ -868,10 +867,13 @@ def fetch_index_history(
         first = dates.min().date()
         last = dates.max().date()
         start_slack = 10
-        end_slack = 10
+        # The final benchmark date is a hard requirement for a PIT production
+        # snapshot. Accepting a stale index through a calendar-day slack window
+        # silently creates missing market-context features for the target
+        # session and can leave thousands of rows incorrectly gated.
         if first > start_d + timedelta(days=start_slack):
             return False
-        if last < end_d - timedelta(days=end_slack):
+        if last < end_d:
             return False
         span_days = max(1, (end_d - start_d).days)
         if span_days >= 90:
