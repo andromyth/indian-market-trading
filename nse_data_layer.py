@@ -1623,16 +1623,71 @@ def fetch_corporate_announcements(symbol: str) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
 
 
-def fetch_intraday_1m_current(symbol: str, sync_drive: bool = True) -> pd.DataFrame:
+def fetch_intraday_1m_current(
+    symbol: str,
+    sync_drive: bool = True,
+    retries: int = 3,
+) -> pd.DataFrame:
     """Fetch today's NSE quote-chart path and aggregate available prints to 1-minute OHLC.
 
-    NSE's public quote chart is an LTP/time series, not a full broker websocket.
-    Volume is therefore left missing in this path; it must not be invented.
+    ``retries`` is configurable so interactive Streamlit calls can fail fast
+    when a hosted NSE edge is temporarily unavailable, while scheduled
+    ingestion retains the conservative default retry policy.
     """
     s = root_symbol(symbol)
     params = {"index": s + "EQN"}
-    r = _request(EQUITY_CHART_ENDPOINT, params=params)
-    payload = r.json()
+    global _nse_session, _nse_session_at, _last_nse_diagnostic
+
+    # Use the public equity quote page as the referrer context for the chart
+    # request. This matches the browser path users reach from NSE.
+    session = _session()
+    chart_headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": f"{NSE_BASE}/get-quote/equity/{s}",
+        "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    response = None
+    last_exc = None
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            _sleep_rate_limit(0.2 if attempts == 1 else 1.5)
+            response = session.get(
+                NSE_BASE + EQUITY_CHART_ENDPOINT,
+                params=params,
+                headers=chart_headers,
+                timeout=(3, 6),
+            )
+            _last_nse_diagnostic = {
+                "path": EQUITY_CHART_ENDPOINT,
+                "status_code": response.status_code,
+                "content_type": response.headers.get("content-type", ""),
+                "bytes": len(response.content),
+                "attempt": attempt + 1,
+            }
+            if response.status_code == 200:
+                break
+            if response.status_code in (401, 403, 408, 429, 500, 502, 503, 504):
+                _nse_session = None
+                _nse_session_at = 0.0
+                if attempt + 1 < attempts:
+                    session = _session()
+                continue
+            response.raise_for_status()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+
+    if response is None or response.status_code != 200:
+        if last_exc:
+            raise RuntimeError(f"NSE request failed: {type(last_exc).__name__}: {last_exc}") from last_exc
+        raise RuntimeError(f"NSE request failed after {attempts} attempts: {EQUITY_CHART_ENDPOINT}")
+
+    payload = response.json()
     pts = payload.get("grapthData", []) if isinstance(payload, dict) else []
     if not pts:
         return pd.DataFrame()
@@ -1654,8 +1709,6 @@ def fetch_intraday_1m_current(symbol: str, sync_drive: bool = True) -> pd.DataFr
         except Exception:
             pass
     return bars
-
-
 def fetch_fno_history(symbol: str, start: date | datetime, end: date | datetime,
                       instrument_type: str, expiry_date: date | datetime,
                       option_type: str | None = None, strike_price: float | None = None,
