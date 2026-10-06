@@ -145,7 +145,18 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
     if rank_needed:
         p = add_cross_sectional_ranks(p, rank_needed)
 
+    float32_max = float(np.finfo(np.float32).max)
+    # Convert selected model features to numeric before the final float32
+    # conversion. Object/string feature columns can contain textual "inf"/large
+    # numeric values that the earlier dtype-based cleanup cannot see.
+    for col in sel["features"]:
+        if col in p.columns:
+            v = pd.to_numeric(p[col], errors="coerce")
+            v = v.mask(~np.isfinite(v) | (v.abs() > float32_max))
+            p[col] = v.astype("float32")
     for col in p.columns:
+        if col in sel["features"]:
+            continue
         if pd.api.types.is_float_dtype(p[col]):
             p[col] = pd.to_numeric(p[col], errors="coerce").astype("float32")
         elif pd.api.types.is_integer_dtype(p[col]):
