@@ -115,6 +115,16 @@ class Bundle:
         return np.clip(self.iso.predict(p), 0.001, 0.999) if self.iso is not None else p
 
 
+def _clean_model_matrix(df: pd.DataFrame, features: Sequence[str]) -> pd.DataFrame:
+    """Convert model inputs to finite numeric values without fabricating data."""
+    x = df[list(features)].apply(pd.to_numeric, errors="coerce")
+    float32_max = float(np.finfo(np.float32).max)
+    for c in x.columns:
+        v = x[c]
+        x[c] = v.mask(~np.isfinite(v) | (v.abs() > float32_max), np.nan)
+    return x.astype("float32")
+
+
 def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: ModelConfig,
                date_col: str = "date") -> Bundle:
     features = list(features)
@@ -122,9 +132,9 @@ def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: Mode
     cut = d[int(len(d) * (1 - cfg.val_frac))]
     dd = pd.to_datetime(df[date_col]).dt.normalize()
     tr, va = df[dd < cut], df[dd >= cut]
-    Xtr = tr[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    Xtr = _clean_model_matrix(tr, features)
     ytr = tr[target].astype(int)
-    Xva = va[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    Xva = _clean_model_matrix(va, features)
     yva = va[target].astype(int)
     hgb = HistGradientBoostingClassifier(**cfg.hgb_params).fit(Xtr, ytr)
     lg = _logit_pipe(cfg.logit_C).fit(Xtr, ytr)
@@ -137,7 +147,7 @@ def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: Mode
     pv = best_w * ph + (1 - best_w) * pl
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.001, y_max=0.999).fit(pv, yva) if cfg.calibrate else None
     # refit base learners on the full window (calibration map stays from the held-out tail)
-    Xall = df[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    Xall = _clean_model_matrix(df, features)
     yall = df[target].astype(int)
     hgb = HistGradientBoostingClassifier(**cfg.hgb_params).fit(Xall, yall)
     lg = _logit_pipe(cfg.logit_C).fit(Xall, yall)
