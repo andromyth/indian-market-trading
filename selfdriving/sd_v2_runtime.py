@@ -95,6 +95,65 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
                           fno_daily: pd.DataFrame | None = None) -> dict[str, Any]:
     """Run the isolated Beta V2 Delivery champion for one current symbol."""
     store = _drive()
+
+    # Check model readiness before touching optional feature archives. A fresh
+    # deployment can legitimately have no Beta V2 training artefacts yet; that
+    # state must produce an explicit ABSTAIN rather than a misleading
+    # FileNotFoundError for a missing optional global/news cache.
+    registry_root = CACHE / "models"
+    registry_root.mkdir(parents=True, exist_ok=True)
+    reg_local = registry_root / "registry.json"
+    try:
+        _ensure(
+            f"{REMOTE_ROOT}/models/registry.json",
+            reg_local,
+        )
+    except FileNotFoundError:
+        return {
+            "prediction_status": "ABSTAIN",
+            "symbol": str(symbol).upper(),
+            "reason": "beta_v2_delivery_champion_not_trained",
+            "runtime_state": "NO_REGISTRY",
+        }
+
+    try:
+        state = json.loads(reg_local.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "prediction_status": "ERROR",
+            "symbol": str(symbol).upper(),
+            "reason": f"invalid_beta_v2_registry:{type(exc).__name__}:{exc}",
+        }
+
+    champion = state.get("champion")
+    if not champion:
+        return {
+            "prediction_status": "ABSTAIN",
+            "symbol": str(symbol).upper(),
+            "reason": "beta_v2_delivery_champion_not_trained",
+            "runtime_state": "NO_CHAMPION",
+        }
+
+    bundle_name = str(champion.get("file", "")).strip()
+    if not bundle_name:
+        return {
+            "prediction_status": "ERROR",
+            "symbol": str(symbol).upper(),
+            "reason": "beta_v2_registry_champion_file_missing",
+        }
+
+    try:
+        _ensure(
+            f"{REMOTE_ROOT}/models/{bundle_name}",
+            registry_root / bundle_name,
+        )
+    except FileNotFoundError:
+        return {
+            "prediction_status": "ERROR",
+            "symbol": str(symbol).upper(),
+            "reason": f"beta_v2_champion_bundle_missing:{bundle_name}",
+        }
+
     # Find newest PIT snapshot directly from Drive.
     parent = store.root_id
     for part in ("features", "daily"):
@@ -168,23 +227,6 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
             "reason": "symbol_not_present_in_latest_pit_snapshot",
             "audit": audit,
         }
-
-    registry_root = CACHE / "models"
-    registry_root.mkdir(parents=True, exist_ok=True)
-
-    # Download registry and champion bundle referenced by it.
-    reg_local = registry_root / "registry.json"
-    _ensure(f"{REMOTE_ROOT}/models/registry.json", reg_local)
-    state = json.loads(reg_local.read_text(encoding="utf-8"))
-    champion = state.get("champion")
-    if not champion:
-        return {
-            "prediction_status": "ABSTAIN",
-            "symbol": str(symbol).upper(),
-            "reason": "beta_v2_delivery_champion_not_trained",
-        }
-    bundle_name = str(champion["file"])
-    _ensure(f"{REMOTE_ROOT}/models/{bundle_name}", registry_root / bundle_name)
 
     pred = predict_stage(inference, registry_root)
     row = pred.iloc[0].to_dict()
