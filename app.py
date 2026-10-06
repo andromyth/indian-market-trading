@@ -2397,7 +2397,7 @@ delivery_results = {}
 # inference path. Do not fetch the legacy 420-day chart/context stack or run
 # the legacy delivery_prediction engine during a Delivery request; those calls
 # duplicate work and can turn a single-symbol prediction into a long wait.
-if style != "Delivery":
+if style != "Delivery" and live_mode != "Intraday 5-minute":
     # The legacy/30-minute Intraday path uses news context; the dedicated
     # 5-minute stream does not. This is intentionally lazy and remains outside
     # the critical 5-minute forecast function.
