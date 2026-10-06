@@ -48,125 +48,12 @@ from free_data import (
     CORE_SYMBOLS, discover_repo_symbols, download_equity_universe, download_fno_archive,
     scan_coverage, scan_quality, storage_summary, local_history_provider, ensure_dirs as ensure_data_dirs,
 )
-from production_model import (
-    build_feature_rows as build_certified_intraday_features,
-    model_status as certified_intraday_model_status,
-    model_target_contract,
-    predict as certified_intraday_predict,
+from selfdriving.sd_v2_runtime import (
+    beta_delivery_predict,
+    beta_intraday_predict,
+    beta_status,
 )
-from autonomous_engine import delivery_prediction
-from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
-from all_nse_intraday_5m_model import (
-    predict_multihorizon as intraday_5m_predict_multihorizon,
-    model_status as intraday_5m_model_status,
-    _norm as normalize_intraday_5m_frame,
-)
-from directional_ensemble import enrich_delivery_prediction
 
-
-def certified_intraday_prediction(
-    symbol,
-    price_df,
-    market_df=None,
-    fo=None,
-    decision_ts=None,
-    matched_news=None,
-    announcements=None,
-    event_risk=0.0,
-):
-    """Run the certified target_30m / 137-feature Intraday model."""
-    feature_frame = build_certified_intraday_features([{
-        "symbol": symbol,
-        "price_df": price_df,
-        "market_df": market_df,
-        "matched_news": matched_news or [],
-        "announcements": announcements or [],
-        "event_risk": event_risk,
-        "fo": fo or {},
-        "decision_ts": decision_ts,
-    }])
-    predictions = certified_intraday_predict(feature_frame)
-    if not predictions:
-        raise RuntimeError("Certified Intraday model returned no prediction row")
-    result = predictions[0]
-    result["prediction_status"] = "PASS"
-    result["mode"] = "Intraday"
-    result["prediction_horizon"] = "30m"
-    result["model_version"] = "2026-certified-30m-137-feature"
-    try:
-        result["signal_price_reference"] = float(
-            pd.to_numeric(
-                price_df["Close"] if "Close" in price_df.columns else price_df.iloc[:, 0],
-                errors="coerce",
-            ).dropna().iloc[-1]
-        )
-    except Exception:
-        result["signal_price_reference"] = np.nan
-    result["probability_down_30m"] = (
-        float(1.0 - float(result["probability_up_30m"]))
-        if pd.notna(result.get("probability_up_30m"))
-        else np.nan
-    )
-    if decision_ts is not None:
-        ts = pd.Timestamp(decision_ts)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("Asia/Kolkata")
-        else:
-            ts = ts.tz_convert("Asia/Kolkata")
-        result["signal_horizon_end"] = str(ts + pd.Timedelta(minutes=30))
-    persisted = append_prediction(result, sync_drive=True)
-    result["prediction_id"] = persisted.get("prediction_id")
-    result["prediction_ledger_status"] = persisted.get("status")
-    result["prediction_ledger_synced"] = bool(persisted.get("synced"))
-    if persisted.get("sync_error"):
-        result["prediction_ledger_sync_error"] = persisted["sync_error"]
-    return result
-from prediction_ledger import load_records, load_validation_records, save_validation_results, append_prediction, append_predictions
-
-
-def multihorizon_intraday_prediction(
-    symbol,
-    price_df,
-    market_df=None,
-    fo=None,
-    decision_ts=None,
-):
-    """Run direct +5/+10/+15/+20/+25/+30 forecasts and persist each horizon."""
-    result = intraday_5m_predict_multihorizon(
-        symbol,
-        price_df,
-        market_df,
-        fo,
-        decision_ts,
-    )
-    records = []
-    for item in result.get("horizons", []):
-        horizon = int(item.get("horizon_minutes"))
-        records.append({
-            "prediction_status": "PASS",
-            "mode": "Intraday",
-            "symbol": symbol,
-            "prediction_horizon": f"{horizon}m",
-            "horizon_minutes": horizon,
-            "decision_timestamp": result.get("decision_timestamp"),
-            "target_timestamp": item.get("target_timestamp"),
-            "signal": item.get("signal"),
-            "probability_up": item.get("probability_up"),
-            "probability_down": item.get("probability_down"),
-            "current_price": item.get("current_price"),
-            "predicted_price": item.get("predicted_price"),
-            "predicted_change": item.get("predicted_change"),
-            "expected_return": item.get("expected_return"),
-            "model_version": result.get("model_version"),
-            "feature_count": result.get("feature_count"),
-        })
-    result["ledger"] = append_predictions(records, sync_drive=True) if records else {
-        "status": "NO_DATA",
-        "new_rows": 0,
-        "existing_rows_seen": 0,
-        "synced": False,
-    }
-    return result
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
 from historical_audit import run_batch_intraday_audit
@@ -503,13 +390,6 @@ def _delivery_opening_stats(
         return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_all_nse_delivery_prediction(symbol: str, as_of_date: str) -> dict:
-    """Cache the authoritative Delivery inference for the current trading date."""
-    ts = pd.Timestamp(as_of_date).tz_localize("Asia/Kolkata") + pd.Timedelta(hours=15, minutes=30)
-    return all_nse_delivery_predict(symbol, ts)
-
-
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_nse_ltp(symbol: str):
     """Fresh official NSE quote snapshot for display only; never feeds the locked Delivery model."""
@@ -580,53 +460,6 @@ def _cached_live_news() -> list[dict]:
         return []
 
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_persisted_delivery_news() -> pd.DataFrame:
-    """Load the newest persisted production RSS snapshot for advisory context."""
-    try:
-        from autonomous_engine import _load_persisted_live_news
-        frame = _load_persisted_live_news()
-        return frame if frame is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-def _delivery_live_news_context(symbol: str, as_of) -> dict:
-    """Summarize persisted news without changing the locked Delivery ML model."""
-    try:
-        x = _cached_persisted_delivery_news()
-        if x is None or x.empty:
-            return {"count_24h": 0, "high_impact": 0, "score": 0.0, "fresh_hours": None, "state": "NO LIVE NEWS SNAPSHOT"}
-        ts = pd.Timestamp(as_of)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("Asia/Kolkata")
-        ts = ts.tz_convert("UTC")
-        root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
-        x = x.copy()
-        x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
-        x["published_at"] = pd.to_datetime(x["published_at"], errors="coerce", utc=True)
-        x = x[
-            x["symbol"].isin([root, "MARKET"])
-            & x["published_at"].notna()
-            & x["published_at"].le(ts)
-            & x["published_at"].ge(ts - pd.Timedelta(hours=24))
-        ].copy()
-        metrics = news_metrics(x.to_dict("records"), now=ts.to_pydatetime())
-        return {
-            "count_24h": int(metrics.get("count", 0) or 0),
-            "high_impact": int(metrics.get("high_impact", 0) or 0),
-            "score": float(metrics.get("score", 0.0) or 0.0),
-            "fresh_hours": metrics.get("fresh_hours"),
-            "state": "LIVE PERSISTED NEWS",
-        }
-    except Exception as exc:
-        return {
-            "count_24h": 0,
-            "high_impact": 0,
-            "score": 0.0,
-            "fresh_hours": None,
-            "state": f"NEWS CONTEXT ERROR: {type(exc).__name__}",
-        }
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_live_benchmark_summary(benchmark_symbol: str) -> dict:
@@ -726,12 +559,10 @@ def _cached_live_option_chain(symbol: str):
         return {}
 
 
-def _intraday_action_text(signal: str) -> str:
-    return {
-        "BUY": "Bullish 30-minute direction: P(UP) is at or above the production BUY threshold.",
-        "SELL": "Bearish 30-minute direction: P(UP) is at or below the production SELL threshold.",
-        "HOLD": "No qualifying 30-minute directional edge at the production probability thresholds.",
-    }.get(str(signal).upper(), "No production decision is available.")
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_beta_status() -> dict:
+    """Return the current Beta V2 training/manifest state for UI diagnostics."""
+    return beta_status()
 
 
 if interface_mode == "Live Test":
@@ -776,818 +607,321 @@ if interface_mode == "Live Test":
     s3.metric("Symbols selected", str(len(symbols)))
 
     if live_mode == "Delivery":
-        try:
-            model = all_nse_delivery_model_status()
-            ready = (
-                model.get("status") == "READY"
-                and int(model.get("feature_count", 0)) == 59
-            )
-            if ready:
-                st.success(
-                    f"Delivery model READY · {int(model.get('trainable_symbol_count', 0)):,} "
-                    f"trainable / {int(model.get('universe_symbol_count', 0)):,} NSE universe · "
-                    "locked 59-feature contract"
-                )
-            else:
-                st.error("Delivery model is not ready.")
-        except Exception as exc:
-            st.error(f"Delivery model status failed: {type(exc).__name__}: {exc}")
-            model = {}
+        beta_state = _cached_beta_status()
+        delivery_state = beta_state.get("delivery", {}) or {}
+        delivery_status = str(delivery_state.get("status") or "NOT_TRAINED").upper()
 
-        if 9 <= now_ist.hour < 10:
-            st.info(
-                "NSE pre-open is active. The projected open below is the model/display estimate; "
-                "the exchange's pre-open equilibrium price is determined during the pre-open auction. "
-                "Refresh live data during pre-open and again after 09:15 IST for current-market context."
+        if delivery_status == "PROMOTED":
+            st.success("Beta V2 Delivery model is active with a validated champion.")
+        elif delivery_status == "REJECTED":
+            st.warning(
+                "The latest Beta V2 Delivery challenger was rejected by the validation gate. "
+                "An existing validated champion remains eligible when present."
+            )
+        else:
+            st.warning(
+                f"Beta V2 Delivery status: {delivery_status}. "
+                "Prediction is emitted only when a validated champion is available."
             )
 
-        rows = []
+        gate_info = delivery_state.get("gate") or {}
+        if isinstance(gate_info, dict) and gate_info.get("reasons"):
+            st.caption(
+                "Latest training gate: "
+                + " · ".join(map(str, gate_info["reasons"]))
+            )
+
+        st.caption(
+            "The Live Delivery route calls the Beta V2 runtime adapter directly. "
+            "Its canonical point-in-time global/news/F&O inputs are resolved from the persisted "
+            "Beta V2 data layer; the UI's live advisory feeds are not substituted into the model."
+        )
+
+        beta_delivery_results = {}
+        beta_delivery_errors = {}
+
         for sym in symbols:
             if not sym.endswith(".NS"):
-                rows.append({
+                beta_delivery_results[sym] = {
+                    "prediction_status": "BLOCKED",
                     "symbol": sym,
-                    "status": "BLOCKED",
-                    "signal": "—",
-                    "probability_up": np.nan,
-                    "expected_move": np.nan,
-                    "reference_close": np.nan,
-                    "predicted_open": np.nan,
-                    "predicted_high": np.nan,
-                    "predicted_low": np.nan,
-                    "predicted_close": np.nan,
-                    "predicted_change": np.nan,
-                    "ohlc_method": "—",
-                    "live_ltp": np.nan,
-                    "live_ltp_change": np.nan,
-                    "data_gate": False,
-                    "data_gate_reason": "NON_NSE_SYMBOL",
-                    "pit_news_state": "UNKNOWN",
-                    "live_news_count_24h": np.nan,
-                    "live_news_score": np.nan,
-                    "live_high_impact_news": np.nan,
-                    "live_news_fresh_hours": np.nan,
-                    "live_news_state": "NOT APPLICABLE",
-                    "live_event_count": np.nan,
-                    "live_fno_pcr": np.nan,
-                    "live_fno_max_pain": np.nan,
-                    "live_fno_expiry": "—",
-                    "benchmark_symbol": "—",
-                    "benchmark_last": np.nan,
-                    "benchmark_change_30m": np.nan,
-                    "reference_session": "—",
-                    "ledger": "—",
-                })
+                    "reason": "BETA_V2_DELIVERY_REQUIRES_NSE_SYMBOL",
+                }
                 continue
 
             try:
-                root = sym.replace(".NS", "").upper()
-                # The locked ALL-NSE production result is authoritative for
-                # the interactive Delivery display. This branch executes before
-                # the later legacy dashboard variables are initialized, so call
-                # the production model directly here.
-                result = all_nse_delivery_predict(
+                beta_delivery_results[sym] = beta_delivery_predict(
                     sym,
-                    now_ist,
+                    None,
+                    None,
+                    None,
                 )
-                if result.get("prediction_status") != "PASS":
-                    raise RuntimeError(
-                        result.get("reason")
-                        or "ALL-NSE Delivery model returned no production result"
-                    )
-
-                # Keep the critical prediction path network-light. These are
-                # display-only advisory fields and are intentionally not allowed
-                # to delay the locked Delivery model result.
-                live_news = {"count_24h": 0, "score": 0.0, "high_impact": 0, "fresh_hours": np.nan, "state": "NOT LOADED"}
-                live_fo = {}
-                live_events = []
-                benchmark_symbol = benchmark_for_symbol(sym)
-                benchmark_live = {"benchmark": benchmark_symbol, "last": np.nan, "change_30m": np.nan}
-
-                predicted_close = result.get("predicted_price_next_session")
-                reference_close = result.get("reference_close")
-                ref_date = result.get("reference_session")
-
-                # Calculate projected open/high/low after the authoritative
-                # ML result. These are statistical display estimates, not extra
-                # ML predictions, and the helper is cached/Drive-first.
-                ohlc = (
-                    _delivery_opening_stats(
-                        root,
-                        str(ref_date),
-                        float(reference_close) if pd.notna(reference_close) else np.nan,
-                        float(predicted_close) if pd.notna(predicted_close) else np.nan,
-                    )
-                    if ref_date
-                    else {"status": "NO_DATA"}
-                )
-                live_ltp = None
-                live_change = (
-                    (float(live_ltp) / float(reference_close) - 1.0)
-                    if live_ltp is not None
-                    and pd.notna(reference_close)
-                    and np.isfinite(float(reference_close))
-                    and float(reference_close) != 0
-                    else np.nan
-                )
-
-                rows.append({
-                    "symbol": sym,
-                    "status": result.get("prediction_status"),
-                    "signal": result.get("signal", "—"),
-                    "probability_up": result.get("probability_up_next_session"),
-                    "expected_move": result.get("predicted_return_next_session"),
-                    "reference_close": reference_close,
-                    "predicted_open": ohlc.get("expected_open", np.nan),
-                    "predicted_high": ohlc.get("expected_high", np.nan),
-                    "predicted_low": ohlc.get("expected_low", np.nan),
-                    "predicted_close": predicted_close,
-                    "predicted_change": result.get("predicted_price_change_next_session"),
-                    "ohlc_method": ohlc.get("method", "—"),
-                    "live_ltp": live_ltp if live_ltp is not None else np.nan,
-                    "live_ltp_change": live_change,
-                    "data_gate": result.get("production_data_quality_gate"),
-                    "data_gate_reason": result.get("data_gate_reason", "UNKNOWN"),
-                    "pit_news_state": (result.get("optional_information_status") or {}).get("news", "UNKNOWN"),
-                    "live_news_count_24h": live_news.get("count_24h", 0),
-                    "live_news_score": live_news.get("score", 0.0),
-                    "live_high_impact_news": live_news.get("high_impact", 0),
-                    "live_news_fresh_hours": live_news.get("fresh_hours", np.nan),
-                    "live_news_state": live_news.get("state", "UNKNOWN"),
-                    "live_event_count": int(len(live_events)),
-                    "live_fno_pcr": live_fo.get("pcr", np.nan),
-                    "live_fno_max_pain": live_fo.get("max_pain", np.nan),
-                    "live_fno_expiry": live_fo.get("expiry", "—"),
-                    "benchmark_symbol": benchmark_live.get("benchmark", benchmark_symbol),
-                    "benchmark_last": benchmark_live.get("last", np.nan),
-                    "benchmark_change_30m": benchmark_live.get("change_30m", np.nan),
-                    "reference_session": result.get("reference_session"),
-                    "ledger": result.get("prediction_ledger_status", "—"),
-                })
             except Exception as exc:
-                rows.append({
+                beta_delivery_errors[sym] = {
                     "symbol": sym,
-                    "status": "ERROR",
-                    "signal": "—",
-                    "probability_up": np.nan,
-                    "expected_move": np.nan,
-                    "reference_close": np.nan,
-                    "predicted_open": np.nan,
-                    "predicted_high": np.nan,
-                    "predicted_low": np.nan,
-                    "predicted_close": np.nan,
-                    "predicted_change": np.nan,
-                    "ohlc_method": "—",
-                    "live_ltp": np.nan,
-                    "live_ltp_change": np.nan,
-                    "data_gate": False,
-                    "data_gate_reason": (
-                        f"ERROR: {type(exc).__name__}: {exc}"
-                    ),
-                    "pit_news_state": "UNKNOWN",
-                    "live_news_count_24h": np.nan,
-                    "live_news_score": np.nan,
-                    "live_high_impact_news": np.nan,
-                    "live_news_fresh_hours": np.nan,
-                    "live_news_state": "UNKNOWN",
-                    "live_event_count": np.nan,
-                    "live_fno_pcr": np.nan,
-                    "live_fno_max_pain": np.nan,
-                    "live_fno_expiry": "—",
-                    "benchmark_symbol": "—",
-                    "benchmark_last": np.nan,
-                    "benchmark_change_30m": np.nan,
-                    "reference_session": "—",
-                    "ledger": f"{type(exc).__name__}: {exc}",
-                })
-
-        result_df = pd.DataFrame(rows)
-        if not result_df.empty:
-            display_df = result_df.copy()
-            display_df["probability_up"] = pd.to_numeric(
-                display_df["probability_up"], errors="coerce"
-            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-            display_df["expected_move"] = pd.to_numeric(
-                display_df["expected_move"], errors="coerce"
-            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-
-            for price_col in [
-                "reference_close",
-                "predicted_open",
-                "predicted_high",
-                "predicted_low",
-                "predicted_close",
-                "predicted_change",
-                "live_ltp",
-            ]:
-                display_df[price_col] = pd.to_numeric(
-                    display_df[price_col], errors="coerce"
-                ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-
-            display_df["live_ltp_change"] = pd.to_numeric(
-                display_df["live_ltp_change"], errors="coerce"
-            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-            display_df["live_news_score"] = pd.to_numeric(
-                display_df["live_news_score"], errors="coerce"
-            ).map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
-            display_df["live_news_fresh_hours"] = pd.to_numeric(
-                display_df["live_news_fresh_hours"], errors="coerce"
-            ).map(lambda x: f"{x:.1f}h" if pd.notna(x) else "—")
-            display_df["live_fno_pcr"] = pd.to_numeric(
-                display_df["live_fno_pcr"], errors="coerce"
-            ).map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-            display_df["live_fno_max_pain"] = pd.to_numeric(
-                display_df["live_fno_max_pain"], errors="coerce"
-            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["benchmark_last"] = pd.to_numeric(
-                display_df["benchmark_last"], errors="coerce"
-            ).map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
-            display_df["benchmark_change_30m"] = pd.to_numeric(
-                display_df["benchmark_change_30m"], errors="coerce"
-            ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-            display_df["data_gate"] = display_df["data_gate"].map(
-                lambda x: "PASS" if bool(x) else "BLOCKED"
-            )
-
-            blocked = display_df.loc[display_df["data_gate"].eq("BLOCKED")]
-            if not blocked.empty:
-                reasons = sorted(
-                    set(
-                        str(x)
-                        for x in blocked["data_gate_reason"].dropna()
-                        if str(x).strip()
-                    )
-                )
-                st.warning(
-                    "Delivery prediction is blocked for the active symbol. "
-                    "Check the exact NSE symbol below before treating this as a model/data-quality failure."
-                )
-                if reasons:
-                    st.caption("Gate reason(s): " + " · ".join(reasons))
-
-            st.subheader("Delivery — next-session production signal")
-            table_df = display_df[
-                [
-                    "symbol", "signal", "probability_up",
-                    "reference_close", "predicted_open", "predicted_high",
-                    "predicted_low", "predicted_close", "predicted_change",
-                    "expected_move", "live_ltp", "live_ltp_change",
-                    "data_gate", "data_gate_reason", "reference_session",
-                ]
-            ].rename(
-                columns={
-                    "symbol": "Symbol",
-                    "signal": "Signal",
-                    "probability_up": "P(Up)",
-                    "reference_close": "Reference close",
-                    "predicted_open": "Projected open",
-                    "predicted_high": "Projected high",
-                    "predicted_low": "Projected low",
-                    "predicted_close": "ML predicted close",
-                    "predicted_change": "Close change",
-                    "expected_move": "Expected move",
-                    "live_ltp": "Live LTP",
-                    "live_ltp_change": "Live LTP vs ref",
-                    "data_gate": "Data gate",
-                    "data_gate_reason": "Gate reason",
-                    "reference_session": "Reference session",
+                    "prediction_status": "ERROR",
+                    "error": f"{type(exc).__name__}: {exc}",
                 }
+
+        table_rows = []
+        for sym in symbols:
+            result = beta_delivery_results.get(sym, {})
+            p_up = pd.to_numeric(result.get("p"), errors="coerce")
+            coverage = pd.to_numeric(
+                result.get("feature_coverage"), errors="coerce"
             )
-            st.dataframe(table_df, width="stretch", hide_index=True)
+            table_rows.append({
+                "Symbol": sym,
+                "Status": result.get("prediction_status", "ERROR"),
+                "Signal": result.get("signal", "—"),
+                "P(UP)": f"{float(p_up):.1%}" if pd.notna(p_up) else "—",
+                "Feature coverage": (
+                    f"{float(coverage):.1%}"
+                    if pd.notna(coverage) else "—"
+                ),
+                "Reference date": str(result.get("date") or "—"),
+                "Model": str(result.get("model_file") or "—"),
+                "Reason": str(
+                    result.get("signal_reason")
+                    or result.get("reason")
+                    or result.get("error")
+                    or "—"
+                ),
+            })
 
-            st.caption(
-                "ML predicted close is the locked 59-feature Production Delivery output. "
-                "Projected open/high/low are statistical next-session estimates from prior completed sessions; "
-                "they are not separate trained ML outputs. Live news, F&O, announcements and benchmark values "
-                "are displayed as current advisory context."
-            )
-
-            st.subheader("Delivery — live decision context")
-            context_rows = []
-            for row in rows:
-                if row.get("status") not in {"PASS", "ERROR"}:
-                    continue
-                context_rows.append({
-                    "Symbol": row.get("symbol"),
-                    "PIT news input": row.get("pit_news_state", "UNKNOWN"),
-                    "Live news / 24h": row.get("live_news_count_24h", np.nan),
-                    "News score": row.get("live_news_score", np.nan),
-                    "High-impact": row.get("live_high_impact_news", np.nan),
-                    "Announcements": row.get("live_event_count", np.nan),
-                    "F&O PCR": row.get("live_fno_pcr", np.nan),
-                    "F&O max pain": row.get("live_fno_max_pain", np.nan),
-                    "Benchmark": row.get("benchmark_symbol", "—"),
-                    "Benchmark 30m": row.get("benchmark_change_30m", np.nan),
-                    "Gate": "PASS" if bool(row.get("data_gate")) else "BLOCKED",
-                })
-            if context_rows:
-                context_df = pd.DataFrame(context_rows)
-                context_df["News score"] = pd.to_numeric(
-                    context_df["News score"], errors="coerce"
-                ).map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
-                context_df["F&O PCR"] = pd.to_numeric(
-                    context_df["F&O PCR"], errors="coerce"
-                ).map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-                context_df["F&O max pain"] = pd.to_numeric(
-                    context_df["F&O max pain"], errors="coerce"
-                ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-                context_df["Benchmark 30m"] = pd.to_numeric(
-                    context_df["Benchmark 30m"], errors="coerce"
-                ).map(lambda x: f"{x:+.2%}" if pd.notna(x) else "—")
-                st.dataframe(context_df, width="stretch", hide_index=True)
-
-            st.caption(
-                "The locked 59-feature contract includes point-in-time news availability. "
-                "Live headline sentiment is shown separately because live headline sentiment is not a feature "
-                "of the locked model; the unvalidated contextual-fusion engine is not permitted to replace "
-                "the production probability."
+        st.subheader("Beta V2 Delivery — next-session directional signal")
+        if table_rows:
+            st.dataframe(
+                pd.DataFrame(table_rows),
+                width="stretch",
+                hide_index=True,
             )
 
-            st.subheader("Delivery — projected next-session OHLC")
-            for row in rows:
-                if row.get("status") != "PASS":
-                    continue
-                ref_close = pd.to_numeric(row.get("reference_close"), errors="coerce")
-                ref_date = row.get("reference_session")
-                if not np.isfinite(ref_close) or not ref_date:
-                    continue
-                root = str(row["symbol"]).replace(".NS", "").upper()
-                ohlc = _delivery_opening_stats(
-                    root,
-                    str(ref_date),
-                    float(ref_close),
-                    float(row.get("predicted_close")) if pd.notna(row.get("predicted_close")) else np.nan,
+        if beta_delivery_errors:
+            with st.expander("Beta V2 Delivery runtime errors", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(beta_delivery_errors.values()),
+                    width="stretch",
+                    hide_index=True,
                 )
-                live_ltp = row.get("live_ltp")
-                live_change = row.get("live_ltp_change")
-                if ohlc.get("status") == "PASS":
-                    o1, o2, o3, o4, o5 = st.columns(5)
-                    o1.metric("Reference close", f"₹{float(ref_close):,.2f}")
-                    o2.metric("Projected open", f"₹{ohlc['expected_open']:,.2f}")
-                    o3.metric(
-                        "Projected high",
-                        f"₹{ohlc['expected_high']:,.2f}"
-                        if pd.notna(ohlc.get("expected_high")) else "—",
-                    )
-                    o4.metric(
-                        "Projected low",
-                        f"₹{ohlc['expected_low']:,.2f}"
-                        if pd.notna(ohlc.get("expected_low")) else "—",
-                    )
-                    o5.metric(
-                        "ML predicted close",
-                        f"₹{float(row['predicted_close']):,.2f}"
-                        if pd.notna(row.get("predicted_close")) else "—",
-                    )
-                    live_text = (
-                        f"Official NSE LTP ₹{float(live_ltp):,.2f} ({float(live_change):+.2%} vs reference)"
-                        if live_ltp is not None and pd.notna(live_change)
-                        else "Official NSE LTP unavailable"
-                    )
-                    st.caption(
-                        f"{root}: {live_text} · opening-gap median {ohlc['median_gap']:+.2%} "
-                        f"from {ohlc['samples']} prior sessions. "
-                        "Projected high/low use empirical daily excursion around the projected open/close."
-                    )
-                else:
-                    st.info(
-                        f"{root}: OHLC statistical projection unavailable; the locked production model still "
-                        "provides the next-session close projection when its predicted return and reference close are available."
-                    )
 
+        with st.expander("Beta V2 Delivery runtime status", expanded=False):
+            st.json(beta_state)
 
+        st.caption(
+            "P(UP) is the calibrated probability that the stock beats the same-session "
+            "cross-sectional median over the next session. BUY/SELL are emitted only inside "
+            "the validated Wilson-bound action band; otherwise the model explicitly abstains."
+        )
 
     elif live_mode == "Intraday 5-minute":
-        try:
-            model = intraday_5m_model_status()
-            ready = model.get("status") == "READY"
-            if ready:
-                st.success("Intraday 5-minute model READY · direct +5/+10/+15/+20/+25/+30 minute forecasts")
-                st.caption(
-                    f"Training through: **{model.get('trained_until') or 'unknown'}** · "
-                    f"{int(model.get('training_symbol_count', 0) or 0):,} training symbols / "
-                    f"{int(model.get('universe_size', 0) or 0):,} NSE universe."
-                )
-            else:
-                st.warning("The 5-minute-step model is not yet VERIFIED. Run the Colab trainer before using this live mode.")
-                st.caption("The certified 30-minute production model remains untouched and is not used for these 5-minute forecasts.")
-        except Exception as exc:
-            model = {}
-            st.error(f"5-minute Intraday model status failed: {type(exc).__name__}: {exc}")
+        beta_state = _cached_beta_status()
+        intraday_state = beta_state.get("intraday", {}) or {}
+        manifest_status = str(intraday_state.get("status") or "NOT_TRAINED").upper()
 
-        if model.get("status") != "READY":
+        if manifest_status == "CANDIDATE_ONLY":
             st.info(
-                "The 5-minute-step model is not available for live prediction yet. "
-                "The existing certified 30-minute production model remains unchanged. "
-                "Run the 5-minute Colab trainer and verify the six-horizon holdout gates before live use."
+                "Beta V2 Intraday manifest is present. Each horizon requires its own validated "
+                "champion before BUY/SELL can be emitted."
             )
-            st.stop()
+        else:
+            st.warning(
+                f"Beta V2 Intraday status: {manifest_status}. "
+                "Run the Beta V2 Intraday trainer before expecting trained horizon models."
+            )
 
         universe_df = _searchable_nse_universe()
         if universe_df is None or universe_df.empty:
             candidates = [s for s in symbols if s.endswith(".NS")]
             candidate_labels = {s: s for s in candidates}
         else:
-            candidates = [f"{s}.NS" for s in universe_df["symbol"].astype(str).str.upper()]
+            candidates = [
+                f"{s}.NS"
+                for s in universe_df["symbol"].astype(str).str.upper()
+            ]
             candidate_labels = {
                 f"{row.symbol}.NS": (
                     f"{row.symbol} — {row.company}"
-                    if str(row.company).strip() and str(row.company).lower() != "nan"
+                    if str(row.company).strip()
+                    and str(row.company).lower() != "nan"
                     else str(row.symbol)
                 )
                 for row in universe_df.itertuples()
             }
+
         if not candidates:
-            st.info("Official NSE equity universe is unavailable for 5-minute selection.")
+            st.info("Official NSE equity universe is unavailable for Beta V2 Intraday selection.")
         else:
             live_default = st.session_state.get("live_intraday_selected_symbol")
             if live_default not in candidates:
                 live_default = candidates[0]
+
             selected_symbol = st.selectbox(
-                "Stock for continuous 5-minute forecast",
+                "Stock for continuous Beta V2 Intraday forecast",
                 candidates,
                 index=candidates.index(live_default),
                 format_func=lambda s: candidate_labels.get(s, s),
                 key="live_intraday_selected_symbol",
-                help="Select any current NSE equity; forecast recalculates whenever a new completed 1-minute bar arrives.",
+                help="Select any current NSE equity; the forecast refreshes when a new completed 1-minute bar arrives.",
             )
             auto_update = st.checkbox(
                 "Continuous recalculation every new 1-minute bar",
                 value=True,
                 key="live_intraday_auto_update",
             )
-            st.caption("The engine polls every minute but uses only completed 1-minute NSE bars. A new forecast is generated only when the completed-bar timestamp changes.")
+            st.caption(
+                "Only completed 1-minute bars are passed to Beta V2. "
+                "The six independent horizons are +5/+10/+15/+20/+25/+30 minutes."
+            )
             run_every = "60s" if auto_update else None
 
-            @st.fragment(run_every=run_every, key="live_intraday_5m_stream")
-            def _render_live_5m_stream():
+            @st.fragment(run_every=run_every, key="live_intraday_beta_v2_stream")
+            def _render_live_beta_v2_intraday_stream():
                 now = pd.Timestamp.now(tz="Asia/Kolkata")
                 root = selected_symbol.replace(".NS", "").upper()
-                in_session = pd.Timestamp("09:15").time() <= now.time() <= pd.Timestamp("15:30").time()
+                in_session = (
+                    pd.Timestamp("09:15").time()
+                    <= now.time()
+                    <= pd.Timestamp("15:30").time()
+                )
                 if not in_session:
-                    st.info(f"5-minute forecast stream idle outside regular NSE hours · IST {now.strftime('%H:%M:%S')}")
+                    st.info(
+                        f"Beta V2 Intraday stream idle outside regular NSE hours · "
+                        f"IST {now.strftime('%H:%M:%S')}"
+                    )
                     return
 
                 try:
                     raw, live_source = _live_5m_price_frame(selected_symbol)
                     if raw is None or raw.empty:
-                        st.error("Live 1-minute market data is currently unavailable from NSE and the configured fallback providers.")
-                        return
-
-                    # Normalize the provider frame before any timestamp
-                    # comparison. This prevents hosted NSE/fallback responses
-                    # with MultiIndex/duplicate columns from reaching timestamp
-                    # filtering or pandas datetime conversion with a non-1D object.
-                    raw = normalize_intraday_5m_frame(raw)
-                    if raw is None or raw.empty:
-                        st.error("Live 1-minute market data could not be normalized into a valid NSE timestamped frame.")
+                        st.error(
+                            "Live 1-minute market data is unavailable from NSE and the configured fallbacks."
+                        )
                         return
 
                     cutoff = now.floor("min")
                     completed = raw.loc[raw.index < cutoff].copy()
                     if completed.empty:
-                        st.info("Waiting for the first completed 1-minute NSE bar.")
+                        st.info("Waiting for the first completed NSE 1-minute bar.")
                         return
+
                     latest_ts = completed.index[-1]
-                    source_label = {"NSE_OFFICIAL_CHART": "NSE official", "PERSISTENT_LOCAL_CACHE": "persistent local cache", "DHAN": "Dhan", "YAHOO_FINANCE": "Yahoo Finance", "YFINANCE": "yfinance"}.get(live_source, "fallback provider")
-                    state_key = f"live_5m_last_ts::{root}"
-                    result_key = f"live_5m_result::{root}"
-                    previous_ts = st.session_state.get(state_key)
-                    if previous_ts == str(latest_ts) and result_key in st.session_state:
-                        result = st.session_state[result_key]
+                    if len(completed) < 80:
+                        st.info(
+                            f"Beta V2 warm-up: {len(completed)}/80 completed 1-minute rows available."
+                        )
+                        return
+
+                    benchmark_symbol = benchmark_for_symbol(selected_symbol)
+                    market_df = _cached_live_market_context(benchmark_symbol)
+
+                    state_key = f"beta_v2_intraday_last_ts::{root}"
+                    result_key = f"beta_v2_intraday_result::{root}"
+
+                    if (
+                        st.session_state.get(state_key) == str(latest_ts)
+                        and result_key in st.session_state
+                    ):
+                        predictions = st.session_state[result_key]
                         recalculated = False
                     else:
-                        if len(completed) < 50:
-                            st.info(f"Model warm-up: {len(completed)}/50 completed 1-minute bars available.")
-                            return
-                        benchmark_symbol = benchmark_for_symbol(selected_symbol)
-                        market_df = _cached_live_market_context(benchmark_symbol)
-                        # The 5m model loads the same previous-session PIT F&O
-                        # snapshot used during training; do not pass today's live
-                        # option-chain values into this model.
-                        result = multihorizon_intraday_prediction(
-                            selected_symbol, completed, market_df, None, latest_ts
+                        predictions = beta_intraday_predict(
+                            selected_symbol,
+                            completed,
+                            market_df,
                         )
                         st.session_state[state_key] = str(latest_ts)
-                        st.session_state[result_key] = result
+                        st.session_state[result_key] = predictions
                         recalculated = True
 
-                    hrows = result.get("horizons", [])
-                    base_price = pd.to_numeric(result.get("base_price"), errors="coerce")
-                    decision_ts = pd.Timestamp(result.get("decision_timestamp"))
+                    source_label = {
+                        "NSE_OFFICIAL_CHART": "NSE official",
+                        "PERSISTENT_LOCAL_CACHE": "persistent local cache",
+                        "DHAN": "Dhan",
+                        "YAHOO_FINANCE": "Yahoo Finance",
+                        "YFINANCE": "yfinance",
+                    }.get(live_source, "fallback provider")
+
+                    if not predictions:
+                        st.warning(
+                            "Beta V2 returned no horizon rows. A validated horizon champion "
+                            "may not be available yet."
+                        )
+                        return
+
                     table_rows = []
-                    for item in hrows:
-                        target_ts = pd.Timestamp(item["target_timestamp"])
-                        if target_ts.tzinfo is None: target_ts = target_ts.tz_localize("Asia/Kolkata")
+                    for item in predictions:
+                        p_up = pd.to_numeric(
+                            item.get("probability_up"), errors="coerce"
+                        )
                         table_rows.append({
-                            "Target": target_ts.strftime("%H:%M"),
-                            "Minutes": int(item["horizon_minutes"]),
-                            "Predicted ₹": f"₹{float(item['predicted_price']):,.2f}" if pd.notna(item.get("predicted_price")) else "—",
-                            "Change ₹": f"₹{float(item['predicted_change']):+,.2f}" if pd.notna(item.get("predicted_change")) else "—",
-                            "Expected return": f"{float(item['expected_return']):+.2%}" if pd.notna(item.get("expected_return")) else "—",
-                            "P(UP)": f"{float(item['probability_up']):.1%}",
-                            "P(DOWN)": f"{float(item['probability_down']):.1%}",
-                            "Signal": item["signal"],
+                            "Horizon": f"+{int(item.get('horizon_min', 0))}m",
+                            "Signal": item.get("signal", "ABSTAIN"),
+                            "P(UP)": (
+                                f"{float(p_up):.1%}"
+                                if pd.notna(p_up) else "—"
+                            ),
+                            "Reference price": (
+                                f"₹{float(item.get('reference_close')):,.2f}"
+                                if pd.notna(item.get("reference_close"))
+                                else "—"
+                            ),
+                            "Decision": str(
+                                item.get("decision_timestamp") or latest_ts
+                            ),
+                            "Reason": item.get(
+                                "signal_reason",
+                                item.get("reason", "—"),
+                            ),
                         })
 
                     if recalculated:
-                        st.success(f"Recalculated from new completed 1-minute bar · {latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}")
+                        st.success(
+                            f"Beta V2 recalculated from completed 1-minute bar "
+                            f"{latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}"
+                        )
                     else:
-                        st.info(f"Showing latest forecast from {latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}")
-
-                    h0 = hrows[0] if hrows else {}
-                    a, b, d, e = st.columns(4)
-                    a.metric("Reference price ₹", f"₹{float(base_price):,.2f}" if pd.notna(base_price) else "—")
-                    b.metric("Next 5m price ₹", f"₹{float(h0.get('predicted_price')):,.2f}" if pd.notna(h0.get("predicted_price")) else "—")
-                    d.metric("Next 5m signal", str(h0.get("signal", "—")))
-                    e.metric("Next 5m P(UP)", f"{float(h0.get('probability_up')):.1%}" if pd.notna(h0.get("probability_up")) else "—")
-
-                    st.subheader("Every 5-minute future prediction")
-                    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
-
-                    st.subheader("Future price prediction graph")
-                    st.caption("Each point is a direct model estimate for its horizon. The connecting line is for visualization; it is not a guaranteed tick-by-tick path.")
-                    plot_rows = [{"timestamp": decision_ts, "price": float(base_price)}]
-                    for item in hrows:
-                        if pd.notna(item.get("predicted_price")):
-                            ts = pd.Timestamp(item["target_timestamp"])
-                            if ts.tzinfo is None: ts = ts.tz_localize("Asia/Kolkata")
-                            plot_rows.append({"timestamp": ts, "price": float(item["predicted_price"])})
-                    plot_df = pd.DataFrame(plot_rows).drop_duplicates("timestamp").set_index("timestamp").sort_index()
-                    st.line_chart(plot_df, height=360)
-                    ledger = result.get("ledger") or {}
-                    st.caption(
-                        f"Signal source: direct 5-minute-step model · live data source: {source_label} · latest completed bar {latest_ts.strftime('%H:%M:%S')} IST · "
-                        f"ledger {ledger.get('status','—')} · new rows {ledger.get('new_rows','—')} · "
-                        f"Drive sync {'YES' if ledger.get('synced') else 'NO'}."
-                    )
-                except Exception as exc:
-                    st.error(f"Live 5-minute forecast failed: {type(exc).__name__}: {exc}")
-
-            _render_live_5m_stream()
-
-    else:
-        try:
-            model = certified_intraday_model_status()
-            ready = (
-                int(model.get("feature_count", 0)) == 137
-                and bool(model.get("manifest_sha256_match"))
-            )
-            if ready:
-                trained_until = model.get("training_end_exclusive") or "unknown"
-                st.success(
-                    "Intraday model VERIFIED · 137-feature certified contract · target_30m"
-                )
-                model_age_days = model.get("model_age_days")
-                st.caption(
-                    f"Production model training data ends at: **{trained_until}**. "
-                    "Live predictions use current NSE inputs; the model weights are not changed at runtime."
-                )
-                if isinstance(model_age_days, (int, float)) and model_age_days >= 30:
-                    st.warning(
-                        f"The certified Intraday model is {int(model_age_days)} days old. "
-                        "This is a model-freshness warning only; the certified artifact is still used unchanged."
-                    )
-            else:
-                st.error("Intraday model verification failed.")
-        except Exception as exc:
-            st.error(f"Intraday model status failed: {type(exc).__name__}: {exc}")
-
-        rows = []
-        live_frames = {}
-        for sym in symbols:
-            if not sym.endswith(".NS"):
-                rows.append({
-                    "symbol": sym,
-                    "status": "BLOCKED",
-                    "signal": "—",
-                    "p_up_30m": np.nan,
-                    "p_down_30m": np.nan,
-                    "current_price": np.nan,
-                    "signal_horizon_end": "—",
-                    "signal_price_reference": np.nan,
-                    "confidence": "—",
-                    "input_missing": np.nan,
-                    "_input_audit": {},
-                    "readiness": np.nan,
-                    "live_1m_rows": 0,
-                    "latest_bar": "—",
-                    "news": "NO",
-                    "events": "NO",
-                    "fno": "NO",
-                    "market": "NO",
-                    "ledger": "—",
-                })
-                continue
-
-            root = sym.replace(".NS", "").upper()
-            try:
-                price_1m = nse_fetch_intraday_1m_current(
-                    root,
-                    sync_drive=True,
-                )
-                if price_1m is None or price_1m.empty:
-                    raise RuntimeError("NSE live 1-minute stream returned no rows")
-
-                live_frames[root] = price_1m.copy()
-                decision_ts = price_1m.index[-1]
-                benchmark_symbol = benchmark_for_symbol(sym)
-                market_df = _cached_live_market_context(benchmark_symbol)
-
-                live_news_all = _cached_live_news()
-                matched_news = news_for_symbol(
-                    stock_news_keywords(sym),
-                    live_news_all,
-                )
-
-                announcements = _cached_live_announcements(root)
-
-                try:
-                    event_news = matched_news + announcement_to_news(announcements)
-                    event_risk = event_risk_score(
-                        matched_news,
-                        announcements,
-                    )
-                except Exception:
-                    event_risk = 0.0
-
-                fo = _cached_live_option_chain(root)
-
-                result = certified_intraday_prediction(
-                    sym,
-                    price_1m,
-                    market_df,
-                    fo,
-                    decision_ts,
-                    matched_news,
-                    announcements,
-                    event_risk,
-                )
-                rows.append({
-                    "symbol": sym,
-                    "status": result.get("prediction_status"),
-                    "signal": result.get("signal", "—"),
-                    "p_up_30m": result.get("probability_up_30m"),
-                    "p_down_30m": result.get("probability_down_30m"),
-                    "current_price": float(pd.to_numeric(price_1m["Close"] if "Close" in price_1m.columns else price_1m.iloc[:, 0], errors="coerce").dropna().iloc[-1]),
-                    "signal_horizon_end": result.get("signal_horizon_end"),
-                    "signal_price_reference": result.get("signal_price_reference"),
-                    "confidence": result.get("confidence"),
-                    "input_missing": (result.get("input_audit") or {}).get("missing_input_feature_count"),
-                    "_input_audit": result.get("input_audit") or {},
-                    "readiness": result.get("data_readiness_score"),
-                    "live_1m_rows": len(price_1m),
-                    "latest_bar": str(decision_ts),
-                    "news": "YES" if matched_news else "NO",
-                    "events": "YES" if announcements else "NO",
-                    "fno": "YES" if fo else "NO",
-                    "market": "YES" if market_df is not None and not market_df.empty else "NO",
-                    "ledger": result.get("prediction_ledger_status", "—"),
-                })
-            except Exception as exc:
-                # Keep the compact result schema stable even when one of the
-                # live-data/model inputs fails. The UI table must never raise a
-                # KeyError merely because an optional input was unavailable.
-                rows.append({
-                    "symbol": sym,
-                    "status": "ERROR",
-                    "signal": "—",
-                    "p_up_30m": np.nan,
-                    "p_down_30m": np.nan,
-                    "current_price": np.nan,
-                    "signal_horizon_end": "—",
-                    "signal_price_reference": np.nan,
-                    "confidence": "—",
-                    "readiness": np.nan,
-                    "live_1m_rows": 0,
-                    "latest_bar": "—",
-                    "news": "NO",
-                    "events": "NO",
-                    "fno": "NO",
-                    "market": "NO",
-                    "ledger": f"{type(exc).__name__}: {exc}",
-                })
-
-        result_df = pd.DataFrame(rows)
-        if not result_df.empty:
-            display_df = result_df.copy()
-            display_df["p_up_30m"] = pd.to_numeric(
-                display_df["p_up_30m"], errors="coerce"
-            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-            for probability_col in ["p_down_30m"]:
-                display_df[probability_col] = pd.to_numeric(
-                    display_df[probability_col], errors="coerce"
-                ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-            display_df["current_price"] = pd.to_numeric(
-                display_df["current_price"], errors="coerce"
-            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["signal_price_reference"] = pd.to_numeric(
-                display_df["signal_price_reference"], errors="coerce"
-            ).map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["readiness"] = pd.to_numeric(
-                display_df["readiness"], errors="coerce"
-            ).map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-            display_df["input_missing"] = pd.to_numeric(
-                display_df["input_missing"], errors="coerce"
-            ).map(lambda x: f"{int(x)}" if pd.notna(x) else "—")
-
-            st.subheader("Intraday — next 30-minute production signal")
-            st.dataframe(
-                display_df[
-                    [
-                        "symbol", "signal", "current_price",
-                        "signal_price_reference", "p_up_30m", "p_down_30m",
-                        "confidence", "readiness", "input_missing", "live_1m_rows",
-                        "latest_bar", "signal_horizon_end", "news", "events",
-                        "fno", "market", "ledger",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-
-            for row in rows:
-                if row.get("status") != "PASS":
-                    continue
-                signal = str(row.get("signal") or "—").upper()
-                p_up = pd.to_numeric(row.get("p_up_30m"), errors="coerce")
-                p_down = pd.to_numeric(row.get("p_down_30m"), errors="coerce")
-                price = pd.to_numeric(row.get("current_price"), errors="coerce")
-                horizon = str(row.get("signal_horizon_end") or "—")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric(f"{row.get('symbol')} action", signal)
-                c2.metric("Current ₹", f"₹{price:,.2f}" if pd.notna(price) else "—")
-                c3.metric("P(UP) / P(DOWN)", f"{p_up:.1%} / {p_down:.1%}" if pd.notna(p_up) and pd.notna(p_down) else "—")
-                c4.metric("30m horizon end", horizon)
-                st.caption(
-                    f"{row.get('symbol')}: {_intraday_action_text(signal)} "
-                    f"Confidence={row.get('confidence','—')} · "
-                    f"missing model inputs={row.get('input_missing','—')}."
-                )
-
-            with st.expander("Production input audit", expanded=False):
-                for row in rows:
-                    if row.get("status") != "PASS":
-                        continue
-                    symbol = row.get("symbol")
-                    audit = row.get("_input_audit") or {}
-                    st.write(
-                        f"**{symbol}** — missing current inputs: "
-                        f"{audit.get('missing_input_feature_count','—')}/{audit.get('feature_count','—')}"
-                    )
-                    missing_names = audit.get("missing_input_features") or []
-                    if missing_names:
-                        st.caption("Missing in this live row: " + ", ".join(missing_names))
-                    empty_fit = audit.get("model_fit_empty_features") or []
-                    if empty_fit:
-                        st.caption(
-                            "Features with no observed training statistic in the loaded imputer: "
-                            + ", ".join(empty_fit)
+                        st.info(
+                            f"Showing Beta V2 forecast from {latest_ts.strftime('%H:%M:%S')} IST · "
+                            f"source: {source_label}"
                         )
 
-            st.caption(
-                "Intraday uses the certified production model against the current NSE 1-minute stream. "
-                "Each refresh creates a new 30-minute directional decision from the latest available bar. "
-                "BUY = P(UP) ≥ 55%; SELL = P(UP) ≤ 45%; otherwise HOLD. "
-                "This is a directional model, not a guaranteed minute-by-minute price forecast."
-            )
+                    h0 = predictions[0]
+                    p0 = pd.to_numeric(h0.get("probability_up"), errors="coerce")
+                    a, b, c = st.columns(3)
+                    a.metric(
+                        "Reference price ₹",
+                        (
+                            f"₹{float(h0.get('reference_close')):,.2f}"
+                            if pd.notna(h0.get("reference_close"))
+                            else "—"
+                        ),
+                    )
+                    b.metric(
+                        "Next +5m signal",
+                        str(h0.get("signal", "ABSTAIN")),
+                    )
+                    c.metric(
+                        "Next +5m P(UP)",
+                        f"{float(p0):.1%}" if pd.notna(p0) else "—",
+                    )
 
-            st.markdown("### How to read the Intraday call")
-            st.info(
-                "At each refresh, the production model evaluates the newest available 1-minute information "
-                "and estimates the probability that the stock's return over the following 30 minutes will be positive. "
-                "BUY = P(UP) ≥ 55%; SELL = P(UP) ≤ 45%; otherwise HOLD. "
-                "Current price is the live market price at the signal timestamp. "
-                "Signal price reference is the exact price used by the production feature row. "
-                "Horizon end is 30 minutes after that decision timestamp. "
-                "The model does not directly predict a minute-by-minute OHLC path."
-            )
-
-            st.subheader("Intraday — numeric 30-minute price map")
-            st.caption(
-                "The BUY/SELL/HOLD call and probability come from the locked 137-feature production model. "
-                "The minute-by-minute prices below are a realized-volatility envelope from the current 1-minute stream, "
-                "not fabricated ML prices. They show the numeric range that the current volatility implies around the live price."
-            )
-            for sym in symbols:
-                if not sym.endswith(".NS"):
-                    continue
-                try:
-                    root = sym.replace(".NS", "").upper()
-                    live_px = live_frames.get(root)
-                    if live_px is None or live_px.empty:
-                        continue
-                    env = _intraday_price_envelope(live_px, live_px.index[-1], 30)
-                    if env.empty:
-                        continue
-                    st.write(f"**{sym}**")
+                    st.subheader("Beta V2 multi-horizon directional predictions")
                     st.dataframe(
-                        env,
+                        pd.DataFrame(table_rows),
                         width="stretch",
                         hide_index=True,
                     )
+                    st.caption(
+                        "These are direct Beta V2 probabilities from the volume-free price/time "
+                        "feature contract. No legacy precomputed volume features are passed."
+                    )
                 except Exception as exc:
-                    st.caption(f"{sym}: numeric price map unavailable — {type(exc).__name__}: {exc}")
+                    st.error(
+                        f"Beta V2 Intraday forecast failed: {type(exc).__name__}: {exc}"
+                    )
+
+            _render_live_beta_v2_intraday_stream()
 
     st.divider()
     st.subheader("What to watch tomorrow")
@@ -1627,12 +961,15 @@ if analysis_view == "Historical Replay":
         "Pick a past date/time. The replay uses only information available up to that timestamp, then compares the prediction with what actually happened afterward. "
         "Unavailable historical news/F&O sources are shown as missing rather than replaced with current data."
     )
-    with st.expander("Production target/data-model contract", expanded=False):
+    with st.expander("Beta V2 runtime status", expanded=False):
         try:
-            st.json(model_target_contract())
-            st.caption("The certified target is target_30m. Class 1 means the future 30-minute return is positive (UP). A BUY followed by an actual DOWN move is therefore a model miss, not a BUY/SELL label inversion.")
+            st.json(_cached_beta_status())
+            st.caption(
+                "Historical replay remains a research-only screen. Live prediction routing "
+                "is handled exclusively by the Beta V2 runtime adapters."
+            )
         except Exception as exc:
-            st.error(f"Production target contract check failed: {type(exc).__name__}: {exc}")
+            st.error(f"Beta V2 status check failed: {type(exc).__name__}: {exc}")
 
     batch_audit = st.sidebar.checkbox("Batch historical audit", value=False, help="Run many historical 30-minute predictions and compare each with the subsequent actual move.")
     if batch_audit:
@@ -1810,108 +1147,22 @@ if analysis_view == "Historical Replay":
                         "event_risk": event_risk_score(hist_news, hist_ann), "fo": {}, "decision_ts": decision_ts,
                     }]
                     try:
-                        ml = certified_intraday_prediction(
-                            replay_symbol,
-                            price_df[price_df.index <= decision_ts],
-                            benchmark_df,
-                            {},
-                            decision_ts,
+                        st.info(
+                            "Beta V2 historical Intraday replay is not connected to a "
+                            "point-in-time historical inference adapter in this screen."
                         )
-                        entry_info = _entry_exit_metrics(price_df[price_df.index <= decision_ts], decision_ts, "Intraday", int(replay_horizon))
-                        outcome = actual_outcome(price_df, decision_ts, ml["signal"], "Intraday", int(replay_horizon), entry_info)
-                        st.markdown(f"### {replay_symbol} — {replay_mode} replay")
-                        st.write(f"**Decision timestamp:** {decision_ts} IST")
-                        m1,m2,m3,m4 = st.columns(4)
-                        m1.metric("ML Signal", ml["signal"])
-                        m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
-                        m3.metric("Model confidence", ml["confidence"])
-                        readiness_count = int(
-                            ml.get(
-                                "non_missing_feature_count",
-                                round(
-                                    float(
-                                        ml.get(
-                                            "data_readiness_score",
-                                            0.0,
-                                        )
-                                    )
-                                    * int(
-                                        ml.get(
-                                            "feature_count",
-                                            59,
-                                        )
-                                    )
-                                ),
-                            )
-                        )
-                        readiness_total = int(
-                            ml.get(
-                                "feature_count",
-                                59,
-                            )
-                        )
-                        m4.metric(
-                            "Data readiness",
-                            (
-                                f"{readiness_count}/{readiness_total} "
-                                f"({readiness_count / readiness_total:.1%})"
-                                if readiness_total > 0
-                                else "—"
+                        st.write({
+                            "decision_timestamp": str(decision_ts),
+                            "symbol": replay_symbol,
+                            "status": "BETA_V2_HISTORICAL_REPLAY_NOT_CONNECTED",
+                            "historical_rows_available": int(
+                                len(price_df[price_df.index <= decision_ts])
                             ),
-                        )
-                        if float(ml.get("data_readiness_score", 0.0)) < 0.70:
-                            st.warning("DATA-LIMITED REPLAY: the certified model produced a 30-minute probability, but fewer than 70% of the required information groups were historically available. Treat the model probability as model output, not as full-data trading confidence.")
-                        r1,r2,r3,r4 = st.columns(4)
-                        r1.metric("Decision price", f"₹{entry_info.get('entry_reference', float('nan')):,.2f}")
-                        tgt = entry_info.get('entry_reference', 0)+entry_info.get('target_distance', 0) if ml["signal"] == "BUY" else entry_info.get('entry_reference', 0)-entry_info.get('target_distance', 0)
-                        stp = entry_info.get('entry_reference', 0)-entry_info.get('stop_distance', 0) if ml["signal"] == "BUY" else entry_info.get('entry_reference', 0)+entry_info.get('stop_distance', 0)
-                        r2.metric("Target", f"₹{tgt:,.2f}")
-                        r3.metric("Stop", f"₹{stp:,.2f}")
-                        r4.metric("News", "Available" if hist_news else "Not available")
-                        st.markdown("#### Prediction vs actual")
-                        if outcome.get("status") == "OK":
-                            o1,o2,o3,o4 = st.columns(4)
-                            o1.metric("Actual price", f"₹{outcome['actual_price']:,.2f}")
-                            o2.metric("Actual move", f"{outcome['actual_move_pct']:+.2f}%")
-                            o3.metric("Actual direction", outcome["actual_direction"])
-                            o4.metric("Direction match", "YES" if outcome.get("correct_direction") else "NO" if outcome.get("correct_direction") is not None else "N/A")
-                            st.write({"target_hit": outcome.get("target_hit"), "stop_hit": outcome.get("stop_hit"), "first_touch": outcome.get("first_touch"), "horizon": outcome.get("horizon_label")})
-                        else:
-                            st.warning(outcome.get("status", "Future data unavailable."))
-                        readiness = {
-                            "intraday price": bool(not price_df[price_df.index <= decision_ts].empty),
-                            "market context": bool(not benchmark_df.empty),
-                            "historical news": bool(hist_news),
-                            "corporate announcements": bool(hist_ann),
-                            "historical F&O chain": False,
-                            "historical fundamentals": False,
-                        }
-                        st.markdown("#### Point-in-time data availability")
-                        st.dataframe(pd.DataFrame([{
-                            "group": k, "available": v
-                        } for k,v in readiness.items()]), width="stretch", hide_index=True)
-                        if hist_news:
-                            with st.expander("Historical news used by replay", expanded=False):
-                                for n in hist_news[:15]: st.write(f"**{n.get('title','')}** — {n.get('published','')} — {n.get('source','')}")
-                        else:
-                            st.info("No timestamped historical news was retrieved. The production model was not given today's headlines.")
-                        if hist_ann:
-                            with st.expander("Historical corporate announcements", expanded=False):
-                                for a in hist_ann[:15]: st.write(f"{a['date']}: {a['subject']}")
-                        if replay_mode.startswith("F&O"):
-                            st.warning("This F&O replay currently uses the underlying stock's production 30-minute model. Historical option-chain/OI/IV fields are not substituted with today's chain; they remain unavailable until a timestamped historical derivatives archive is wired in.")
-                        st.caption("Intraday model: pooled ALL-NSE Logistic Regression + Ridge · 34-feature contract · target_30m. Class 1/BUY means the model estimates a positive future 30-minute return. Historical replay actual direction uses future close vs decision close over the same 30-minute horizon.")
-                        ledger = {
-                            "timestamp": str(decision_ts), "symbol": replay_symbol, "mode": replay_mode,
-                            "prediction": ml["signal"], "probability_up_30m": ml["probability_up_30m"],
-                            "confidence": ml["confidence"], "data_readiness": ml["data_readiness_score"],
-                            "decision_price": entry_info.get("entry_reference"), "target": tgt, "stop": stp,
-                            "actual_move_pct": outcome.get("actual_move_pct"), "correct": outcome.get("correct_direction"),
-                            "news_available": bool(hist_news), "announcements_available": bool(hist_ann), "fo_historical_available": False,
-                        }
-                        st.session_state.setdefault("replay_ledger", []).append(ledger)
-                        st.download_button("Export replay record", pd.DataFrame(st.session_state["replay_ledger"]).to_csv(index=False).encode("utf-8"), file_name="historical_replay_ledger.csv", mime="text/csv")
-                    except Exception as exc:
+                            "market_rows_available": int(len(benchmark_df)),
+                            "historical_news_available": bool(hist_news),
+                            "historical_announcements_available": bool(hist_ann),
+                        })
+                except Exception as exc:
                         st.error(f"Historical {replay_mode} replay failed: {type(exc).__name__}: {exc}")
 
     if "replay_ledger" in st.session_state and st.session_state["replay_ledger"]:
@@ -2387,746 +1638,16 @@ def cached_delivery_validation():
         assess_delivery_health(validated),
     )
 
-# ---------------------------------------------------------------- Production ML
-# Fetch all watchlist inputs first so the model can compute cross-sectional
-# ranks/breadth across the user's actual watchlist rather than one symbol at a time.
-# ---------------------------------------------------------------------------
-# Direct ALL-NSE Delivery inference
-# ---------------------------------------------------------------------------
-# Delivery ML must not depend on the legacy generic history loader. On a
-# completed NSE session the candidate's exact PIT snapshot in Drive is the
-# preferred source, so run the model directly for the requested NSE symbols.
+# ---------------------------------------------------------------- Research context
+# No legacy production-model routing remains in Research / Diagnostics.
+# The existing renderer continues to show non-ML analytical context only.
+beta_delivery_results = {}
+beta_intraday_results = {}
 direct_delivery_results = {}
 direct_delivery_errors = {}
 direct_delivery_runtime = None
-
-if interface_mode == "Live Test" and live_mode == "Delivery":
-
-    try:
-        direct_delivery_runtime = all_nse_delivery_model_status()
-    except Exception as exc:
-        direct_delivery_runtime = {
-            "status": "MODEL_RUNTIME_ERROR",
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-        }
-
-    for requested_symbol in symbols:
-
-        if not requested_symbol.endswith(".NS"):
-            direct_delivery_errors[requested_symbol] = {
-                "stage": "INPUT",
-                "error_type": "UNSUPPORTED_SUFFIX",
-                "error": (
-                    "The active ALL-NSE Delivery model is NSE-equity only; "
-                    "use SYMBOL.NS or a bare NSE symbol."
-                ),
-            }
-            continue
-
-        try:
-            result = _cached_all_nse_delivery_prediction(
-                requested_symbol,
-                pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat(),
-            )
-
-            if result.get("prediction_status") == "BLOCKED":
-                # Preserve an input-validation block as such. Do not turn an
-                # invalid/non-trainable symbol into a generic RuntimeError.
-                direct_delivery_results[requested_symbol] = result
-                direct_delivery_errors[requested_symbol] = {
-                    "stage": "INPUT_VALIDATION",
-                    "error_type": "SYMBOL_NOT_SUPPORTED",
-                    "error": str(
-                        result.get("reason")
-                        or "symbol_not_in_current_all_nse_trainable_roster"
-                    ),
-                }
-            else:
-                direct_delivery_results[requested_symbol] = result
-
-        except Exception as exc:
-            direct_delivery_errors[requested_symbol] = {
-                "stage": "ALL_NSE_DELIVERY_MODEL",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-
-live_records = []
-data_diagnostics = []
-revision = int(st.session_state.get("watchlist_revision", 0))
 production_results = {}
 delivery_results = {}
-
-# The dedicated ALL-NSE Delivery path above is the only production Delivery
-# inference path. Do not fetch the legacy 420-day chart/context stack or run
-# the legacy delivery_prediction engine during a Delivery request; those calls
-# duplicate work and can turn a single-symbol prediction into a long wait.
-if interface_mode != "Live Test":
-    # The legacy/30-minute Intraday path uses news context; the dedicated
-    # 5-minute stream does not. This is intentionally lazy and remains outside
-    # the critical 5-minute forecast function.
-    news_items = tag_news_items(load_news())
-
-
-    # Delivery ML uses the official NSE daily layer directly. The generic
-    # dashboard history provider must not block Delivery inference.
-    for symbol in symbols:
-
-        raw_df = pd.DataFrame()
-        company_root = (
-            symbol.replace(".NS", "")
-            .replace(".BO", "")
-            .upper()
-        )
-
-        if style == "Delivery" and symbol.endswith(".NS"):
-            try:
-                end_date = pd.Timestamp.now(
-                    tz="Asia/Kolkata"
-                ).date()
-
-                start_date = (
-                    end_date
-                    - pd.Timedelta(days=420)
-                )
-
-                official = nse_fetch_equity_history(
-                    company_root,
-                    start_date,
-                    end_date,
-                    sync_drive=True,
-                )
-
-                if official is not None and not official.empty:
-                    raw_df = official.copy()
-
-            except Exception as exc:
-                data_diagnostics.append({
-                    "symbol": symbol,
-                    "status": "NSE_OFFICIAL_ERROR",
-                    "reason": f"{type(exc).__name__}: {exc}",
-                })
-
-        # Intraday production ML uses the official NSE public quote-chart capture
-        # as its primary live price stream. A generic provider remains only a UI
-        # fallback when the exchange chart is unavailable outside/around market
-        # hours; it is never claimed as NSE provenance.
-        if style == "Intraday" and symbol.endswith(".NS"):
-            try:
-                official_intraday = nse_fetch_intraday_1m_current(
-                    company_root,
-                    sync_drive=True,
-                )
-                if official_intraday is not None and not official_intraday.empty:
-                    raw_df = official_intraday.copy()
-                    data_diagnostics.append({
-                        "symbol": symbol,
-                        "status": "NSE_OFFICIAL_INTRADAY",
-                        "rows": int(len(raw_df)),
-                    })
-            except Exception as exc:
-                data_diagnostics.append({
-                    "symbol": symbol,
-                    "status": "NSE_OFFICIAL_INTRADAY_ERROR",
-                    "reason": f"{type(exc).__name__}: {exc}",
-                })
-
-        # Fallback is allowed for obtaining the UI chart/context only. The
-        # all-NSE Delivery model itself independently verifies and fetches its
-        # official NSE history.
-        if raw_df.empty:
-            try:
-                if style == "Delivery":
-                    fallback = get_historical(
-                        symbol,
-                        "420d",
-                        "1d",
-                        force_refresh=True,
-                    )
-                else:
-                    fallback = load_history(
-                        symbol,
-                        period,
-                        interval,
-                        revision,
-                    )
-
-                if fallback is not None and not fallback.empty:
-                    raw_df = fallback.copy()
-
-            except Exception:
-                raw_df = pd.DataFrame()
-
-        if raw_df.empty:
-            if not any(
-                x.get("symbol") == symbol
-                for x in data_diagnostics
-            ):
-                data_diagnostics.append({
-                    "symbol": symbol,
-                    "status": "NO_DATA",
-                    "reason": "No usable official NSE or fallback history.",
-                })
-            continue
-
-        # Canonicalize the EOD frame for the existing dashboard components.
-        if "date" in raw_df.columns:
-            raw_df["date"] = pd.to_datetime(
-                raw_df["date"],
-                errors="coerce",
-            ).dt.normalize()
-
-            raw_df = (
-                raw_df
-                .dropna(subset=["date"])
-                .sort_values("date")
-                .drop_duplicates("date", keep="last")
-                .set_index("date")
-            )
-
-            for col in [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]:
-                if col in raw_df.columns:
-                    raw_df[col] = pd.to_numeric(
-                        raw_df[col],
-                        errors="coerce",
-                    )
-
-        raw_df = raw_df.rename(
-            columns={
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-            }
-        )
-
-        if "Volume" not in raw_df.columns:
-            raw_df["Volume"] = np.nan
-
-        raw_df = raw_df.sort_index()
-
-        if len(raw_df) < slow + 15:
-            data_diagnostics.append({
-                "symbol": symbol,
-                "status": "INSUFFICIENT_HISTORY",
-                "rows": int(len(raw_df)),
-                "required": int(slow + 15),
-            })
-            continue
-
-        benchmark_symbol = benchmark_for_symbol(symbol)
-
-        try:
-            market_df = load_benchmark(
-                benchmark_symbol,
-                period,
-                interval,
-                revision,
-            )
-        except Exception:
-            market_df = pd.DataFrame()
-
-        try:
-            df = add_indicators(
-                raw_df,
-                fast=fast,
-                slow=slow,
-            )
-        except Exception:
-            df = pd.DataFrame()
-
-        try:
-            mkt_df = (
-                add_indicators(
-                    market_df,
-                    fast=fast,
-                    slow=slow,
-                )
-                if not market_df.empty
-                else market_df
-            )
-        except Exception:
-            mkt_df = pd.DataFrame()
-
-        aliases = stock_news_keywords(symbol)
-        matched_news = news_for_symbol(
-            aliases,
-            news_items,
-        )
-
-        news_stat = news_metrics(
-            matched_news
-        )
-
-        news_perception_label, news_freshness = (
-            news_perception(news_stat)
-        )
-
-        try:
-            announcements_raw = load_announcements(
-                company_root
-            )
-        except Exception:
-            announcements_raw = []
-
-        announcements = []
-
-        for item in announcements_raw[:5]:
-            if not isinstance(item, dict):
-                continue
-
-            announcements.append({
-                "subject":
-                    item.get("subject")
-                    or item.get("desc")
-                    or item.get("attchmntText")
-                    or "Corporate announcement",
-
-                "date":
-                    item.get("an_dt")
-                    or item.get("date")
-                    or item.get("sort_date")
-                    or "",
-
-                "link":
-                    item.get("attchmntFile")
-                    or item.get("link")
-                    or "",
-            })
-
-        event_items = announcement_to_news(
-            announcements
-        )
-
-        all_event_news = (
-            matched_news
-            + event_items
-        )
-
-        event_risk = event_risk_score(
-            matched_news,
-            announcements,
-        )
-
-        live_news_score = (
-            news_metrics(all_event_news)["score"]
-            if all_event_news
-            else 0.0
-        )
-
-        if company_root in INDEX_SYMBOLS:
-            fo_symbol, is_index = company_root, True
-        else:
-            fo_symbol, is_index = company_root, False
-
-        try:
-            raw_chain = load_option_chain(
-                fo_symbol,
-                is_index,
-            )
-            fo = (
-                fo_summarize(raw_chain)
-                if raw_chain
-                else {}
-            )
-        except Exception:
-            fo = {}
-
-        try:
-            t_score = (
-                technical_score(
-                    df,
-                    fast=fast,
-                    slow=slow,
-                )
-                if not df.empty
-                else 0.0
-            )
-        except Exception:
-            t_score = 0.0
-
-        try:
-            m_score = (
-                market_regime_score(
-                    mkt_df,
-                    fast=fast,
-                    slow=slow,
-                )
-                if not mkt_df.empty
-                else 0.0
-            )
-        except Exception:
-            m_score = 0.0
-
-        live_records.append({
-            "symbol": symbol,
-            "raw_df": raw_df,
-            "df": df,
-            "market_df": market_df,
-            "mkt_df": mkt_df,
-            "benchmark_symbol": benchmark_symbol,
-            "matched_news": matched_news,
-            "news_stat": news_stat,
-            "news_perception_label": news_perception_label,
-            "news_freshness": news_freshness,
-            "announcements": announcements,
-            "event_risk": event_risk,
-                         "live_news_score": live_news_score,
-            "fo": fo,
-            "t_score": t_score,
-            "m_score": m_score,
-        })
-
-    production_results = {}
-    delivery_results = {}
-    if style == "Intraday" and live_records:
-        try:
-            for r in live_records:
-                try:
-                    ml = certified_intraday_prediction(
-                        r["symbol"],
-                        r["raw_df"],
-                        r.get("market_df"),
-                        r.get("fo") or {},
-                        r["raw_df"].index[-1] if not r["raw_df"].empty else None,
-                        r.get("matched_news", []),
-                        r.get("announcements", []),
-                        r.get("event_risk", 0.0),
-                    )
-                    production_results[r["symbol"]] = ml
-                except Exception as inner_exc:
-                    production_results[r["symbol"]] = {"prediction_status":"ERROR","symbol":r["symbol"],"error_type":type(inner_exc).__name__,"error":str(inner_exc)}
-        except Exception as exc:
-            st.error(f"Production ML engine could not produce a live prediction: {type(exc).__name__}: {exc}")
-            production_results = {}
-
-    if style == "Delivery" and live_records:
-        try:
-            for r in live_records:
-                company_root = (
-                    r["symbol"]
-                    .replace(".NS", "")
-                    .replace(".BO", "")
-                )
-
-                item = {
-                    "symbol": company_root,
-                    "price_df": r["raw_df"],
-                    "market_df": r["market_df"],
-                    "news": {
-                        "available": (
-                            1.0
-                            if r.get("matched_news")
-                            else 0.0
-                        ),
-                    },
-                    "event": {
-                        "available": (
-                            1.0
-                            if r.get("announcements")
-                            else 0.0
-                        ),
-                        "high_impact": (
-                            1.0
-                            if r.get("announcements")
-                            else 0.0
-                        ),
-                    },
-                    "fno": {
-                        **(r.get("fo") or {}),
-                        "available": (
-                            1.0
-                            if r.get("fo")
-                            else 0.0
-                        ),
-                    },
-                    "decision_timestamp": str(
-                        r["raw_df"].index[-1]
-                    ),
-                }
-
-                result = delivery_prediction(
-                    item,
-                    sync_drive=True,
-                )
-
-                delivery_results[
-                    r["symbol"]
-                ] = result
-
-            # Existing primary prediction is retained. Add the gated model/context
-            # diagnostics after successful inference so they can never mask a
-            # primary prediction failure.
-            for r in live_records:
-                symbol_key = r["symbol"]
-                base_result = (
-                    direct_delivery_results.get(
-                        symbol_key
-                    )
-                    or delivery_results.get(
-                        symbol_key
-                    )
-                )
-
-                if not base_result:
-                    continue
-
-                if base_result.get(
-                    "prediction_status"
-                ) != "PASS":
-                    continue
-
-                try:
-                    hist = r["raw_df"].copy()
-
-                    if "date" not in hist.columns:
-                        hist = hist.reset_index()
-
-                    market = r.get(
-                        "market_df"
-                    )
-
-                    if market is None:
-                        market = pd.DataFrame()
-
-                    else:
-                        market = market.copy()
-
-                        if "date" not in market.columns:
-                            market = market.reset_index()
-
-                    feature_row = all_nse_feature_builder(
-                        hist,
-                        market,
-                    )
-
-                    enriched = enrich_delivery_prediction(
-                        base_result,
-                        symbol_key,
-                        feature_row,
-                        hist,
-                        market,
-                        base_result.get(
-                            "decision_timestamp"
-                        )
-                        or r["raw_df"].index[-1],
-                        news_items=tag_news_items(
-                            r.get(
-                                "matched_news",
-                                [],
-                            )
-                        ),
-                        announcements=r.get(
-                            "announcements",
-                            [],
-                        ),
-                        fno=r.get(
-                            "fo",
-                            {},
-                        ),
-                    )
-
-                    if direct_delivery_results.get(
-                        symbol_key
-                    ):
-                        direct_delivery_results[
-                            symbol_key
-                        ] = enriched
-
-                    if delivery_results.get(
-                        symbol_key
-                    ):
-                        delivery_results[
-                            symbol_key
-                        ] = enriched
-
-                except Exception as enrich_exc:
-                    base_result[
-                        "ensemble_context_status"
-                    ] = "ERROR"
-                    base_result[
-                        "ensemble_context_error"
-                    ] = (
-                        f"{type(enrich_exc).__name__}: "
-                        f"{enrich_exc}"
-                    )
-
-            cached_delivery_validation.clear()
-
-        except Exception as exc:
-            st.error(
-                "Delivery ML engine could not produce a live prediction: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-
-    if live_mode == "Delivery" and direct_delivery_runtime is not None:
-        with st.expander("ALL-NSE Delivery runtime diagnostic", expanded=True):
-            st.json(direct_delivery_runtime)
-
-        if direct_delivery_errors:
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "symbol": s,
-                            **details,
-                        }
-                        for s, details in direct_delivery_errors.items()
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-
-    if not live_records:
-        if style == "Delivery" and direct_delivery_results:
-            st.info(
-                "Delivery ML result is available from the dedicated ALL-NSE "
-                "model path. The legacy chart/context history path did not "
-                "produce a record; it does not block the model result."
-            )
-        else:
-            st.error(
-                "No stock analysis result was produced from the active watchlist."
-            )
-
-        if data_diagnostics:
-            st.dataframe(
-                pd.DataFrame(data_diagnostics),
-                width="stretch",
-                hide_index=True,
-            )
-
-        diag = source_diagnostics()
-
-        if diag:
-            with st.expander(
-                "NSE transport diagnostic",
-                expanded=True,
-            ):
-                st.json(diag)
-
-        if style != "Delivery" or not direct_delivery_results:
-            st.info(
-                "NSE official data is the first remote source for NSE equities. "
-                "Persistent/local data is used as cache; Dhan and Yahoo are "
-                "fallbacks only when NSE cannot provide usable history."
-            )
-
-# Render direct ALL-NSE Delivery model results even when the generic
-# dashboard context history is unavailable.
-if live_mode == "Delivery" and direct_delivery_results and not live_records:
-
-    for symbol, dlv in direct_delivery_results.items():
-
-        st.markdown(f"## {symbol}")
-
-        st.markdown(
-            "### Live ALL-NSE Delivery ML — next-session signal"
-        )
-
-        if dlv.get("prediction_status") == "PASS":
-
-            d1, d2, d3, d4, d5 = st.columns(5)
-
-            d1.metric(
-                "Delivery Signal",
-                dlv.get("signal", "HOLD"),
-            )
-
-            d2.metric(
-                "P(up) next session",
-                f"{dlv.get('probability_up_next_session', np.nan):.1%}",
-            )
-
-            d3.metric(
-                "Expected move",
-                f"{dlv.get('predicted_return_next_session', np.nan):+.2%}",
-            )
-
-            d4.metric(
-                "Confidence",
-                dlv.get("confidence", "UNKNOWN"),
-            )
-
-            d5.metric(
-                "Model inputs",
-                str(dlv.get("feature_count", 59)),
-            )
-
-            st.write({
-                "model_version":
-                    dlv.get("model_version"),
-                "reference_session":
-                    dlv.get("reference_session"),
-                "feature_source":
-                    dlv.get("feature_source"),
-                "PIT_snapshot_date":
-                    dlv.get("pit_snapshot_date"),
-                "data_readiness":
-                    dlv.get("data_readiness_score"),
-                "non_missing_features":
-                    (
-                        f"{dlv.get('non_missing_feature_count', 0)}/"
-                        f"{dlv.get('feature_count', 59)}"
-                    ),
-                "trainable_NSE_symbols":
-                    dlv.get("trainable_symbol_count"),
-                "NSE_universe_symbols":
-                    dlv.get("universe_symbol_count"),
-            })
-
-            st.caption(
-                "Direct Delivery inference from the exact persisted "
-                "ALL-NSE PIT feature snapshot. Intraday is unchanged. "
-                "No orders are placed."
-            )
-
-        elif dlv.get("prediction_status") == "BLOCKED":
-
-            st.error(
-                "Delivery prediction blocked: "
-                + str(dlv.get("reason", "unknown"))
-            )
-
-        else:
-
-            st.warning(
-                "Delivery model did not return a prediction."
-            )
-
-    if direct_delivery_errors:
-
-        with st.expander(
-            "Why some Delivery predictions failed",
-            expanded=True,
-        ):
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "symbol": s,
-                            **details,
-                        }
-                        for s, details
-                        in direct_delivery_errors.items()
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-
-if live_mode == "Delivery" and direct_delivery_results:
-    render_delivery_forecast(direct_delivery_results)
 
 for rec in live_records:
     symbol = rec["symbol"]
