@@ -142,20 +142,28 @@ jobs:
           echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
 
       - name: Build target production PIT snapshot
-        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
+        if: steps.target.outputs.target_date != ''
         run: |
-          python -u delivery_production_refresh.py --lookback-days 150 --delivery-lookback-days 150 --expected-date "${{ steps.target.outputs.target_date }}"
+          if [ "${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
+            echo "Target PIT snapshot already exists; skipping rebuild."
+          else
+            python -u delivery_production_refresh.py \
+              --lookback-days 150 \
+              --delivery-lookback-days 150 \
+              --source-wait-minutes 0 \
+              --expected-date "${{ steps.target.outputs.target_date }}"
+          fi
 
       - name: Validate completed Delivery predictions
-        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
+        if: steps.target.outputs.target_date != ''
         run: python -u validate_prediction_ledger.py
 
       - name: Generate Delivery OOS diagnostics
-        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
+        if: steps.target.outputs.target_date != ''
         run: python -u delivery_validation_diagnostics.py
 
       - name: Update OOS-gated adaptive Delivery policy
-        if: steps.target.outputs.target_date != '' && steps.snapshot.outputs.exists != 'YES'
+        if: steps.target.outputs.target_date != ''
         run: python -u delivery_policy_update.py --min-samples 80
 
       - name: Confirm target snapshot
