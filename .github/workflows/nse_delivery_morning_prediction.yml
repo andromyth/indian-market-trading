@@ -1,0 +1,124 @@
+name: NSE Delivery pre-open prediction
+
+on:
+  workflow_dispatch:
+    inputs:
+      prediction_date:
+        description: "Optional NSE prediction session date YYYY-MM-DD"
+        required: false
+        default: ""
+  # 08:00 IST on NSE trading weekdays = 02:30 UTC.
+  # The run uses the immediately preceding NSE trading session as the
+  # point-in-time reference and produces the next-session prediction before
+  # the cash market opens.
+  schedule:
+    - cron: "30 2 * * 1-5"
+
+concurrency:
+  group: nse-delivery-morning-prediction
+  cancel-in-progress: false
+
+jobs:
+  morning-prediction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Prepare persistent data path
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.market_data"
+
+      - name: Resolve prediction session
+        id: target
+        env:
+          MANUAL_PREDICTION_DATE: ${{ inputs.prediction_date }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from production_data_freshness_gate import HOLIDAYS, previous_trading_day
+
+          IST = ZoneInfo("Asia/Kolkata")
+          manual = os.environ.get("MANUAL_PREDICTION_DATE", "").strip()
+          now = datetime.now(IST)
+          target = datetime.fromisoformat(manual).date() if manual else now.date()
+
+          if target.weekday() >= 5 or target in HOLIDAYS:
+              print(f"NO_TRADING_SESSION: {target}")
+              open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8").write("prediction_date=\nreference_date=\n")
+              raise SystemExit(0)
+
+          reference = previous_trading_day(target)
+          print(f"Prediction session : {target}")
+          print(f"Reference session  : {reference}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"prediction_date={target.isoformat()}\n")
+              out.write(f"reference_date={reference.isoformat()}\n")
+          PY
+
+      - name: Verify Google Drive authentication
+        if: steps.target.outputs.prediction_date != ''
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status()
+          print(status)
+          if not status.get("configured") or status.get("reachable") is False:
+              raise SystemExit("Google Drive authentication check failed")
+          PY
+
+      - name: Refresh reference-session PIT snapshot
+        if: steps.target.outputs.prediction_date != ''
+        run: |
+          set -euo pipefail
+          python -u delivery_production_refresh.py \
+            --lookback-days 150 \
+            --delivery-lookback-days 150 \
+            --source-wait-minutes 0 \
+            --expected-date "${{ steps.target.outputs.reference_date }}"
+
+      - name: Generate pre-open Delivery predictions
+        if: steps.target.outputs.prediction_date != ''
+        run: |
+          set -euo pipefail
+          python -u delivery_all_nse_prediction_cycle.py \
+            --snapshot-date "${{ steps.target.outputs.reference_date }}" \
+            --prediction-date "${{ steps.target.outputs.prediction_date }}"
+
+      - name: Publish prediction CSV ledger
+        if: steps.target.outputs.prediction_date != ''
+        run: |
+          set -euo pipefail
+          python -u delivery_prediction_csv_ledger.py
+
+      - name: Syntax check
+        if: steps.target.outputs.prediction_date != ''
+        run: |
+          python -m py_compile \
+            production_data_freshness_gate.py \
+            delivery_production_refresh.py \
+            delivery_all_nse_prediction_cycle.py \
+            delivery_prediction_csv_ledger.py \
+            prediction_ledger.py \
+            prediction_validation.py \
+            validate_prediction_ledger.py \
+            app.py
