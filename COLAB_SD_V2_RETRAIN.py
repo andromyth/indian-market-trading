@@ -11,6 +11,8 @@ import argparse
 import json
 from pathlib import Path
 
+import duckdb
+
 import pandas as pd
 
 from delivery_training_universe import training_roster
@@ -35,6 +37,135 @@ def load_optional(path: Path) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
     return pd.read_parquet(path)
+
+
+def build_full_history_panel_chunked(
+    base: Path,
+    out: Path,
+    master: Path,
+    *,
+    chunk_size: int = 100,
+) -> pd.DataFrame:
+    """Build the full-history Beta V2 base panel in resumable symbol chunks.
+
+    The previous implementation held 2,382 per-symbol DataFrames in memory and
+    then performed one large concat. On Colab this can be interrupted after the
+    final progress message during the peak-memory concat. This version writes
+    each completed symbol chunk to Drive, resumes existing chunks, and uses
+    DuckDB to assemble the completed Parquet parts without creating another
+    giant Python-side concat.
+    """
+    parts_dir = out / "base_panel_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    bulk = load_canonical_cash_research_history(master)
+    if bulk.empty:
+        raise RuntimeError("Canonical NSE cash research view is empty")
+
+    roster = training_roster(bulk, min_history=60, force_refresh=False)
+    trainable = list(roster["trainable_symbols"])
+    if not trainable:
+        raise RuntimeError("No trainable NSE symbols found in canonical cash history")
+
+    delivery = load_delivery_history(
+        DEFAULT_DELIVERY_ROOT,
+        symbols=trainable,
+        start=bulk["date"].min(),
+        end=bulk["date"].max(),
+    )
+
+    # Prepare a cheap symbol lookup so each batch filters the large source
+    # once, rather than copying the complete 4M+ row frame.
+    bulk["symbol"] = bulk["symbol"].astype(str).str.upper().str.strip()
+    delivery = delivery.copy()
+    if not delivery.empty and "symbol" in delivery.columns:
+        delivery["symbol"] = delivery["symbol"].astype(str).str.upper().str.strip()
+
+    total = len(trainable)
+    for start in range(0, total, chunk_size):
+        end = min(total, start + chunk_size)
+        chunk_index = start // chunk_size + 1
+        part = parts_dir / f"part_{chunk_index:04d}_{start+1:04d}_{end:04d}.parquet"
+
+        if part.exists() and part.stat().st_size > 0:
+            print(
+                f"base panel chunk {chunk_index}: reused symbols {start+1:,}-{end:,}; "
+                f"file={part.name}",
+                flush=True,
+            )
+            continue
+
+        symbols = trainable[start:end]
+        symbol_set = set(str(x).upper().strip() for x in symbols)
+        bulk_chunk = bulk[bulk["symbol"].isin(symbol_set)].copy()
+        delivery_chunk = (
+            delivery[delivery["symbol"].isin(symbol_set)].copy()
+            if not delivery.empty and "symbol" in delivery.columns
+            else delivery
+        )
+
+        print(
+            f"base panel chunk {chunk_index}: building symbols {start+1:,}-{end:,} "
+            f"({len(symbols):,} symbols)",
+            flush=True,
+        )
+        chunk_panel = make_panel(
+            bulk_chunk,
+            symbols,
+            sort_output=False,
+            delivery=delivery_chunk,
+        )
+        if chunk_panel.empty:
+            raise RuntimeError(
+                f"Base panel chunk {chunk_index} produced no rows "
+                f"for symbols {start+1}-{end}"
+            )
+        chunk_panel.to_parquet(part, index=False)
+        print(
+            f"base panel chunk {chunk_index}: saved rows={len(chunk_panel):,} "
+            f"symbols={chunk_panel['symbol'].nunique():,}",
+            flush=True,
+        )
+        del bulk_chunk, delivery_chunk, chunk_panel
+
+    # Assemble via DuckDB directly into one Parquet file. This avoids the
+    # peak-memory pandas concat that repeatedly interrupted the Colab run.
+    combined = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
+    glob = str(parts_dir / "part_*.parquet").replace("'", "''")
+    tmp = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet.tmp"
+    if not combined.exists() or combined.stat().st_size == 0:
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"""
+                COPY (
+                    SELECT *
+                    FROM read_parquet('{glob}')
+                )
+                TO '{str(tmp).replace("'", "''")}'
+                (FORMAT PARQUET, COMPRESSION ZSTD);
+                """
+            )
+        finally:
+            con.close()
+        tmp.replace(combined)
+
+    panel = pd.read_parquet(combined)
+    sessions = int(
+        pd.to_datetime(panel["date"], errors="coerce").dt.normalize().nunique()
+    )
+    if sessions < MIN_WALKFORWARD_SESSIONS:
+        raise RuntimeError(
+            f"Chunked canonical source build produced only {sessions} sessions; "
+            f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
+        )
+    print(
+        f"Full-history base panel ready: rows={len(panel):,}, "
+        f"symbols={panel['symbol'].nunique():,}, sessions={sessions:,}; "
+        f"saved={combined}",
+        flush=True,
+    )
+    return panel
 
 
 def main() -> int:
@@ -95,45 +226,11 @@ def main() -> int:
                 f"base panel from the canonical NSE cash master for full-history walk-forward training.",
                 flush=True,
             )
-            bulk = load_canonical_cash_research_history(master)
-            roster = training_roster(bulk, min_history=60, force_refresh=False)
-            trainable = list(roster["trainable_symbols"])
-            delivery = load_delivery_history(
-                DEFAULT_DELIVERY_ROOT,
-                symbols=trainable,
-                start=bulk["date"].min(),
-                end=bulk["date"].max(),
-            )
-            # The downstream code sorts by symbol/date where needed. Avoid the
-            # expensive global sort here because this panel can contain millions
-            # of rows.
-            rebuilt = make_panel(
-                bulk,
-                trainable,
-                sort_output=False,
-                delivery=delivery,
-            )
-            if rebuilt.empty:
-                raise RuntimeError("Full-history Beta V2 base-panel rebuild produced no rows")
-
-            rebuilt_sessions = int(
-                pd.to_datetime(rebuilt["date"], errors="coerce")
-                .dt.normalize()
-                .nunique()
-            )
-            if rebuilt_sessions < MIN_WALKFORWARD_SESSIONS:
-                raise RuntimeError(
-                    f"Canonical source rebuild produced only {rebuilt_sessions} sessions; "
-                    f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}. "
-                    "The available historical source is not yet sufficient for the configured OOS design."
-                )
-            panel = rebuilt
-            panel.to_parquet(source_copy, index=False)
-            print(
-                f"Full-history base panel ready: rows={len(panel):,}, "
-                f"symbols={panel['symbol'].nunique():,}, sessions={rebuilt_sessions:,}; "
-                f"saved={source_copy}",
-                flush=True,
+            panel = build_full_history_panel_chunked(
+                base,
+                out,
+                master,
+                chunk_size=100,
             )
 
     global_path = base / "selfdriving/global_cues.parquet"
