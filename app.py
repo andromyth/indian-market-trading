@@ -92,8 +92,8 @@ interface_mode = st.sidebar.radio(
 if interface_mode == "Research / Diagnostics":
     st.title("Indian Market Trading — Research & Diagnostics")
     st.caption(
-        "Development and research tools. The active production Delivery model is the ALL-NSE 59-feature path; "
-        "the active Intraday model is the certified 137-feature target_30m path. No orders are placed."
+        "Development and research tools. Live Test uses the Beta V2 self-driving Delivery and Intraday runtime adapters. "
+        "Research / Diagnostics remains separate from live model serving. No orders are placed."
     )
 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
@@ -1641,6 +1641,7 @@ def cached_delivery_validation():
 # ---------------------------------------------------------------- Research context
 # No legacy production-model routing remains in Research / Diagnostics.
 # The existing renderer continues to show non-ML analytical context only.
+live_records = []
 beta_delivery_results = {}
 beta_intraday_results = {}
 direct_delivery_results = {}
