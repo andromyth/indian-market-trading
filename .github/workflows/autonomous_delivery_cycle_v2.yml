@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: beta_version2
+          ref: main
 
       - uses: actions/setup-python@v5
         with:
