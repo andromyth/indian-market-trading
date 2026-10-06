@@ -278,12 +278,12 @@ def _session_rows(
                 "tod_sin": np.sin(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
                 "tod_cos": np.cos(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
                 "mins_since_open": float(mins_since),
-                "market_ret_5m": float(mret5.iloc[pos]) if np.isfinite(mret5.iloc[pos]) else np.nan,
-                "market_ret_15m": float(mret15.iloc[pos]) if np.isfinite(mret15.iloc[pos]) else np.nan,
-                "market_ret_30m": float(mret30.iloc[pos]) if np.isfinite(mret30.iloc[pos]) else np.nan,
-                "relative_ret_5m": float(r5[pos] - mret5.iloc[pos]) if np.isfinite(r5[pos]) and np.isfinite(mret5.iloc[pos]) else np.nan,
-                "relative_ret_15m": float(r15[pos] - mret15.iloc[pos]) if np.isfinite(r15[pos]) and np.isfinite(mret15.iloc[pos]) else np.nan,
-                "relative_ret_30m": float(r30[pos] - mret30.iloc[pos]) if np.isfinite(r30.iloc[pos]) and np.isfinite(mret30.iloc[pos]) else np.nan,
+                "market_ret_5m": float(mret5_arr[pos]) if np.isfinite(mret5_arr[pos]) else np.nan,
+                "market_ret_15m": float(mret15_arr[pos]) if np.isfinite(mret15_arr[pos]) else np.nan,
+                "market_ret_30m": float(mret30_arr[pos]) if np.isfinite(mret30_arr[pos]) else np.nan,
+                "relative_ret_5m": float(r5[pos] - mret5_arr[pos]) if np.isfinite(r5[pos]) and np.isfinite(mret5_arr[pos]) else np.nan,
+                "relative_ret_15m": float(r15[pos] - mret15_arr[pos]) if np.isfinite(r15[pos]) and np.isfinite(mret15_arr[pos]) else np.nan,
+                "relative_ret_30m": float(r30[pos] - mret30_arr[pos]) if np.isfinite(r30.iloc[pos]) and np.isfinite(mret30_arr[pos]) else np.nan,
             }
 
             for hmin in horizons:
