@@ -184,6 +184,49 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Process-local index of official intraday files. The previous implementation
+# called official.rglob("<SYMBOL>.parquet") for every symbol. With the full NSE
+# universe this repeatedly walked the entire Drive tree and could make a fresh
+# Colab session appear hung for many minutes.
+_OFFICIAL_FILE_INDEX: dict[str, list[Path]] | None = None
+_OFFICIAL_FILE_INDEX_ROOT: Path | None = None
+
+
+def _official_intraday_file_index(root: Path) -> dict[str, list[Path]]:
+    global _OFFICIAL_FILE_INDEX, _OFFICIAL_FILE_INDEX_ROOT
+
+    official = (root / INTRADAY_REL).resolve()
+    if not official.exists():
+        return {}
+
+    if _OFFICIAL_FILE_INDEX is not None and _OFFICIAL_FILE_INDEX_ROOT == official:
+        return _OFFICIAL_FILE_INDEX
+
+    print(
+        f"BUILDING OFFICIAL INTRADAY FILE INDEX: {official}",
+        flush=True,
+    )
+    index: dict[str, list[Path]] = {}
+    for p in official.rglob("*.parquet"):
+        key = p.stem.strip().upper()
+        if key.endswith(".NS") or key.endswith(".BO"):
+            key = key.rsplit(".", 1)[0]
+        index.setdefault(key, []).append(p)
+
+    for key in index:
+        index[key].sort()
+
+    _OFFICIAL_FILE_INDEX = index
+    _OFFICIAL_FILE_INDEX_ROOT = official
+
+    print(
+        f"OFFICIAL INTRADAY FILE INDEX READY: files={sum(len(v) for v in index.values()):,}, "
+        f"symbols={len(index):,}",
+        flush=True,
+    )
+    return index
+
+
 def load_symbol(root:Path,sym:str)->pd.DataFrame:
     parts=[]
     seed=root/SEED_REL/f"symbol={sym}"
@@ -193,13 +236,16 @@ def load_symbol(root:Path,sym:str)->pd.DataFrame:
                 z=pd.read_parquet(p)
                 if not z.empty: parts.append(_norm(z))
             except Exception: pass
-    official=root/INTRADAY_REL
+
+    official = root / INTRADAY_REL
     if official.exists():
-        for p in sorted(official.rglob(f"{sym}.parquet")):
+        index = _official_intraday_file_index(root)
+        for p in index.get(str(sym).strip().upper(), []):
             try:
                 z=pd.read_parquet(p)
                 if not z.empty: parts.append(_norm(z))
             except Exception: pass
+
     parts=[x for x in parts if x is not None and not x.empty]
     if not parts: return pd.DataFrame()
     q=pd.concat(parts).sort_index()
