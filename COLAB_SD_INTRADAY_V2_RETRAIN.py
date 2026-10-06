@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import joblib
@@ -278,11 +279,22 @@ def main() -> int:
                     "status": "ERROR",
                     "error": f"{type(exc).__name__}: {exc}",
                 })
-
-            if i == batch_start + 1 or i == batch_end:
                 print(
-                    f"prepared {i:,}/{len(universe):,} symbols in batch {part_no}; "
-                    f"batch_rows={len(batch_rows):,}",
+                    f"symbol {i:,}/{len(universe):,} {sym}: ERROR "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"symbol {i:,}/{len(universe):,} {sym}: "
+                    f"generated={len(generated):,}; batch_rows={len(batch_rows):,}",
+                    flush=True,
+                )
+
+            if i == batch_end:
+                print(
+                    f"prepared batch {part_no}: completed symbols "
+                    f"{batch_start+1:,}-{batch_end:,}; batch_rows={len(batch_rows):,}",
                     flush=True,
                 )
 
