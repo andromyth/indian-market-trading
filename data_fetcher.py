@@ -262,14 +262,12 @@ def _yahoo_period_bounds(period: str, interval: str):
 
 
 def _yahoo_chart_history(symbol: str, period: str, interval: str):
-    """Fetch Yahoo history through the public chart JSON API.
+    """Fetch Yahoo Finance chart data with dual-host fallback.
 
-    This deliberately avoids yfinance's internal cookie/session machinery,
-    which can fail on hosted runtimes with repeated `Connection already opened`
-    OperationalErrors. A fresh HTTP request is used for each fetch.
+    Yahoo's chart service is used only as the non-NSE fallback. query2 is
+    attempted first because some hosted environments route query1 poorly.
     """
     period1, period2 = _yahoo_period_bounds(period, interval)
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {
         "period1": period1,
         "period2": period2,
@@ -278,39 +276,72 @@ def _yahoo_chart_history(symbol: str, period: str, interval: str):
         "includeAdjustedClose": "true",
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+        ),
         "Accept": "application/json,text/plain,*/*",
     }
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=(5, 15))
-        response.raise_for_status()
-        payload = response.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            return pd.DataFrame()
-        result0 = result[0]
-        timestamps = result0.get("timestamp") or []
-        indicators = result0.get("indicators") or {}
-        quote_list = indicators.get("quote") or []
-        if not timestamps or not quote_list:
-            return pd.DataFrame()
-        quote = quote_list[0]
-        adj_list = indicators.get("adjclose") or []
-        adj = adj_list[0].get("adjclose", []) if adj_list else []
-        frame = pd.DataFrame({
-            "Open": quote.get("open", []),
-            "High": quote.get("high", []),
-            "Low": quote.get("low", []),
-            "Close": quote.get("close", []),
-            "Volume": quote.get("volume", []),
-        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
-        if len(adj) == len(frame):
-            frame["Adj Close"] = adj
-        frame.index.name = "Datetime"
-        return _normalize_historical_frame(frame)
-    except Exception:
-        return pd.DataFrame()
 
+    for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{symbol}"
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=(5, 15),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result = (payload.get("chart") or {}).get("result") or []
+            if not result:
+                continue
+
+            result0 = result[0]
+            timestamps = result0.get("timestamp") or []
+            indicators = result0.get("indicators") or {}
+            quote_list = indicators.get("quote") or []
+            if not timestamps or not quote_list:
+                continue
+
+            quote = quote_list[0]
+            frame = pd.DataFrame(
+                {
+                    "Open": quote.get("open", []),
+                    "High": quote.get("high", []),
+                    "Low": quote.get("low", []),
+                    "Close": quote.get("close", []),
+                    "Volume": quote.get("volume", []),
+                },
+                index=pd.to_datetime(timestamps, unit="s", utc=True),
+            )
+
+            adj_list = indicators.get("adjclose") or []
+            adj = adj_list[0].get("adjclose", []) if adj_list else []
+            if len(adj) == len(frame):
+                frame["Adj Close"] = adj
+
+            frame.index.name = "Datetime"
+            normalized = _normalize_historical_frame(frame)
+            if not normalized.empty:
+                return normalized
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+def fetch_yahoo_intraday_1m(symbol: str, days: int = 3) -> pd.DataFrame:
+    """Public non-NSE fallback for current 1-minute NSE-equity data."""
+    try:
+        days = max(1, min(int(days), 7))
+    except Exception:
+        days = 3
+    ticker = str(symbol).strip().upper()
+    if not ticker.endswith(".NS"):
+        ticker = f"{ticker}.NS"
+    return _yahoo_chart_history(ticker, f"{days}d", "1m")
 
 def _yahoo_history(symbol: str, period: str, interval: str):
     """Yahoo reference fallback without yfinance."""
