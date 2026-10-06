@@ -57,32 +57,75 @@ def build_full_history_panel_chunked(
     """
     parts_dir = out / "base_panel_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
+    combined = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
 
-    bulk = load_canonical_cash_research_history(master)
-    if bulk.empty:
-        raise RuntimeError("Canonical NSE cash research view is empty")
+    # Fast resume path: if the combined parquet already exists, do not reload
+    # the canonical 4M+ row source just to discover that the work is complete.
+    if combined.exists() and combined.stat().st_size > 0:
+        print(
+            f"Full-history base panel already assembled: {combined} "
+            f"({combined.stat().st_size / 1024 / 1024:.1f} MB); loading it.",
+            flush=True,
+        )
+        panel = pd.read_parquet(combined)
+        sessions = int(
+            pd.to_datetime(panel["date"], errors="coerce").dt.normalize().nunique()
+        )
+        if sessions < MIN_WALKFORWARD_SESSIONS:
+            raise RuntimeError(
+                f"Cached full-history base panel has only {sessions} sessions; "
+                f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}."
+            )
+        print(
+            f"Cached full-history base panel loaded: rows={len(panel):,}, "
+            f"symbols={panel['symbol'].nunique():,}, sessions={sessions:,}",
+            flush=True,
+        )
+        return panel
 
-    roster = training_roster(bulk, min_history=60, force_refresh=False)
-    trainable = list(roster["trainable_symbols"])
-    if not trainable:
-        raise RuntimeError("No trainable NSE symbols found in canonical cash history")
+    # Second fast resume path: when every symbol chunk is already present,
+    # assemble directly. No canonical source or Delivery reread is needed.
+    final_part = parts_dir / "part_0024_2301_2382.parquet"
+    existing_parts = sorted(parts_dir.glob("part_*.parquet"))
+    if final_part.exists() and len(existing_parts) >= 24:
+        print(
+            f"All {len(existing_parts)} checkpoint files are present; "
+            "assembling cached chunks directly.",
+            flush=True,
+        )
+    else:
+        existing_parts = []
 
-    delivery = load_delivery_history(
-        DEFAULT_DELIVERY_ROOT,
-        symbols=trainable,
-        start=bulk["date"].min(),
-        end=bulk["date"].max(),
-    )
+    bulk = None
+    trainable = None
+    delivery = None
+    if not existing_parts:
+        bulk = load_canonical_cash_research_history(master)
+        if bulk.empty:
+            raise RuntimeError("Canonical NSE cash research view is empty")
 
-    # Prepare a cheap symbol lookup so each batch filters the large source
+        roster = training_roster(bulk, min_history=60, force_refresh=False)
+        trainable = list(roster["trainable_symbols"])
+        if not trainable:
+            raise RuntimeError("No trainable NSE symbols found in canonical cash history")
+
+        delivery = load_delivery_history(
+            DEFAULT_DELIVERY_ROOT,
+            symbols=trainable,
+            start=bulk["date"].min(),
+            end=bulk["date"].max(),
+        )
+
+        # Prepare a cheap symbol lookup so each batch filters the large source
     # once, rather than copying the complete 4M+ row frame.
     bulk["symbol"] = bulk["symbol"].astype(str).str.upper().str.strip()
     delivery = delivery.copy()
     if not delivery.empty and "symbol" in delivery.columns:
         delivery["symbol"] = delivery["symbol"].astype(str).str.upper().str.strip()
 
-    total = len(trainable)
-    for start in range(0, total, chunk_size):
+    if not existing_parts:
+        total = len(trainable)
+        for start in range(0, total, chunk_size):
         end = min(total, start + chunk_size)
         chunk_index = start // chunk_size + 1
         part = parts_dir / f"part_{chunk_index:04d}_{start+1:04d}_{end:04d}.parquet"
