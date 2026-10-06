@@ -97,8 +97,8 @@ def pull_latest_pit(store) -> Path | None:
     return local
 
 
-def pull_recent_pit_snapshots(store, limit: int = 100) -> tuple[pd.DataFrame, Path | None]:
-    """Pull recent persisted official NSE PIT snapshots for live inference and realised returns."""
+def pull_latest_pit_snapshot(store) -> Path | None:
+    """Pull only the latest persisted official NSE PIT snapshot for live inference."""
     parent = store.root_id
     for part in ("features", "daily"):
         hit = store._find_child(parent, part, "application/vnd.google-apps.folder")
@@ -127,7 +127,7 @@ def pull_recent_pit_snapshots(store, limit: int = 100) -> tuple[pd.DataFrame, Pa
     latest_path = None
     from googleapiclient.http import MediaIoBaseDownload
 
-    for i, item in enumerate(files):
+    for item in files:
         local = ROOT / "pit_history" / str(item["name"])
         local.parent.mkdir(parents=True, exist_ok=True)
         if not local.exists() or local.stat().st_size == 0:
@@ -155,31 +155,11 @@ def pull_recent_pit_snapshots(store, limit: int = 100) -> tuple[pd.DataFrame, Pa
                 x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
                 x["close"] = pd.to_numeric(x["close"], errors="coerce")
                 frames.append(x.dropna(subset=["symbol", "date", "close"]))
-                if i == 0:
-                    latest_path = local
+                latest_path = local
         except Exception:
             continue
 
-    if not frames:
-        return pd.DataFrame(), latest_path
-
-    hist = (
-        pd.concat(frames, ignore_index=True)
-        .drop_duplicates(["symbol", "date"], keep="last")
-        .sort_values(["symbol", "date"])
-        .reset_index(drop=True)
-    )
-    hist["y_return"] = (
-        hist.groupby("symbol", sort=False)["close"].shift(-1) / hist["close"] - 1.0
-    )
-    realised = (
-        hist.dropna(subset=["y_return"])[["symbol", "date", "y_return"]]
-        .drop_duplicates(["symbol", "date"], keep="last")
-        .sort_values(["date", "symbol"])
-        .reset_index(drop=True)
-    )
-    realised.to_parquet(ROOT / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet", index=False)
-    return realised, latest_path
+    return latest_path
 
 
 def pull_sources(store) -> dict:
@@ -227,11 +207,33 @@ def main() -> int:
 
     store = drive()
     status["stages"]["pull"] = pull_sources(store)
-    realised, latest_pit = pull_recent_pit_snapshots(store, limit=100)
+    latest_pit = pull_latest_pit_snapshot(store)
+
+    realised = pd.DataFrame()
+    training_local = ROOT / "BETA_V2_DELIVERY_TRAINING_PANEL.parquet"
+    if training_local.exists():
+        try:
+            tp = pd.read_parquet(training_local)
+            if {"symbol", "date", "y_return"}.issubset(tp.columns):
+                realised = (
+                    tp[["symbol", "date", "y_return"]]
+                    .dropna()
+                    .drop_duplicates(["symbol", "date"], keep="last")
+                    .sort_values(["date", "symbol"])
+                    .reset_index(drop=True)
+                )
+                realised.to_parquet(
+                    ROOT / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet",
+                    index=False,
+                )
+        except Exception:
+            realised = pd.DataFrame()
+
     status["stages"]["pit_history"] = {
-        "status": "PASS" if len(realised) else "NO_DATA",
-        "realised_rows": int(len(realised)),
+        "status": "PASS" if latest_pit else "NO_DATA",
         "latest_pit": str(latest_pit) if latest_pit else None,
+        "realised_rows": int(len(realised)),
+        "realised_source": "BETA_V2_DELIVERY_TRAINING_PANEL",
     }
 
     # Refresh global cues and headlines incrementally. Both layers are explicitly
