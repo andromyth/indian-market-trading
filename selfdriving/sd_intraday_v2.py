@@ -1,9 +1,9 @@
-"""Volume-free Beta V2 intraday feature and label engine.
+"""Volume-free Beta V2 intraday feature/label engine.
 
-This module is deliberately independent of the current production 5-minute
-model. It creates features that can actually be supplied by the NSE public
-quote-chart live lane: price and time only, with no per-minute volume fields.
-Labels are session-safe and market-neutral.
+The current production 5-minute model is intentionally not modified here.
+Beta V2 uses only price/time inputs that are actually available from the NSE
+public quote-chart lane: no minute-volume feature exists anywhere in this
+contract. Labels are exact-session and market-neutral.
 """
 from __future__ import annotations
 
@@ -34,11 +34,24 @@ RANK_FEATURE_SOURCES = [
 ]
 
 
+def _dedupe_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    x = frame.copy()
+    x.columns = [str(c).strip() for c in x.columns]
+    if not x.columns.duplicated().any():
+        return x
+
+    out = pd.DataFrame(index=x.index)
+    for name in list(dict.fromkeys(x.columns)):
+        part = x.loc[:, x.columns.eq(name)]
+        out[name] = part.iloc[:, 0] if part.shape[1] == 1 else part.bfill(axis=1).iloc[:, 0]
+    return out
+
+
 def _norm(frame: pd.DataFrame | None) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame()
-    x = frame.copy()
-    x.columns = [str(c).strip() for c in x.columns]
+
+    x = _dedupe_columns(frame)
     aliases = {
         "timestamp": "ts", "datetime": "ts", "date": "ts", "time": "ts",
         "open": "open", "high": "high", "low": "low",
@@ -46,31 +59,35 @@ def _norm(frame: pd.DataFrame | None) -> pd.DataFrame:
     }
     x = x.rename(columns={c: aliases.get(str(c).lower(), c) for c in x.columns})
 
-    if "ts" in x.columns:
-        raw = x.pop("ts")
+    raw_ts = x.pop("ts") if "ts" in x.columns else x.index
+    if isinstance(raw_ts, pd.MultiIndex):
+        candidates = []
+        for level in range(raw_ts.nlevels):
+            parsed = pd.to_datetime(raw_ts.get_level_values(level), errors="coerce", utc=True)
+            candidates.append((int(parsed.notna().sum()), parsed))
+        ts = max(candidates, key=lambda z: z[0])[1] if candidates else pd.DatetimeIndex([])
     else:
-        raw = x.index
-    ts = pd.to_datetime(raw, errors="coerce", utc=True)
-    x["ts"] = ts
+        ts = pd.to_datetime(raw_ts, errors="coerce", utc=True)
 
+    x["ts"] = pd.DatetimeIndex(ts)
     for c in ("open", "high", "low", "close"):
         if c not in x.columns:
             x[c] = np.nan
         x[c] = pd.to_numeric(x[c], errors="coerce")
 
-    x = x.dropna(subset=["ts", "open", "high", "low", "close"]).sort_values("ts")
-    return x.drop_duplicates("ts", keep="last").reset_index(drop=True)
+    x = (
+        x.dropna(subset=["ts", "open", "high", "low", "close"])
+         .sort_values("ts")
+         .drop_duplicates("ts", keep="last")
+         .reset_index(drop=True)
+    )
+    return x
 
 
-def _rsi(c: pd.Series, n: int) -> float:
-    d = c.diff()
-    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    if up.empty or pd.isna(up.iloc[-1]) or pd.isna(dn.iloc[-1]):
-        return np.nan
-    if dn.iloc[-1] == 0:
-        return 100.0
-    return float(100.0 - 100.0 / (1.0 + up.iloc[-1] / dn.iloc[-1]))
+def _lookup_return(logc_by_min: pd.Series, mins: pd.Series, lag: int) -> np.ndarray:
+    target = (mins - int(lag)).astype(int)
+    values = logc_by_min.reindex(target.to_numpy()).to_numpy()
+    return logc_by_min.reindex(mins.to_numpy()).to_numpy() - values
 
 
 def _session_rows(g: pd.DataFrame, market: pd.DataFrame | None, horizons: Iterable[int]) -> list[dict]:
@@ -80,15 +97,18 @@ def _session_rows(g: pd.DataFrame, market: pd.DataFrame | None, horizons: Iterab
 
     z["ist"] = z["ts"].dt.tz_convert(IST)
     z["session"] = z["ist"].dt.date
-    rows: list[dict] = []
-
     market_n = _norm(market) if market is not None else pd.DataFrame()
 
+    rows: list[dict] = []
     for session, d in z.groupby("session", sort=False):
         d = d.sort_values("ts").copy()
-        mod = d["ist"].dt.hour * 60 + d["ist"].dt.minute
-        mask = (mod >= OPEN_MIN) & (mod < CLOSE_MIN)
+        minutes = (
+            d["ist"].dt.hour.to_numpy(dtype=int) * 60
+            + d["ist"].dt.minute.to_numpy(dtype=int)
+        )
+        mask = (minutes >= OPEN_MIN) & (minutes < CLOSE_MIN)
         d = d.loc[mask].copy()
+        minutes = minutes[mask]
         if len(d) < 80:
             continue
 
@@ -96,119 +116,180 @@ def _session_rows(g: pd.DataFrame, market: pd.DataFrame | None, horizons: Iterab
         h = d["high"].to_numpy(float)
         lo = d["low"].to_numpy(float)
         o = d["open"].to_numpy(float)
-        ts = d["ts"].to_numpy()
-        minutes = d["ist"].dt.hour.to_numpy() * 60 + d["ist"].dt.minute.to_numpy()
-
-        # Exact minute-of-day lookup inside one session prevents an accidental
-        # bridge over lunch/overnight gaps.
-        minute_to_idx = {int(m): int(i) for i, m in enumerate(minutes)}
-        run_hi = np.maximum.accumulate(h)
-        run_lo = np.minimum.accumulate(lo)
-
-        or_mask = minutes < OPEN_MIN + 15
-        if not bool(or_mask.any()):
-            continue
-        or_hi = float(np.nanmax(h[or_mask]))
-        or_lo = float(np.nanmin(lo[or_mask]))
+        close_by_min = pd.Series(c, index=minutes)
         logc = np.log(np.clip(c, 1e-12, None))
-        r1 = np.diff(logc, prepend=logc[0])
+        log_by_min = pd.Series(logc, index=minutes)
 
-        market_close = None
+        # Require one unique observation per minute. Duplicate minutes would
+        # make future-label alignment ambiguous.
+        if not close_by_min.index.is_unique:
+            keep = ~pd.Index(minutes).duplicated(keep="last")
+            d = d.iloc[np.flatnonzero(keep)]
+            minutes = minutes[keep]
+            c, h, lo, o = [arr[keep] for arr in (c, h, lo, o)]
+            close_by_min = pd.Series(c, index=minutes)
+            logc = np.log(np.clip(c, 1e-12, None))
+            log_by_min = pd.Series(logc, index=minutes)
+
+        decision_mask = (
+            (minutes >= OPEN_MIN + 15)
+            & (((minutes - OPEN_MIN) % 5) == 0)
+        )
+        if not bool(decision_mask.any()):
+            continue
+
+        idx = pd.DatetimeIndex(d["ts"])
+        close_s = pd.Series(c, index=idx)
+        open_s = pd.Series(o, index=idx)
+        high_s = pd.Series(h, index=idx)
+        low_s = pd.Series(lo, index=idx)
+
+        ret1 = log_by_min.diff()
+        rsi_delta = pd.Series(c, index=idx).diff()
+        up = rsi_delta.clip(lower=0).ewm(
+            alpha=1/14, adjust=False, min_periods=14
+        ).mean()
+        down = (-rsi_delta.clip(upper=0)).ewm(
+            alpha=1/14, adjust=False, min_periods=14
+        ).mean()
+        rsi14 = 100.0 - 100.0 / (1.0 + up / down.replace(0, np.nan))
+        rsi14 = rsi14.where(down.ne(0), 100.0)
+
+        prev_close = close_s.shift(1)
+        tr = pd.concat(
+            [
+                high_s - low_s,
+                (high_s - prev_close).abs(),
+                (low_s - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr14 = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+
+        ema8 = close_s.ewm(span=8, adjust=False, min_periods=8).mean()
+        ema21 = close_s.ewm(span=21, adjust=False, min_periods=21).mean()
+        ma5 = close_s.rolling(5, min_periods=5).mean()
+        ma10 = close_s.rolling(10, min_periods=10).mean()
+        ma20 = close_s.rolling(20, min_periods=20).mean()
+        ma50 = close_s.rolling(50, min_periods=50).mean()
+
+        run_hi = high_s.cummax()
+        run_lo = low_s.cummin()
+        or_data = pd.DataFrame({"h": h, "l": lo}, index=idx).loc[minutes < OPEN_MIN + 15]
+        or_hi = float(or_data["h"].max())
+        or_lo = float(or_data["l"].min())
+
+        mins_s = pd.Series(minutes, index=idx)
+        dmask = pd.Series(decision_mask, index=idx)
+
+        market_aligned = pd.Series(np.nan, index=idx, dtype=float)
         if not market_n.empty:
             mn = market_n.copy()
             mn["ist"] = mn["ts"].dt.tz_convert(IST)
             mn["session"] = mn["ist"].dt.date
             mn = mn[mn["session"].eq(session)].sort_values("ts")
             if not mn.empty:
-                ms = mn.set_index("ts")["close"]
-                market_close = ms.reindex(d["ts"], method="ffill", tolerance=pd.Timedelta(minutes=2))
+                ms = pd.Series(
+                    pd.to_numeric(mn["close"], errors="coerce").to_numpy(),
+                    index=pd.DatetimeIndex(mn["ts"]),
+                )
+                market_aligned = ms.reindex(
+                    idx, method="ffill", tolerance=pd.Timedelta(minutes=2)
+                )
 
-        for i in range(len(d)):
-            mins = int(minutes[i] - OPEN_MIN)
-            if mins < 15 or mins % 5 != 0:
-                continue
+        market_log = np.log(pd.to_numeric(market_aligned, errors="coerce"))
+        market_by_min = pd.Series(
+            market_log.to_numpy(),
+            index=minutes,
+        ) if market_aligned.notna().any() else pd.Series(dtype=float)
 
-            def back(k: int) -> float:
-                j = minute_to_idx.get(int(minutes[i] - k))
-                return float(logc[i] - logc[j]) if j is not None else np.nan
+        mret5 = mret15 = mret30 = pd.Series(np.nan, index=idx)
+        if not market_by_min.empty:
+            cur_m = market_by_min.reindex(minutes).to_numpy()
+            mret5_vals = cur_m - market_by_min.reindex(minutes - 5).to_numpy()
+            mret15_vals = cur_m - market_by_min.reindex(minutes - 15).to_numpy()
+            mret30_vals = cur_m - market_by_min.reindex(minutes - 30).to_numpy()
+            mret5 = pd.Series(mret5_vals, index=idx)
+            mret15 = pd.Series(mret15_vals, index=idx)
+            mret30 = pd.Series(mret30_vals, index=idx)
 
-            rng = float(run_hi[i] - run_lo[i])
-            w = r1[max(1, i - 29): i + 1]
-            rv30 = float(np.sqrt(np.sum(w ** 2))) if len(w) >= 10 else np.nan
+        ret1_arr = ret1.to_numpy()
+        r5 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 5)
+        r15 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 15)
+        r30 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 30)
+        r60 = _lookup_return(log_by_min, pd.Series(minutes, index=idx), 60)
 
-            def safe_ratio(a: float, b: float) -> float:
-                return float(a / b - 1.0) if np.isfinite(a) and np.isfinite(b) and b != 0 else np.nan
+        rv30 = pd.Series(ret1_arr, index=idx).rolling(30, min_periods=10).apply(
+            lambda a: float(np.sqrt(np.sum(a * a))), raw=True
+        )
 
-            ema8 = pd.Series(c[: i + 1]).ewm(span=8, adjust=False, min_periods=8).mean().iloc[-1]
-            ema21 = pd.Series(c[: i + 1]).ewm(span=21, adjust=False, min_periods=21).mean().iloc[-1]
-            ma5 = pd.Series(c[: i + 1]).rolling(5, min_periods=5).mean().iloc[-1]
-            ma10 = pd.Series(c[: i + 1]).rolling(10, min_periods=10).mean().iloc[-1]
-            ma20 = pd.Series(c[: i + 1]).rolling(20, min_periods=20).mean().iloc[-1]
-            ma50 = pd.Series(c[: i + 1]).rolling(50, min_periods=50).mean().iloc[-1]
-            tr = np.maximum.reduce([
-                h[: i + 1] - lo[: i + 1],
-                np.abs(h[: i + 1] - np.r_[np.nan, c[:i]]),
-                np.abs(lo[: i + 1] - np.r_[np.nan, c[:i]]),
-            ])
-            atr = pd.Series(tr).ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1]
+        symbol = str(g["symbol"].iloc[0]) if "symbol" in g.columns else ""
 
-            market_r5 = market_r15 = market_r30 = np.nan
-            if market_close is not None:
-                mc = pd.to_numeric(market_close, errors="coerce").to_numpy(float)
-                if i < len(mc) and np.isfinite(mc[i]):
-                    def mback(k: int) -> float:
-                        if i - k >= 0 and np.isfinite(mc[i-k]):
-                            return float(np.log(mc[i]) - np.log(mc[i-k]))
-                        return np.nan
-                    market_r5, market_r15, market_r30 = mback(5), mback(15), mback(30)
+        for pos in np.flatnonzero(decision_mask):
+            mins_since = int(minutes[pos] - OPEN_MIN)
+            dt = pd.Timestamp(idx[pos])
+
+            def v(series: pd.Series) -> float:
+                value = series.iloc[pos]
+                return float(value) if np.isfinite(value) else np.nan
+
+            current = float(c[pos])
+            prev = float(o[pos])
+            range_now = float(run_hi.iloc[pos] - run_lo.iloc[pos])
 
             row = {
-                "symbol": str(g["symbol"].iloc[0]) if "symbol" in g.columns else "",
-                "decision_timestamp": pd.Timestamp(ts[i]),
+                "symbol": symbol,
+                "decision_timestamp": dt,
                 "date": pd.Timestamp(session),
-                "ret_1m": back(1),
-                "ret_5m": back(5),
-                "ret_15m": back(15),
-                "ret_30m": back(30),
-                "ret_60m": back(60),
-                "rsi7": _rsi(pd.Series(c[:i+1]), 7),
-                "rsi14": _rsi(pd.Series(c[:i+1]), 14),
-                "atr14_pct": safe_ratio(float(atr), float(c[i])),
-                "ema8_ratio": safe_ratio(float(c[i]), float(ema8)),
-                "ema21_ratio": safe_ratio(float(c[i]), float(ema21)),
-                "ma5_ratio": safe_ratio(float(c[i]), float(ma5)),
-                "ma10_ratio": safe_ratio(float(c[i]), float(ma10)),
-                "ma20_ratio": safe_ratio(float(c[i]), float(ma20)),
-                "ma50_ratio": safe_ratio(float(c[i]), float(ma50)),
-                "session_return": safe_ratio(float(c[i]), float(o[0])),
-                "pos_in_range": (c[i] - run_lo[i]) / rng if rng > 0 else 0.5,
-                "or_break": 1.0 if c[i] > or_hi else (-1.0 if c[i] < or_lo else 0.0),
-                "or_dist": (c[i] - (or_hi + or_lo) / 2.0) / max(or_hi - or_lo, 1e-9),
-                "range_pct": safe_ratio(float(h[i] - lo[i]), float(c[i])),
-                "body_pct": safe_ratio(float(c[i]), float(o[i])),
-                "ret_accel_1_5": back(1) - back(5) / 5.0 if np.isfinite(back(1)) and np.isfinite(back(5)) else np.nan,
-                "tod_sin": np.sin(2*np.pi*mins/(CLOSE_MIN-OPEN_MIN)),
-                "tod_cos": np.cos(2*np.pi*mins/(CLOSE_MIN-OPEN_MIN)),
-                "mins_since_open": float(mins),
-                "market_ret_5m": market_r5,
-                "market_ret_15m": market_r15,
-                "market_ret_30m": market_r30,
-                "relative_ret_5m": back(5) - market_r5 if np.isfinite(back(5)) and np.isfinite(market_r5) else np.nan,
-                "relative_ret_15m": back(15) - market_r15 if np.isfinite(back(15)) and np.isfinite(market_r15) else np.nan,
-                "relative_ret_30m": back(30) - market_r30 if np.isfinite(back(30)) and np.isfinite(market_r30) else np.nan,
+                "ret_1m": float(ret1_arr[pos]) if np.isfinite(ret1_arr[pos]) else np.nan,
+                "ret_5m": float(r5[pos]) if np.isfinite(r5[pos]) else np.nan,
+                "ret_15m": float(r15[pos]) if np.isfinite(r15[pos]) else np.nan,
+                "ret_30m": float(r30[pos]) if np.isfinite(r30[pos]) else np.nan,
+                "ret_60m": float(r60[pos]) if np.isfinite(r60[pos]) else np.nan,
+                "rsi7": v((100.0 - 100.0 / (1.0 + (
+                    rsi_delta.clip(lower=0).ewm(alpha=1/7, adjust=False, min_periods=7).mean()
+                    / (-rsi_delta.clip(upper=0)).ewm(alpha=1/7, adjust=False, min_periods=7).mean().replace(0, np.nan)
+                )))),
+                "rsi14": v(rsi14),
+                "atr14_pct": v(atr14 / close_s.replace(0, np.nan)),
+                "ema8_ratio": v(close_s / ema8.replace(0, np.nan) - 1.0),
+                "ema21_ratio": v(close_s / ema21.replace(0, np.nan) - 1.0),
+                "ma5_ratio": v(close_s / ma5.replace(0, np.nan) - 1.0),
+                "ma10_ratio": v(close_s / ma10.replace(0, np.nan) - 1.0),
+                "ma20_ratio": v(close_s / ma20.replace(0, np.nan) - 1.0),
+                "ma50_ratio": v(close_s / ma50.replace(0, np.nan) - 1.0),
+                "session_return": current / float(o[0]) - 1.0 if o[0] else np.nan,
+                "pos_in_range": (current - float(run_lo.iloc[pos])) / range_now if range_now > 0 else 0.5,
+                "or_break": 1.0 if current > or_hi else (-1.0 if current < or_lo else 0.0),
+                "or_dist": (current - (or_hi + or_lo) / 2.0) / max(or_hi - or_lo, 1e-9),
+                "range_pct": (float(h[pos] - lo[pos]) / current) if current else np.nan,
+                "body_pct": (current - prev) / prev if prev else np.nan,
+                "ret_accel_1_5": float(r5[pos] - r1_arr[pos]) if np.isfinite(r5[pos]) and np.isfinite(r1_arr[pos]) else np.nan,
+                "tod_sin": np.sin(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
+                "tod_cos": np.cos(2*np.pi*mins_since/(CLOSE_MIN-OPEN_MIN)),
+                "mins_since_open": float(mins_since),
+                "market_ret_5m": float(mret5.iloc[pos]) if np.isfinite(mret5.iloc[pos]) else np.nan,
+                "market_ret_15m": float(mret15.iloc[pos]) if np.isfinite(mret15.iloc[pos]) else np.nan,
+                "market_ret_30m": float(mret30.iloc[pos]) if np.isfinite(mret30.iloc[pos]) else np.nan,
+                "relative_ret_5m": float(r5[pos] - mret5.iloc[pos]) if np.isfinite(r5[pos]) and np.isfinite(mret5.iloc[pos]) else np.nan,
+                "relative_ret_15m": float(r15[pos] - mret15.iloc[pos]) if np.isfinite(r15[pos]) and np.isfinite(mret15.iloc[pos]) else np.nan,
+                "relative_ret_30m": float(r30[pos] - mret30.iloc[pos]) if np.isfinite(r30.iloc[pos]) and np.isfinite(mret30.iloc[pos]) else np.nan,
             }
 
             for hmin in horizons:
-                target_min = int(minutes[i] + hmin)
-                j = minute_to_idx.get(target_min)
-                if j is None:
+                target_min = int(minutes[pos] + int(hmin))
+                future = close_by_min.get(target_min, np.nan)
+                if not np.isfinite(future):
                     continue
                 row2 = row.copy()
-                row2["horizon_min"] = hmin
-                row2["reference_close"] = float(c[i])
-                row2["future_close"] = float(c[j])
-                row2["fwd_ret"] = float(c[j] / c[i] - 1.0)
-                row2["target_timestamp"] = pd.Timestamp(ts[j])
+                row2["horizon_min"] = int(hmin)
+                row2["reference_close"] = current
+                row2["future_close"] = float(future)
+                row2["fwd_ret"] = float(future / current - 1.0) if current else np.nan
+                future_idx = minute_to_position = np.where(minutes == target_min)[0]
+                row2["target_timestamp"] = (
+                    pd.Timestamp(idx[future_idx[0]]) if len(future_idx) else pd.NaT
+                )
                 rows.append(row2)
 
     return rows
@@ -222,12 +303,11 @@ def add_cross_sectional_targets(panel: pd.DataFrame) -> pd.DataFrame:
     x["fwd_ret_excess"] = x["fwd_ret"] - med
     x["y_up_excess"] = (x["fwd_ret_excess"] > 0).astype("int8")
 
-    rank_cols = []
     for c in RANK_FEATURE_SOURCES:
         if c in x:
-            name = c + "_xs_rank"
-            x[name] = x.groupby(["decision_timestamp", "horizon_min"])[c].rank(pct=True)
-            rank_cols.append(name)
+            x[c + "_xs_rank"] = x.groupby(
+                ["decision_timestamp", "horizon_min"]
+            )[c].rank(pct=True)
 
     return x
 
