@@ -173,8 +173,20 @@ def main() -> int:
         "--out",
         default="/content/drive/MyDrive/Indian_Market_Research/selfdriving/beta_version2/intraday",
     )
-    ap.add_argument("--max-decisions-per-symbol", type=int, default=100)
-    ap.add_argument("--global-row-cap", type=int, default=900000)
+    ap.add_argument(
+        "--max-decisions-per-symbol",
+        type=int,
+        default=60,
+        help="Decision timestamps retained per symbol across all six horizons. "
+             "Keeps the full NSE universe while bounding Colab RAM.",
+    )
+    ap.add_argument(
+        "--global-row-cap",
+        type=int,
+        default=900000,
+        help="Hard cap on generated rows; with 60 timestamps/symbol and 2,382 symbols "
+             "the normal panel remains below this cap.",
+    )
     args = ap.parse_args()
 
     root = Path(args.drive_root)
@@ -186,60 +198,136 @@ def main() -> int:
     if market is None or market.empty:
         raise RuntimeError("NIFTY 50 1-minute market context could not be loaded")
 
+    parts_dir = out / "prepared_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
     rows = []
     coverage = []
-    for i, sym in enumerate(universe, 1):
-        try:
-            raw = load_symbol(root, sym)
-            if raw is None or raw.empty:
-                coverage.append({"symbol": sym, "status": "NO_DATA"})
-                continue
-            frame = raw.reset_index()
-            frame["symbol"] = sym
-            frame = frame.rename(columns={frame.columns[0]: "ts"})
-            generated = _session_rows(frame, market, HORIZONS)
-            generated = cap_symbol_rows(generated, args.max_decisions_per_symbol)
-            rows.extend(generated)
-            coverage.append({
-                "symbol": sym,
-                "status": "OK",
-                "decision_rows": int(len(set(pd.to_datetime(x["decision_timestamp"], utc=True) for x in generated))),
-                "output_rows": int(len(generated)),
-            })
-        except Exception as exc:
-            coverage.append({
-                "symbol": sym,
-                "status": "ERROR",
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-        if i == 1 or i % 100 == 0 or i == len(universe):
-            print(f"prepared {i:,}/{len(universe):,} symbols; rows={len(rows):,}", flush=True)
 
-    panel = pd.DataFrame(rows)
+    # Checkpoint in 100-symbol batches. The previous implementation retained
+    # every generated row for the entire NSE universe in one Python list,
+    # creating unnecessary RAM pressure on 12-GB Colab runtimes.
+    batch_size = 100
+    for batch_start in range(0, len(universe), batch_size):
+        batch_end = min(len(universe), batch_start + batch_size)
+        part_no = batch_start // batch_size + 1
+        part_path = parts_dir / f"part_{part_no:04d}_{batch_start+1:04d}_{batch_end:04d}.parquet"
+
+        if part_path.exists() and part_path.stat().st_size > 0:
+            print(
+                f"prepared batch {part_no}: reused symbols {batch_start+1:,}-{batch_end:,}",
+                flush=True,
+            )
+            continue
+
+        batch_rows = []
+        for i, sym in enumerate(universe[batch_start:batch_end], batch_start + 1):
+            try:
+                raw = load_symbol(root, sym)
+                if raw is None or raw.empty:
+                    coverage.append({"symbol": sym, "status": "NO_DATA"})
+                    continue
+
+                frame = raw.reset_index()
+                frame["symbol"] = sym
+                frame = frame.rename(columns={frame.columns[0]: "ts"})
+                generated = _session_rows(frame, market, HORIZONS)
+                generated = cap_symbol_rows(
+                    generated,
+                    args.max_decisions_per_symbol,
+                )
+
+                batch_rows.extend(generated)
+                coverage.append({
+                    "symbol": sym,
+                    "status": "OK",
+                    "decision_rows": int(
+                        len(set(
+                            pd.to_datetime(
+                                x["decision_timestamp"],
+                                utc=True,
+                            )
+                            for x in generated
+                        ))
+                    ),
+                    "output_rows": int(len(generated)),
+                })
+            except Exception as exc:
+                coverage.append({
+                    "symbol": sym,
+                    "status": "ERROR",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+            if i == batch_start + 1 or i == batch_end:
+                print(
+                    f"prepared {i:,}/{len(universe):,} symbols in batch {part_no}; "
+                    f"batch_rows={len(batch_rows):,}",
+                    flush=True,
+                )
+
+        batch_panel = pd.DataFrame(batch_rows)
+        if batch_panel.empty:
+            # Keep an explicit marker so a completed no-data batch is resumable.
+            pd.DataFrame(
+                columns=[
+                    "symbol", "decision_timestamp", "date",
+                    "horizon_min", "reference_close", "future_close", "fwd_ret",
+                ]
+            ).to_parquet(part_path, index=False)
+        else:
+            batch_panel.to_parquet(part_path, index=False)
+            print(
+                f"prepared batch {part_no}: saved rows={len(batch_panel):,} "
+                f"symbols={batch_panel['symbol'].nunique():,}",
+                flush=True,
+            )
+        del batch_rows, batch_panel
+
+    part_files = sorted(parts_dir.glob("part_*.parquet"))
+    if len(part_files) != int(np.ceil(len(universe) / batch_size)):
+        raise RuntimeError(
+            f"Prepared checkpoint count incomplete: {len(part_files)} files for "
+            f"{len(universe)} symbols"
+        )
+
+    panel_path = out / "BETA_V2_INTRADAY_PANEL.parquet"
+    if not panel_path.exists() or panel_path.stat().st_size == 0:
+        glob = str(parts_dir / "part_*.parquet").replace("'", "''")
+        tmp = out / "BETA_V2_INTRADAY_PANEL.parquet.tmp"
+        con = __import__("duckdb").connect()
+        try:
+            con.execute(
+                f"""
+                COPY (
+                    SELECT *
+                    FROM read_parquet('{glob}')
+                )
+                TO '{str(tmp).replace("'", "''")}'
+                (FORMAT PARQUET, COMPRESSION ZSTD);
+                """
+            )
+        finally:
+            con.close()
+        tmp.replace(panel_path)
+
+    panel = pd.read_parquet(panel_path)
     if panel.empty:
         raise RuntimeError("No Beta V2 intraday feature rows were built")
 
-    # Apply any global memory cap by whole decision-timestamp blocks.
-    # Never delete arbitrary rows before the cross-sectional median is formed;
-    # that would change the market-neutral target distribution.
     if len(panel) > args.global_row_cap:
-        ts_values = np.array(sorted(pd.to_datetime(
-            panel["decision_timestamp"], utc=True
-        ).unique()))
-        rows_per_ts = max(1, int(np.ceil(len(panel) / max(len(ts_values), 1))))
-        keep_n = max(1, min(
-            len(ts_values),
-            int(args.global_row_cap // rows_per_ts),
-        ))
-        keep_idx = np.linspace(0, len(ts_values) - 1, keep_n).round().astype(int)
-        keep_ts = set(ts_values[np.unique(keep_idx)])
-        panel = panel[
-            pd.to_datetime(panel["decision_timestamp"], utc=True).isin(keep_ts)
-        ].copy()
+        raise RuntimeError(
+            f"Prepared intraday panel has {len(panel):,} rows, exceeding the configured "
+            f"global cap of {args.global_row_cap:,}. Lower --max-decisions-per-symbol "
+            "rather than arbitrarily deleting timestamps."
+        )
 
     panel = add_cross_sectional_targets(panel)
-    panel.to_parquet(out / "BETA_V2_INTRADAY_PANEL.parquet", index=False)
-    pd.DataFrame(coverage).to_parquet(out / "BETA_V2_INTRADAY_COVERAGE.parquet", index=False)
+    panel.to_parquet(panel_path, index=False)
+    pd.DataFrame(coverage).to_parquet(
+        out / "BETA_V2_INTRADAY_COVERAGE.parquet",
+        index=False,
+    )
 
     results = {}
     registry_root = out / "models"
