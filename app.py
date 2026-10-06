@@ -56,7 +56,11 @@ from production_model import (
 )
 from autonomous_engine import delivery_prediction
 from all_nse_delivery_model import predict_symbol as all_nse_delivery_predict, model_status as all_nse_delivery_model_status, _build_latest_features as all_nse_feature_builder
-from all_nse_intraday_5m_model import predict_multihorizon as intraday_5m_predict_multihorizon, model_status as intraday_5m_model_status
+from all_nse_intraday_5m_model import (
+    predict_multihorizon as intraday_5m_predict_multihorizon,
+    model_status as intraday_5m_model_status,
+    _norm as normalize_intraday_5m_frame,
+)
 from directional_ensemble import enrich_delivery_prediction
 
 
@@ -1202,6 +1206,16 @@ if interface_mode == "Live Test":
                     if raw is None or raw.empty:
                         st.error("Live 1-minute market data is currently unavailable from NSE and the configured fallback providers.")
                         return
+
+                    # Normalize the provider frame before any timestamp
+                    # comparison. This prevents hosted NSE/fallback responses
+                    # with MultiIndex/duplicate columns from reaching timestamp
+                    # filtering or pandas datetime conversion with a non-1D object.
+                    raw = normalize_intraday_5m_frame(raw)
+                    if raw is None or raw.empty:
+                        st.error("Live 1-minute market data could not be normalized into a valid NSE timestamped frame.")
+                        return
+
                     cutoff = now.floor("min")
                     completed = raw.loc[raw.index < cutoff].copy()
                     if completed.empty:
