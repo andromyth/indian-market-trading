@@ -698,14 +698,27 @@ def main() -> int:
     results = {}
     registry_root = out / "models"
 
+    # Read each compact symbol checkpoint ONCE and fan it out to all six
+    # horizons. This removes six full-universe Drive scans.
+    all_horizon_data, all_horizon_meta = _make_all_horizon_training_rows(
+        symbol_paths,
+        args.train_rows_per_symbol,
+        args.global_row_cap,
+    )
+
     for horizon in HORIZONS:
         print(f"TRAINING HORIZON +{horizon}M", flush=True)
 
-        horizon_data, history_meta = _make_horizon_training_rows(
-            symbol_paths,
+        horizon_data = all_horizon_data.get(horizon, pd.DataFrame())
+        history_meta = all_horizon_meta.get(
             horizon,
-            args.train_rows_per_symbol,
-            args.global_row_cap,
+            {
+                "eligible_symbols": 0,
+                "preferred_symbols": 0,
+                "limited_symbols": 0,
+                "retained_rows": 0,
+                "history": [],
+            },
         )
 
         if horizon_data.empty:
@@ -716,7 +729,6 @@ def main() -> int:
             }
             continue
 
-        # train_horizon uses the common long-format contract.
         training_frame = horizon_data.rename(
             columns={f"fwd_ret_{horizon}m": "fwd_ret"}
         ).copy()
@@ -739,7 +751,7 @@ def main() -> int:
         }
         results[str(horizon)] = result
 
-        del horizon_data
+        del horizon_data, training_frame
         import gc
         gc.collect()
 
@@ -764,6 +776,8 @@ def main() -> int:
         "max_decisions_per_symbol": args.max_decisions_per_symbol,
         "train_rows_per_symbol": args.train_rows_per_symbol,
         "global_row_cap_per_horizon": args.global_row_cap,
+        "workers": args.workers,
+        "fast_profile": bool(args.fast),
         "checkpoint_format": "one_decision_row_with_six_future_horizon_returns",
         "features": feature_columns(),
         "feature_count": len(feature_columns()),
