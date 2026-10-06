@@ -201,20 +201,17 @@ jobs:
               out.write(f"exists={'YES' if ready else 'NO'}\n")
           PY
 
-      - name: Build target production PIT snapshot
+      - name: Rebuild target production PIT snapshot from latest persisted inputs
         if: steps.target.outputs.target_date != ''
         run: |
-          if [ "${{ steps.snapshot.outputs.exists }}" = "YES" ]; then
-            echo "Target PIT snapshot is current and production-ready; skipping rebuild."
-          else
-            echo "Target PIT snapshot is missing or stale/blocked; rebuilding."
-            python -u delivery_production_refresh.py \
-              --lookback-days 150 \
-              --delivery-lookback-days 150 \
-              --source-wait-minutes 0 \
-              --expected-date "${{ steps.target.outputs.target_date }}"
-          fi
-
+          echo "Rebuilding the target PIT snapshot on every scheduled retry."
+          echo "This is intentional: upstream NSE/F&O/news/events inputs can change between hourly runs,"
+          echo "and every prediction must use the newest persisted point-in-time data."
+          python -u delivery_production_refresh.py \
+            --lookback-days 150 \
+            --delivery-lookback-days 150 \
+            --source-wait-minutes 0 \
+            --expected-date "${{ steps.target.outputs.target_date }}"
       - name: Generate target Delivery predictions
         if: steps.target.outputs.target_date != ''
         run: |
