@@ -42,6 +42,11 @@ def main() -> int:
     ap.add_argument("--base", default=str(DEFAULT_BASE))
     ap.add_argument("--panel", default=str(DEFAULT_PANEL))
     ap.add_argument("--out", default="")
+    ap.add_argument(
+        "--force-rebuild-base",
+        action="store_true",
+        help="Force rebuilding the full-history Beta V2 base panel instead of reusing its Drive cache.",
+    )
     args = ap.parse_args()
 
     base = Path(args.base)
@@ -66,40 +71,70 @@ def main() -> int:
                 f"missing: {master}. Build the full-history canonical cash master first."
             )
 
-        print(
-            f"Input panel has only {panel_sessions} sessions. Rebuilding the Beta V2 "
-            f"base panel from the canonical NSE cash master for full-history walk-forward training.",
-            flush=True,
-        )
-        bulk = load_canonical_cash_research_history(master)
-        roster = training_roster(bulk, min_history=60, force_refresh=False)
-        trainable = list(roster["trainable_symbols"])
-        delivery = load_delivery_history(
-            DEFAULT_DELIVERY_ROOT,
-            symbols=trainable,
-            start=bulk["date"].min(),
-            end=bulk["date"].max(),
-        )
-        rebuilt = make_panel(bulk, trainable, delivery=delivery)
-        if rebuilt.empty:
-            raise RuntimeError("Full-history Beta V2 base-panel rebuild produced no rows")
-
-        rebuilt_sessions = int(pd.to_datetime(rebuilt["date"], errors="coerce").dt.normalize().nunique())
-        if rebuilt_sessions < MIN_WALKFORWARD_SESSIONS:
-            raise RuntimeError(
-                f"Canonical source rebuild produced only {rebuilt_sessions} sessions; "
-                f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}. "
-                "The available historical source is not yet sufficient for the configured OOS design."
-            )
-        panel = rebuilt
         source_copy = out / "BETA_V2_DELIVERY_BASE_PANEL_FULL_HISTORY.parquet"
-        panel.to_parquet(source_copy, index=False)
-        print(
-            f"Full-history base panel ready: rows={len(panel):,}, "
-            f"symbols={panel['symbol'].nunique():,}, sessions={rebuilt_sessions:,}; "
-            f"saved={source_copy}",
-            flush=True,
-        )
+        if (
+            not args.force_rebuild_base
+            and source_copy.exists()
+            and source_copy.stat().st_size > 0
+        ):
+            panel = pd.read_parquet(source_copy)
+            rebuilt_sessions = int(
+                pd.to_datetime(panel["date"], errors="coerce")
+                .dt.normalize()
+                .nunique()
+            )
+            print(
+                f"Reusing cached full-history Beta V2 base panel: "
+                f"rows={len(panel):,}, symbols={panel['symbol'].nunique():,}, "
+                f"sessions={rebuilt_sessions:,}; cached={source_copy}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Input panel has only {panel_sessions} sessions. Rebuilding the Beta V2 "
+                f"base panel from the canonical NSE cash master for full-history walk-forward training.",
+                flush=True,
+            )
+            bulk = load_canonical_cash_research_history(master)
+            roster = training_roster(bulk, min_history=60, force_refresh=False)
+            trainable = list(roster["trainable_symbols"])
+            delivery = load_delivery_history(
+                DEFAULT_DELIVERY_ROOT,
+                symbols=trainable,
+                start=bulk["date"].min(),
+                end=bulk["date"].max(),
+            )
+            # The downstream code sorts by symbol/date where needed. Avoid the
+            # expensive global sort here because this panel can contain millions
+            # of rows.
+            rebuilt = make_panel(
+                bulk,
+                trainable,
+                sort_output=False,
+                delivery=delivery,
+            )
+            if rebuilt.empty:
+                raise RuntimeError("Full-history Beta V2 base-panel rebuild produced no rows")
+
+            rebuilt_sessions = int(
+                pd.to_datetime(rebuilt["date"], errors="coerce")
+                .dt.normalize()
+                .nunique()
+            )
+            if rebuilt_sessions < MIN_WALKFORWARD_SESSIONS:
+                raise RuntimeError(
+                    f"Canonical source rebuild produced only {rebuilt_sessions} sessions; "
+                    f"Beta V2 requires >= {MIN_WALKFORWARD_SESSIONS}. "
+                    "The available historical source is not yet sufficient for the configured OOS design."
+                )
+            panel = rebuilt
+            panel.to_parquet(source_copy, index=False)
+            print(
+                f"Full-history base panel ready: rows={len(panel):,}, "
+                f"symbols={panel['symbol'].nunique():,}, sessions={rebuilt_sessions:,}; "
+                f"saved={source_copy}",
+                flush=True,
+            )
 
     global_path = base / "selfdriving/global_cues.parquet"
     news_path = base / "selfdriving/raw_news.parquet"
