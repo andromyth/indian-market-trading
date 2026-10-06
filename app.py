@@ -774,17 +774,17 @@ if interface_mode == "Live Test":
             try:
                 root = sym.replace(".NS", "").upper()
                 # The locked ALL-NSE production result is authoritative for
-                # the interactive Delivery display. Do not depend on the legacy
-                # wrapper's ledger append/auxiliary context path merely to render
-                # a production prediction.
-                result = direct_delivery_results.get(sym)
-                if not result or result.get("prediction_status") != "PASS":
-                    result = delivery_prediction(
-                        {
-                            "symbol": root,
-                            "decision_timestamp": now_ist,
-                        },
-                        sync_drive=False,
+                # the interactive Delivery display. This branch executes before
+                # the later legacy dashboard variables are initialized, so call
+                # the production model directly here.
+                result = all_nse_delivery_predict(
+                    sym,
+                    now_ist,
+                )
+                if result.get("prediction_status") != "PASS":
+                    raise RuntimeError(
+                        result.get("reason")
+                        or "ALL-NSE Delivery model returned no production result"
                     )
 
                 live_news = _delivery_live_news_context(sym, now_ist)
