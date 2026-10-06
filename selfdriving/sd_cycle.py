@@ -68,6 +68,7 @@ def feature_groups(df: pd.DataFrame) -> Dict[str, List[str]]:
         "price": [c for c in PRICE_BASE if c in cols] + [c for c in cols if c.endswith("_csr")],
         "global": [c for c in cols if c.startswith("g_") and not c.endswith("_age_h")],
         "news": [c for c in cols if c.startswith(("news_", "mkt_news_"))],
+        "events": [c for c in cols if c.startswith("event_")],
         "fno": [c for c in cols if c.startswith("fno_")],
         "fundamental": [c for c in cols if c.startswith(("fundamental_", "fund_"))],
     }
@@ -80,7 +81,7 @@ def select_groups(df: pd.DataFrame, min_cov: float = 0.6, min_dates: Dict[str, i
     This is what stops an empty or thin source (e.g. a news archive that started last week)
     from adding noise, and lets it switch itself on automatically once coverage is real.
     """
-    min_dates = min_dates or {"news": 120, "global": 120, "fno": 60}
+    min_dates = min_dates or {"news": 120, "global": 120, "events": 30, "fno": 60}
     d = pd.to_datetime(df["date"]).dt.normalize()
     recent = df[d >= d.max() - pd.Timedelta(days=recent_days * 1.5)]
     chosen, report = [], {}
@@ -103,7 +104,11 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
                 cfg: Optional[ModelConfig] = None) -> Dict:
     spec = spec or FoldSpec()
     p = ensure_delivery_targets(panel)
+    p = p.dropna(subset=["y_return"]).copy()
+    if "cross_section_n" in p.columns:
+        p = p[p["cross_section_n"] >= 20].copy()
     p = add_targets(p)
+    p = p.dropna(subset=["y_up_excess"]).copy()
     p = add_cross_sectional_ranks(p, RANK_SOURCE)
     sel = select_groups(p)
     if not sel["features"]:
@@ -131,6 +136,13 @@ def train_stage(panel: pd.DataFrame, registry_dir: str | Path, spec: Optional[Fo
             }
 
     decision = gate(champ_m, m_c, paired if champ_m is not None else None, rules)
+    if thr.get("abstain_all", True):
+        decision = {
+            "promote": False,
+            "reasons": list(decision.get("reasons", [])) + [
+                "no validated BUY/SELL action band; challenger must ABSTAIN"
+            ],
+        }
     if decision["promote"]:
         from .sd_walkforward import fit_bundle
         final = fit_bundle(p.dropna(subset=["y_up_excess"]), sel["features"], "y_up_excess", cfg or ModelConfig())
