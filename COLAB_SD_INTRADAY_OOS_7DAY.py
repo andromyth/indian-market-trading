@@ -192,6 +192,7 @@ def _fetch_history(
     *,
     start: pd.Timestamp = START_DATE,
     end: pd.Timestamp = END_DATE,
+    allow_session_fallback: bool = False,
 ) -> pd.DataFrame:
     def fetch_window(
         window_start: pd.Timestamp,
@@ -271,9 +272,9 @@ def _fetch_history(
         ].copy()
         return frame.reset_index(drop=True)
 
-    # Prefer one request for the entire OOS window. Some NSE charting
-    # deployments return an empty/partial 1-minute index response for a
-    # multi-session window even though single-session requests succeed.
+    # Prefer one request for the entire OOS window. This is the normal,
+    # fast path for equities. Per-session fallback is intentionally opt-in
+    # because applying it to 2,599 symbols can multiply API traffic by 8x.
     errors: list[str] = []
     try:
         frame = fetch_window(start, end)
@@ -289,9 +290,21 @@ def _fetch_history(
         if required_dates.issubset(observed):
             return frame
 
-    # Deterministic per-session fallback. This is especially important for
-    # the NIFTY 50 index lane and also makes the equity downloader resilient
-    # to provider-side intraday range limits.
+    if not allow_session_fallback:
+        detail = " | ".join(errors[-4:])
+        observed_text = (
+            sorted(observed)
+            if not frame.empty
+            else []
+        )
+        raise RuntimeError(
+            f"{symbol}: OOS history incomplete from single window; "
+            f"rows={len(frame):,} observed_sessions={observed_text}"
+            + (f"; diagnostics={detail}" if detail else "")
+        )
+
+    # Deterministic per-session fallback. This is reserved for NIFTY 50,
+    # where the multi-session minute request has previously returned empty.
     parts: list[pd.DataFrame] = [frame] if not frame.empty else []
     for session_date in OOS_SESSIONS:
         try:
@@ -677,7 +690,12 @@ def main() -> int:
         "--drive-root",
         default="/content/drive/MyDrive/Indian_Market_Research",
     )
-    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=6,
+        help="Concurrent NSE charting workers; capped at 6.",
+    )
     ap.add_argument("--max-symbols", type=int, default=0)
     ap.add_argument("--download-only", action="store_true")
     ap.add_argument("--evaluate-only", action="store_true")
@@ -763,7 +781,7 @@ def main() -> int:
             return symbol, info, frame
 
         results: dict[str, dict[str, Any]] = {}
-        worker_count = max(1, min(int(args.workers), 2))
+        worker_count = max(1, min(int(args.workers), 6))
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(download_one, symbol): symbol
@@ -898,7 +916,11 @@ def main() -> int:
                     f"token={candidate_info.get('scripcode')}",
                     flush=True,
                 )
-                nifty = _fetch_history(candidate, candidate_info)
+                nifty = _fetch_history(
+                    candidate,
+                    candidate_info,
+                    allow_session_fallback=True,
+                )
                 dates = (
                     set(
                         nifty["ts"].dt.tz_convert(IST)
@@ -975,7 +997,7 @@ def main() -> int:
             ),
         )
 
-    worker_count = max(1, min(int(args.workers), 2))
+    worker_count = max(1, min(int(args.workers), 6))
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = {
             pool.submit(predict_one, symbol): symbol
