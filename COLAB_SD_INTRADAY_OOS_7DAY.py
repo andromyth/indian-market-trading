@@ -1218,7 +1218,7 @@ def main() -> int:
                 symbol,
                 bundles,
                 thresholds,
-                market,
+                market_oos,
             ),
         )
 
