@@ -481,6 +481,254 @@ def _raw_oos_file_usable(path: Path) -> tuple[bool, dict[str, int]]:
     return usable, counts
 
 
+def _raw_oos_file_usable_from_frame(
+    frame: pd.DataFrame,
+) -> tuple[bool, dict[str, int]]:
+    if frame is None or frame.empty:
+        return False, {}
+    counts = _oos_session_counts(frame)
+    return (
+        all(
+            counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+            for session_date in OOS_SESSIONS
+        ),
+        counts,
+    )
+
+
+def _nse_charting_probe() -> tuple[bool, str]:
+    """Probe NSE charting once before starting thousands of requests."""
+    try:
+        obj = _request_json(
+            SEARCH_URL,
+            {"symbol": "RELIANCE", "segment": "EQ"},
+            attempts=1,
+        )
+        rows = obj.get("data")
+        if isinstance(rows, list) and rows:
+            return True, "NSE_CHARTING_OK"
+        return False, f"NSE_CHARTING_EMPTY_RESPONSE keys={sorted(obj.keys())}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _download_oos_yahoo_batch(
+    universe: list[str],
+    raw_root: Path,
+    *,
+    batch_size: int = 50,
+) -> dict[str, dict[str, Any]]:
+    """Download OOS equity prices using yfinance multi-ticker batches.
+
+    The seven OOS sessions are split into two calendar windows so each 1-minute
+    request stays within Yahoo's short intraday window. Yahoo's yfinance
+    download API supports a list of tickers in one request.
+    """
+    import yfinance as yf
+
+    windows = (
+        ("2026-09-25", "2026-10-02"),
+        ("2026-10-02", "2026-10-07"),
+    )
+
+    remaining: list[str] = []
+    for symbol in universe:
+        path = raw_root / f"symbol={symbol}.parquet"
+        usable, _ = (
+            _raw_oos_file_usable(path) if path.exists() else (False, {})
+        )
+        if not usable:
+            remaining.append(symbol)
+
+    print(
+        "OOS YAHOO BATCH START: "
+        f"symbols={len(remaining):,} batch_size={batch_size}",
+        flush=True,
+    )
+
+    results: dict[str, dict[str, Any]] = {}
+
+    def normalize_batch(data: pd.DataFrame, requested: list[str]) -> dict[str, pd.DataFrame]:
+        if data is None or data.empty:
+            return {}
+        out: dict[str, pd.DataFrame] = {}
+        req = {s.upper() for s in requested}
+
+        if isinstance(data.columns, pd.MultiIndex):
+            levels = [
+                [str(v).upper() for v in data.columns.get_level_values(i)]
+                for i in range(data.columns.nlevels)
+            ]
+            fields = {"OPEN", "HIGH", "LOW", "CLOSE"}
+            if fields.intersection(levels[0]):
+                field_level, ticker_level = 0, 1
+            elif len(levels) > 1 and fields.intersection(levels[1]):
+                field_level, ticker_level = 1, 0
+            else:
+                return {}
+
+            for ticker in dict.fromkeys(levels[ticker_level]):
+                symbol = ticker[:-3] if ticker.endswith(".NS") else ticker
+                symbol = symbol.upper()
+                if symbol not in req:
+                    continue
+                cols = [
+                    col for col in data.columns
+                    if str(col[ticker_level]).upper() == ticker
+                ]
+                part = data.loc[:, cols].copy()
+                part.columns = [
+                    str(col[field_level]).lower()
+                    for col in cols
+                ]
+                out[symbol] = part
+            return out
+
+        if requested and {"open", "high", "low", "close"}.issubset(
+            {str(col).lower() for col in data.columns}
+        ):
+            out[requested[0].upper()] = data.copy()
+        return out
+
+    def clean(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        x = part.copy()
+        x.index = pd.to_datetime(x.index, utc=True, errors="coerce")
+        x = x[~x.index.isna()].reset_index()
+        x = x.rename(columns={x.columns[0]: "ts"})
+        required = {"ts", "open", "high", "low", "close"}
+        if not required.issubset(x.columns):
+            return pd.DataFrame()
+
+        x["ts"] = pd.to_datetime(x["ts"], utc=True, errors="coerce")
+        for col in ("open", "high", "low", "close"):
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+        x = x.dropna(subset=["ts", "open", "high", "low", "close"]).copy()
+
+        local = x["ts"].dt.tz_convert(IST)
+        minute = local.dt.hour * 60 + local.dt.minute
+        x = x[
+            local.dt.strftime("%Y-%m-%d").isin(OOS_SESSIONS)
+            & (minute >= 9 * 60 + 15)
+            & (minute < 15 * 60 + 30)
+        ].copy()
+
+        x["symbol"] = symbol
+        x["source"] = "YAHOO_FINANCE"
+        x["provenance"] = "Yahoo Finance 1-minute historical chart fallback"
+        return (
+            x[
+                [
+                    "ts",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "symbol",
+                    "source",
+                    "provenance",
+                ]
+            ]
+            .drop_duplicates("ts", keep="last")
+            .sort_values("ts")
+            .reset_index(drop=True)
+        )
+
+    total_batches = (len(remaining) + batch_size - 1) // batch_size
+    for window_idx, (window_start, window_end) in enumerate(windows, start=1):
+        for batch_idx, offset in enumerate(
+            range(0, len(remaining), batch_size),
+            start=1,
+        ):
+            batch_symbols = remaining[offset : offset + batch_size]
+            tickers = [f"{s}.NS" for s in batch_symbols]
+
+            try:
+                data = yf.download(
+                    tickers,
+                    start=pd.Timestamp(window_start, tz=IST).to_pydatetime(),
+                    end=pd.Timestamp(window_end, tz=IST).to_pydatetime(),
+                    interval="1m",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    group_by="ticker",
+                    timeout=20,
+                )
+                parts = normalize_batch(data, batch_symbols)
+
+                for symbol in batch_symbols:
+                    part = parts.get(symbol.upper())
+                    if part is None or part.empty:
+                        continue
+                    clean_frame = clean(part, symbol)
+                    if clean_frame.empty:
+                        continue
+
+                    path = raw_root / f"symbol={symbol}.parquet"
+                    old = None
+                    if path.exists():
+                        try:
+                            old = pd.read_parquet(path)
+                        except Exception:
+                            old = None
+                    if old is not None and not old.empty:
+                        clean_frame = (
+                            pd.concat([old, clean_frame], ignore_index=True)
+                            .drop_duplicates("ts", keep="last")
+                            .sort_values("ts")
+                            .reset_index(drop=True)
+                        )
+
+                    usable, counts = _raw_oos_file_usable_from_frame(clean_frame)
+                    if usable:
+                        _write_atomic(clean_frame, path)
+                        results[symbol] = {
+                            "status": "OK",
+                            "rows": int(len(clean_frame)),
+                            "session_counts": counts,
+                        }
+
+            except Exception as exc:
+                print(
+                    "OOS YAHOO BATCH ERROR: "
+                    f"window={window_start}->{window_end} "
+                    f"batch={batch_idx}/{total_batches} "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+            ok_now = sum(v["status"] == "OK" for v in results.values())
+            print(
+                "OOS YAHOO BATCH PROGRESS: "
+                f"window={window_idx}/{len(windows)} "
+                f"batch={batch_idx}/{total_batches} "
+                f"completed_symbols={ok_now:,}/{len(remaining):,}",
+                flush=True,
+            )
+
+    for symbol in remaining:
+        if symbol in results:
+            continue
+        path = raw_root / f"symbol={symbol}.parquet"
+        usable, counts = (
+            _raw_oos_file_usable(path)
+            if path.exists()
+            else (False, {})
+        )
+        results[symbol] = {
+            "status": "OK" if usable else "ERROR",
+            "rows": int(sum(counts.values())),
+            "session_counts": counts,
+            **(
+                {}
+                if usable
+                else {"error": "Yahoo Finance did not provide complete seven-session 1m history"}
+            ),
+        }
+
+    return results
+
+
 def _write_atomic(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
