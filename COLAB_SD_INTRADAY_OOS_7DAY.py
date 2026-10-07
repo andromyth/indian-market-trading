@@ -372,7 +372,6 @@ def _fetch_history(
         frame = pd.DataFrame()
         errors.append(f"window={type(exc).__name__}: {exc}")
 
-    required_dates = set(OOS_SESSIONS)
     if not frame.empty:
         counts = _oos_session_counts(frame)
         if all(
@@ -383,11 +382,7 @@ def _fetch_history(
 
     if not allow_session_fallback:
         detail = " | ".join(errors[-4:])
-        observed_text = (
-            sorted(observed)
-            if not frame.empty
-            else []
-        )
+        observed_text = sorted(_oos_session_counts(frame))
         raise RuntimeError(
             f"{symbol}: OOS history incomplete from single window; "
             f"rows={len(frame):,} observed_sessions={observed_text}"
