@@ -493,24 +493,42 @@ def main() -> int:
     # Resume from the last completed batch. This covers both successful
     # compact checkpoints and deliberate <200-session exclusions.
     coverage_map: dict[str, dict] = {}
-    if coverage_progress_path.exists():
+
+    # A previous 3-way preparation may already have classified the complete
+    # universe. When running the final single-runtime path (1/1), import those
+    # shard coverage records so short-history/NO_DATA symbols are not recalculated.
+    coverage_sources = [coverage_progress_path]
+    if args.num_shards == 1:
+        coverage_sources.extend(
+            prep_dir / f"COVERAGE_PROGRESS_SHARD_{sid}of3.parquet"
+            for sid in (1, 2, 3)
+        )
+
+    for coverage_source in coverage_sources:
+        if not coverage_source.exists():
+            continue
         try:
-            prev = pd.read_parquet(coverage_progress_path)
+            prev = pd.read_parquet(coverage_source)
             if "symbol" in prev.columns:
                 for _, row in prev.iterrows():
                     sym0 = str(row.get("symbol", "")).strip().upper()
                     if sym0:
+                        # Prefer an actual compact checkpoint over an older
+                        # exclusion record if both exist.
                         coverage_map[sym0] = row.to_dict()
-                print(
-                    f"RESUME_SHARD_COVERAGE: {len(coverage_map):,}/{len(universe):,} "
-                    f"symbols already recorded",
-                    flush=True,
-                )
         except Exception as exc:
             print(
-                f"RESUME_COVERAGE_WARNING: {type(exc).__name__}: {exc}",
+                f"RESUME_COVERAGE_WARNING: {coverage_source.name}: "
+                f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
+
+    if coverage_map:
+        print(
+            f"RESUME_COVERAGE: {len(coverage_map):,}/{len(universe):,} "
+            f"symbols already classified from reusable coverage records",
+            flush=True,
+        )
 
     # Warm immutable market state once before worker threads start.
     warm_market_cache(market)
