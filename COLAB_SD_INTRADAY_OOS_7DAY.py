@@ -38,6 +38,7 @@ import requests
 
 from colab_build_all_nse_intraday_5m_multifactor import load_market
 from delivery_training_universe import official_nse_symbols
+from nse_data_layer import fetch_index_history
 from selfdriving.sd_intraday_fast_prepare import build_compact_symbol
 from selfdriving.sd_intraday_v2 import _norm
 from selfdriving.sd_walkforward import wilson_lower
@@ -600,27 +601,11 @@ def main() -> int:
             encoding="utf-8",
         )
 
-    coverage_file = (
-        drive_root
-        / "selfdriving/beta_version2/intraday/BETA_V2_INTRADAY_COVERAGE.parquet"
-    )
-    if coverage_file.exists():
-        try:
-            universe = sorted(
-                pd.read_parquet(
-                    coverage_file, columns=["symbol"]
-                )["symbol"]
-                .astype(str)
-                .str.upper()
-                .str.strip()
-                .dropna()
-                .unique()
-                .tolist()
-            )
-        except Exception:
-            universe = official_nse_symbols(force_refresh=False)
-    else:
-        universe = official_nse_symbols(force_refresh=False)
+    # The coverage checkpoint is a diagnostic/eligibility table, not the OOS
+    # evaluation universe. The earlier implementation accidentally reduced
+    # OOS to the 428 excluded/unavailable symbols. Evaluate against the same
+    # full official NSE roster used by candidate training.
+    universe = official_nse_symbols(force_refresh=False)
 
     if args.max_symbols > 0:
         universe = universe[: args.max_symbols]
@@ -734,22 +719,103 @@ def main() -> int:
         print(json.dumps(state, indent=2, default=str))
         return 0
 
-    # Use the same NIFTY history source for market-relative features.
-    # Some NSE charting responses do not expose NIFTY 50 through the generic
-    # IDX search route even though the equity history route works. For OOS,
-    # therefore prefer the repository's existing historical NIFTY series and
-    # only fall back to direct charting API retrieval when necessary.
+    # Prefer an already-complete cached minute NIFTY file. Otherwise obtain
+    # official NSE daily index history for provenance and diagnostics, then
+    # use the charting IDX lane for the required minute-level feature series.
     market_path = raw_root / "NIFTY50.parquet"
     market_oos = pd.DataFrame()
 
     if market_path.exists():
         try:
-            market_oos = _norm(pd.read_parquet(market_path))
+            cached = _norm(pd.read_parquet(market_path))
+            dates = (
+                cached["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d")
+                if not cached.empty else pd.Series(dtype=str)
+            )
+            if set(OOS_SESSIONS).issubset(set(dates.unique())):
+                market_oos = cached
         except Exception:
             market_oos = pd.DataFrame()
 
+    daily_diag = pd.DataFrame()
+    try:
+        daily_diag = fetch_index_history(
+            "^NSEI",
+            start=OOS_SESSIONS[0],
+            end=OOS_SESSIONS[-1],
+            sync_drive=True,
+        )
+        if not daily_diag.empty:
+            print(
+                "NIFTY DAILY OFFICIAL HISTORY: "
+                f"rows={len(daily_diag):,} "
+                f"range={daily_diag['date'].min().date()}..{daily_diag['date'].max().date()}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            "NIFTY DAILY OFFICIAL HISTORY WARNING: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
     if market_oos.empty:
-        seed_market = _load_seed_market(root)
+        candidates = ("NIFTY 50", "NIFTY50", "NIFTY")
+        errors: list[str] = []
+        info = token_cache.get("__NIFTY_50__")
+
+        for candidate in candidates:
+            try:
+                candidate_info = (
+                    info if info and candidate == "NIFTY 50"
+                    else _resolve_symbol(candidate, "IDX")
+                )
+                print(
+                    "NIFTY IDX RESOLVED: "
+                    f"query={candidate} "
+                    f"symbol={candidate_info.get('symbol')} "
+                    f"type={candidate_info.get('type')} "
+                    f"token={candidate_info.get('scripcode')}",
+                    flush=True,
+                )
+                nifty = _fetch_history(candidate, candidate_info)
+                dates = (
+                    set(
+                        nifty["ts"].dt.tz_convert(IST)
+                        .dt.strftime("%Y-%m-%d")
+                        .unique()
+                    )
+                    if not nifty.empty else set()
+                )
+                missing = [d for d in OOS_SESSIONS if d not in dates]
+                if dates and not missing:
+                    market_oos = nifty
+                    info = candidate_info
+                    break
+                errors.append(
+                    f"{candidate}: rows={len(nifty):,} missing_sessions={missing}"
+                )
+            except Exception as exc:
+                errors.append(
+                    f"{candidate}: {type(exc).__name__}: {exc}"
+                )
+
+        if market_oos.empty:
+            raise RuntimeError(
+                "NIFTY 50 OOS history unavailable. "
+                "Attempt diagnostics: " + " | ".join(errors)
+            )
+
+        token_cache["__NIFTY_50__"] = info
+        _write_atomic(market_oos, market_path)
+        token_cache_path.write_text(
+            json.dumps(token_cache, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        _write_atomic(market_oos, market_path)
+
+    seed_market = _load_seed_market(root)
         if not seed_market.empty:
             seed_local = seed_market[
                 seed_market["ts"]
