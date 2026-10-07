@@ -219,6 +219,7 @@ def _fetch_history(
     start: pd.Timestamp = START_DATE,
     end: pd.Timestamp = END_DATE,
     allow_session_fallback: bool = False,
+    existing_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     def fetch_window(
         window_start: pd.Timestamp,
@@ -302,9 +303,63 @@ def _fetch_history(
     # fast path for equities. Per-session fallback is intentionally opt-in
     # because applying it to 2,599 symbols can multiply API traffic by 8x.
     errors: list[str] = []
+
+    # When an existing raw OOS file is incomplete/thin, repair only
+    # deficient sessions instead of re-downloading the whole seven-session
+    # window. This makes interrupted runs resume efficiently.
+    if allow_session_fallback and existing_frame is not None:
+        try:
+            existing = existing_frame.copy()
+            if not existing.empty and "ts" in existing.columns:
+                existing = _norm(existing)
+                counts = _oos_session_counts(existing)
+                if all(
+                    counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+                    for session_date in OOS_SESSIONS
+                ):
+                    return existing
+                repair_sessions = [
+                    d for d in OOS_SESSIONS
+                    if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+                ]
+                parts: list[pd.DataFrame] = [existing]
+                for session_date in repair_sessions:
+                    try:
+                        day_start = pd.Timestamp(
+                            f"{session_date} 09:15",
+                            tz=IST,
+                        )
+                        day_end = pd.Timestamp(
+                            f"{session_date} 15:30",
+                            tz=IST,
+                        )
+                        day = fetch_window(day_start, day_end)
+                        if not day.empty:
+                            parts.append(day)
+                    except Exception as exc:
+                        errors.append(
+                            f"session={session_date}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                combined = (
+                    pd.concat(parts, ignore_index=True)
+                    .drop_duplicates("ts", keep="last")
+                    .sort_values("ts")
+                    .reset_index(drop=True)
+                )
+                counts = _oos_session_counts(combined)
+                if all(
+                    counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+                    for session_date in OOS_SESSIONS
+                ):
+                    return combined
+                frame = combined
+        except Exception as exc:
+            errors.append(
+                f"existing_repair={type(exc).__name__}: {exc}"
+            )
     try:
-        frame = fetch_window(start, end)
-    except Exception as exc:
+        frame = fetch_window(start, end)    except Exception as exc:
         frame = pd.DataFrame()
         errors.append(f"window={type(exc).__name__}: {exc}")
 
@@ -329,10 +384,18 @@ def _fetch_history(
             + (f"; diagnostics={detail}" if detail else "")
         )
 
-    # Deterministic per-session fallback. This is reserved for NIFTY 50,
-    # where the multi-session minute request has previously returned empty.
+    # Deterministic per-session repair. Only sessions that are absent or
+    # too thin are requested, so an existing partial file is repaired without
+    # re-downloading sessions that are already present.
     parts: list[pd.DataFrame] = [frame] if not frame.empty else []
-    for session_date in OOS_SESSIONS:
+    existing_counts = _oos_session_counts(frame)
+    repair_sessions = [
+        session_date
+        for session_date in OOS_SESSIONS
+        if existing_counts.get(session_date, 0) < MIN_OOS_SESSION_ROWS
+    ]
+
+    for session_date in repair_sessions:
         try:
             day_start = pd.Timestamp(
                 f"{session_date} 09:15",
@@ -354,7 +417,7 @@ def _fetch_history(
     if not parts:
         detail = " | ".join(errors[-8:])
         raise RuntimeError(
-            f"{symbol}: no OOS history after window and per-session fallback"
+            f"{symbol}: no OOS history after window and per-session repair"
             + (f"; diagnostics={detail}" if detail else "")
         )
 
@@ -364,15 +427,17 @@ def _fetch_history(
         .sort_values("ts")
         .reset_index(drop=True)
     )
-    observed = set(
-        combined["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
-    )
-    missing = [d for d in OOS_SESSIONS if d not in observed]
-    if missing:
+    counts = _oos_session_counts(combined)
+    thin = [
+        d
+        for d in OOS_SESSIONS
+        if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+    ]
+    if thin:
         detail = " | ".join(errors[-8:])
         raise RuntimeError(
-            f"{symbol}: OOS history incomplete after per-session fallback; "
-            f"missing_sessions={missing}"
+            f"{symbol}: OOS history still incomplete after repair; "
+            f"session_counts={counts} thin_sessions={thin}"
             + (f"; diagnostics={detail}" if detail else "")
         )
     return combined
