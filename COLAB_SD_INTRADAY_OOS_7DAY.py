@@ -65,6 +65,10 @@ IST = "Asia/Kolkata"
 SEARCH_URL = "https://charting.nseindia.com/v1/exchanges/symbolsDynamic"
 HIST_URL = "https://charting.nseindia.com/v1/charts/symbolHistoricalData"
 
+# Public NSE charting clients use a short-lived CSRF token in addition to
+# browser cookies. Keep the bootstrap token on the thread-local session.
+_CSRF_HEADER_NAMES = ("x-nse-token", "x-csrftoken", "x-csrf-token")
+
 _thread_local = threading.local()
 
 
@@ -96,15 +100,27 @@ def _session() -> requests.Session:
     )
 
     # Prime both domains so charting cookies / anti-bot context are present.
-    for bootstrap_url, timeout in (
+    bootstrap_pages = (
         ("https://www.nseindia.com", (8, 20)),
-        ("https://charting.nseindia.com", (8, 15)),
-    ):
+        ("https://charting.nseindia.com/", (8, 15)),
+    )
+    for bootstrap_url, timeout in bootstrap_pages:
         try:
-            session.get(bootstrap_url, timeout=timeout)
+            response = session.get(bootstrap_url, timeout=timeout)
+            # Some NSE deployments expose a CSRF token in a response header.
+            for name in _CSRF_HEADER_NAMES:
+                token = response.headers.get(name)
+                if token:
+                    session.headers["X-NSE-Token"] = token
+                    break
+            if not session.headers.get("X-NSE-Token"):
+                # Also accept the common cookie names used by the charting UI.
+                for cookie_name in ("nseToken", "csrfToken", "XSRF-TOKEN"):
+                    token = session.cookies.get(cookie_name)
+                    if token:
+                        session.headers["X-NSE-Token"] = token
+                        break
         except Exception:
-            # Historical/search requests below still provide the useful
-            # transport diagnostics if a bootstrap endpoint is unavailable.
             pass
 
     _thread_local.session = session
@@ -119,11 +135,20 @@ def _request_json(
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            # NSE charting's symbolsDynamic and symbolHistoricalData
-            # endpoints use POST with a JSON payload.
+            # NSE charting accepts the request as a JSON POST. Include
+            # the browser-origin headers and CSRF token when available.
             response = _session().post(
                 url,
                 json=payload,
+                headers={
+                    "Origin": "https://charting.nseindia.com",
+                    "Referer": "https://charting.nseindia.com/",
+                    **(
+                        {"X-NSE-Token": _session().headers["X-NSE-Token"]}
+                        if _session().headers.get("X-NSE-Token")
+                        else {}
+                    ),
+                },
                 timeout=(8, 30),
             )
             if response.status_code in (
