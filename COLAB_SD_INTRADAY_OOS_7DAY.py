@@ -27,7 +27,7 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -130,7 +130,7 @@ def _session() -> requests.Session:
 def _request_json(
     url: str,
     payload: dict[str, Any],
-    attempts: int = 5,
+    attempts: int = 3,
 ) -> dict[str, Any]:
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -752,7 +752,7 @@ def main() -> int:
     ap.add_argument(
         "--workers",
         type=int,
-        default=6,
+        default=4,
         help="Concurrent NSE charting workers; capped at 6.",
     )
     ap.add_argument("--max-symbols", type=int, default=0)
