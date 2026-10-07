@@ -679,9 +679,12 @@ def _download_oos_yahoo_batch(
                             .reset_index(drop=True)
                         )
 
+                    # Persist each completed Yahoo window immediately so an
+                    # interrupted run resumes from partial progress. Mark the
+                    # symbol successful only after all seven sessions are present.
+                    _write_atomic(clean_frame, path)
                     usable, counts = _raw_oos_file_usable_from_frame(clean_frame)
                     if usable:
-                        _write_atomic(clean_frame, path)
                         results[symbol] = {
                             "status": "OK",
                             "rows": int(len(clean_frame)),
