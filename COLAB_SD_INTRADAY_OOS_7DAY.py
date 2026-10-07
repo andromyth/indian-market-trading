@@ -119,10 +119,11 @@ def _request_json(
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            # Current NSE charting API is served through GET query parameters.
-            response = _session().get(
+            # NSE charting's symbolsDynamic and symbolHistoricalData
+            # endpoints use POST with a JSON payload.
+            response = _session().post(
                 url,
-                params=payload,
+                json=payload,
                 timeout=(8, 30),
             )
             if response.status_code in (
