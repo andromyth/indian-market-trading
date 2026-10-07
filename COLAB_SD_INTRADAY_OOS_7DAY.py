@@ -378,6 +378,39 @@ def _fetch_history(
     return combined
 
 
+MIN_OOS_SESSION_ROWS = 80
+NIFTY_CACHE_MIN_SESSION_ROWS = 300
+
+
+def _oos_session_counts(frame: pd.DataFrame) -> dict[str, int]:
+    if frame is None or frame.empty or "ts" not in frame.columns:
+        return {}
+    ts = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
+    local = ts.dt.tz_convert(IST)
+    mask = local.dt.strftime("%Y-%m-%d").isin(OOS_SESSIONS)
+    return (
+        local.loc[mask]
+        .dt.strftime("%Y-%m-%d")
+        .value_counts()
+        .sort_index()
+        .astype(int)
+        .to_dict()
+    )
+
+
+def _raw_oos_file_usable(path: Path) -> tuple[bool, dict[str, int]]:
+    try:
+        frame = pd.read_parquet(path, columns=["ts"])
+    except Exception:
+        return False, {}
+    counts = _oos_session_counts(frame)
+    usable = all(
+        counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+        for session_date in OOS_SESSIONS
+    )
+    return usable, counts
+
+
 def _write_atomic(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -788,14 +821,25 @@ def main() -> int:
         token_cache = {}
 
     if not args.evaluate_only:
-        pending = [
-            symbol
-            for symbol in universe
-            if not (raw_root / f"symbol={symbol}.parquet").exists()
-        ]
+        pending: list[str] = []
+        existing_usable = 0
+        existing_invalid = 0
+        for symbol in universe:
+            path = raw_root / f"symbol={symbol}.parquet"
+            if not path.exists():
+                pending.append(symbol)
+                continue
+            usable, _ = _raw_oos_file_usable(path)
+            if usable:
+                existing_usable += 1
+            else:
+                existing_invalid += 1
+                pending.append(symbol)
+
         print(
             f"OOS DOWNLOAD: universe={len(universe):,}; "
-            f"pending={len(pending):,}; sessions={len(OOS_SESSIONS)}",
+            f"pending={len(pending):,}; existing_usable={existing_usable:,}; "
+            f"existing_invalid={existing_invalid:,}; sessions={len(OOS_SESSIONS)}",
             flush=True,
         )
 
@@ -806,7 +850,7 @@ def main() -> int:
             frame = _fetch_history(
                 symbol,
                 info,
-                allow_session_fallback=False,
+                allow_session_fallback=True,
             )
             return symbol, info, frame
 
@@ -902,12 +946,18 @@ def main() -> int:
     if market_path.exists():
         try:
             cached = _norm(pd.read_parquet(market_path))
-            dates = (
-                cached["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d")
-                if not cached.empty else pd.Series(dtype=str)
-            )
-            if set(OOS_SESSIONS).issubset(set(dates.unique())):
+            counts = _oos_session_counts(cached)
+            if all(
+                counts.get(session_date, 0) >= NIFTY_CACHE_MIN_SESSION_ROWS
+                for session_date in OOS_SESSIONS
+            ):
                 market_oos = cached
+            else:
+                print(
+                    "NIFTY CACHE REJECTED: insufficient minute rows; "
+                    f"session_counts={counts}",
+                    flush=True,
+                )
         except Exception:
             market_oos = pd.DataFrame()
 
@@ -1007,16 +1057,11 @@ def main() -> int:
                             f"{session_date} 15:30",
                             tz=IST,
                         )
-                        yf_start = (
-                            session_start
-                            .tz_convert("UTC")
-                            .tz_localize(None)
-                        )
-                        yf_end = (
-                            session_end
-                            .tz_convert("UTC")
-                            .tz_localize(None)
-                        )
+                        # Preserve the Asia/Kolkata timezone. Passing UTC-naive
+                        # datetimes shifts the Yahoo request clock and can truncate
+                        # a full Indian session to only its first ~45 minutes.
+                        yf_start = session_start.to_pydatetime()
+                        yf_end = session_end.to_pydatetime()
                         chunk = yf.download(
                             "^NSEI",
                             start=yf_start,
@@ -1195,6 +1240,40 @@ def main() -> int:
 
     state["candidate_artifacts"] = artifacts
     save_state()
+
+    raw_usable = 0
+    raw_invalid = 0
+    raw_missing = 0
+    for symbol in universe:
+        raw_path = raw_root / f"symbol={symbol}.parquet"
+        if not raw_path.exists():
+            raw_missing += 1
+            continue
+        usable, _ = _raw_oos_file_usable(raw_path)
+        if usable:
+            raw_usable += 1
+        else:
+            raw_invalid += 1
+
+    state["oos_raw_audit"] = {
+        "usable_files": raw_usable,
+        "invalid_files": raw_invalid,
+        "missing_files": raw_missing,
+        "minimum_rows_per_session": MIN_OOS_SESSION_ROWS,
+    }
+    save_state()
+    print(
+        "OOS RAW PREFLIGHT: "
+        f"usable={raw_usable:,} invalid={raw_invalid:,} missing={raw_missing:,}",
+        flush=True,
+    )
+    if raw_usable == 0:
+        raise RuntimeError(
+            "No usable OOS equity raw files were found. "
+            "At least "
+            f"{MIN_OOS_SESSION_ROWS} rows are required in every one of the seven sessions. "
+            "Run the OOS validator without --evaluate-only to repair invalid/missing files."
+        )
 
     pending_predictions = [
         symbol
