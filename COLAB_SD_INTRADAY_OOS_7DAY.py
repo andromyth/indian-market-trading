@@ -193,78 +193,150 @@ def _fetch_history(
     start: pd.Timestamp = START_DATE,
     end: pd.Timestamp = END_DATE,
 ) -> pd.DataFrame:
-    payload = {
-        "token": token_info["scripcode"],
-        "fromDate": int(start.tz_convert("UTC").timestamp()),
-        "toDate": int(end.tz_convert("UTC").timestamp()),
-        "symbol": token_info["symbol"],
-        "symbolType": token_info["type"],
-        "chartType": "I",
-        "timeInterval": 1,
-    }
-    obj = _request_json(HIST_URL, payload)
-    status = obj.get("status")
-    rows = obj.get("data")
-    if not isinstance(rows, list):
-        raise RuntimeError(
-            f"{symbol}: chart API returned non-list data; "
-            f"status={status!r} keys={sorted(obj.keys())} "
-            f"message={obj.get('message')!r} error={obj.get('error')!r}"
-        )
-    if not rows:
-        raise RuntimeError(
-            f"{symbol}: chart API returned empty data; "
-            f"status={status!r} keys={sorted(obj.keys())} "
-            f"message={obj.get('message')!r} error={obj.get('error')!r}"
-        )
-
-    raw = pd.DataFrame(rows)
-    raw = raw.rename(
-        columns={
-            "time": "ts",
-            "timestamp": "ts",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
+    def fetch_window(
+        window_start: pd.Timestamp,
+        window_end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        payload = {
+            "token": token_info["scripcode"],
+            "fromDate": int(window_start.tz_convert("UTC").timestamp()),
+            "toDate": int(window_end.tz_convert("UTC").timestamp()),
+            "symbol": token_info["symbol"],
+            "symbolType": token_info["type"],
+            "chartType": "I",
+            "timeInterval": 1,
         }
-    )
-    required = {"ts", "open", "high", "low", "close"}
-    if not required.issubset(raw.columns):
-        raise RuntimeError(
-            f"{symbol}: chart response missing columns {sorted(required - set(raw.columns))}"
+        obj = _request_json(HIST_URL, payload)
+        status = obj.get("status")
+        rows = obj.get("data")
+        if not isinstance(rows, list):
+            raise RuntimeError(
+                f"{symbol}: chart API returned non-list data; "
+                f"status={status!r} keys={sorted(obj.keys())} "
+                f"message={obj.get('message')!r} error={obj.get('error')!r}"
+            )
+        if not rows:
+            raise RuntimeError(
+                f"{symbol}: chart API returned empty data; "
+                f"status={status!r} keys={sorted(obj.keys())} "
+                f"message={obj.get('message')!r} error={obj.get('error')!r}"
+            )
+
+        raw = pd.DataFrame(rows)
+        raw = raw.rename(
+            columns={
+                "time": "ts",
+                "timestamp": "ts",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+            }
+        )
+        required = {"ts", "open", "high", "low", "close"}
+        if not required.issubset(raw.columns):
+            raise RuntimeError(
+                f"{symbol}: chart response missing columns "
+                f"{sorted(required - set(raw.columns))}"
+            )
+
+        ts_values = raw["ts"]
+        if pd.api.types.is_numeric_dtype(ts_values):
+            ts = pd.to_datetime(ts_values, unit="ms", utc=True, errors="coerce")
+        else:
+            ts = pd.to_datetime(ts_values, utc=True, errors="coerce")
+
+        frame = pd.DataFrame(
+            {
+                "ts": ts,
+                "open": pd.to_numeric(raw["open"], errors="coerce"),
+                "high": pd.to_numeric(raw["high"], errors="coerce"),
+                "low": pd.to_numeric(raw["low"], errors="coerce"),
+                "close": pd.to_numeric(raw["close"], errors="coerce"),
+            }
+        )
+        frame["symbol"] = symbol
+        frame = (
+            frame.dropna(subset=["ts", "open", "high", "low", "close"])
+            .drop_duplicates("ts", keep="last")
+            .sort_values("ts")
         )
 
-    ts_values = raw["ts"]
-    if pd.api.types.is_numeric_dtype(ts_values):
-        ts = pd.to_datetime(ts_values, unit="ms", utc=True, errors="coerce")
-    else:
-        ts = pd.to_datetime(ts_values, utc=True, errors="coerce")
+        local = frame["ts"].dt.tz_convert(IST)
+        minute = local.dt.hour * 60 + local.dt.minute
+        frame = frame[
+            local.dt.strftime("%Y-%m-%d").isin(OOS_SESSIONS)
+            & (minute >= 9 * 60 + 15)
+            & (minute < 15 * 60 + 30)
+        ].copy()
+        return frame.reset_index(drop=True)
 
-    frame = pd.DataFrame(
-        {
-            "ts": ts,
-            "open": pd.to_numeric(raw["open"], errors="coerce"),
-            "high": pd.to_numeric(raw["high"], errors="coerce"),
-            "low": pd.to_numeric(raw["low"], errors="coerce"),
-            "close": pd.to_numeric(raw["close"], errors="coerce"),
-        }
-    )
-    frame["symbol"] = symbol
-    frame = (
-        frame.dropna(subset=["ts", "open", "high", "low", "close"])
+    # Prefer one request for the entire OOS window. Some NSE charting
+    # deployments return an empty/partial 1-minute index response for a
+    # multi-session window even though single-session requests succeed.
+    errors: list[str] = []
+    try:
+        frame = fetch_window(start, end)
+    except Exception as exc:
+        frame = pd.DataFrame()
+        errors.append(f"window={type(exc).__name__}: {exc}")
+
+    required_dates = set(OOS_SESSIONS)
+    if not frame.empty:
+        observed = set(
+            frame["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
+        )
+        if required_dates.issubset(observed):
+            return frame
+
+    # Deterministic per-session fallback. This is especially important for
+    # the NIFTY 50 index lane and also makes the equity downloader resilient
+    # to provider-side intraday range limits.
+    parts: list[pd.DataFrame] = [frame] if not frame.empty else []
+    for session_date in OOS_SESSIONS:
+        try:
+            day_start = pd.Timestamp(
+                f"{session_date} 09:15",
+                tz=IST,
+            )
+            day_end = pd.Timestamp(
+                f"{session_date} 15:30",
+                tz=IST,
+            )
+            day = fetch_window(day_start, day_end)
+            if not day.empty:
+                parts.append(day)
+        except Exception as exc:
+            errors.append(
+                f"session={session_date}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if not parts:
+        detail = " | ".join(errors[-8:])
+        raise RuntimeError(
+            f"{symbol}: no OOS history after window and per-session fallback"
+            + (f"; diagnostics={detail}" if detail else "")
+        )
+
+    combined = (
+        pd.concat(parts, ignore_index=True)
         .drop_duplicates("ts", keep="last")
         .sort_values("ts")
+        .reset_index(drop=True)
     )
-
-    local = frame["ts"].dt.tz_convert(IST)
-    minute = local.dt.hour * 60 + local.dt.minute
-    frame = frame[
-        local.dt.strftime("%Y-%m-%d").isin(OOS_SESSIONS)
-        & (minute >= 9 * 60 + 15)
-        & (minute < 15 * 60 + 30)
-    ].copy()
-    return frame.reset_index(drop=True)
+    observed = set(
+        combined["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
+    )
+    missing = [d for d in OOS_SESSIONS if d not in observed]
+    if missing:
+        detail = " | ".join(errors[-8:])
+        raise RuntimeError(
+            f"{symbol}: OOS history incomplete after per-session fallback; "
+            f"missing_sessions={missing}"
+            + (f"; diagnostics={detail}" if detail else "")
+        )
+    return combined
 
 
 def _write_atomic(frame: pd.DataFrame, path: Path) -> None:
