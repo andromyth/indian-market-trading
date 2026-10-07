@@ -1293,28 +1293,28 @@ def main() -> int:
                 )
                 print(
                     "OOS DOWNLOAD SOURCE SWITCH: "
-                    "using YAHOO_FINANCE batched multi-ticker fallback "
+                    "using INDSTOCKS authenticated historical 1-minute API "
                     "for equity OOS prices",
                     flush=True,
                 )
-                state["oos_equity_source"] = "YAHOO_FINANCE_FALLBACK"
+                state["oos_equity_source"] = "INDSTOCKS_API"
                 save_state()
 
-                yahoo_results = _download_oos_yahoo_batch(
+                indstocks_results = _download_oos_indstocks_batch(
                     pending,
                     raw_root,
-                    batch_size=50,
+                    batch_size=5,
                 )
                 ok_count = sum(
                     value["status"] == "OK"
-                    for value in yahoo_results.values()
+                    for value in indstocks_results.values()
                 )
                 error_count = sum(
                     value["status"] == "ERROR"
-                    for value in yahoo_results.values()
+                    for value in indstocks_results.values()
                 )
                 state["download"] = {
-                    "source": "YAHOO_FINANCE_FALLBACK",
+                    "source": "INDSTOCKS_API",
                     "pending_at_start": len(pending),
                     "ok": int(ok_count),
                     "empty": 0,
