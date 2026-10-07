@@ -348,12 +348,20 @@ def _fetch_history(
                     .reset_index(drop=True)
                 )
                 counts = _oos_session_counts(combined)
-                if all(
-                    counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
-                    for session_date in OOS_SESSIONS
-                ):
+                thin = [
+                    d for d in OOS_SESSIONS
+                    if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+                ]
+                if not thin:
                     return combined
-                frame = combined
+                detail = " | ".join(errors[-8:])
+                raise RuntimeError(
+                    f"{symbol}: existing OOS file could not be fully repaired; "
+                    f"session_counts={counts} thin_sessions={thin}"
+                    + (f"; diagnostics={detail}" if detail else "")
+                )
+        except RuntimeError:
+            raise
         except Exception as exc:
             errors.append(
                 f"existing_repair={type(exc).__name__}: {exc}"
