@@ -35,6 +35,10 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
 
 from colab_build_all_nse_intraday_5m_multifactor import load_market
 from delivery_training_universe import official_nse_symbols
@@ -68,7 +72,15 @@ def _session() -> requests.Session:
     session = getattr(_thread_local, "session", None)
     if session is not None:
         return session
-    session = requests.Session()
+
+    # NSE's current charting service expects browser-like transport. The
+    # reference OpenChart client uses curl_cffi Chrome impersonation and
+    # initializes both the NSE and charting domains before API calls.
+    if curl_requests is not None:
+        session = curl_requests.Session(impersonate="chrome120")
+    else:
+        session = requests.Session()
+
     session.headers.update(
         {
             "User-Agent": (
@@ -78,32 +90,53 @@ def _session() -> requests.Session:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate",
-            "Content-Type": "application/json",
             "Origin": "https://charting.nseindia.com",
             "Referer": "https://charting.nseindia.com/",
         }
     )
+
+    # Prime both domains so charting cookies / anti-bot context are present.
+    for bootstrap_url, timeout in (
+        ("https://www.nseindia.com", (8, 20)),
+        ("https://charting.nseindia.com", (8, 15)),
+    ):
+        try:
+            session.get(bootstrap_url, timeout=timeout)
+        except Exception:
+            # Historical/search requests below still provide the useful
+            # transport diagnostics if a bootstrap endpoint is unavailable.
+            pass
+
     _thread_local.session = session
     return session
 
 
-def _request_json(url: str, payload: dict[str, Any], attempts: int = 5) -> dict[str, Any]:
+def _request_json(
+    url: str,
+    payload: dict[str, Any],
+    attempts: int = 5,
+) -> dict[str, Any]:
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            response = _session().post(
+            # Current NSE charting API is served through GET query parameters.
+            response = _session().get(
                 url,
-                json=payload,
+                params=payload,
                 timeout=(8, 30),
             )
-            if response.status_code in (401, 403, 408, 425, 429, 500, 502, 503, 504):
+            if response.status_code in (
+                401, 403, 408, 425, 429, 500, 502, 503, 504
+            ):
                 raise RuntimeError(
-                    f"HTTP {response.status_code}: {response.text[:250]}"
+                    f"HTTP {response.status_code}: {response.text[:400]}"
                 )
             response.raise_for_status()
             obj = response.json()
             if not isinstance(obj, dict):
-                raise RuntimeError(f"unexpected JSON type: {type(obj).__name__}")
+                raise RuntimeError(
+                    f"unexpected JSON type: {type(obj).__name__}"
+                )
             return obj
         except Exception as exc:
             last = exc
@@ -112,7 +145,9 @@ def _request_json(url: str, payload: dict[str, Any], attempts: int = 5) -> dict[
                     min(20.0, 1.25 * (2 ** (attempt - 1)))
                     + random.random()
                 )
-    raise RuntimeError(f"request failed after {attempts} attempts: {last}") from last
+    raise RuntimeError(
+        f"request failed after {attempts} attempts: {last}"
+    ) from last
 
 
 def _resolve_symbol(symbol: str, segment: str = "EQ") -> dict[str, str]:
@@ -168,9 +203,20 @@ def _fetch_history(
         "timeInterval": 1,
     }
     obj = _request_json(HIST_URL, payload)
+    status = obj.get("status")
     rows = obj.get("data")
-    if not isinstance(rows, list) or not rows:
-        return pd.DataFrame()
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            f"{symbol}: chart API returned non-list data; "
+            f"status={status!r} keys={sorted(obj.keys())} "
+            f"message={obj.get('message')!r} error={obj.get('error')!r}"
+        )
+    if not rows:
+        raise RuntimeError(
+            f"{symbol}: chart API returned empty data; "
+            f"status={status!r} keys={sorted(obj.keys())} "
+            f"message={obj.get('message')!r} error={obj.get('error')!r}"
+        )
 
     raw = pd.DataFrame(rows)
     raw = raw.rename(
