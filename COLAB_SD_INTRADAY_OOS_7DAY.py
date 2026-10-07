@@ -512,23 +512,83 @@ def _nse_charting_probe() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _download_oos_yahoo_batch(
+def _download_oos_indstocks_batch(
     universe: list[str],
     raw_root: Path,
     *,
-    batch_size: int = 50,
+    batch_size: int = 5,
 ) -> dict[str, dict[str, Any]]:
-    """Download OOS equity prices using yfinance multi-ticker batches.
+    """Download seven-session OOS equity candles from INDstocks.
 
-    The seven OOS sessions are split into two calendar windows so each 1-minute
-    request stays within Yahoo's short intraday window. Yahoo's yfinance
-    download API supports a list of tickers in one request.
+    INDstocks supports authenticated 1-minute history for up to five NSE
+    instruments per request and a maximum seven-day window per call. The
+    seven OOS sessions are therefore covered by two bounded requests per
+    five-symbol batch. The access token is read from INDSTOCKS_TOKEN and is
+    never persisted to disk or GitHub.
     """
-    import yfinance as yf
+    import requests as http_requests
 
-    windows = (
-        ("2026-09-25", "2026-10-02"),
-        ("2026-10-02", "2026-10-07"),
+    token = os.environ.get("INDSTOCKS_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "INDSTOCKS_TOKEN is not set. Generate an INDstocks API access token "
+            "from the INDstocks API access-token page and set it in this Colab "
+            "session as os.environ['INDSTOCKS_TOKEN']. The token is required "
+            "for historical 1-minute OOS recovery because the NSE charting "
+            "edge returned HTTP 403 and Yahoo 1-minute history no longer "
+            "covers the earliest OOS session."
+        )
+
+    base_url = "https://api.indstocks.com"
+    headers = {"Authorization": token}
+
+    print(
+        "OOS INDSTOCKS: loading NSE equity instrument master",
+        flush=True,
+    )
+    response = http_requests.get(
+        f"{base_url}/market/instruments",
+        headers=headers,
+        params={"source": "equity"},
+        timeout=(5, 20),
+    )
+    response.raise_for_status()
+    master = pd.read_csv(
+        __import__("io").BytesIO(response.content)
+    )
+    master.columns = [str(col).strip() for col in master.columns]
+
+    required_cols = {"SECURITY_ID", "SYMBOL_NAME", "EXCH", "SERIES"}
+    missing = required_cols - set(master.columns)
+    if missing:
+        raise RuntimeError(
+            "INDstocks instrument master missing columns: "
+            + repr(sorted(missing))
+        )
+
+    master["EXCH"] = master["EXCH"].astype(str).str.strip().str.upper()
+    master["SERIES"] = master["SERIES"].astype(str).str.strip().str.upper()
+    master["SYMBOL_NAME"] = (
+        master["SYMBOL_NAME"].astype(str).str.strip().str.upper()
+    )
+    master["SECURITY_ID"] = pd.to_numeric(
+        master["SECURITY_ID"], errors="coerce"
+    )
+    master = master[
+        master["EXCH"].eq("NSE")
+        & master["SERIES"].eq("EQ")
+        & master["SECURITY_ID"].notna()
+    ].copy()
+    master["SYMBOL_NAME"] = (
+        master["SYMBOL_NAME"]
+        .str.replace(".NS", "", regex=False)
+        .str.strip()
+    )
+    security_map = (
+        master.drop_duplicates("SYMBOL_NAME", keep="first")
+        .set_index("SYMBOL_NAME")["SECURITY_ID"]
+        .astype(int)
+        .to_dict()
     )
 
     remaining: list[str] = []
@@ -541,69 +601,100 @@ def _download_oos_yahoo_batch(
             remaining.append(symbol)
 
     print(
-        "OOS YAHOO BATCH START: "
+        "OOS INDSTOCKS START: "
         f"symbols={len(remaining):,} batch_size={batch_size}",
         flush=True,
     )
 
-    results: dict[str, dict[str, Any]] = {}
+    windows = (
+        (pd.Timestamp("2026-09-25", tz=IST), pd.Timestamp("2026-10-02", tz=IST)),
+        (pd.Timestamp("2026-10-02", tz=IST), pd.Timestamp("2026-10-07", tz=IST)),
+    )
 
-    def normalize_batch(data: pd.DataFrame, requested: list[str]) -> dict[str, pd.DataFrame]:
-        if data is None or data.empty:
-            return {}
-        out: dict[str, pd.DataFrame] = {}
-        req = {s.upper() for s in requested}
-
-        if isinstance(data.columns, pd.MultiIndex):
-            levels = [
-                [str(v).upper() for v in data.columns.get_level_values(i)]
-                for i in range(data.columns.nlevels)
-            ]
-            fields = {"OPEN", "HIGH", "LOW", "CLOSE"}
-            if fields.intersection(levels[0]):
-                field_level, ticker_level = 0, 1
-            elif len(levels) > 1 and fields.intersection(levels[1]):
-                field_level, ticker_level = 1, 0
-            else:
-                return {}
-
-            for ticker in dict.fromkeys(levels[ticker_level]):
-                symbol = ticker[:-3] if ticker.endswith(".NS") else ticker
-                symbol = symbol.upper()
-                if symbol not in req:
+    def request_batch(
+        codes: list[str],
+        start_dt: pd.Timestamp,
+        end_dt: pd.Timestamp,
+    ) -> dict[str, pd.DataFrame]:
+        params = {
+            "scrip-codes": ",".join(codes),
+            "start_time": int(start_dt.tz_convert("UTC").timestamp() * 1000),
+            "end_time": int(end_dt.tz_convert("UTC").timestamp() * 1000),
+        }
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = http_requests.get(
+                    f"{base_url}/market/historical/1minute",
+                    headers=headers,
+                    params=params,
+                    timeout=(5, 30),
+                )
+                if response.status_code == 429:
+                    time.sleep(1.0 * attempt)
                     continue
-                cols = [
-                    col for col in data.columns
-                    if str(col[ticker_level]).upper() == ticker
-                ]
-                part = data.loc[:, cols].copy()
-                part.columns = [
-                    str(col[field_level]).lower()
-                    for col in cols
-                ]
-                out[symbol] = part
-            return out
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data", {})
+                if not isinstance(data, dict):
+                    raise RuntimeError(
+                        f"unexpected INDstocks data shape: {type(data).__name__}"
+                    )
 
-        if requested and {"open", "high", "low", "close"}.issubset(
-            {str(col).lower() for col in data.columns}
-        ):
-            out[requested[0].upper()] = data.copy()
-        return out
+                out: dict[str, pd.DataFrame] = {}
+                for code, rows in data.items():
+                    if not isinstance(rows, list) or not rows:
+                        continue
+                    raw = pd.DataFrame(rows)
+                    aliases = {
+                        "ts": "ts",
+                        "timestamp": "ts",
+                        "o": "open",
+                        "open": "open",
+                        "h": "high",
+                        "high": "high",
+                        "l": "low",
+                        "low": "low",
+                        "c": "close",
+                        "close": "close",
+                        "v": "volume",
+                        "volume": "volume",
+                    }
+                    raw = raw.rename(
+                        columns={
+                            col: aliases.get(str(col).lower(), col)
+                            for col in raw.columns
+                        }
+                    )
+                    required = {"ts", "open", "high", "low", "close"}
+                    if not required.issubset(raw.columns):
+                        continue
+                    raw["ts"] = pd.to_datetime(
+                        raw["ts"], unit="ms", utc=True, errors="coerce"
+                    )
+                    if raw["ts"].isna().all():
+                        raw["ts"] = pd.to_datetime(
+                            raw["ts"], utc=True, errors="coerce"
+                        )
+                    for col in ("open", "high", "low", "close"):
+                        raw[col] = pd.to_numeric(
+                            raw[col], errors="coerce"
+                        )
+                    raw = raw.dropna(
+                        subset=["ts", "open", "high", "low", "close"]
+                    ).copy()
+                    out[code.upper()] = raw
+                return out
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 3:
+                    time.sleep(min(2.0, 0.75 * attempt))
+        raise RuntimeError(
+            f"INDstocks historical request failed after 3 attempts: {last_exc}"
+        ) from last_exc
 
-    def clean(part: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        x = part.copy()
-        x.index = pd.to_datetime(x.index, utc=True, errors="coerce")
-        x = x[~x.index.isna()].reset_index()
-        x = x.rename(columns={x.columns[0]: "ts"})
-        required = {"ts", "open", "high", "low", "close"}
-        if not required.issubset(x.columns):
-            return pd.DataFrame()
-
-        x["ts"] = pd.to_datetime(x["ts"], utc=True, errors="coerce")
-        for col in ("open", "high", "low", "close"):
-            x[col] = pd.to_numeric(x[col], errors="coerce")
-        x = x.dropna(subset=["ts", "open", "high", "low", "close"]).copy()
-
+    def clean(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        x = frame.copy()
         local = x["ts"].dt.tz_convert(IST)
         minute = local.dt.hour * 60 + local.dt.minute
         x = x[
@@ -611,10 +702,11 @@ def _download_oos_yahoo_batch(
             & (minute >= 9 * 60 + 15)
             & (minute < 15 * 60 + 30)
         ].copy()
-
         x["symbol"] = symbol
-        x["source"] = "YAHOO_FINANCE"
-        x["provenance"] = "Yahoo Finance 1-minute historical chart fallback"
+        x["source"] = "INDSTOCKS_API"
+        x["provenance"] = (
+            "INDstocks authenticated historical 1-minute OHLCV API"
+        )
         return (
             x[
                 [
@@ -633,81 +725,98 @@ def _download_oos_yahoo_batch(
             .reset_index(drop=True)
         )
 
-    total_batches = (len(remaining) + batch_size - 1) // batch_size
-    for window_idx, (window_start, window_end) in enumerate(windows, start=1):
-        for batch_idx, offset in enumerate(
-            range(0, len(remaining), batch_size),
-            start=1,
+    # The API ceiling is five instruments per call. Rate limit the client to
+    # stay safely below the documented 5 data-API requests/second limit.
+    results: dict[str, dict[str, Any]] = {}
+    unresolved = 0
+    batches_total = (len(remaining) + batch_size - 1) // batch_size
+    batches_done = 0
+
+    for offset in range(0, len(remaining), batch_size):
+        batch_symbols = remaining[offset : offset + batch_size]
+        pairs = [
+            (symbol, security_map.get(symbol))
+            for symbol in batch_symbols
+        ]
+        missing_symbols = [s for s, sec in pairs if sec is None]
+        unresolved += len(missing_symbols)
+
+        code_to_symbol = {
+            f"NSE_{int(sec)}": symbol
+            for symbol, sec in pairs
+            if sec is not None
+        }
+        codes = list(code_to_symbol)
+
+        merged: dict[str, pd.DataFrame] = {}
+        for window_idx, (window_start, window_end) in enumerate(
+            windows, start=1
         ):
-            batch_symbols = remaining[offset : offset + batch_size]
-            tickers = [f"{s}.NS" for s in batch_symbols]
-
-            try:
-                data = yf.download(
-                    tickers,
-                    start=pd.Timestamp(window_start, tz=IST).to_pydatetime(),
-                    end=pd.Timestamp(window_end, tz=IST).to_pydatetime(),
-                    interval="1m",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                    group_by="ticker",
-                    timeout=20,
+            if codes:
+                data = request_batch(
+                    codes,
+                    window_start,
+                    window_end,
                 )
-                parts = normalize_batch(data, batch_symbols)
+                for code, raw in data.items():
+                    symbol = code_to_symbol.get(code)
+                    if symbol:
+                        clean_part = clean(raw, symbol)
+                        if not clean_part.empty:
+                            merged.setdefault(
+                                symbol, []
+                            ).append(clean_part)
 
-                for symbol in batch_symbols:
-                    part = parts.get(symbol.upper())
-                    if part is None or part.empty:
-                        continue
-                    clean_frame = clean(part, symbol)
-                    if clean_frame.empty:
-                        continue
+                # Stay below the documented data API rate limit.
+                time.sleep(0.22)
 
-                    path = raw_root / f"symbol={symbol}.parquet"
-                    old = None
-                    if path.exists():
-                        try:
-                            old = pd.read_parquet(path)
-                        except Exception:
-                            old = None
-                    if old is not None and not old.empty:
-                        clean_frame = (
-                            pd.concat([old, clean_frame], ignore_index=True)
+        for symbol, parts in list(merged.items()):
+            if not parts:
+                continue
+            frame = (
+                pd.concat(parts, ignore_index=True)
+                .drop_duplicates("ts", keep="last")
+                .sort_values("ts")
+                .reset_index(drop=True)
+            )
+            path = raw_root / f"symbol={symbol}.parquet"
+            if path.exists():
+                try:
+                    old = pd.read_parquet(path)
+                    if not old.empty:
+                        frame = (
+                            pd.concat([old, frame], ignore_index=True)
                             .drop_duplicates("ts", keep="last")
                             .sort_values("ts")
                             .reset_index(drop=True)
                         )
+                except Exception:
+                    pass
 
-                    # Persist each completed Yahoo window immediately so an
-                    # interrupted run resumes from partial progress. Mark the
-                    # symbol successful only after all seven sessions are present.
-                    _write_atomic(clean_frame, path)
-                    usable, counts = _raw_oos_file_usable_from_frame(clean_frame)
-                    if usable:
-                        results[symbol] = {
-                            "status": "OK",
-                            "rows": int(len(clean_frame)),
-                            "session_counts": counts,
-                        }
+            _write_atomic(frame, path)
+            usable, counts = _raw_oos_file_usable_from_frame(frame)
+            if usable:
+                results[symbol] = {
+                    "status": "OK",
+                    "rows": int(len(frame)),
+                    "session_counts": counts,
+                }
+            else:
+                results[symbol] = {
+                    "status": "PARTIAL",
+                    "rows": int(len(frame)),
+                    "session_counts": counts,
+                }
 
-            except Exception as exc:
-                print(
-                    "OOS YAHOO BATCH ERROR: "
-                    f"window={window_start}->{window_end} "
-                    f"batch={batch_idx}/{total_batches} "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-
-            ok_now = sum(v["status"] == "OK" for v in results.values())
-            print(
-                "OOS YAHOO BATCH PROGRESS: "
-                f"window={window_idx}/{len(windows)} "
-                f"batch={batch_idx}/{total_batches} "
-                f"completed_symbols={ok_now:,}/{len(remaining):,}",
-                flush=True,
-            )
+        batches_done += 1
+        ok_now = sum(v["status"] == "OK" for v in results.values())
+        print(
+            "OOS INDSTOCKS PROGRESS: "
+            f"batch={batches_done}/{batches_total} "
+            f"symbols_with_complete_history={ok_now:,}/{len(remaining):,} "
+            f"unmapped_in_master={unresolved:,}",
+            flush=True,
+        )
 
     for symbol in remaining:
         if symbol in results:
@@ -725,7 +834,7 @@ def _download_oos_yahoo_batch(
             **(
                 {}
                 if usable
-                else {"error": "Yahoo Finance did not provide complete seven-session 1m history"}
+                else {"error": "INDstocks did not provide complete seven-session history"}
             ),
         }
 
