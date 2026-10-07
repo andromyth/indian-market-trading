@@ -913,143 +913,196 @@ def main() -> int:
             flush=True,
         )
 
-        def download_one(symbol: str):
-            info = token_cache.get(symbol)
-            if not info:
-                info = _resolve_symbol(symbol, "EQ")
-
-            existing_path = raw_root / f"symbol={symbol}.parquet"
-            existing_frame = None
-            if existing_path.exists():
-                try:
-                    existing_frame = pd.read_parquet(existing_path)
-                except Exception:
-                    existing_frame = None
-
-            frame = _fetch_history(
-                symbol,
-                info,
-                allow_session_fallback=True,
-                existing_frame=existing_frame,
-            )
-            return symbol, info, frame
-
-        results: dict[str, dict[str, Any]] = {}
-        worker_count = max(1, min(int(args.workers), 6))
-        started_at = time.monotonic()
-        total_pending = len(pending)
-        completed = 0
-
-        print(
-            f"OOS DOWNLOAD CONFIG: workers={worker_count}; "
-            f"pending={total_pending:,}; heartbeat=30s",
-            flush=True,
-        )
-
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            futures = {
-                pool.submit(download_one, symbol): symbol
-                for symbol in pending
+        if pending:
+            # Hosted Colab IPs can be rejected by the NSE charting edge. Probe
+            # the resolver once before launching thousands of per-symbol
+            # requests. When unavailable, use Yahoo Finance's documented
+            # multi-ticker download path as an explicit OOS fallback.
+            nse_charting_ok, nse_charting_diag = _nse_charting_probe()
+            state["nse_charting_probe"] = {
+                "available": bool(nse_charting_ok),
+                "diagnostic": nse_charting_diag,
             }
+            save_state()
 
-            while futures:
-                done, _ = wait(
-                    futures,
-                    timeout=30,
-                    return_when=FIRST_COMPLETED,
+            if not nse_charting_ok:
+                print(
+                    "OOS NSE CHARTING UNAVAILABLE: "
+                    f"{nse_charting_diag}",
+                    flush=True,
+                )
+                print(
+                    "OOS DOWNLOAD SOURCE SWITCH: "
+                    "using YAHOO_FINANCE batched multi-ticker fallback "
+                    "for equity OOS prices",
+                    flush=True,
+                )
+                state["oos_equity_source"] = "YAHOO_FINANCE_FALLBACK"
+                save_state()
+
+                yahoo_results = _download_oos_yahoo_batch(
+                    pending,
+                    raw_root,
+                    batch_size=50,
+                )
+                ok_count = sum(
+                    value["status"] == "OK"
+                    for value in yahoo_results.values()
+                )
+                error_count = sum(
+                    value["status"] == "ERROR"
+                    for value in yahoo_results.values()
+                )
+                state["download"] = {
+                    "source": "YAHOO_FINANCE_FALLBACK",
+                    "pending_at_start": len(pending),
+                    "ok": int(ok_count),
+                    "empty": 0,
+                    "errors": int(error_count),
+                    "raw_files_now": int(
+                        len(list(raw_root.glob("symbol=*.parquet")))
+                    ),
+                }
+                save_state()
+            else:
+                def download_one(symbol: str):
+                    info = token_cache.get(symbol)
+                    if not info:
+                        info = _resolve_symbol(symbol, "EQ")
+
+                    existing_path = raw_root / f"symbol={symbol}.parquet"
+                    existing_frame = None
+                    if existing_path.exists():
+                        try:
+                            existing_frame = pd.read_parquet(existing_path)
+                        except Exception:
+                            existing_frame = None
+
+                    frame = _fetch_history(
+                        symbol,
+                        info,
+                        allow_session_fallback=True,
+                        existing_frame=existing_frame,
+                    )
+                    return symbol, info, frame
+
+                results: dict[str, dict[str, Any]] = {}
+                worker_count = max(1, min(int(args.workers), 6))
+                started_at = time.monotonic()
+                total_pending = len(pending)
+                completed = 0
+
+                print(
+                    f"OOS DOWNLOAD CONFIG: workers={worker_count}; "
+                    f"pending={total_pending:,}; heartbeat=30s",
+                    flush=True,
                 )
 
-                if not done:
-                    elapsed_min = (time.monotonic() - started_at) / 60.0
-                    print(
-                        "OOS DOWNLOAD HEARTBEAT: "
-                        f"completed={completed:,}/{total_pending:,} "
-                        f"active_workers={min(worker_count, len(futures)):,} "
-                        f"elapsed={elapsed_min:.1f}m",
-                        flush=True,
-                    )
-                    continue
+                with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                    futures = {
+                        pool.submit(download_one, symbol): symbol
+                        for symbol in pending
+                    }
 
-                for future in done:
-                    symbol = futures.pop(future)
-                    completed += 1
-                    try:
-                        symbol, info, frame = future.result()
-                        token_cache[symbol] = info
-                        if frame.empty:
-                            results[symbol] = {
-                                "status": "EMPTY",
-                                "rows": 0,
-                            }
-                        else:
-                            _write_atomic(
-                                frame,
-                                raw_root / f"symbol={symbol}.parquet",
+                    while futures:
+                        done, _ = wait(
+                            futures,
+                            timeout=30,
+                            return_when=FIRST_COMPLETED,
+                        )
+
+                        if not done:
+                            elapsed_min = (time.monotonic() - started_at) / 60.0
+                            print(
+                                "OOS DOWNLOAD HEARTBEAT: "
+                                f"completed={completed:,}/{total_pending:,} "
+                                f"active_workers={min(worker_count, len(futures)):,} "
+                                f"elapsed={elapsed_min:.1f}m",
+                                flush=True,
                             )
-                            results[symbol] = {
-                                "status": "OK",
-                                "rows": int(len(frame)),
-                                "dates": int(
-                                    frame["ts"]
-                                    .dt.tz_convert(IST)
-                                    .dt.strftime("%Y-%m-%d")
-                                    .nunique()
-                                ),
-                            }
-                    except Exception as exc:
-                        results[symbol] = {
-                            "status": "ERROR",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
+                            continue
 
-                    if completed % 10 == 0 or completed == total_pending:
-                        token_cache_path.write_text(
-                            json.dumps(token_cache, indent=2),
-                            encoding="utf-8",
-                        )
-                        elapsed = max(0.001, time.monotonic() - started_at)
-                        rate = completed / elapsed
-                        remaining = max(0, total_pending - completed)
-                        eta_min = (
-                            remaining / rate / 60.0
-                            if rate > 0 else float("inf")
-                        )
-                        ok_count = sum(
-                            v["status"] == "OK"
-                            for v in results.values()
-                        )
-                        error_count = sum(
-                            v["status"] == "ERROR"
-                            for v in results.values()
-                        )
-                        print(
-                            f"OOS DOWNLOAD PROGRESS: "
-                            f"{completed:,}/{total_pending:,} "
-                            f"ok={ok_count:,} errors={error_count:,} "
-                            f"rate={rate:.2f}/s eta={eta_min:.1f}m",
-                            flush=True,
-                        )
+                        for future in done:
+                            symbol = futures.pop(future)
+                            completed += 1
+                            try:
+                                symbol, info, frame = future.result()
+                                token_cache[symbol] = info
+                                if frame.empty:
+                                    results[symbol] = {
+                                        "status": "EMPTY",
+                                        "rows": 0,
+                                    }
+                                else:
+                                    _write_atomic(
+                                        frame,
+                                        raw_root / f"symbol={symbol}.parquet",
+                                    )
+                                    results[symbol] = {
+                                        "status": "OK",
+                                        "rows": int(len(frame)),
+                                        "dates": int(
+                                            frame["ts"]
+                                            .dt.tz_convert(IST)
+                                            .dt.strftime("%Y-%m-%d")
+                                            .nunique()
+                                        ),
+                                    }
+                            except Exception as exc:
+                                results[symbol] = {
+                                    "status": "ERROR",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
 
-        token_cache_path.write_text(
-            json.dumps(token_cache, indent=2),
-            encoding="utf-8",
-        )
-        state["download"] = {
-            "pending_at_start": len(pending),
-            "ok": int(
-                sum(v["status"] == "OK" for v in results.values())
-            ),
-            "empty": int(
-                sum(v["status"] == "EMPTY" for v in results.values())
-            ),
-            "errors": int(
-                sum(v["status"] == "ERROR" for v in results.values())
-            ),
-            "raw_files_now": int(
-                len(list(raw_root.glob("symbol=*.parquet")))
-            ),
-        }
-        save_state()
+                            if completed % 10 == 0 or completed == total_pending:
+                                token_cache_path.write_text(
+                                    json.dumps(token_cache, indent=2),
+                                    encoding="utf-8",
+                                )
+                                elapsed = max(0.001, time.monotonic() - started_at)
+                                rate = completed / elapsed
+                                remaining = max(0, total_pending - completed)
+                                eta_min = (
+                                    remaining / rate / 60.0
+                                    if rate > 0 else float("inf")
+                                )
+                                ok_count = sum(
+                                    v["status"] == "OK"
+                                    for v in results.values()
+                                )
+                                error_count = sum(
+                                    v["status"] == "ERROR"
+                                    for v in results.values()
+                                )
+                                print(
+                                    f"OOS DOWNLOAD PROGRESS: "
+                                    f"{completed:,}/{total_pending:,} "
+                                    f"ok={ok_count:,} errors={error_count:,} "
+                                    f"rate={rate:.2f}/s eta={eta_min:.1f}m",
+                                    flush=True,
+                                )
+
+                token_cache_path.write_text(
+                    json.dumps(token_cache, indent=2),
+                    encoding="utf-8",
+                )
+                state["download"] = {
+                    "source": "NSE_CHARTING_API",
+                    "pending_at_start": len(pending),
+                    "ok": int(
+                        sum(v["status"] == "OK" for v in results.values())
+                    ),
+                    "empty": int(
+                        sum(v["status"] == "EMPTY" for v in results.values())
+                    ),
+                    "errors": int(
+                        sum(v["status"] == "ERROR" for v in results.values())
+                    ),
+                    "raw_files_now": int(
+                        len(list(raw_root.glob("symbol=*.parquet")))
+                    ),
+                }
+                save_state()
 
     if args.download_only:
         state["status"] = "DOWNLOAD_COMPLETE"
