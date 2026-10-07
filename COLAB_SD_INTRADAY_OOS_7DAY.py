@@ -27,7 +27,7 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -130,7 +130,7 @@ def _session() -> requests.Session:
 def _request_json(
     url: str,
     payload: dict[str, Any],
-    attempts: int = 5,
+    attempts: int = 3,
 ) -> dict[str, Any]:
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -219,6 +219,7 @@ def _fetch_history(
     start: pd.Timestamp = START_DATE,
     end: pd.Timestamp = END_DATE,
     allow_session_fallback: bool = False,
+    existing_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     def fetch_window(
         window_start: pd.Timestamp,
@@ -302,37 +303,104 @@ def _fetch_history(
     # fast path for equities. Per-session fallback is intentionally opt-in
     # because applying it to 2,599 symbols can multiply API traffic by 8x.
     errors: list[str] = []
+
+    # When an existing raw OOS file is incomplete/thin, repair only
+    # deficient sessions instead of re-downloading the whole seven-session
+    # window. This makes interrupted runs resume efficiently.
+    if allow_session_fallback and existing_frame is not None:
+        try:
+            existing = existing_frame.copy()
+            if not existing.empty and "ts" in existing.columns:
+                existing = _norm(existing)
+                counts = _oos_session_counts(existing)
+                if all(
+                    counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+                    for session_date in OOS_SESSIONS
+                ):
+                    return existing
+                repair_sessions = [
+                    d for d in OOS_SESSIONS
+                    if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+                ]
+                parts: list[pd.DataFrame] = [existing]
+                for session_date in repair_sessions:
+                    try:
+                        day_start = pd.Timestamp(
+                            f"{session_date} 09:15",
+                            tz=IST,
+                        )
+                        day_end = pd.Timestamp(
+                            f"{session_date} 15:30",
+                            tz=IST,
+                        )
+                        day = fetch_window(day_start, day_end)
+                        if not day.empty:
+                            parts.append(day)
+                    except Exception as exc:
+                        errors.append(
+                            f"session={session_date}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                combined = (
+                    pd.concat(parts, ignore_index=True)
+                    .drop_duplicates("ts", keep="last")
+                    .sort_values("ts")
+                    .reset_index(drop=True)
+                )
+                counts = _oos_session_counts(combined)
+                thin = [
+                    d for d in OOS_SESSIONS
+                    if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+                ]
+                if not thin:
+                    return combined
+                detail = " | ".join(errors[-8:])
+                raise RuntimeError(
+                    f"{symbol}: existing OOS file could not be fully repaired; "
+                    f"session_counts={counts} thin_sessions={thin}"
+                    + (f"; diagnostics={detail}" if detail else "")
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            errors.append(
+                f"existing_repair={type(exc).__name__}: {exc}"
+            )
     try:
         frame = fetch_window(start, end)
     except Exception as exc:
         frame = pd.DataFrame()
         errors.append(f"window={type(exc).__name__}: {exc}")
 
-    required_dates = set(OOS_SESSIONS)
     if not frame.empty:
-        observed = set(
-            frame["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
-        )
-        if required_dates.issubset(observed):
+        counts = _oos_session_counts(frame)
+        if all(
+            counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+            for session_date in OOS_SESSIONS
+        ):
             return frame
 
     if not allow_session_fallback:
         detail = " | ".join(errors[-4:])
-        observed_text = (
-            sorted(observed)
-            if not frame.empty
-            else []
-        )
+        observed_text = sorted(_oos_session_counts(frame))
         raise RuntimeError(
             f"{symbol}: OOS history incomplete from single window; "
             f"rows={len(frame):,} observed_sessions={observed_text}"
             + (f"; diagnostics={detail}" if detail else "")
         )
 
-    # Deterministic per-session fallback. This is reserved for NIFTY 50,
-    # where the multi-session minute request has previously returned empty.
+    # Deterministic per-session repair. Only sessions that are absent or
+    # too thin are requested, so an existing partial file is repaired without
+    # re-downloading sessions that are already present.
     parts: list[pd.DataFrame] = [frame] if not frame.empty else []
-    for session_date in OOS_SESSIONS:
+    existing_counts = _oos_session_counts(frame)
+    repair_sessions = [
+        session_date
+        for session_date in OOS_SESSIONS
+        if existing_counts.get(session_date, 0) < MIN_OOS_SESSION_ROWS
+    ]
+
+    for session_date in repair_sessions:
         try:
             day_start = pd.Timestamp(
                 f"{session_date} 09:15",
@@ -354,7 +422,7 @@ def _fetch_history(
     if not parts:
         detail = " | ".join(errors[-8:])
         raise RuntimeError(
-            f"{symbol}: no OOS history after window and per-session fallback"
+            f"{symbol}: no OOS history after window and per-session repair"
             + (f"; diagnostics={detail}" if detail else "")
         )
 
@@ -364,15 +432,17 @@ def _fetch_history(
         .sort_values("ts")
         .reset_index(drop=True)
     )
-    observed = set(
-        combined["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
-    )
-    missing = [d for d in OOS_SESSIONS if d not in observed]
-    if missing:
+    counts = _oos_session_counts(combined)
+    thin = [
+        d
+        for d in OOS_SESSIONS
+        if counts.get(d, 0) < MIN_OOS_SESSION_ROWS
+    ]
+    if thin:
         detail = " | ".join(errors[-8:])
         raise RuntimeError(
-            f"{symbol}: OOS history incomplete after per-session fallback; "
-            f"missing_sessions={missing}"
+            f"{symbol}: OOS history still incomplete after repair; "
+            f"session_counts={counts} thin_sessions={thin}"
             + (f"; diagnostics={detail}" if detail else "")
         )
     return combined
@@ -752,7 +822,7 @@ def main() -> int:
     ap.add_argument(
         "--workers",
         type=int,
-        default=6,
+        default=4,
         help="Concurrent NSE charting workers; capped at 6.",
     )
     ap.add_argument("--max-symbols", type=int, default=0)
@@ -847,66 +917,118 @@ def main() -> int:
             info = token_cache.get(symbol)
             if not info:
                 info = _resolve_symbol(symbol, "EQ")
+
+            existing_path = raw_root / f"symbol={symbol}.parquet"
+            existing_frame = None
+            if existing_path.exists():
+                try:
+                    existing_frame = pd.read_parquet(existing_path)
+                except Exception:
+                    existing_frame = None
+
             frame = _fetch_history(
                 symbol,
                 info,
                 allow_session_fallback=True,
+                existing_frame=existing_frame,
             )
             return symbol, info, frame
 
         results: dict[str, dict[str, Any]] = {}
         worker_count = max(1, min(int(args.workers), 6))
         started_at = time.monotonic()
+        total_pending = len(pending)
+        completed = 0
+
+        print(
+            f"OOS DOWNLOAD CONFIG: workers={worker_count}; "
+            f"pending={total_pending:,}; heartbeat=30s",
+            flush=True,
+        )
+
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(download_one, symbol): symbol
                 for symbol in pending
             }
-            for i, future in enumerate(as_completed(futures), start=1):
-                symbol = futures[future]
-                try:
-                    symbol, info, frame = future.result()
-                    token_cache[symbol] = info
-                    if frame.empty:
-                        results[symbol] = {
-                            "status": "EMPTY",
-                            "rows": 0,
-                        }
-                    else:
-                        _write_atomic(
-                            frame,
-                            raw_root / f"symbol={symbol}.parquet",
-                        )
-                        results[symbol] = {
-                            "status": "OK",
-                            "rows": int(len(frame)),
-                            "dates": int(
-                                frame["ts"]
-                                .dt.tz_convert(IST)
-                                .dt.strftime("%Y-%m-%d")
-                                .nunique()
-                            ),
-                        }
-                except Exception as exc:
-                    results[symbol] = {
-                        "status": "ERROR",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
 
-                if i % 25 == 0 or i == len(pending):
-                    token_cache_path.write_text(
-                        json.dumps(token_cache, indent=2),
-                        encoding="utf-8",
-                    )
-                    elapsed = max(0.001, time.monotonic() - started_at)
-                    rate = i / elapsed
-                    remaining = max(0, len(pending) - i)
-                    eta_min = remaining / rate / 60.0 if rate > 0 else float("inf")
+            while futures:
+                done, _ = wait(
+                    futures,
+                    timeout=30,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                if not done:
+                    elapsed_min = (time.monotonic() - started_at) / 60.0
                     print(
-                        f"OOS DOWNLOAD PROGRESS: {i:,}/{len(pending):,} "
-                        f"rate={rate:.2f}/s eta={eta_min:.1f}m",
+                        "OOS DOWNLOAD HEARTBEAT: "
+                        f"completed={completed:,}/{total_pending:,} "
+                        f"active_workers={min(worker_count, len(futures)):,} "
+                        f"elapsed={elapsed_min:.1f}m",
                         flush=True,
                     )
+                    continue
+
+                for future in done:
+                    symbol = futures.pop(future)
+                    completed += 1
+                    try:
+                        symbol, info, frame = future.result()
+                        token_cache[symbol] = info
+                        if frame.empty:
+                            results[symbol] = {
+                                "status": "EMPTY",
+                                "rows": 0,
+                            }
+                        else:
+                            _write_atomic(
+                                frame,
+                                raw_root / f"symbol={symbol}.parquet",
+                            )
+                            results[symbol] = {
+                                "status": "OK",
+                                "rows": int(len(frame)),
+                                "dates": int(
+                                    frame["ts"]
+                                    .dt.tz_convert(IST)
+                                    .dt.strftime("%Y-%m-%d")
+                                    .nunique()
+                                ),
+                            }
+                    except Exception as exc:
+                        results[symbol] = {
+                            "status": "ERROR",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+
+                    if completed % 10 == 0 or completed == total_pending:
+                        token_cache_path.write_text(
+                            json.dumps(token_cache, indent=2),
+                            encoding="utf-8",
+                        )
+                        elapsed = max(0.001, time.monotonic() - started_at)
+                        rate = completed / elapsed
+                        remaining = max(0, total_pending - completed)
+                        eta_min = (
+                            remaining / rate / 60.0
+                            if rate > 0 else float("inf")
+                        )
+                        ok_count = sum(
+                            v["status"] == "OK"
+                            for v in results.values()
+                        )
+                        error_count = sum(
+                            v["status"] == "ERROR"
+                            for v in results.values()
+                        )
+                        print(
+                            f"OOS DOWNLOAD PROGRESS: "
+                            f"{completed:,}/{total_pending:,} "
+                            f"ok={ok_count:,} errors={error_count:,} "
+                            f"rate={rate:.2f}/s eta={eta_min:.1f}m",
+                            flush=True,
+                        )
 
         token_cache_path.write_text(
             json.dumps(token_cache, indent=2),
