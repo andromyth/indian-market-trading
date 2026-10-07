@@ -1029,19 +1029,6 @@ def main() -> int:
                             f"rate={rate:.2f}/s eta={eta_min:.1f}m",
                             flush=True,
                         )
-        token_cache_path.write_text(
-                        json.dumps(token_cache, indent=2),
-                        encoding="utf-8",
-                    )
-                    elapsed = max(0.001, time.monotonic() - started_at)
-                    rate = i / elapsed
-                    remaining = max(0, len(pending) - i)
-                    eta_min = remaining / rate / 60.0 if rate > 0 else float("inf")
-                    print(
-                        f"OOS DOWNLOAD PROGRESS: {i:,}/{len(pending):,} "
-                        f"rate={rate:.2f}/s eta={eta_min:.1f}m",
-                        flush=True,
-                    )
 
         token_cache_path.write_text(
             json.dumps(token_cache, indent=2),
