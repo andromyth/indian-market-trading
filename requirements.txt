@@ -13,3 +13,4 @@ google-auth
 yfinance
 duckdb
 lxml
+curl_cffi
