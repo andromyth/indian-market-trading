@@ -735,28 +735,62 @@ def main() -> int:
         return 0
 
     # Use the same NIFTY history source for market-relative features.
+    # Some NSE charting responses do not expose NIFTY 50 through the generic
+    # IDX search route even though the equity history route works. For OOS,
+    # therefore prefer the repository's existing historical NIFTY series and
+    # only fall back to direct charting API retrieval when necessary.
     market_path = raw_root / "NIFTY50.parquet"
-    if not market_path.exists():
+    market_oos = pd.DataFrame()
+
+    if market_path.exists():
+        try:
+            market_oos = _norm(pd.read_parquet(market_path))
+        except Exception:
+            market_oos = pd.DataFrame()
+
+    if market_oos.empty:
+        seed_market = _load_seed_market(root)
+        if not seed_market.empty:
+            seed_local = seed_market[
+                seed_market["ts"]
+                .dt.tz_convert(IST)
+                .dt.strftime("%Y-%m-%d")
+                .isin(OOS_SESSIONS)
+            ].copy()
+            if not seed_local.empty:
+                market_oos = seed_local.copy()
+
+    if market_oos.empty:
+        # Final fallback: try the dedicated index search name variants.
+        candidates = ("NIFTY 50", "NIFTY50", "NIFTY")
         info = token_cache.get("__NIFTY_50__")
-        if not info:
-            info = _resolve_symbol("NIFTY 50", "IDX")
-            token_cache["__NIFTY_50__"] = info
-            token_cache_path.write_text(
-                json.dumps(token_cache, indent=2),
-                encoding="utf-8",
+        for candidate in candidates:
+            try:
+                info = info or _resolve_symbol(candidate, "IDX")
+                nifty = _fetch_history(candidate, info)
+                if not nifty.empty:
+                    market_oos = nifty
+                    break
+            except Exception:
+                continue
+
+        if market_oos.empty:
+            raise RuntimeError(
+                "NIFTY 50 OOS history unavailable from seed, cached OOS file, "
+                "or NSE charting index fallback"
             )
 
-        nifty = _fetch_history(
-            "NIFTY 50",
-            info,
+        token_cache["__NIFTY_50__"] = info
+        _write_atomic(market_oos, market_path)
+        token_cache_path.write_text(
+            json.dumps(token_cache, indent=2),
+            encoding="utf-8",
         )
-        if nifty.empty:
-            raise RuntimeError("NIFTY 50 OOS history returned no rows")
-        _write_atomic(nifty, market_path)
+    else:
+        _write_atomic(market_oos, market_path)
 
-    market_seed = _load_seed_market(root)
-    market_oos = _norm(pd.read_parquet(market_path))
-    market_parts = [x for x in (market_seed, market_oos) if not x.empty]
+    seed_market = _load_seed_market(root)
+    market_parts = [x for x in (seed_market, market_oos) if not x.empty]
     if not market_parts:
         raise RuntimeError("no NIFTY market history available")
     market = (
