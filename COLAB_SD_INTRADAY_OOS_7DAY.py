@@ -367,16 +367,18 @@ def _fetch_history(
                 f"existing_repair={type(exc).__name__}: {exc}"
             )
     try:
-        frame = fetch_window(start, end)    except Exception as exc:
+        frame = fetch_window(start, end)
+    except Exception as exc:
         frame = pd.DataFrame()
         errors.append(f"window={type(exc).__name__}: {exc}")
 
     required_dates = set(OOS_SESSIONS)
     if not frame.empty:
-        observed = set(
-            frame["ts"].dt.tz_convert(IST).dt.strftime("%Y-%m-%d").unique()
-        )
-        if required_dates.issubset(observed):
+        counts = _oos_session_counts(frame)
+        if all(
+            counts.get(session_date, 0) >= MIN_OOS_SESSION_ROWS
+            for session_date in OOS_SESSIONS
+        ):
             return frame
 
     if not allow_session_fallback:
