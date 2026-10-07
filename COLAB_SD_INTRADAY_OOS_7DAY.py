@@ -669,12 +669,15 @@ def _download_oos_indstocks_batch(
                     required = {"ts", "open", "high", "low", "close"}
                     if not required.issubset(raw.columns):
                         continue
-                    raw["ts"] = pd.to_datetime(
-                        raw["ts"], unit="ms", utc=True, errors="coerce"
-                    )
-                    if raw["ts"].isna().all():
+                    raw_ts = raw["ts"]
+                    if pd.api.types.is_numeric_dtype(raw_ts):
+                        unit = "ms" if float(raw_ts.dropna().abs().median() or 0) > 1e11 else "s"
                         raw["ts"] = pd.to_datetime(
-                            raw["ts"], utc=True, errors="coerce"
+                            raw_ts, unit=unit, utc=True, errors="coerce"
+                        )
+                    else:
+                        raw["ts"] = pd.to_datetime(
+                            raw_ts, utc=True, errors="coerce"
                         )
                     for col in ("open", "high", "low", "close"):
                         raw[col] = pd.to_numeric(
@@ -1276,8 +1279,9 @@ def main() -> int:
         if pending:
             # Hosted Colab IPs can be rejected by the NSE charting edge. Probe
             # the resolver once before launching thousands of per-symbol
-            # requests. When unavailable, use Yahoo Finance's documented
-            # multi-ticker download path as an explicit OOS fallback.
+            # requests. When unavailable, use the authenticated
+            # INDstocks historical-data API, which supports 1-minute NSE
+            # history beyond Yahoo Finance's short intraday retention window.
             nse_charting_ok, nse_charting_diag = _nse_charting_probe()
             state["nse_charting_probe"] = {
                 "available": bool(nse_charting_ok),
