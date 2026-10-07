@@ -722,6 +722,8 @@ def main() -> int:
     # Prefer an already-complete cached minute NIFTY file. Otherwise obtain
     # official NSE daily index history for provenance and diagnostics, then
     # use the charting IDX lane for the required minute-level feature series.
+    # NIFTY minute market context for OOS. Reuse a complete cached
+    # minute series; otherwise resolve the NSE charting IDX instrument.
     market_path = raw_root / "NIFTY50.parquet"
     market_oos = pd.DataFrame()
 
@@ -814,60 +816,6 @@ def main() -> int:
         )
     else:
         _write_atomic(market_oos, market_path)
-
-    seed_market = _load_seed_market(root)
-        if not seed_market.empty:
-            seed_local = seed_market[
-                seed_market["ts"]
-                .dt.tz_convert(IST)
-                .dt.strftime("%Y-%m-%d")
-                .isin(OOS_SESSIONS)
-            ].copy()
-            if not seed_local.empty:
-                market_oos = seed_local.copy()
-
-    if market_oos.empty:
-        # Final fallback: try the dedicated index search name variants.
-        candidates = ("NIFTY 50", "NIFTY50", "NIFTY")
-        info = token_cache.get("__NIFTY_50__")
-        for candidate in candidates:
-            try:
-                info = info or _resolve_symbol(candidate, "IDX")
-                nifty = _fetch_history(candidate, info)
-                if not nifty.empty:
-                    market_oos = nifty
-                    break
-            except Exception:
-                continue
-
-        if market_oos.empty:
-            raise RuntimeError(
-                "NIFTY 50 OOS history unavailable from seed, cached OOS file, "
-                "or NSE charting index fallback"
-            )
-
-        token_cache["__NIFTY_50__"] = info
-        _write_atomic(market_oos, market_path)
-        token_cache_path.write_text(
-            json.dumps(token_cache, indent=2),
-            encoding="utf-8",
-        )
-    else:
-        _write_atomic(market_oos, market_path)
-
-    seed_market = _load_seed_market(root)
-    market_parts = [x for x in (seed_market, market_oos) if not x.empty]
-    if not market_parts:
-        raise RuntimeError("no NIFTY market history available")
-    market = (
-        pd.concat(market_parts, ignore_index=True)
-        .sort_values("ts")
-        .drop_duplicates("ts", keep="last")
-    )
-    market = market[
-        market["ts"]
-        <= END_DATE.tz_convert("UTC")
-    ].reset_index(drop=True)
 
     bundles: dict[int, Any] = {}
     thresholds: dict[int, dict[str, Any]] = {}
