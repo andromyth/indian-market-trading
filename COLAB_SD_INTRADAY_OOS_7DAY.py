@@ -783,6 +783,7 @@ def main() -> int:
 
         results: dict[str, dict[str, Any]] = {}
         worker_count = max(1, min(int(args.workers), 6))
+        started_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(download_one, symbol): symbol
@@ -824,8 +825,13 @@ def main() -> int:
                         json.dumps(token_cache, indent=2),
                         encoding="utf-8",
                     )
+                    elapsed = max(0.001, time.monotonic() - started_at)
+                    rate = i / elapsed
+                    remaining = max(0, len(pending) - i)
+                    eta_min = remaining / rate / 60.0 if rate > 0 else float("inf")
                     print(
-                        f"OOS DOWNLOAD PROGRESS: {i:,}/{len(pending):,}",
+                        f"OOS DOWNLOAD PROGRESS: {i:,}/{len(pending):,} "
+                        f"rate={rate:.2f}/s eta={eta_min:.1f}m",
                         flush=True,
                     )
 
