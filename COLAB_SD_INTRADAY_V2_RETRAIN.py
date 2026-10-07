@@ -490,6 +490,28 @@ def main() -> int:
         f"COVERAGE_PROGRESS_SHARD_{args.shard_id + 1}of{args.num_shards}.parquet"
     )
 
+    # Resume from the last completed batch. This covers both successful
+    # compact checkpoints and deliberate <200-session exclusions.
+    coverage_map: dict[str, dict] = {}
+    if coverage_progress_path.exists():
+        try:
+            prev = pd.read_parquet(coverage_progress_path)
+            if "symbol" in prev.columns:
+                for _, row in prev.iterrows():
+                    sym0 = str(row.get("symbol", "")).strip().upper()
+                    if sym0:
+                        coverage_map[sym0] = row.to_dict()
+                print(
+                    f"RESUME_SHARD_COVERAGE: {len(coverage_map):,}/{len(universe):,} "
+                    f"symbols already recorded",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"RESUME_COVERAGE_WARNING: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
     # Warm immutable market state once before worker threads start.
     warm_market_cache(market)
 
@@ -587,6 +609,13 @@ def main() -> int:
         pending: list[tuple[int, str, Path]] = []
         for global_i, sym in batch_items:
             symbol_path = symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
+            if sym in coverage_map:
+                print(
+                    f"symbol {global_i:,}/{len(full_universe):,} {sym}: "
+                    f"reused prior coverage status={coverage_map[sym].get('status', 'RECORDED')}",
+                    flush=True,
+                )
+                continue
             if symbol_path.exists() and symbol_path.stat().st_size > 0:
                 print(
                     f"symbol {global_i:,}/{len(full_universe):,} {sym}: "
@@ -610,12 +639,14 @@ def main() -> int:
         # disconnect loses at most the symbol currently being prepared.
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
-                executor.submit(prepare_one_symbol, i, sym): (i, sym, symbol_path)
-                for i, sym, symbol_path in pending
+                executor.submit(prepare_one_symbol, global_i, sym): (
+                    global_i, sym, symbol_path
+                )
+                for global_i, sym, symbol_path in pending
             }
 
             for future in as_completed(futures):
-                i, sym, symbol_path = futures[future]
+                global_i, sym, symbol_path = futures[future]
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -636,11 +667,14 @@ def main() -> int:
                     compact.to_parquet(tmp, index=False)
                     tmp.replace(symbol_path)
 
-                coverage.append({
+                row0 = {
                     k: result[k]
                     for k in ("symbol", "status", "raw_rows", "sessions", "rows")
                     if k in result
-                })
+                }
+                coverage.append(row0)
+                if row0.get("symbol"):
+                    coverage_map[str(row0["symbol"]).strip().upper()] = row0
 
                 if result.get("status") == "ERROR":
                     print(
@@ -688,20 +722,18 @@ def main() -> int:
         return 0
 
     if args.prep_only:
-        prepared = sum(
+        processed = sum(
             1
             for global_i, sym in universe_items
-            if (
+            if sym in coverage_map
+            or (
                 symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
             ).exists()
-            and (
-                symbol_parts_dir / f"{global_i:04d}_{sym}.parquet"
-            ).stat().st_size > 0
         )
         print(
             f"PREP_ONLY_COMPLETE: shard={args.shard_id + 1}/{args.num_shards}; "
             f"global_range={shard_start + 1:,}-{shard_end:,}; "
-            f"checkpoints={prepared:,}/{len(universe_items):,}",
+            f"processed={processed:,}/{len(universe_items):,}",
             flush=True,
         )
         return 0
