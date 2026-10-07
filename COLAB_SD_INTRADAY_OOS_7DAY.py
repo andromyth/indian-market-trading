@@ -778,7 +778,11 @@ def main() -> int:
             info = token_cache.get(symbol)
             if not info:
                 info = _resolve_symbol(symbol, "EQ")
-            frame = _fetch_history(symbol, info)
+            frame = _fetch_history(
+                symbol,
+                info,
+                allow_session_fallback=False,
+            )
             return symbol, info, frame
 
         results: dict[str, dict[str, Any]] = {}
