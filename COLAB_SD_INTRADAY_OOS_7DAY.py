@@ -979,9 +979,135 @@ def main() -> int:
                 )
 
         if market_oos.empty:
+            # Independent OOS fallback for the market-context series.
+            # Yahoo Finance exposes recent 1-minute NIFTY 50 history and the
+            # requested seven sessions are within its intraday retention
+            # window. This fallback is used only for the market feature
+            # series; equity OOS prices remain NSE charting data.
+            try:
+                import yfinance as yf
+
+                yf_start = pd.Timestamp(
+                    OOS_SESSIONS[0], tz=IST
+                ).tz_convert("UTC").tz_localize(None)
+                yf_end = (
+                    pd.Timestamp(OOS_SESSIONS[-1], tz=IST)
+                    + pd.Timedelta(days=1)
+                ).tz_convert("UTC").tz_localize(None)
+
+                print(
+                    "NIFTY OOS FALLBACK: requesting Yahoo Finance ^NSEI "
+                    "1-minute market context",
+                    flush=True,
+                )
+                yf_frame = yf.download(
+                    "^NSEI",
+                    start=yf_start,
+                    end=yf_end,
+                    interval="1m",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+                if isinstance(yf_frame.columns, pd.MultiIndex):
+                    yf_frame.columns = [
+                        str(col[0]).lower() for col in yf_frame.columns
+                    ]
+                else:
+                    yf_frame.columns = [
+                        str(col).lower() for col in yf_frame.columns
+                    ]
+
+                rename = {
+                    "datetime": "ts",
+                    "date": "ts",
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                }
+                yf_frame = yf_frame.rename(columns=rename)
+                if not isinstance(yf_frame.index, pd.DatetimeIndex):
+                    yf_frame.index = pd.to_datetime(
+                        yf_frame.index, utc=True, errors="coerce"
+                    )
+                else:
+                    idx = yf_frame.index
+                    if idx.tz is None:
+                        idx = idx.tz_localize("UTC")
+                    else:
+                        idx = idx.tz_convert("UTC")
+                    yf_frame.index = idx
+                yf_frame = yf_frame.reset_index()
+                if "ts" not in yf_frame.columns:
+                    yf_frame = yf_frame.rename(
+                        columns={yf_frame.columns[0]: "ts"}
+                    )
+                required = {"ts", "open", "high", "low", "close"}
+                if required.issubset(yf_frame.columns):
+                    market_oos = yf_frame[
+                        ["ts", "open", "high", "low", "close"]
+                    ].copy()
+                    market_oos["symbol"] = "NIFTY 50"
+                    market_oos["ts"] = pd.to_datetime(
+                        market_oos["ts"], utc=True, errors="coerce"
+                    )
+                    for col in ("open", "high", "low", "close"):
+                        market_oos[col] = pd.to_numeric(
+                            market_oos[col], errors="coerce"
+                        )
+                    market_oos = market_oos.dropna(
+                        subset=["ts", "open", "high", "low", "close"]
+                    )
+                    local_dates = (
+                        market_oos["ts"]
+                        .dt.tz_convert(IST)
+                        .dt.strftime("%Y-%m-%d")
+                    )
+                    market_oos = market_oos[
+                        local_dates.isin(OOS_SESSIONS)
+                    ].copy()
+                    observed = set(
+                        market_oos["ts"]
+                        .dt.tz_convert(IST)
+                        .dt.strftime("%Y-%m-%d")
+                        .unique()
+                    )
+                    missing = [
+                        d for d in OOS_SESSIONS if d not in observed
+                    ]
+                    if missing:
+                        market_oos = pd.DataFrame()
+                        errors.append(
+                            "Yahoo ^NSEI: missing_sessions="
+                            + repr(missing)
+                        )
+                    else:
+                        market_oos = (
+                            market_oos
+                            .drop_duplicates("ts", keep="last")
+                            .sort_values("ts")
+                            .reset_index(drop=True)
+                        )
+                        print(
+                            "NIFTY OOS FALLBACK OK: "
+                            f"rows={len(market_oos):,} "
+                            f"sessions={len(observed)} source=YAHOO_FINANCE",
+                            flush=True,
+                        )
+                        state["nifty_market_source"] = "YAHOO_FINANCE_FALLBACK"
+                        save_state()
+            except Exception as exc:
+                errors.append(
+                    "Yahoo ^NSEI: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if market_oos.empty:
             raise RuntimeError(
-                "NIFTY 50 OOS history unavailable. "
-                "Attempt diagnostics: " + " | ".join(errors)
+                "NIFTY 50 OOS history unavailable from NSE charting "
+                "or Yahoo Finance fallback. Attempt diagnostics: "
+                + " | ".join(errors)
             )
 
         token_cache["__NIFTY_50__"] = info
