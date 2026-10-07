@@ -987,86 +987,152 @@ def main() -> int:
             try:
                 import yfinance as yf
 
-                yf_start = pd.Timestamp(
-                    OOS_SESSIONS[0], tz=IST
-                ).tz_convert("UTC").tz_localize(None)
-                yf_end = (
-                    pd.Timestamp(OOS_SESSIONS[-1], tz=IST)
-                    + pd.Timedelta(days=1)
-                ).tz_convert("UTC").tz_localize(None)
-
+                # Yahoo Finance limits 1-minute history requests to a short
+                # calendar window. The seven OOS sessions span more than
+                # that limit, so request each exact session independently.
+                yahoo_parts: list[pd.DataFrame] = []
                 print(
                     "NIFTY OOS FALLBACK: requesting Yahoo Finance ^NSEI "
-                    "1-minute market context",
+                    "1-minute market context in per-session chunks",
                     flush=True,
                 )
-                yf_frame = yf.download(
-                    "^NSEI",
-                    start=yf_start,
-                    end=yf_end,
-                    interval="1m",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-                if isinstance(yf_frame.columns, pd.MultiIndex):
-                    yf_frame.columns = [
-                        str(col[0]).lower() for col in yf_frame.columns
-                    ]
-                else:
-                    yf_frame.columns = [
-                        str(col).lower() for col in yf_frame.columns
-                    ]
 
-                rename = {
-                    "datetime": "ts",
-                    "date": "ts",
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "close": "close",
-                }
-                yf_frame = yf_frame.rename(columns=rename)
-                if not isinstance(yf_frame.index, pd.DatetimeIndex):
-                    yf_frame.index = pd.to_datetime(
-                        yf_frame.index, utc=True, errors="coerce"
-                    )
-                else:
-                    idx = yf_frame.index
-                    if idx.tz is None:
-                        idx = idx.tz_localize("UTC")
-                    else:
-                        idx = idx.tz_convert("UTC")
-                    yf_frame.index = idx
-                yf_frame = yf_frame.reset_index()
-                if "ts" not in yf_frame.columns:
-                    yf_frame = yf_frame.rename(
-                        columns={yf_frame.columns[0]: "ts"}
-                    )
-                required = {"ts", "open", "high", "low", "close"}
-                if required.issubset(yf_frame.columns):
-                    market_oos = yf_frame[
-                        ["ts", "open", "high", "low", "close"]
-                    ].copy()
-                    market_oos["symbol"] = "NIFTY 50"
-                    market_oos["ts"] = pd.to_datetime(
-                        market_oos["ts"], utc=True, errors="coerce"
-                    )
-                    for col in ("open", "high", "low", "close"):
-                        market_oos[col] = pd.to_numeric(
-                            market_oos[col], errors="coerce"
+                for session_date in OOS_SESSIONS:
+                    try:
+                        session_start = pd.Timestamp(
+                            f"{session_date} 09:15",
+                            tz=IST,
                         )
-                    market_oos = market_oos.dropna(
-                        subset=["ts", "open", "high", "low", "close"]
+                        session_end = pd.Timestamp(
+                            f"{session_date} 15:30",
+                            tz=IST,
+                        )
+                        yf_start = (
+                            session_start
+                            .tz_convert("UTC")
+                            .tz_localize(None)
+                        )
+                        yf_end = (
+                            session_end
+                            .tz_convert("UTC")
+                            .tz_localize(None)
+                        )
+                        chunk = yf.download(
+                            "^NSEI",
+                            start=yf_start,
+                            end=yf_end,
+                            interval="1m",
+                            auto_adjust=False,
+                            progress=False,
+                            threads=False,
+                        )
+
+                        if chunk is None or chunk.empty:
+                            errors.append(
+                                f"Yahoo ^NSEI {session_date}: empty response"
+                            )
+                            continue
+
+                        if isinstance(chunk.columns, pd.MultiIndex):
+                            chunk.columns = [
+                                str(col[0]).lower()
+                                for col in chunk.columns
+                            ]
+                        else:
+                            chunk.columns = [
+                                str(col).lower()
+                                for col in chunk.columns
+                            ]
+
+                        chunk.index = pd.to_datetime(
+                            chunk.index,
+                            utc=True,
+                            errors="coerce",
+                        )
+                        chunk = chunk.reset_index()
+
+                        if "ts" not in chunk.columns:
+                            chunk = chunk.rename(
+                                columns={chunk.columns[0]: "ts"}
+                            )
+
+                        required = {
+                            "ts",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                        }
+                        if not required.issubset(chunk.columns):
+                            errors.append(
+                                f"Yahoo ^NSEI {session_date}: "
+                                f"missing_columns="
+                                f"{sorted(required - set(chunk.columns))}"
+                            )
+                            continue
+
+                        part = chunk[
+                            ["ts", "open", "high", "low", "close"]
+                        ].copy()
+                        part["symbol"] = "NIFTY 50"
+                        part["ts"] = pd.to_datetime(
+                            part["ts"],
+                            utc=True,
+                            errors="coerce",
+                        )
+
+                        for col in ("open", "high", "low", "close"):
+                            part[col] = pd.to_numeric(
+                                part[col],
+                                errors="coerce",
+                            )
+
+                        part = part.dropna(
+                            subset=[
+                                "ts",
+                                "open",
+                                "high",
+                                "low",
+                                "close",
+                            ]
+                        )
+
+                        local = part["ts"].dt.tz_convert(IST)
+                        minute = local.dt.hour * 60 + local.dt.minute
+                        part = part[
+                            local.dt.strftime("%Y-%m-%d").eq(session_date)
+                            & (minute >= 9 * 60 + 15)
+                            & (minute < 15 * 60 + 30)
+                        ].copy()
+
+                        if part.empty:
+                            errors.append(
+                                f"Yahoo ^NSEI {session_date}: "
+                                "no regular-session minute rows"
+                            )
+                            continue
+
+                        yahoo_parts.append(part)
+                        print(
+                            "NIFTY OOS FALLBACK SESSION OK: "
+                            f"{session_date} rows={len(part):,}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        errors.append(
+                            f"Yahoo ^NSEI {session_date}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                if yahoo_parts:
+                    market_oos = (
+                        pd.concat(yahoo_parts, ignore_index=True)
+                        .drop_duplicates("ts", keep="last")
+                        .sort_values("ts")
+                        .reset_index(drop=True)
                     )
-                    local_dates = (
-                        market_oos["ts"]
-                        .dt.tz_convert(IST)
-                        .dt.strftime("%Y-%m-%d")
-                    )
-                    market_oos = market_oos[
-                        local_dates.isin(OOS_SESSIONS)
-                    ].copy()
+
+                if not market_oos.empty:
                     observed = set(
                         market_oos["ts"]
                         .dt.tz_convert(IST)
@@ -1083,19 +1149,16 @@ def main() -> int:
                             + repr(missing)
                         )
                     else:
-                        market_oos = (
-                            market_oos
-                            .drop_duplicates("ts", keep="last")
-                            .sort_values("ts")
-                            .reset_index(drop=True)
-                        )
                         print(
                             "NIFTY OOS FALLBACK OK: "
                             f"rows={len(market_oos):,} "
-                            f"sessions={len(observed)} source=YAHOO_FINANCE",
+                            f"sessions={len(observed)} "
+                            "source=YAHOO_FINANCE",
                             flush=True,
                         )
-                        state["nifty_market_source"] = "YAHOO_FINANCE_FALLBACK"
+                        state["nifty_market_source"] = (
+                            "YAHOO_FINANCE_FALLBACK"
+                        )
                         save_state()
             except Exception as exc:
                 errors.append(
