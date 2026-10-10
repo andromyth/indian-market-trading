@@ -85,8 +85,8 @@ def main():
     cr=float(existing.get("min_expected_return",DEFAULT["min_expected_return"]))
     baseline=_precision(hold,cb,cs,cr)
     candidates=[]
-    for buy in np.arange(0.55,0.76,0.02):
-        for sell in np.arange(0.25,0.46,0.02):
+    for buy in np.arange(0.60,0.861,0.02):
+        for sell in np.arange(0.14,0.401,0.02):
             if buy<=0.50 or sell>=0.50: continue
             t=_precision(tune,round(float(buy),2),round(float(sell),2),cr)
             if t["actions"]<MIN_TUNING_ACTIONS or not np.isfinite(t["precision"]): continue
