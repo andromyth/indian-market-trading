@@ -26,7 +26,7 @@ concurrency:
 jobs:
   sync-fno:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
     steps:
