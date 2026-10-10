@@ -278,13 +278,14 @@ def refresh_realised_outcomes(store, snapshots: list[tuple[date, Path]]) -> dict
 
 
 def _current_expected_reference_date() -> date | None:
-    from production_data_freshness_gate import HOLIDAYS, expected_session_date
+    from production_data_freshness_gate import expected_session_date
+    from selfdriving.sd_data_quality import is_nse_session_day
 
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     # The challenger is a pre-open prediction job. On a weekend or NSE holiday
     # there is no session to predict, so do not interpret the prior close as a
     # current-session prediction simply because it is the newest saved PIT.
-    if now_ist.date().weekday() >= 5 or now_ist.date() in HOLIDAYS:
+    if not is_nse_session_day(now_ist.date()):
         return None
     return expected_session_date(now_ist)
 
