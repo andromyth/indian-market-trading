@@ -1048,7 +1048,12 @@ def merge_optional(panel):
             out = pd.concat(pieces, ignore_index=True)
         fa = pd.to_datetime(out.get("fundamental_available_at"), errors="coerce", utc=True)
         valid = fa.notna() & fa.le(out["decision_timestamp"])
-        out["fundamentals_available"] = valid.astype("Int8")
+        # A parsed filing proves availability when one exists. No as-of row is
+        # not enough to assert "no filing": the symbol may be absent from the
+        # filing catalog or its filings may have failed parsing.
+        out["fundamentals_available"] = pd.Series(
+            np.where(valid, 1.0, np.nan), index=out.index, dtype="float64"
+        )
         out["fundamental_age_days"] = np.nan
         out.loc[valid, "fundamental_age_days"] = (
             out.loc[valid, "decision_timestamp"] - fa.loc[valid]
