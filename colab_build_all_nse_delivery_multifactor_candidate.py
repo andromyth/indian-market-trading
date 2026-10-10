@@ -1140,7 +1140,7 @@ def fit_models(frame, horizon):
     # Prevent a nominal 59-column model where one or more inputs were never
     # observed in training and therefore cannot contribute a learned signal.
     coverage = assert_training_feature_coverage(
-        Xtr, FEATURES_59, min_observations=100, min_fraction=0.005
+        tr.loc[good], FEATURES_59, min_observations=100, min_fraction=0.005
     )
     clf = Pipeline([
         ("imputer", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
