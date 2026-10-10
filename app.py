@@ -85,6 +85,12 @@ from market_session_guard import (
     parse_reference_date,
 )
 
+from market_watchlist import (
+    build_stock_watchlist,
+    fetch_watchlist_articles,
+    target_session_date as resolve_watch_target_session,
+)
+
 try:
     from indstocks_client import (
         configured as _indstocks_configured,
@@ -98,32 +104,6 @@ except Exception:
     _indstocks_latest_quote = _indstocks_test_history = _indstocks_profile = None
 
 st.set_page_config(page_title="Indian Market Trading", layout="wide")
-
-# On-demand, read-only connectivity check. It runs only when clicked and
-# deliberately does not display account profile fields or credentials.
-st.sidebar.subheader("INDstocks API")
-if st.sidebar.button("Test INDstocks connection", key="indstocks_connection_test"):
-    if _indstocks_configured is None or not _indstocks_configured():
-        st.sidebar.error("INDstocks credentials are not configured in Streamlit Secrets.")
-    elif _indstocks_profile is None or _indstocks_latest_quote is None or _indstocks_test_history is None:
-        st.sidebar.error("INDstocks client could not be loaded. Check the deployment logs.")
-    else:
-        try:
-            with st.spinner("Checking INDstocks authentication and read-only market data..."):
-                _indstocks_profile()  # Authentication smoke test; never display profile details.
-                _indstocks_quote_test = _indstocks_latest_quote("RELIANCE.NS")
-                _indstocks_candles_test = _indstocks_test_history("RELIANCE.NS", days=1)
-            st.sidebar.success("Authentication and quote API: PASS")
-            st.sidebar.metric("RELIANCE latest quote", f"₹{float(_indstocks_quote_test['live_price']):,.2f}")
-            if _indstocks_candles_test is not None and not _indstocks_candles_test.empty:
-                _indstocks_last_bar = pd.Timestamp(_indstocks_candles_test.index.max())
-                st.sidebar.success(f"Historical 1-minute candles: PASS ({len(_indstocks_candles_test)} rows)")
-                st.sidebar.caption(f"Most recent candle timestamp: {_indstocks_last_bar}")
-            else:
-                st.sidebar.warning("Authentication and quote passed, but no one-minute candles were returned for the last day.")
-            st.sidebar.caption("Read-only test only. No orders are placed.")
-        except Exception as _indstocks_test_error:
-            st.sidebar.error(f"INDstocks check failed: {_indstocks_test_error}")
 
 interface_mode = st.sidebar.radio(
     "Interface",
@@ -140,9 +120,6 @@ if interface_mode == "Research / Diagnostics":
     )
 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
-
-default_watchlist = "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS"
-st.sidebar.header("Watchlist")
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def _searchable_nse_universe() -> pd.DataFrame:
@@ -194,93 +171,8 @@ def _searchable_nse_universe() -> pd.DataFrame:
     return out.sort_values(["company", "symbol"], na_position="last").reset_index(drop=True)
 
 
-if "watchlist_revision" not in st.session_state:
-    st.session_state["watchlist_revision"] = 0
+default_watchlist = ""
 
-# Keep text entry separate from the active watchlist so typing does not trigger
-# a full analysis on every keystroke. The explicit Analyze button is the
-# authoritative submit action; it also fixes the previous Ctrl+Enter confusion
-# where the text area was not inside a Streamlit form.
-if "active_watchlist" not in st.session_state:
-    st.session_state["active_watchlist"] = default_watchlist
-
-st.sidebar.caption("Find a stock by NSE symbol or company name")
-try:
-    _search_df = _searchable_nse_universe()
-except Exception:
-    _search_df = pd.DataFrame()
-
-if not _search_df.empty:
-    search_text = st.sidebar.text_input(
-        "Search NSE stock",
-        key="nse_stock_search",
-        placeholder="e.g. Tata Motors, Reliance, TCS",
-        help="Search the official NSE securities list by symbol or company name.",
-    ).strip().lower()
-
-    search_results = _search_df
-    if search_text:
-        mask = (
-            search_results["symbol"].str.lower().str.contains(search_text, regex=False, na=False)
-            | search_results["company"].str.lower().str.contains(search_text, regex=False, na=False)
-        )
-        search_results = search_results.loc[mask].head(40)
-
-    if search_results.empty:
-        st.sidebar.caption("No NSE stock matched that search.")
-    else:
-        options = [
-            f"{row.symbol} — {row.company}" if row.company and row.company.lower() != "nan"
-            else row.symbol
-            for row in search_results.itertuples()
-        ]
-        selected_search = st.sidebar.selectbox(
-            "Matching stocks",
-            options,
-            key="nse_stock_search_result",
-        )
-        selected_symbol = selected_search.split(" — ", 1)[0].strip().upper()
-        if st.sidebar.button("Add to watchlist", width="stretch"):
-            current = []
-            for item in st.session_state.get("active_watchlist", default_watchlist).split(","):
-                value = item.strip().upper()
-                if not value:
-                    continue
-                if not value.endswith((".NS", ".BO")) and not value.startswith("^"):
-                    value = f"{value}.NS"
-                current.append(value)
-            selected_ns = f"{selected_symbol}.NS"
-            if selected_ns not in current:
-                current.append(selected_ns)
-            new_watchlist = ", ".join(current)
-            st.session_state["active_watchlist"] = new_watchlist
-            st.session_state["watchlist_input"] = new_watchlist
-            st.session_state["watchlist_revision"] = int(st.session_state.get("watchlist_revision", 0)) + 1
-            st.rerun()
-else:
-    st.sidebar.caption("NSE stock search is temporarily unavailable; symbol entry remains available below.")
-
-with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
-    watchlist_input = st.text_area(
-        "NSE/BSE symbols (suffix optional)",
-        st.session_state.get("active_watchlist", default_watchlist),
-        key="watchlist_input",
-        height=90,
-        help="Example: BHARTIARTL, RELIANCE.NS, TCS.BO. Bare symbols default to NSE (.NS)."
-    )
-    analyze_watchlist = st.form_submit_button("Analyze", type="primary", width="stretch")
-
-if analyze_watchlist:
-    cleaned = ", ".join([part.strip() for part in watchlist_input.split(",") if part.strip()])
-    if cleaned:
-        st.session_state["active_watchlist"] = cleaned
-        st.session_state["watchlist_revision"] = int(st.session_state.get("watchlist_revision", 0)) + 1
-        st.session_state["analysis_requested"] = True
-
-raw_symbols = st.session_state.get("active_watchlist", default_watchlist)
-
-if interface_mode == "Live Test":
-    st.sidebar.caption(f"Active analysis watchlist: {raw_symbols}")
 
 def normalize_symbol(value: str) -> str:
     """Normalize user input for Yahoo Finance. Bare Indian symbols default to NSE."""
@@ -291,9 +183,89 @@ def normalize_symbol(value: str) -> str:
         return s
     if s.endswith((".NS", ".BO")):
         return s
-    # The dashboard is Indian-market focused; bare symbols are treated as NSE.
     return f"{s}.NS"
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _today_stock_watchlist() -> dict:
+    """Cache the internet-sourced, source-attributed daily NSE watchlist for 15 minutes."""
+    try:
+        universe = _searchable_nse_universe()
+    except Exception:
+        universe = pd.DataFrame()
+    sources = fetch_watchlist_articles()
+    return build_stock_watchlist(universe, sources, max_stocks=5)
+
+
+if "watchlist_revision" not in st.session_state:
+    st.session_state["watchlist_revision"] = 0
+if "active_watchlist" not in st.session_state:
+    st.session_state["active_watchlist"] = ""
+# Clear the former built-in three-stock starter list from existing sessions.
+if st.session_state.get("active_watchlist", "").strip().upper() == "BHARTIARTL.NS, RELIANCE.NS, SBIN.NS":
+    st.session_state["active_watchlist"] = ""
+
+_search_df = pd.DataFrame()
+if interface_mode == "Research / Diagnostics":
+    st.sidebar.subheader("Manual research universe")
+    st.sidebar.caption("Live Test uses the automatically sourced daily watchlist. Manual symbols are only for research tools.")
+    try:
+        _search_df = _searchable_nse_universe()
+    except Exception:
+        _search_df = pd.DataFrame()
+
+    if not _search_df.empty:
+        search_text = st.sidebar.text_input(
+            "Find NSE stock",
+            key="nse_stock_search",
+            placeholder="Company name or NSE symbol",
+        ).strip().lower()
+        search_results = _search_df
+        if search_text:
+            mask = (
+                search_results["symbol"].str.lower().str.contains(search_text, regex=False, na=False)
+                | search_results["company"].str.lower().str.contains(search_text, regex=False, na=False)
+            )
+            search_results = search_results.loc[mask].head(40)
+
+        if not search_results.empty:
+            options = [
+                f"{row.symbol} — {row.company}" if row.company and row.company.lower() != "nan"
+                else row.symbol
+                for row in search_results.itertuples()
+            ]
+            selected_search = st.sidebar.selectbox("Matching stocks", options, key="nse_stock_search_result")
+            selected_symbol = selected_search.split(" — ", 1)[0].strip().upper()
+            if st.sidebar.button("Add to research symbols", width="stretch"):
+                current = [
+                    value.strip().upper()
+                    for value in st.session_state.get("active_watchlist", "").split(",")
+                    if value.strip()
+                ]
+                selected_ns = f"{selected_symbol}.NS"
+                if selected_ns not in current:
+                    current.append(selected_ns)
+                st.session_state["active_watchlist"] = ", ".join(current)
+                st.session_state["watchlist_input"] = st.session_state["active_watchlist"]
+                st.session_state["watchlist_revision"] += 1
+                st.rerun()
+
+    with st.sidebar.form("watchlist_form", clear_on_submit=False, border=False):
+        watchlist_input = st.text_area(
+            "Research symbols (comma-separated)",
+            st.session_state.get("active_watchlist", ""),
+            key="watchlist_input",
+            height=78,
+            placeholder="Example: TCS, INFY, HDFCBANK",
+        )
+        analyze_watchlist = st.form_submit_button("Apply research symbols", width="stretch")
+
+    if analyze_watchlist:
+        cleaned = ", ".join(part.strip() for part in watchlist_input.split(",") if part.strip())
+        st.session_state["active_watchlist"] = cleaned
+        st.session_state["watchlist_revision"] += 1
+
+raw_symbols = st.session_state.get("active_watchlist", "") if interface_mode == "Research / Diagnostics" else ""
 symbols = [normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
 
 
