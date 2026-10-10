@@ -13,7 +13,9 @@ REMOTE_POLICY="models/all_nse_delivery_multifactor_replacement_2026/ACTIVE_SIGNA
 LOCAL_POLICY=Path("/tmp/ACTIVE_SIGNAL_POLICY.json")
 DEFAULT={"buy_probability_threshold":0.60,"sell_probability_threshold":0.40,"min_expected_return":0.0015}
 MIN_SAMPLES=80
-MIN_HOLDOUT_ACTIONS=10
+MIN_TUNING_ACTIONS=20
+MIN_HOLDOUT_ACTIONS=30
+TARGET_HOLDOUT_PRECISION=0.80
 
 def _load_existing():
     try:
@@ -33,15 +35,27 @@ def _load_existing():
     except Exception:
         return {"status":"DEFAULT","samples":0,**DEFAULT}
 
+def _wilson_lower_bound(successes: int, trials: int, z: float = 1.96) -> float:
+    """Two-sided 95% Wilson lower bound for a binomial hit rate."""
+    if trials <= 0:
+        return float("nan")
+    p = successes / trials
+    denom = 1.0 + z * z / trials
+    center = p + z * z / (2.0 * trials)
+    margin = z * np.sqrt((p * (1.0 - p) + z * z / (4.0 * trials)) / trials)
+    return float((center - margin) / denom)
+
 def _precision(df,buy,sell,min_ret):
     p=pd.to_numeric(df["probability_up_next_session"],errors="coerce")
     r=pd.to_numeric(df["predicted_return_next_session"],errors="coerce")
     actual=df["actual_direction_d1"].astype(str).str.upper().to_numpy()
     signal=np.where((p>=buy)&(r>min_ret),"BUY",np.where((p<=sell)&(r<-min_ret),"SELL","HOLD"))
     action=np.isin(signal,["BUY","SELL"])
-    if not action.any(): return {"precision":np.nan,"actions":0,"coverage":0.0}
+    if not action.any(): return {"precision":np.nan,"wilson_lower_95":np.nan,"actions":0,"coverage":0.0}
     correct=((signal=="BUY")&(actual=="UP"))|((signal=="SELL")&(actual=="DOWN"))
-    return {"precision":float(correct[action].mean()),"actions":int(action.sum()),"coverage":float(action.mean())}
+    successes=int(correct[action].sum()); actions=int(action.sum())
+    return {"precision":float(successes/actions),"wilson_lower_95":_wilson_lower_bound(successes,actions),
+            "actions":actions,"coverage":float(action.mean())}
 
 def _join():
     p=pd.DataFrame(load_records()); v=pd.DataFrame(load_validation_records())
@@ -71,23 +85,34 @@ def main():
     cr=float(existing.get("min_expected_return",DEFAULT["min_expected_return"]))
     baseline=_precision(hold,cb,cs,cr)
     candidates=[]
-    for buy in np.arange(0.55,0.76,0.02):
-        for sell in np.arange(0.25,0.46,0.02):
+    for buy in np.arange(0.60,0.861,0.02):
+        for sell in np.arange(0.14,0.401,0.02):
             if buy<=0.50 or sell>=0.50: continue
             t=_precision(tune,round(float(buy),2),round(float(sell),2),cr)
-            if t["actions"]<15 or not np.isfinite(t["precision"]): continue
-            candidates.append((t["precision"]+0.10*t["coverage"],round(float(buy),2),round(float(sell),2),t))
+            if t["actions"]<MIN_TUNING_ACTIONS or not np.isfinite(t["precision"]): continue
+            # Prefer a conservative confidence-bound estimate over raw precision.
+            candidates.append((t["wilson_lower_95"],t["precision"],round(float(buy),2),round(float(sell),2),t))
     chosen={**existing,"status":"UNCHANGED","samples":int(len(data)),"method":"walk-forward-policy-tuning"}
     if candidates:
-        _,buy,sell,tuned=max(candidates,key=lambda z:(z[0],z[3]["actions"]))
+        _,_,buy,sell,tuned=max(candidates,key=lambda z:(z[0],z[1],z[4]["actions"]))
         ch=_precision(hold,buy,sell,cr)
         improve=np.isfinite(ch["precision"]) and (not np.isfinite(baseline["precision"]) or ch["precision"]>=baseline["precision"]+0.05)
-        keepcov=ch["coverage"]>=max(0.03,baseline["coverage"]*0.50)
-        if ch["actions"]>=MIN_HOLDOUT_ACTIONS and improve and keepcov:
+        keepcov=ch["coverage"]>=max(0.02,baseline["coverage"]*0.25)
+        # The final chronological holdout must itself meet the user's high-precision
+        # objective. Never activate a merely better-than-baseline but weak policy.
+        meets_target=np.isfinite(ch["precision"]) and ch["precision"]>=TARGET_HOLDOUT_PRECISION
+        if ch["actions"]>=MIN_HOLDOUT_ACTIONS and meets_target and improve and keepcov:
             chosen.update({"status":"ADAPTIVE","buy_probability_threshold":buy,"sell_probability_threshold":sell,"min_expected_return":cr,
-                "selection_tuning_precision":tuned["precision"],"selection_tuning_actions":tuned["actions"],
-                "holdout_precision":ch["precision"],"holdout_actions":ch["actions"],"holdout_coverage":ch["coverage"],
+                "target_holdout_precision":TARGET_HOLDOUT_PRECISION,
+                "selection_tuning_precision":tuned["precision"],"selection_tuning_wilson_lower_95":tuned["wilson_lower_95"],"selection_tuning_actions":tuned["actions"],
+                "holdout_precision":ch["precision"],"holdout_wilson_lower_95":ch["wilson_lower_95"],"holdout_actions":ch["actions"],"holdout_coverage":ch["coverage"],
                 "baseline_holdout_precision":baseline["precision"],"baseline_holdout_actions":baseline["actions"]})
+        else:
+            chosen.update({"status":"UNCHANGED_TARGET_NOT_MET","target_holdout_precision":TARGET_HOLDOUT_PRECISION,
+                "candidate_holdout_precision":ch["precision"],"candidate_holdout_wilson_lower_95":ch["wilson_lower_95"],
+                "candidate_holdout_actions":ch["actions"],"baseline_holdout_precision":baseline["precision"],
+                "baseline_holdout_actions":baseline["actions"],
+                "reason":"Keep current policy unless the later chronological holdout has >=80% action precision, enough actions, and a meaningful improvement."})
     chosen["updated_at"]=datetime.now(timezone.utc).isoformat()
     g=GoogleDriveStore(); LOCAL_POLICY.write_text(json.dumps(chosen,indent=2,default=str),encoding="utf-8")
     g.upload_or_update(LOCAL_POLICY,REMOTE_POLICY,mime_type="application/json")
