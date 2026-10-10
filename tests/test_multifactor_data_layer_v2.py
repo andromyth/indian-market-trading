@@ -73,6 +73,7 @@ def test_coverage_report_detects_zero_observation_features():
 def test_training_gate_blocks_silent_empty_or_rare_features():
     rows = 250
     frame = pd.DataFrame({name: np.arange(rows, dtype=float) for name in FEATURES_59})
+    frame["fno_available"] = 1.0
     frame["fno_iv_change"] = np.nan
     with pytest.raises(RuntimeError, match="fno_iv_change"):
         assert_training_feature_coverage(frame)
