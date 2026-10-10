@@ -83,6 +83,25 @@ def test_training_gate_blocks_silent_empty_or_rare_features():
         assert_training_feature_coverage(frame)
 
 
+def test_training_gate_counts_fno_features_only_when_fno_is_applicable():
+    rows = 400
+    frame = pd.DataFrame({name: np.arange(rows, dtype=float) for name in FEATURES_59})
+    # F&O is relevant for only 120 rows. The feature is complete within that
+    # applicable subset; the other 280 NaNs must not be misclassified as a
+    # broken F&O feed.
+    frame["fno_available"] = 0.0
+    frame.loc[:119, "fno_available"] = 1.0
+    frame["fno_iv_change"] = np.nan
+    frame.loc[:119, "fno_iv_change"] = np.linspace(0.01, 0.12, 120)
+    frame["ready_fundamentals"] = 1
+    report = assert_training_feature_coverage(
+        frame, min_observations=100, min_fraction=0.005
+    )
+    iv = report["coverage_scope_by_feature"]["fno_iv_change"]
+    assert iv["scope"] == "fno_applicable_rows"
+    assert iv["scope_rows"] == 120
+    assert iv["observed_rows_in_scope"] == 120
+
 def test_pit_merge_expires_old_observations_instead_of_forward_filling_forever():
     base = pd.DataFrame({
         "symbol": ["ABC", "ABC", "ABC"],
