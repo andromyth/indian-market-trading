@@ -186,10 +186,69 @@ def _save_manifest(obj: dict[str, Any]) -> None:
     tmp.replace(MANIFEST)
 
 
+def _mounted_drive_root() -> Path | None:
+    """Return the research root on an already-mounted Google Drive, if present.
+
+    Colab's mounted filesystem does not provide Compute Engine metadata
+    credentials. Prefer a verified mounted path there; hosted deployments
+    without a mount continue to use the configured Google Drive API client.
+    """
+    import os
+
+    candidates = [
+        os.environ.get("INDIAN_MARKET_RESEARCH_DRIVE_ROOT", "").strip(),
+        "/content/drive/MyDrive/Indian_Market_Research",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate).expanduser()
+            if path.is_dir():
+                return path
+        except Exception:
+            continue
+    return None
+
+
 def _drive_upload(local_path: Path, remote_path: str, mime: str = "application/octet-stream") -> dict[str, Any]:
+    """Persist to a mounted Drive in Colab, otherwise use the Drive API."""
+    source = Path(local_path)
+    if not source.is_file():
+        return {"status": "NOT_SYNCED", "error": f"Local file does not exist: {source}"}
+
+    mounted_root = _mounted_drive_root()
+    if mounted_root is not None:
+        try:
+            relative = Path(*[part for part in str(remote_path).replace("\\\\", "/").split("/") if part])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"Unsafe Drive destination path: {remote_path}")
+            destination = mounted_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + ".uploading")
+            import shutil
+            shutil.copyfile(source, temporary)
+            if temporary.stat().st_size != source.stat().st_size:
+                raise IOError(
+                    f"Drive copy size mismatch: source={source.stat().st_size}, "
+                    f"copied={temporary.stat().st_size}"
+                )
+            temporary.replace(destination)
+            return {
+                "status": "OK",
+                "mode": "mounted_drive_copy",
+                "path": str(destination),
+                "bytes": int(destination.stat().st_size),
+            }
+        except Exception as exc:
+            return {
+                "status": "NOT_SYNCED",
+                "error": f"Mounted Drive copy failed: {type(exc).__name__}: {exc}",
+            }
+
     try:
         from persistent_store import GoogleDriveStore
-        return GoogleDriveStore().upload_or_update(local_path, remote_path, mime_type=mime)
+        return GoogleDriveStore().upload_or_update(source, remote_path, mime_type=mime)
     except Exception as exc:
         return {"status": "NOT_SYNCED", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -457,6 +516,40 @@ def _drive_index_history(
 ) -> pd.DataFrame:
     """Read persisted official NSE benchmark parquet files from Google Drive."""
     root = str(index_symbol).strip().upper()
+
+    # Colab's mounted Drive is a filesystem, not a Compute Engine service
+    # account. Read complete persisted range caches from that mount directly
+    # before attempting the Google Drive API path used by hosted deployments.
+    mounted_root = _mounted_drive_root()
+    if mounted_root is not None:
+        folder_name = root.replace("^", "").replace("/", "_")
+        mounted_dir = (
+            mounted_root / "production_data" / "nse_official"
+            / "indices" / folder_name
+        )
+        if mounted_dir.is_dir():
+            candidates = []
+            for cache_file in sorted(mounted_dir.glob("*.parquet")):
+                try:
+                    range_start_text, range_end_text = cache_file.stem.split("_", 1)
+                    range_start = datetime.strptime(range_start_text, "%Y%m%d").date()
+                    range_end = datetime.strptime(range_end_text, "%Y%m%d").date()
+                    if (
+                        range_start <= start + timedelta(days=10)
+                        and range_end >= end
+                    ):
+                        candidates.append(cache_file)
+                except (ValueError, TypeError):
+                    continue
+
+            for cache_file in candidates:
+                try:
+                    frame = pd.read_parquet(cache_file)
+                    normalized = _normalize_index_history(frame, root)
+                    if not normalized.empty:
+                        return normalized
+                except Exception:
+                    continue
 
     try:
         from persistent_store import GoogleDriveStore
