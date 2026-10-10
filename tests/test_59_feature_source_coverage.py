@@ -51,6 +51,16 @@ def test_fno_join_is_exact_to_next_exchange_session_and_does_not_forward_fill(tm
 def test_fundamental_availability_index_uses_full_catalog_independently_of_parse(tmp_path, monkeypatch):
     monkeypatch.setattr(candidate, "FUND_AVAILABILITY", tmp_path / "availability.parquet")
     monkeypatch.setattr(candidate, "FUND_AVAILABILITY_META", tmp_path / "availability.meta.json")
+    catalog_cache = tmp_path / "catalog.json"
+    catalog_cache.write_text(json.dumps({
+        "meta": {
+            "coverage_start": "2025-01-01",
+            "coverage_end": "2026-10-10",
+            "coverage_complete": True,
+        },
+        "data": [],
+    }))
+    monkeypatch.setattr(candidate, "FUND_CATALOG_CACHE", catalog_cache)
     catalog = [
         {
             "type": "Integrated Filing- Financials",
