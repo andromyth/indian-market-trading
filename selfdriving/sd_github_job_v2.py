@@ -7,6 +7,7 @@ selfdriving/beta_version2 Drive prefix.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -344,6 +345,172 @@ def _load_frame(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path) if path.exists() and path.stat().st_size else pd.DataFrame()
 
 
+def _target_for_ledger_row(row: dict) -> str | None:
+    value = row.get("target_session_date")
+    if value is not None and not pd.isna(value) and str(value).strip():
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date().isoformat()
+    reference = pd.to_datetime(row.get("date"), errors="coerce")
+    if pd.isna(reference):
+        return None
+    from selfdriving.sd_data_quality import next_nse_session
+    target = next_nse_session(reference.date())
+    return target.isoformat() if target is not None else None
+
+
+def _legacy_revision_id(row: dict) -> str:
+    fields = (
+        "symbol", "date", "target_session_date", "model_file",
+        "p", "signal", "feature_coverage", "feature_fingerprint",
+    )
+    payload = {key: row.get(key) for key in fields}
+    return "legacy-" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _update_forecast_ledger(
+    predictions: pd.DataFrame,
+    inference: pd.DataFrame,
+    active_features: list[str],
+    ledger_path: Path,
+    history_path: Path,
+    target_session_date: date,
+) -> tuple[pd.DataFrame, dict]:
+    """Keep one current forecast per target session and archive changed versions.
+
+    A deterministic fingerprint of the registered champion's actual inputs
+    permits a rerun to issue a new revision when inputs or outputs change.
+    Earlier forecasts move to a separate history file, so validation continues
+    to score only the current forecast rather than inflating its sample count.
+    """
+    now_utc = datetime.now(timezone.utc).isoformat()
+    target_text = target_session_date.isoformat()
+    predictions = predictions.copy()
+    predictions["target_session_date"] = target_text
+    predictions["forecast_as_of_utc"] = now_utc
+
+    fingerprint_cols = [
+        col for col in ["symbol", *active_features]
+        if col in inference.columns
+    ]
+    fingerprints: dict[str, str] = {}
+    for _, row in inference.iterrows():
+        symbol = str(row.get("symbol", "")).strip().upper()
+        sample = pd.DataFrame([{col: row.get(col) for col in fingerprint_cols}])
+        raw_hash = pd.util.hash_pandas_object(sample, index=False).values.tobytes()
+        fingerprints[symbol] = hashlib.sha256(raw_hash).hexdigest()[:24]
+    predictions["feature_fingerprint"] = predictions["symbol"].astype(str).str.upper().map(fingerprints).fillna("NO_FEATURE_FINGERPRINT")
+
+    def make_revision_id(row: dict) -> str:
+        payload = "|".join([
+            str(row.get("symbol", "")).upper(),
+            str(row.get("target_session_date", "")),
+            str(row.get("model_file", "")),
+            str(row.get("feature_fingerprint", "")),
+            str(row.get("signal", "")),
+            str(row.get("p", "")),
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    predictions["prediction_revision_id"] = [
+        make_revision_id(row) for row in predictions.to_dict("records")
+    ]
+    predictions["revision_status"] = "CURRENT"
+
+    old = _load_frame(ledger_path)
+    history = _load_frame(history_path)
+    old_rows = old.to_dict("records") if not old.empty else []
+    history_rows = history.to_dict("records") if not history.empty else []
+
+    by_key: dict[tuple[str, str], list[dict]] = {}
+    for row in old_rows:
+        row["symbol"] = str(row.get("symbol", "")).strip().upper()
+        row["target_session_date"] = _target_for_ledger_row(row)
+        key_target = row.get("target_session_date")
+        if key_target:
+            by_key.setdefault((row["symbol"], key_target), []).append(row)
+
+    current_rows = []
+    archived_rows = []
+    unchanged_count = 0
+    replaced_count = 0
+    updated_keys = set()
+
+    for new_row in predictions.to_dict("records"):
+        key = (
+            str(new_row.get("symbol", "")).strip().upper(),
+            str(new_row.get("target_session_date", "")),
+        )
+        updated_keys.add(key)
+        matches = by_key.pop(key, [])
+        if matches:
+            latest = matches[-1]
+            unchanged = (
+                bool(latest.get("feature_fingerprint"))
+                and str(latest.get("feature_fingerprint")) == str(new_row.get("feature_fingerprint"))
+                and str(latest.get("model_file", "")) == str(new_row.get("model_file", ""))
+                and str(latest.get("signal", "")) == str(new_row.get("signal", ""))
+                and str(latest.get("p", "")) == str(new_row.get("p", ""))
+            )
+            if unchanged:
+                current_rows.append(latest)
+                unchanged_count += 1
+                # If old data already contains accidental same-key duplicates,
+                # archive the extras rather than retaining multiple current rows.
+                for duplicate in matches[:-1]:
+                    duplicate["prediction_revision_id"] = duplicate.get("prediction_revision_id") or _legacy_revision_id(duplicate)
+                    duplicate["revision_status"] = "SUPERSEDED_DUPLICATE"
+                    duplicate["superseded_at_utc"] = now_utc
+                    duplicate["superseded_by_revision_id"] = latest.get("prediction_revision_id")
+                    archived_rows.append(duplicate)
+                continue
+
+            replaced_count += 1
+            for previous in matches:
+                previous["prediction_revision_id"] = previous.get("prediction_revision_id") or _legacy_revision_id(previous)
+                previous["revision_status"] = "SUPERSEDED"
+                previous["superseded_at_utc"] = now_utc
+                previous["superseded_by_revision_id"] = new_row["prediction_revision_id"]
+                archived_rows.append(previous)
+
+        current_rows.append(new_row)
+
+    # Keep forecasts for target dates not touched by this run.
+    for remaining_rows in by_key.values():
+        current_rows.extend(remaining_rows)
+
+    if archived_rows:
+        history_rows.extend(archived_rows)
+    for row in history_rows:
+        row["prediction_revision_id"] = row.get("prediction_revision_id") or _legacy_revision_id(row)
+    history_frame = pd.DataFrame(history_rows)
+    if not history_frame.empty:
+        history_frame = history_frame.drop_duplicates(
+            subset=["prediction_revision_id"], keep="first"
+        )
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_frame.to_parquet(history_path, index=False)
+
+    current = pd.DataFrame(current_rows)
+    if not current.empty:
+        current["revision_status"] = "CURRENT"
+        current = current.drop_duplicates(
+            subset=["symbol", "target_session_date"], keep="last"
+        ).sort_values(["target_session_date", "symbol"]).reset_index(drop=True)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        current.to_parquet(ledger_path, index=False)
+
+    return current, {
+        "target_session_date": target_text,
+        "current_forecasts": int(len(predictions)),
+        "new_or_revised_forecasts": int(len(predictions) - unchanged_count),
+        "unchanged_forecasts": int(unchanged_count),
+        "superseded_versions_archived": int(len(archived_rows)),
+        "history_file": str(history_path),
+    }
+
+
 def main() -> int:
     status = {
         "version": "2026-10-10-beta-v2-daily",
@@ -564,40 +731,40 @@ def main() -> int:
                         "Could not resolve the next NSE session for this forecast."
                     )
                 predictions = predict_stage(inference, registry_path)
-                # `date` stays the PIT reference/decision date. Store the future
-                # NSE target separately so a Saturday/Sunday run is not mistaken
-                # for a signal intended for the weekend itself.
-                predictions["target_session_date"] = target_session_date.isoformat()
-
-                # The first prediction for a symbol/date is immutable. A later
-                # rerun may enrich the audit, but cannot rewrite the issued signal.
-                ledger_path.parent.mkdir(parents=True, exist_ok=True)
-                if ledger_path.exists() and ledger_path.stat().st_size:
-                    old_ledger = pd.read_parquet(ledger_path)
-                    for frame in (old_ledger, predictions):
-                        if "date" in frame.columns:
-                            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
-                    predictions = (
-                        pd.concat([old_ledger, predictions], ignore_index=True)
-                        .drop_duplicates(["symbol", "date"], keep="first")
-                        .sort_values(["date", "symbol"])
-                    )
-                predictions.to_parquet(ledger_path, index=False)
+                # Forecasts are keyed by the future NSE session. When the same
+                # target is rescored after a legitimate feature/source update,
+                # the current ledger is replaced and the previous version is
+                # archived separately for audit. Identical reruns stay idempotent.
+                history_path = ROOT / "ledger" / "predictions_history.parquet"
+                current_ledger, revision_status = _update_forecast_ledger(
+                    predictions,
+                    inference,
+                    active_champion_features,
+                    ledger_path,
+                    history_path,
+                    target_session_date,
+                )
+                current_target = current_ledger[
+                    current_ledger["target_session_date"].astype(str).eq(target_session_date.isoformat())
+                ] if not current_ledger.empty else pd.DataFrame()
 
                 status["stages"]["inference"] = {
                     "status": "PASS",
                     "audit": panel_audit,
-                    "rows_latest": int(
-                        predictions[predictions["date"].eq(predictions["date"].max())].shape[0]
-                    ) if len(predictions) else 0,
-                    "rows_ledger": int(len(predictions)),
+                    "revision_status": revision_status,
+                    "rows_latest": int(len(current_target)),
+                    "rows_ledger": int(len(current_ledger)),
                     "signals_latest": (
-                        predictions[predictions["date"].eq(predictions["date"].max())]["signal"].value_counts().to_dict()
-                        if len(predictions) else {}
+                        current_target["signal"].value_counts().to_dict()
+                        if not current_target.empty else {}
                     ),
-                    "prediction_reference_date": str(predictions["date"].max()) if len(predictions) else None,
+                    "prediction_reference_date": (
+                        str(current_target["date"].max())
+                        if not current_target.empty else None
+                    ),
                     "prediction_target_session_date": target_session_date.isoformat(),
                     "signals_are_decision_support_only": True,
+                    "previous_forecast_versions_preserved": True,
                 }
 
         except Exception as exc:
@@ -647,6 +814,10 @@ def main() -> int:
     safe_upload(ROOT / "raw_news.parquet", f"{REMOTE_BASE}/raw_news.parquet")
     safe_upload(realised_path, f"{REMOTE_BASE}/BETA_V2_DELIVERY_REALISED_RETURNS.parquet")
     safe_upload(ledger_path, f"{REMOTE_BASE}/ledger/predictions.parquet")
+    safe_upload(
+        ROOT / "ledger" / "predictions_history.parquet",
+        f"{REMOTE_BASE}/ledger/predictions_history.parquet",
+    )
     safe_upload(
         ROOT / "BETA_V2_DELIVERY_INFERENCE_PANEL.parquet",
         f"{REMOTE_BASE}/BETA_V2_DELIVERY_INFERENCE_PANEL.parquet",
