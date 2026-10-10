@@ -132,7 +132,7 @@ def beta_status() -> dict[str, Any]:
                 "rows": snapshot_audit.get("rows"),
                 "symbols": snapshot_audit.get("symbols"),
                 "duplicate_symbol_rows": snapshot_audit.get("duplicate_symbol_rows"),
-                "mean_row_feature_non_null_pct": snapshot_audit.get("mean_row_feature_non_null_pct"),
+                "mean_feature_non_null_pct": snapshot_audit.get("mean_feature_non_null_pct"),
                 "production_quality_gate_pct": snapshot_audit.get("production_quality_gate_pct"),
             },
             "stockwise_source_coverage": audit.get("stockwise_source_coverage", {}),
