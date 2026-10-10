@@ -1155,6 +1155,12 @@ def merge_optional(panel, source_cache=None):
             out["news_available"] = np.nan
         audit["news"] = {"exists": False, "rows": 0, "freshness_days": 7}
 
+    # The base panel does not necessarily contain this optional flag.
+    # Create an explicitly unknown column before combining the separate
+    # high-impact event stream; absence must remain NaN, not a fabricated zero.
+    if "event_high_impact" not in out.columns:
+        out["event_high_impact"] = np.nan
+
     if not events.empty and "event_available" in events.columns:
         out = merge_pit_layer(out, events, ["event_available"], "events", max_age=freshness)
         # High-impact status is independent of the latest low-impact event:
