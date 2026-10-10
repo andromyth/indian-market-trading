@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from selfdriving.sd_data_quality import derive_realised_returns, merge_realised_returns, next_nse_session
+from selfdriving.sd_data_quality import (\n    build_input_audit, derive_realised_returns, merge_realised_returns,\n    next_nse_session, parse_pit_date,\n)
 
 
 def snap(rows):
@@ -44,6 +44,35 @@ class RealisedReturnTests(unittest.TestCase):
         self.assertAlmostEqual(float(merged.iloc[0]["y_return"]), 0.02, places=8)
         self.assertEqual(stats["new_keys"], 1)
         self.assertEqual(stats["refreshed_keys"], 1)
+
+
+    def test_pit_snapshot_date_parser_rejects_noncanonical_names(self):
+        self.assertEqual(parse_pit_date("DELIVERY_PIT_FEATURES_2026-10-09.parquet"), date(2026, 10, 9))
+        self.assertIsNone(parse_pit_date("DELIVERY_PIT_FEATURES_latest.parquet"))
+
+    def test_audit_reports_symbolwise_usdinr_and_volume_coverage(self):
+        from multifactor_data_layer_v2 import FEATURES_59
+
+        rows = []
+        for symbol in ("AAA", "BBB"):
+            row = {"symbol": symbol, "close": 100.0, "volume": 1000.0, "production_data_quality_gate": True}
+            row.update({feature: 0.1 for feature in FEATURES_59})
+            rows.append(row)
+        pit = pd.DataFrame(rows)
+        panel = pd.DataFrame([
+            {"symbol": "AAA", "g_inr_z": 0.2, "news_available": 0.0, "news_sent_ewm": 0.1, "fno_buildup": 0.2},
+            {"symbol": "BBB", "g_inr_z": float("nan"), "news_available": float("nan"), "news_sent_ewm": float("nan"), "fno_buildup": float("nan")},
+        ])
+        report = build_input_audit(
+            pit, panel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            expected_date=date(2026, 10, 9),
+            observed_date=date(2026, 10, 9),
+            now=pd.Timestamp("2026-10-10T00:00:00Z"),
+        )
+        self.assertEqual(report["hard_failures"], [])
+        self.assertEqual(len(report["stockwise_input_readiness"]), 2)
+        self.assertEqual(report["stockwise_source_coverage"]["symbols_with_usdinr_feature"], 1)
+        self.assertEqual(report["stockwise_source_coverage"]["symbols_with_daily_volume_ratio"], 2)
 
     def test_known_trading_session_calendar_skips_weekend(self):
         self.assertEqual(next_nse_session(date(2026, 10, 9)), date(2026, 10, 12))
