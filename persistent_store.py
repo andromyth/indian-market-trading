@@ -305,10 +305,23 @@ def gdrive_config() -> dict:
     except Exception:
         pass
 
-    # Prefer a configured service account over user OAuth tokens. GitHub Actions
-    # may contain a legacy/expired OAuth refresh token alongside the long-lived
-    # service-account JSON; selecting OAuth first makes the valid service account
-    # unreachable and breaks unattended Drive jobs with invalid_grant.
+    oauth_write_info = None
+    oauth_write_error = None
+    if oauth_json and service_json:
+        try:
+            parsed_oauth = json.loads(oauth_json)
+            if not isinstance(parsed_oauth, dict):
+                oauth_write_error = "OAuth token JSON is not an object"
+            elif not parsed_oauth.get("refresh_token"):
+                oauth_write_error = "OAuth token JSON has no refresh_token"
+            else:
+                oauth_write_info = parsed_oauth
+        except Exception as exc:
+            oauth_write_error = f"invalid OAuth token JSON: {type(exc).__name__}"
+
+    # Prefer the service account for Drive read/list access when both credential
+    # types exist. For My Drive writes, Google requires OAuth user credentials
+    # because service accounts have no personal storage quota.
     if oauth_json and not service_json:
         try:
             oauth_info = json.loads(oauth_json)
@@ -413,6 +426,9 @@ def gdrive_config() -> dict:
         "root_folder_name": root_name,
         "service_account_info": info,
         "client_email": info.get("client_email"),
+        "oauth_write_token_info": oauth_write_info,
+        "oauth_write_error": oauth_write_error,
+        "oauth_write_configured": bool(oauth_json),
         "secrets_detected": secrets_seen,
         "secret_keys": secret_names,
     }
@@ -455,7 +471,7 @@ def _drive_credentials(cfg: dict):
     )
 
 
-def drive_status() -> dict:
+def drive_status(require_write: bool = False) -> dict:
     cfg = gdrive_config()
     if not cfg.get("configured"):
         return {"configured": False, "reason": cfg.get("reason"), "persistent_local_root": _relative_or_absolute(PERSIST_ROOT)}
@@ -485,16 +501,63 @@ def drive_status() -> dict:
 
         meta = service.files().get(
             fileId=root_id,
-            fields="id,name,mimeType,trashed",
+            fields="id,name,mimeType,trashed,driveId",
         ).execute()
         if meta.get("trashed"):
             return {"configured": False, "reason": "configured root folder is in Trash"}
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             return {"configured": False, "reason": "configured root ID is not a folder"}
+
+        write_auth_method = cfg.get("auth_method")
+        if require_write and cfg.get("auth_method") == "service_account":
+            oauth_info = cfg.get("oauth_write_token_info")
+            if oauth_info:
+                # Validate/refresh the human user's OAuth credentials before
+                # ingestion begins. This avoids downloading NSE files only to
+                # fail later when the service account attempts to upload to My Drive.
+                write_credentials = _drive_credentials({
+                    "auth_method": "oauth",
+                    "oauth_token_info": oauth_info,
+                })
+                write_service = build(
+                    "drive",
+                    "v3",
+                    credentials=write_credentials,
+                    cache_discovery=False,
+                )
+                write_meta = write_service.files().get(
+                    fileId=root_id,
+                    fields="id,name,mimeType,trashed",
+                ).execute()
+                if write_meta.get("trashed") or write_meta.get("mimeType") != "application/vnd.google-apps.folder":
+                    raise RuntimeError("OAuth write identity cannot access the configured Drive root folder")
+                write_auth_method = "oauth"
+            elif not meta.get("driveId"):
+                return {
+                    "configured": True,
+                    "reachable": True,
+                    "write_ready": False,
+                    "reason": (
+                        "Read access works, but this is My Drive and the configured "
+                        "service account has no storage quota for uploads. Configure a "
+                        "valid GOOGLE_OAUTH_TOKEN_JSON or use a Shared Drive."
+                    ),
+                    "root_folder_id": root_id,
+                    "auth_method": cfg.get("auth_method"),
+                    "write_auth_method": None,
+                    "root_name": meta.get("name"),
+                }
+
         return {
             "configured": True,
+            "reachable": True,
+            "write_ready": (
+                write_auth_method != "service_account"
+                or bool(meta.get("driveId"))
+            ),
             "root_folder_id": root_id,
             "auth_method": cfg.get("auth_method"),
+            "write_auth_method": write_auth_method,
             "client_email": cfg.get("client_email"),
             "root_name": meta.get("name"),
         }
@@ -560,6 +623,8 @@ def _discover_drive_root_folder(
 class GoogleDriveStore:
     def __init__(self) -> None:
         cfg = gdrive_config()
+        self.cfg = cfg
+        self._write_service = None
         if not cfg.get("configured"):
             raise RuntimeError(cfg.get("reason", "Google Drive is not configured"))
         try:
@@ -596,11 +661,49 @@ class GoogleDriveStore:
     def _q(value: str) -> str:
         return value.replace("\\", "\\\\").replace("'", "\\'")
 
-    def _find_child(self, parent_id: str, name: str, mime_type: str | None = None) -> dict | None:
+    def _get_write_service(self):
+        if self._write_service is not None:
+            return self._write_service
+        oauth_info = self.cfg.get("oauth_write_token_info")
+        if self.cfg.get("auth_method") == "oauth":
+            self._write_service = self.service
+            return self._write_service
+        if not oauth_info:
+            self._write_service = self.service
+            return self._write_service
+        from googleapiclient.discovery import build
+        try:
+            credentials = _drive_credentials({
+                "auth_method": "oauth",
+                "oauth_token_info": oauth_info,
+            })
+        except Exception as exc:
+            raise RuntimeError(
+                "Google Drive can read via the service account, but the OAuth user "
+                "token required to upload into My Drive is expired/revoked. Re-authorize "
+                "Google Drive and replace the GOOGLE_OAUTH_TOKEN_JSON GitHub secret. "
+                f"Authentication detail: {type(exc).__name__}"
+            ) from exc
+        self._write_service = build(
+            "drive",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+        return self._write_service
+
+    def _find_child(
+        self,
+        parent_id: str,
+        name: str,
+        mime_type: str | None = None,
+        service=None,
+    ) -> dict | None:
+        svc = service or self.service
         q = f"name = '{self._q(name)}' and '{parent_id}' in parents and trashed = false"
         if mime_type:
             q += f" and mimeType = '{mime_type}'"
-        resp = self.service.files().list(
+        resp = svc.files().list(
             q=q,
             spaces="drive",
             fields="files(id,name,mimeType)",
@@ -611,18 +714,24 @@ class GoogleDriveStore:
         files = resp.get("files", [])
         return files[0] if files else None
 
-    def _ensure_folder(self, parent_id: str, name: str) -> str:
-        hit = self._find_child(parent_id, name, "application/vnd.google-apps.folder")
+    def _ensure_folder(self, parent_id: str, name: str, service=None) -> str:
+        svc = service or self.service
+        hit = self._find_child(parent_id, name, "application/vnd.google-apps.folder", service=svc)
         if hit:
             return hit["id"]
         meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-        return self.service.files().create(body=meta, fields="id").execute()["id"]
+        return svc.files().create(
+            body=meta,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()["id"]
 
-    def ensure_path(self, relative_folder: str) -> str:
+    def ensure_path(self, relative_folder: str, service=None) -> str:
+        svc = service or self.service
         parent = self.root_id
         parts = [p for p in relative_folder.replace("\\", "/").split("/") if p]
         for part in parts:
-            parent = self._ensure_folder(parent, part)
+            parent = self._ensure_folder(parent, part, service=svc)
         return parent
 
     def upload_or_update(self, local_path: Path, remote_relative_path: str, mime_type: str = "application/octet-stream") -> dict:
@@ -630,15 +739,36 @@ class GoogleDriveStore:
         parts = remote.split("/")
         name = parts[-1]
         folder = "/".join(parts[:-1])
-        parent_id = self.ensure_path(folder)
-        existing = self._find_child(parent_id, name)
+        write_service = self._get_write_service()
+        parent_id = self.ensure_path(folder, service=write_service)
+        existing = self._find_child(parent_id, name, service=write_service)
         media = self.MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
-        if existing:
-            result = self.service.files().update(fileId=existing["id"], media_body=media, fields="id,name,modifiedTime,size").execute()
-            action = "updated"
-        else:
-            result = self.service.files().create(body={"name": name, "parents": [parent_id]}, media_body=media, fields="id,name,createdTime,size").execute()
-            action = "created"
+        try:
+            if existing:
+                result = write_service.files().update(
+                    fileId=existing["id"],
+                    media_body=media,
+                    fields="id,name,modifiedTime,size",
+                    supportsAllDrives=True,
+                ).execute()
+                action = "updated"
+            else:
+                result = write_service.files().create(
+                    body={"name": name, "parents": [parent_id]},
+                    media_body=media,
+                    fields="id,name,createdTime,size",
+                    supportsAllDrives=True,
+                ).execute()
+                action = "created"
+        except Exception as exc:
+            detail = str(exc)
+            if "storageQuotaExceeded" in detail or "Service Accounts do not have storage quota" in detail:
+                raise RuntimeError(
+                    "Google Drive upload was rejected because a service account cannot "
+                    "own/upload files in My Drive. Configure a valid GOOGLE_OAUTH_TOKEN_JSON "
+                    "for the Drive owner, or use a Google Workspace Shared Drive."
+                ) from exc
+            raise
         return {"status": "OK", "action": action, "remote_path": remote, "file_id": result.get("id"), "size": result.get("size")}
 
 
