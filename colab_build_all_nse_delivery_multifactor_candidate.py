@@ -14,7 +14,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from delivery_training_universe import benchmark_for_symbol, training_roster
+from delivery_training_universe import benchmark_for_symbol, official_nse_symbols, training_roster
 from nse_data_layer import fetch_index_history, load_canonical_cash_research_history
 from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
 from multifactor_data_layer_v2 import FEATURES_59, assert_training_feature_coverage, attach_readiness_flags, feature_coverage_report, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report, session_close_timestamp_utc
@@ -854,7 +854,7 @@ def make_panel(bulk, symbols, sort_output=True, delivery=None):
         out = out.reset_index(drop=True)
     return out
 
-def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
     """Exact next-session join for official NSE derivatives data.
 
     A source-day F&O row is available from the following exchange session at
@@ -878,7 +878,7 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
         }
 
-    f = pd.read_parquet(path)
+    f = source_frame.copy() if source_frame is not None else pd.read_parquet(path)
     if f.empty or not {"symbol", "date"}.issubset(f.columns):
         out = panel.copy()
         for column in fno_columns:
@@ -967,7 +967,7 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "pit_rule": "exact_symbol_and_next_session_date; source_trade_date_available_next_session_09:15_IST; no forward-fill",
     }
 
-def merge_optional(panel):
+def merge_optional(panel, source_cache=None):
     out = panel.copy()
     audit = {}
     fno_columns = [
@@ -977,7 +977,9 @@ def merge_optional(panel):
 
     # The derivatives join is exact by next exchange session. It never carries
     # yesterday's F&O figures into later sessions without a source observation.
-    out, fno_audit = _merge_broad_fno_pit(out)
+    out, fno_audit = _merge_broad_fno_pit(
+        out, source_cache.get("fno") if source_cache is not None else None
+    )
     audit["fno"] = fno_audit
 
     # A complete source manifest is required before missing per-symbol events
@@ -987,11 +989,14 @@ def merge_optional(panel):
         "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
     )
     source_manifest = {}
-    try:
-        if source_manifest_path.exists() and source_manifest_path.stat().st_size > 0:
-            source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        audit["news_events_manifest_error"] = f"{type(exc).__name__}: {exc}"
+    if source_cache is not None:
+        source_manifest = source_cache.get("news_events_manifest", {}) or {}
+    else:
+        try:
+            if source_manifest_path.exists() and source_manifest_path.stat().st_size > 0:
+                source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            audit["news_events_manifest_error"] = f"{type(exc).__name__}: {exc}"
 
     coverage_complete = source_manifest.get("coverage_complete") is True
     coverage_start = pd.to_datetime(source_manifest.get("coverage_start"), errors="coerce")
@@ -1007,8 +1012,14 @@ def merge_optional(panel):
 
     news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
     events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
-    news = load_optional_layer(news_path)
-    events = load_optional_layer(events_path)
+    news = (
+        source_cache.get("news", pd.DataFrame())
+        if source_cache is not None else load_optional_layer(news_path)
+    )
+    events = (
+        source_cache.get("events", pd.DataFrame())
+        if source_cache is not None else load_optional_layer(events_path)
+    )
 
     # These flags mean "at least one announcement/event in the last 7 days",
     # not "this symbol ever had a row in the archive". Old news must expire.
@@ -1094,7 +1105,13 @@ def merge_optional(panel):
     # Never silently fall back to the legacy three-stock pilot.
     fp = BASE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
     fp = fp if fp.exists() and fp.stat().st_size > 0 else None
-    if fp is not None:
+    cached_fundamentals = (
+        source_cache.get("fundamentals") if source_cache is not None else None
+    )
+    if cached_fundamentals is not None and not cached_fundamentals.empty:
+        f = cached_fundamentals
+        fp = fp or Path(source_cache.get("fundamentals_path", str(FUND_BROAD)))
+    elif fp is not None:
         f = pd.read_parquet(fp)
         f["symbol"] = f["symbol"].map(normalize_symbol)
         f["fundamental_available_at"] = pd.to_datetime(
@@ -1150,18 +1167,26 @@ def merge_optional(panel):
         # This separates a genuinely absent-as-of filing (known 0) from an
         # available filing that did not parse (unknown NaN, fail closed).
         availability_meta = {}
-        try:
-            if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size:
-                availability_meta = json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
-        except Exception as exc:
-            audit["fundamental_availability_meta_error"] = f"{type(exc).__name__}: {exc}"
+        if source_cache is not None:
+            availability_meta = source_cache.get("fundamental_availability_meta", {}) or {}
+        else:
+            try:
+                if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size:
+                    availability_meta = json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
+            except Exception as exc:
+                audit["fundamental_availability_meta_error"] = f"{type(exc).__name__}: {exc}"
         availability_path = FUND_AVAILABILITY
         if (
             availability_meta.get("coverage_complete") is True
             and availability_path.exists()
             and availability_path.stat().st_size > 0
         ):
-            availability = pd.read_parquet(availability_path)
+            availability = (
+                source_cache.get("fundamental_availability")
+                if source_cache is not None
+                else pd.read_parquet(availability_path)
+            )
+            availability = availability.copy()
             availability["symbol"] = availability["symbol"].map(normalize_symbol)
             availability["fundamental_available_at"] = pd.to_datetime(
                 availability["fundamental_available_at"], errors="coerce", utc=True
@@ -1295,8 +1320,8 @@ def fit_models(frame, horizon):
     if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique() < 2:
         raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
 
-    Xtr = tr[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    Xte = te[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    Xtr = tr[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float32")
+    Xte = te[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float32")
     yreg = tr[f"target_return_{horizon}"].replace([np.inf, -np.inf], np.nan)
     good = yreg.notna()
     Xtr = Xtr.loc[good]
@@ -1391,306 +1416,815 @@ def _candidate_artifacts_complete(out):
                 return False
     return True
 
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.stem + ".tmp.parquet")
+    frame.to_parquet(tmp, index=False, compression="zstd")
+    os.replace(tmp, path)
+
+
+def _file_signature(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {"exists": False, "path": str(path)}
+        st = path.stat()
+        return {
+            "exists": True, "path": str(path), "is_dir": path.is_dir(),
+            "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns),
+        }
+    except OSError as exc:
+        return {"exists": False, "path": str(path), "error": str(exc)}
+
+
+def _tree_signature(path: Path) -> dict:
+    if not path.exists():
+        return {"exists": False, "path": str(path)}
+    if path.is_file():
+        return _file_signature(path)
+    count = 0
+    total_size = 0
+    latest_mtime = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            p = Path(root) / name
+            if p.suffix.lower() not in {".parquet", ".csv", ".json"}:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            count += 1
+            total_size += int(st.st_size)
+            latest_mtime = max(latest_mtime, int(st.st_mtime_ns))
+    return {
+        "exists": True, "path": str(path), "file_count": count,
+        "total_size": total_size, "latest_mtime_ns": latest_mtime,
+    }
+
+
+def _build_roster_from_canonical_master(
+    cash_master: Path, min_history: int = 60, force_refresh: bool = False
+) -> dict:
+    """Compute the trainable roster in DuckDB without materializing the full master in pandas."""
+    import duckdb
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if not cash_master.exists() or cash_master.stat().st_size == 0:
+        raise FileNotFoundError(f"Canonical NSE cash master missing or empty: {cash_master}")
+    universe = set(official_nse_symbols(force_refresh=force_refresh))
+    if not universe:
+        raise RuntimeError("Official NSE universe is empty; refusing to create a training roster.")
+
+    path_sql = str(cash_master).replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("PRAGMA threads=2")
+        con.execute("PRAGMA memory_limit='2GB'")
+        counts = con.execute(f"""
+            SELECT
+                UPPER(TRIM(CAST(symbol AS VARCHAR))) AS symbol,
+                COUNT(DISTINCT TRY_CAST(date AS DATE)) AS history_sessions
+            FROM read_parquet('{path_sql}')
+            WHERE UPPER(TRIM(CAST(series AS VARCHAR))) IN ('EQ','BE','BZ','SM','ST','SZ')
+              AND TRY_CAST(date AS DATE) IS NOT NULL
+              AND TRY_CAST(open AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(high AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(low AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(close AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(close AS DOUBLE) > 0
+            GROUP BY 1
+        """).fetchdf()
+    finally:
+        con.close()
+
+    counts["symbol"] = counts["symbol"].map(normalize_symbol)
+    history_by_symbol = {
+        str(row.symbol): int(row.history_sessions)
+        for row in counts.itertuples(index=False)
+        if str(row.symbol).strip()
+    }
+    available = sorted(universe.intersection(history_by_symbol))
+    trainable = sorted(
+        symbol for symbol in available
+        if history_by_symbol.get(symbol, 0) >= int(min_history)
+    )
+    excluded = sorted(universe.difference(trainable))
+    return {
+        "universe_source": "NSE_OFFICIAL_EQUITY_L",
+        "universe_as_of": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "universe_symbol_count": len(universe),
+        "symbols_with_bulk_history": len(available),
+        "trainable_symbol_count": len(trainable),
+        "trainable_symbols": trainable,
+        "excluded_symbol_count": len(excluded),
+        "excluded_symbols": excluded,
+        "minimum_history_sessions": int(min_history),
+        "history_sessions_by_symbol": {
+            symbol: history_by_symbol[symbol] for symbol in trainable
+        },
+        "cash_master_signature": _file_signature(cash_master),
+        "roster_method": "DuckDB distinct valid cash sessions; no full pandas cash-master load",
+    }
+
+
+def _read_checkpoint(path: Path, stage: str) -> dict:
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"Missing {stage} checkpoint: {path}. Run the previous stage first."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") != "COMPLETE":
+        raise RuntimeError(f"{stage} checkpoint is not marked COMPLETE: {path}")
+    return payload
+
+
+def _load_roster_checkpoint(out: Path, cash_master: Path) -> dict:
+    payload = _read_checkpoint(out / "TRAINING_UNIVERSE_2026.json", "universe")
+    expected = _file_signature(cash_master)
+    actual = payload.get("cash_master_signature", {})
+    if expected != actual:
+        raise RuntimeError(
+            "Canonical cash master changed after the universe stage. "
+            "Run --stage universe again before proceeding."
+        )
+    roster = payload.get("roster")
+    if not isinstance(roster, dict) or not roster.get("trainable_symbols"):
+        raise RuntimeError("Universe checkpoint has no trainable symbols.")
+    return roster
+
+
+def _load_panel_source_cache() -> dict:
+    """Load the smaller optional PIT layers once per panel process, not once per symbol batch."""
+    fno_path = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
+    news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
+    events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
+    manifest_path = (
+        BASE / "processed/pit_replay/nse_all_universe_raw_2026/"
+        "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    )
+    fundamentals_path = BASE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+
+    cache = {
+        "fno": pd.read_parquet(fno_path) if fno_path.exists() and fno_path.stat().st_size else pd.DataFrame(),
+        "news": load_optional_layer(news_path),
+        "events": load_optional_layer(events_path),
+        "fundamentals": pd.read_parquet(fundamentals_path) if fundamentals_path.exists() and fundamentals_path.stat().st_size else pd.DataFrame(),
+        "fundamentals_path": str(fundamentals_path),
+        "fundamental_availability": pd.read_parquet(FUND_AVAILABILITY) if FUND_AVAILABILITY.exists() and FUND_AVAILABILITY.stat().st_size else pd.DataFrame(),
+        "fundamental_availability_meta": json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8")) if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size else {},
+        "news_events_manifest": json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() and manifest_path.stat().st_size else {},
+    }
+    print(
+        "Optional PIT source cache: "
+        f"F&O rows={len(cache['fno']):,}; news rows={len(cache['news']):,}; "
+        f"event rows={len(cache['events']):,}; fundamental rows={len(cache['fundamentals']):,}; "
+        f"filing-index rows={len(cache['fundamental_availability']):,}",
+        flush=True,
+    )
+    return cache
+
+
+def _panel_source_signature(
+    cash_master: Path, delivery_root: Path, roster: dict, fund_report: dict
+) -> dict:
+    source_paths = {
+        "fno": BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+        "news": BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
+        "events": BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+        "news_events_manifest": BASE / "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
+        "fundamentals": FUND_BROAD,
+        "fundamentals_meta": FUND_BROAD_META,
+        "fundamental_availability": FUND_AVAILABILITY,
+        "fundamental_availability_meta": FUND_AVAILABILITY_META,
+    }
+    return {
+        "stage_version": 2,
+        "feature_count": len(FEATURES_59),
+        "feature_contract_hash": hashlib.sha256(
+            json.dumps(FEATURES_59, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "cash_master": _file_signature(cash_master),
+        "trainable_symbols_hash": _hash_strings(roster["trainable_symbols"]),
+        "delivery_tree": _tree_signature(delivery_root),
+        "fundamentals_report_path": fund_report.get("path"),
+        "fundamentals_rows": fund_report.get("rows"),
+        "sources": {name: _file_signature(path) for name, path in source_paths.items()},
+    }
+
+
+def _feature_coverage_report_from_parquet(path: Path) -> dict:
+    import duckdb
+
+    p = str(path).replace("'", "''")
+    expressions = ["COUNT(*) AS rows", "COUNT(DISTINCT symbol) AS symbols"]
+    for i, name in enumerate(FEATURES_59):
+        q = '"' + name.replace('"', '""') + '"'
+        v = f"TRY_CAST({q} AS DOUBLE)"
+        expressions.append(
+            f"SUM(CASE WHEN {v} IS NOT NULL AND isfinite({v}) THEN 1 ELSE 0 END) AS obs_{i}"
+        )
+        expressions.append(
+            f"COUNT(DISTINCT CASE WHEN {v} IS NOT NULL AND isfinite({v}) THEN {v} ELSE NULL END) AS uniq_{i}"
+        )
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("PRAGMA threads=2")
+        con.execute("PRAGMA memory_limit='2GB'")
+        row = con.execute(
+            f"SELECT {', '.join(expressions)} FROM read_parquet('{p}')"
+        ).fetchone()
+    finally:
+        con.close()
+    n_rows = int(row[0] or 0)
+    features = {}
+    for i, name in enumerate(FEATURES_59):
+        observed = int(row[2 + 2 * i] or 0)
+        unique = int(row[3 + 2 * i] or 0)
+        features[name] = {
+            "column_missing_from_frame": False,
+            "non_missing_rows": observed,
+            "missing_rows": n_rows - observed,
+            "non_missing_pct": round(100.0 * observed / n_rows, 3) if n_rows else 0.0,
+            "unique_non_missing_values": unique,
+            "zero_coverage": observed == 0,
+        }
+    return {
+        "rows": n_rows,
+        "feature_count": len(FEATURES_59),
+        "mean_non_missing_pct": round(
+            sum(v["non_missing_pct"] for v in features.values()) / len(FEATURES_59), 3
+        ),
+        "features_missing_as_columns": [],
+        "features_with_zero_observations": [
+            c for c, v in features.items() if v["zero_coverage"]
+        ],
+        "features": features,
+        "symbols": int(row[1] or 0),
+        "method": "streaming DuckDB aggregation over persisted panel parquet",
+    }
+
+
+def _sql_string(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _prepare_training_sample(
+    panel_path: Path, sample_path: Path, horizon: str, steps: int, max_training_rows: int
+) -> dict:
+    """Use DuckDB to label and deterministically sample without loading the full panel into pandas."""
+    import duckdb
+    import math
+    from shutil import rmtree
+
+    if max_training_rows < 1000:
+        raise ValueError("--max-training-rows must be at least 1000.")
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path("/content") / f"indian_market_duckdb_tmp_{horizon}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    panel_sql = _sql_string(panel_path)
+    temp_sql = _sql_string(temp_dir)
+    cols = [
+        "symbol", "decision_timestamp", "close", "data_readiness_score",
+        "ready_market_price", "ready_market_context", "ready_news",
+        "ready_events", "ready_fno", "ready_fundamentals",
+    ] + list(FEATURES_59)
+    cols = list(dict.fromkeys(cols))
+    projection = ", ".join('"' + c.replace('"', '""') + '"' for c in cols)
+    horizon_ret = f"target_return_{horizon}"
+    horizon_up = f"target_up_{horizon}"
+    con = duckdb.connect(database=":memory:")
+    sample_tmp = sample_path.with_name(sample_path.stem + ".tmp.parquet")
+    try:
+        con.execute("PRAGMA threads=2")
+        con.execute("PRAGMA memory_limit='3GB'")
+        con.execute(f"SET temp_directory={temp_sql}")
+        con.execute(f"""
+            CREATE TEMP TABLE labelled AS
+            WITH ordered AS (
+                SELECT {projection},
+                    LEAD(TRY_CAST(close AS DOUBLE), {int(steps)}) OVER (
+                        PARTITION BY symbol ORDER BY decision_timestamp
+                    ) AS _future_close
+                FROM read_parquet({panel_sql})
+            )
+            SELECT *,
+                _future_close / NULLIF(TRY_CAST(close AS DOUBLE), 0) - 1.0 AS "{horizon_ret}",
+                CASE WHEN _future_close / NULLIF(TRY_CAST(close AS DOUBLE), 0) - 1.0 > 0
+                     THEN 1 ELSE 0 END AS "{horizon_up}"
+            FROM ordered
+            WHERE _future_close IS NOT NULL
+              AND TRY_CAST(close AS DOUBLE) > 0
+        """)
+        max_labelled_ts = con.execute(
+            "SELECT MAX(decision_timestamp) FROM labelled"
+        ).fetchone()[0]
+        if max_labelled_ts is None:
+            raise RuntimeError(f"{horizon}: no rows have a valid {steps}-session future close.")
+        cutoff = pd.Timestamp(max_labelled_ts) - pd.Timedelta(days=60)
+        cutoff_literal = _sql_string(cutoff.to_pydatetime())
+        train_symbols = int(con.execute(
+            f"SELECT COUNT(DISTINCT symbol) FROM labelled WHERE decision_timestamp < {cutoff_literal}"
+        ).fetchone()[0] or 0)
+        if train_symbols <= 0:
+            raise RuntimeError(f"{horizon}: no rows available before the chronological holdout.")
+        quota = max(1, int(math.ceil(max_training_rows / train_symbols)))
+
+        rare_signal = """
+            COALESCE(TRY_CAST(fno_available AS DOUBLE), 0) = 1
+            OR fno_pcr IS NOT NULL OR fno_oi_change IS NOT NULL
+            OR fno_iv_change IS NOT NULL OR fno_fut_close IS NOT NULL
+            OR fno_fut_basis IS NOT NULL OR fno_fut_return IS NOT NULL OR fno_fut_oi IS NOT NULL
+            OR COALESCE(TRY_CAST(news_available AS DOUBLE), 0) = 1
+            OR COALESCE(TRY_CAST(event_available AS DOUBLE), 0) = 1
+            OR COALESCE(TRY_CAST(event_high_impact AS DOUBLE), 0) = 1
+        """
+        con.execute(f"""
+            CREATE TEMP TABLE sampled AS
+            SELECT *, 'full_60_day_holdout' AS _sample_role
+            FROM labelled WHERE decision_timestamp >= {cutoff_literal}
+            UNION ALL
+            SELECT *, 'preserved_rare_source_row' AS _sample_role
+            FROM labelled
+            WHERE decision_timestamp < {cutoff_literal} AND ({rare_signal})
+            UNION ALL
+            SELECT * EXCLUDE (_sample_rank), 'deterministic_history_sample' AS _sample_role
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY symbol
+                    ORDER BY HASH(symbol, CAST(decision_timestamp AS VARCHAR))
+                ) AS _sample_rank
+                FROM labelled
+                WHERE decision_timestamp < {cutoff_literal}
+                  AND NOT ({rare_signal})
+            ) ordinary
+            WHERE _sample_rank <= {quota}
+        """)
+        counts = con.execute("""
+            SELECT _sample_role, COUNT(*) AS rows
+            FROM sampled GROUP BY _sample_role
+        """).fetchdf()
+        sample_stats = {
+            str(row._sample_role): int(row.rows)
+            for row in counts.itertuples(index=False)
+        }
+        sample_stats.update({
+            "horizon": horizon,
+            "steps": int(steps),
+            "chronological_cutoff": str(cutoff),
+            "max_regular_training_rows": int(max_training_rows),
+            "trainable_symbols_before_cutoff": train_symbols,
+            "per_symbol_regular_row_quota": quota,
+            "labelled_population_rows": int(con.execute("SELECT COUNT(*) FROM labelled").fetchone()[0]),
+            "sample_rows_total": int(con.execute("SELECT COUNT(*) FROM sampled").fetchone()[0]),
+            "label_policy": "labels are calculated with full symbol histories before sampling; no sampled-row shift is used",
+            "sampling_policy": "all 60-day holdout rows and all rows with F&O observations or positive news/events are preserved; other pre-cutoff rows are deterministically sampled per symbol",
+        })
+        con.execute(f"""
+            COPY (SELECT * EXCLUDE (_sample_role) FROM sampled)
+            TO {_sql_string(sample_tmp)} (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+    finally:
+        con.close()
+        # The DuckDB spill directory is transient; the durable training sample
+        # has already been written to Google Drive.
+        try:
+            rmtree(temp_dir)
+        except Exception:
+            pass
+    os.replace(sample_tmp, sample_path)
+    return sample_stats
+
 def main():
-    ap=argparse.ArgumentParser(description="Build the ALL-NSE 59-feature Delivery candidate in memory-controlled stages.")
-    ap.add_argument("--cash-master",default=DEFAULT_CASH_MASTER,
-                    help="Canonical identity-preserved NSE cash master.")
-    ap.add_argument("--bulk-root",default=DEFAULT_BULK,
-                    help="Legacy official bulk-EOD fallback; unused unless --allow-bulk-fallback is set.")
-    ap.add_argument("--allow-bulk-fallback",action="store_true",
-                    help="Explicitly allow the older official bulk-EOD view when the canonical cash master is unavailable.")
-    ap.add_argument("--delivery-root",default=str(DEFAULT_DELIVERY_ROOT),
-                    help="Persisted official NSE Security-wise Delivery Position files.")
+    ap=argparse.ArgumentParser(
+        description="Build the ALL-NSE 59-feature Delivery candidate as resumable, memory-controlled stages."
+    )
+    ap.add_argument("--cash-master",default=DEFAULT_CASH_MASTER)
+    ap.add_argument("--bulk-root",default=DEFAULT_BULK)
+    ap.add_argument("--allow-bulk-fallback",action="store_true")
+    ap.add_argument("--delivery-root",default=str(DEFAULT_DELIVERY_ROOT))
     ap.add_argument("--out",default=DEFAULT_OUT)
     ap.add_argument("--min-history",type=int,default=60)
     ap.add_argument("--refresh-fundamentals",action="store_true")
     ap.add_argument("--retry-failed-fundamentals",action="store_true")
-    ap.add_argument("--fundamental-workers",type=int,default=2,
-                    help="Maximum concurrent XBRL parsers; use a low value in memory-constrained Colab.")
+    ap.add_argument("--fundamental-workers",type=int,default=1)
     ap.add_argument("--refresh-universe",action="store_true")
     ap.add_argument("--force-rebuild-candidate",action="store_true")
-    ap.add_argument("--stage",choices=("all","fundamentals","panel","train"),default="all",
-                    help="Run all stages or only the fundamentals refresh, PIT panel build, or model training stage.")
+    ap.add_argument("--panel-batch-size",type=int,default=75)
+    ap.add_argument("--max-training-rows",type=int,default=750000)
+    ap.add_argument(
+        "--stage",
+        choices=("universe","fundamentals","panel","train-next-session","train-3d","train-5d","train-7d"),
+        default="universe",
+        help="Run exactly one stage. Default is universe preparation only.",
+    )
     args=ap.parse_args()
-
     if args.fundamental_workers < 1:
         raise ValueError("--fundamental-workers must be >= 1")
+    if args.panel_batch_size < 1:
+        raise ValueError("--panel-batch-size must be >= 1")
+    if args.max_training_rows < 1000:
+        raise ValueError("--max-training-rows must be at least 1000.")
 
     import gc
+    import shutil
 
     out=Path(args.out)
     out.mkdir(parents=True,exist_ok=True)
     cash_master=Path(args.cash_master)
+    delivery_root=Path(args.delivery_root)
+    roster_path=out/"TRAINING_UNIVERSE_2026.json"
+    fund_stage_path=out/"FUNDAMENTALS_STAGE_REPORT_2026.json"
+    panel_state_path=out/"PANEL_STAGE_STATE_2026.json"
+    panel_meta_path=out/"PANEL_STAGE_META_2026.json"
     panel_path=out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
     readiness_path=out/"DATA_READINESS_REPORT_2026.json"
-    stage_meta_path=out/"CANDIDATE_STAGE_META_2026.json"
-    candidate_meta=out/CANDIDATE_META_NAME
+    shard_dir=out/"panel_shards"
     manifest_path=out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+    candidate_meta=out/CANDIDATE_META_NAME
 
-    # TRAIN is deliberately isolated from the large cash/delivery source tables.
-    # It loads only the persisted PIT panel plus small stage metadata.
-    if args.stage=="train":
-        if not panel_path.exists() or panel_path.stat().st_size==0:
-            raise FileNotFoundError(
-                f"Persisted PIT panel missing: {panel_path}. Run --stage panel first."
-            )
-        if not stage_meta_path.exists() or stage_meta_path.stat().st_size==0:
-            raise FileNotFoundError(
-                f"Stage metadata missing: {stage_meta_path}. Run --stage panel first."
-            )
-        stage_meta=json.loads(stage_meta_path.read_text(encoding="utf-8"))
-        if stage_meta.get("feature_count") != len(FEATURES_59):
-            raise RuntimeError("Stage metadata feature-count contract mismatch; rebuild the panel stage.")
-        panel=pd.read_parquet(panel_path)
-        if panel.empty:
-            raise RuntimeError("Persisted PIT panel is empty; refusing to train.")
-        missing_features=[c for c in FEATURES_59 if c not in panel.columns]
-        if missing_features:
-            raise RuntimeError(f"Persisted PIT panel is missing contract features: {missing_features}")
-        if int(stage_meta.get("panel_rows",-1)) != len(panel):
-            raise RuntimeError("Persisted PIT panel row-count does not match stage metadata.")
-        input_sig=stage_meta["input_signature"]
-        fund_report=stage_meta["fundamentals_report"]
-        universe=stage_meta["universe"]
-        roster_meta=stage_meta["roster"]
-        trainable=stage_meta["trainable_symbols"]
-        bulk_source=stage_meta["cash_source"]
-        delivery_root=Path(stage_meta["delivery_root"])
-        delivery_rows=int(stage_meta["delivery_rows"])
-        delivery_symbols=int(stage_meta["delivery_symbols"])
-        cash_master=Path(stage_meta["cash_master"])
+    # Stage 1: compute trainable symbols in DuckDB. The millions-row cash master
+    # is scanned on disk and only the compact per-symbol counts are returned.
+    if args.stage=="universe":
+        roster=_build_roster_from_canonical_master(
+            cash_master,args.min_history,force_refresh=args.refresh_universe
+        )
+        checkpoint={
+            "stage":"universe",
+            "status":"COMPLETE",
+            "created_at":pd.Timestamp.now(tz="UTC").isoformat(),
+            "cash_master_signature":_file_signature(cash_master),
+            "roster":roster,
+        }
+        _atomic_json(roster_path,checkpoint)
+        print(json.dumps({
+            "stage":"universe","status":"COMPLETE",
+            "universe_symbols":roster["universe_symbol_count"],
+            "symbols_with_history":roster["symbols_with_bulk_history"],
+            "trainable_symbols":roster["trainable_symbol_count"],
+            "excluded_symbols":roster["excluded_symbol_count"],
+            "checkpoint":str(roster_path),
+            "next_command":"--stage fundamentals --refresh-fundamentals --retry-failed-fundamentals --fundamental-workers 1",
+        },indent=2),flush=True)
+        return
+
+    roster=_load_roster_checkpoint(out,cash_master)
+    trainable=list(roster["trainable_symbols"])
+    if not trainable:
+        raise RuntimeError("Universe checkpoint contains no trainable symbols.")
+
+    # Stage 2: refresh fundamentals without loading the full cash master or
+    # security-wise delivery dataset into pandas.
+    if args.stage=="fundamentals":
         print(
-            f"TRAIN stage loaded persisted PIT panel: rows={len(panel):,}; "
-            f"symbols={panel['symbol'].nunique() if 'symbol' in panel.columns else 0:,}; "
-            f"features={len(FEATURES_59)}",
+            f"FUNDAMENTALS stage: trainable_symbols={len(trainable):,}; "
+            f"workers={args.fundamental_workers}; root={BASE}",
             flush=True,
         )
-    else:
-        if cash_master.exists() and cash_master.stat().st_size>0:
-            print(f"Using canonical identity-preserved NSE cash master: {cash_master}",flush=True)
-            bulk=load_canonical_cash_research_history(cash_master)
-            bulk_source="CANONICAL_IDENTITY_PRESERVED_RESEARCH_VIEW"
-        elif args.allow_bulk_fallback:
-            bulk_root=Path(args.bulk_root)
-            print(f"WARNING: canonical cash master unavailable; using explicit official bulk-EOD fallback: {bulk_root}",flush=True)
-            bulk=load_bulk(bulk_root)
-            bulk_source="OFFICIAL_BULK_EOD_FALLBACK"
-        else:
-            raise FileNotFoundError(
-                f"Canonical NSE cash master missing or empty: {cash_master}. "
-                "Use --allow-bulk-fallback only for a deliberate non-canonical run."
-            )
-        if bulk.empty:
-            raise RuntimeError("Canonical NSE cash research view is empty")
-
-        roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
-        trainable=list(roster["trainable_symbols"])
-
-        # FUNDAMENTALS runs without loading delivery history or retaining the
-        # full cash master in RAM. Raw XBRL downloads and parse caches persist in Drive.
-        if args.stage=="fundamentals":
-            print(
-                f"FUNDAMENTALS stage: trainable_symbols={len(trainable):,}; "
-                f"workers={args.fundamental_workers}; persistent_root={BASE}",
-                flush=True,
-            )
-            del bulk, roster
-            gc.collect()
-            fund_report=_ensure_broad_fundamentals(
-                trainable,
-                force_refresh=args.refresh_fundamentals,
-                retry_failed=args.retry_failed_fundamentals,
-                max_workers=args.fundamental_workers,
-            )
-            print(json.dumps({
-                "stage":"fundamentals",
-                "status":"COMPLETE",
-                "report":fund_report,
-                "next_command":"--stage panel --force-rebuild-candidate",
-            },indent=2,default=str),flush=True)
-            return
-
-        delivery_root=Path(args.delivery_root)
-        delivery=load_delivery_history(
-            delivery_root,
-            symbols=trainable,
-            start=bulk["date"].min(),
-            end=bulk["date"].max(),
-        )
-        print(
-            f"Using persisted NSE delivery layer: {delivery_root}; "
-            f"rows={len(delivery):,}; symbols={delivery['symbol'].nunique() if not delivery.empty else 0:,}",
-            flush=True,
-        )
-
         fund_report=_ensure_broad_fundamentals(
             trainable,
             force_refresh=args.refresh_fundamentals,
             retry_failed=args.retry_failed_fundamentals,
             max_workers=args.fundamental_workers,
         )
-
-        universe={
-            "universe_source":roster.get("universe_source"),
-            "universe_as_of":roster.get("universe_as_of"),
-            "universe_symbol_count":int(roster["universe_symbol_count"]),
-            "symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),
-            "trainable_symbol_count":int(roster["trainable_symbol_count"]),
-            "excluded_symbol_count":int(roster["excluded_symbol_count"]),
-            "minimum_history_sessions":int(roster["minimum_history_sessions"]),
-        }
-
-        input_sig=_candidate_input_signature(cash_master,bulk,trainable,fund_report)
-        input_sig["cash_source"]=bulk_source
-        input_sig["delivery_root"]=str(delivery_root)
-        input_sig["delivery_rows"]=int(len(delivery))
-        input_sig["delivery_symbols"]=int(delivery["symbol"].nunique()) if not delivery.empty else 0
-        roster_meta={
-            "universe_symbol_count":int(roster["universe_symbol_count"]),
-            "trainable_symbol_count":int(roster["trainable_symbol_count"]),
-            "excluded_symbol_count":int(roster["excluded_symbol_count"]),
-            "minimum_history_sessions":int(roster["minimum_history_sessions"]),
-        }
-
-        if (
-            args.stage=="all"
-            and not args.force_rebuild_candidate
-            and not args.refresh_fundamentals
-            and candidate_meta.exists()
-            and _candidate_artifacts_complete(out)
-        ):
-            try:
-                old=json.loads(candidate_meta.read_text(encoding="utf-8"))
-                if old.get("input_signature")==input_sig:
-                    print("CANDIDATE BUILD REUSED; inputs and feature contract unchanged.",flush=True)
-                    return
-            except Exception:
-                pass
-
-        # PANEL stage writes its outputs and exits before training. This gives
-        # Colab a clean process boundary between large panel joins and model fit.
-        panel,audit=merge_optional(make_panel(bulk,trainable,delivery=delivery))
-        source_coverage=feature_coverage_report(panel)
-        print(
-            "59-feature data coverage: "
-            f"mean_non_missing={source_coverage['mean_non_missing_pct']:.3f}% "
-            f"zero_coverage={source_coverage['features_with_zero_observations']} "
-            f"missing_columns={source_coverage['features_missing_as_columns']}",
-            flush=True,
-        )
-        readiness_path.write_text(
-            json.dumps({
-                "universe":universe,
-                "readiness":readiness_report(panel),
-                "feature_coverage":source_coverage,
-                "optional_sources":audit,
-                "feature_training_gate":{
-                    "minimum_observations":100,
-                    "minimum_fraction_of_training_rows":0.005,
-                    "description":"Each of the 59 features must have enough real observations in the training fold; sparse per-security values may remain missing and be imputed, but never fabricate values.",
-                },
-            },indent=2,default=str),
-            encoding="utf-8",
-        )
-        panel.to_parquet(panel_path,index=False)
-        stage_meta={
-            "stage_version":1,
-            "panel_path":str(panel_path),
-            "panel_rows":int(len(panel)),
-            "feature_count":len(FEATURES_59),
-            "feature_contract_hash":input_sig["feature_contract_hash"],
-            "input_signature":input_sig,
+        if not FUND_BROAD.exists() or FUND_BROAD.stat().st_size==0:
+            raise RuntimeError("Fundamentals function returned without a persisted broad PIT layer.")
+        if not FUND_AVAILABILITY.exists() or not FUND_AVAILABILITY_META.exists():
+            raise RuntimeError("Fundamentals function returned without the PIT filing availability index.")
+        availability_meta=json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
+        if availability_meta.get("coverage_complete") is not True:
+            raise RuntimeError("Fundamental filing availability index is not coverage-complete.")
+        _atomic_json(fund_stage_path,{
+            "stage":"fundamentals","status":"COMPLETE",
+            "created_at":pd.Timestamp.now(tz="UTC").isoformat(),
+            "roster_hash":_hash_strings(trainable),
             "fundamentals_report":fund_report,
-            "universe":universe,
-            "roster":roster_meta,
-            "trainable_symbols":trainable,
-            "cash_source":bulk_source,
-            "cash_master":str(cash_master),
-            "delivery_root":str(delivery_root),
-            "delivery_rows":int(len(delivery)),
-            "delivery_symbols":int(delivery["symbol"].nunique()) if not delivery.empty else 0,
-        }
-        stage_meta_path.write_text(json.dumps(stage_meta,indent=2,default=str),encoding="utf-8")
-        print(
-            f"PANEL stage saved: rows={len(panel):,}; path={panel_path}; "
-            f"metadata={stage_meta_path}",
-            flush=True,
-        )
-        del bulk, delivery
-        gc.collect()
-        if args.stage=="panel":
+            "fundamentals_signature":_file_signature(FUND_BROAD),
+            "fundamentals_meta_signature":_file_signature(FUND_BROAD_META),
+            "availability_signature":_file_signature(FUND_AVAILABILITY),
+            "availability_meta":availability_meta,
+        })
+        print(json.dumps({
+            "stage":"fundamentals","status":"COMPLETE",
+            "report":fund_report,
+            "checkpoint":str(fund_stage_path),
+            "next_command":"--stage panel --panel-batch-size 75",
+        },indent=2,default=str),flush=True)
+        return
+
+    # Stage 3: chunked, checkpointed PIT panel generation. Each batch reads only
+    # its security subset via DuckDB, writes a durable shard, and releases RAM.
+    if args.stage=="panel":
+        fund_stage=_read_checkpoint(fund_stage_path,"fundamentals")
+        if fund_stage.get("roster_hash") != _hash_strings(trainable):
+            raise RuntimeError("Fundamentals checkpoint belongs to a different universe; rerun fundamentals.")
+        for required in (FUND_BROAD,FUND_BROAD_META,FUND_AVAILABILITY,FUND_AVAILABILITY_META):
+            if not required.exists() or required.stat().st_size==0:
+                raise FileNotFoundError(f"Required fundamentals artifact is missing: {required}")
+
+        source_cache=_load_panel_source_cache()
+        input_signature=_panel_source_signature(cash_master,delivery_root,roster,fund_stage["fundamentals_report"])
+        panel_state={}
+        if args.force_rebuild_candidate:
+            if shard_dir.exists():
+                shutil.rmtree(shard_dir)
+            if panel_state_path.exists():
+                panel_state_path.unlink()
+            if panel_meta_path.exists():
+                panel_meta_path.unlink()
+            # A new panel invalidates the candidate index, but old model files
+            # are not deleted; nothing will reference them until retrained.
+            _atomic_json(manifest_path,{
+                "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v2",
+                "promotion_status":"BRANCH_REPLACEMENT_ONLY",
+                "feature_count":len(FEATURES_59),"features":FEATURES_59,
+                "artifacts":{},
+            })
+        if panel_state_path.exists() and panel_state_path.stat().st_size:
+            panel_state=json.loads(panel_state_path.read_text(encoding="utf-8"))
+            if panel_state.get("input_signature") != input_signature:
+                raise RuntimeError(
+                    "Panel sources changed since the last checkpoint. To intentionally rebuild all panel shards, rerun with --force-rebuild-candidate."
+                )
+        elif shard_dir.exists() and any(shard_dir.glob("*.parquet")):
+            raise RuntimeError(
+                f"Untracked panel shards exist in {shard_dir}. Use --force-rebuild-candidate to rebuild safely."
+            )
+        shard_dir.mkdir(parents=True,exist_ok=True)
+        completed=panel_state.get("completed_batches",{})
+        batch_size=int(args.panel_batch_size)
+        batches=[trainable[i:i+batch_size] for i in range(0,len(trainable),batch_size)]
+        total_batches=len(batches)
+        for batch_index,symbol_batch in enumerate(batches,1):
+            batch_id=f"{batch_index:05d}"
+            shard_path=shard_dir/f"panel_part_{batch_id}.parquet"
+            existing=completed.get(batch_id)
+            if existing and shard_path.exists() and shard_path.stat().st_size>0:
+                try:
+                    import pyarrow.parquet as pq
+                    rows=int(pq.ParquetFile(shard_path).metadata.num_rows)
+                    if rows==int(existing.get("rows",-1)):
+                        print(
+                            f"PANEL batch {batch_index}/{total_batches}: checkpoint reused "
+                            f"({len(symbol_batch)} symbols, {rows:,} rows)",
+                            flush=True,
+                        )
+                        continue
+                except Exception:
+                    pass
+                print(f"PANEL batch {batch_index}/{total_batches}: invalid shard, rebuilding",flush=True)
+
             print(
-                "PANEL STAGE COMPLETE. Run --stage train in a separate cell.",
+                f"PANEL batch {batch_index}/{total_batches}: loading {len(symbol_batch)} symbols",
                 flush=True,
             )
-            return
+            bulk=load_canonical_cash_research_history(cash_master,symbols=symbol_batch)
+            if bulk.empty:
+                raise RuntimeError(f"Panel batch {batch_id} returned empty canonical cash history.")
+            delivery=load_delivery_history(
+                delivery_root,
+                symbols=symbol_batch,
+                start=bulk["date"].min(),
+                end=bulk["date"].max(),
+            )
+            panel,audit=merge_optional(
+                make_panel(bulk,symbol_batch,delivery=delivery),
+                source_cache=source_cache,
+            )
+            # Preserve the exact 59-column contract. Missing source values stay
+            # NaN, and the coverage report/gate—not fabricated zeros—decides readiness.
+            panel=attach_readiness_flags(panel)
+            _atomic_parquet(panel,shard_path)
+            import pyarrow.parquet as pq
+            shard_rows=int(pq.ParquetFile(shard_path).metadata.num_rows)
+            completed[batch_id]={
+                "path":str(shard_path),
+                "rows":shard_rows,
+                "symbols":len(symbol_batch),
+                "first_symbol":symbol_batch[0],
+                "last_symbol":symbol_batch[-1],
+                "size":int(shard_path.stat().st_size),
+            }
+            panel_state={
+                "stage":"panel","status":"IN_PROGRESS",
+                "input_signature":input_signature,
+                "batch_size":batch_size,"total_batches":total_batches,
+                "completed_batches":completed,
+                "updated_at":pd.Timestamp.now(tz="UTC").isoformat(),
+            }
+            _atomic_json(panel_state_path,panel_state)
+            print(
+                f"PANEL batch {batch_index}/{total_batches} saved: rows={shard_rows:,}; "
+                f"file_size_mb={shard_path.stat().st_size/1024/1024:.1f}",
+                flush=True,
+            )
+            del bulk,delivery,panel,audit
+            gc.collect()
 
-    # Model fitting is a separate stage when requested. At that point Colab
-    # reloads only the persisted PIT panel rather than the raw cash/delivery tables.
-    artifacts={}
-    for horizon,steps in (("next_session",1),("3d",3),("5d",5),("7d",7)):
-        cp=out/f"deployment_all_nse_{horizon}_multifactor59_classifier_2026.joblib"
-        rp=out/f"deployment_all_nse_{horizon}_multifactor59_regressor_2026.joblib"
+        if len(completed)!=total_batches:
+            raise RuntimeError(
+                f"Panel checkpoint incomplete: {len(completed)}/{total_batches} batches saved."
+            )
+        shard_glob=str(shard_dir/"panel_part_*.parquet").replace("'","''")
+        tmp_panel=panel_path.with_name(panel_path.stem+".tmp.parquet")
+        import duckdb
+        con=duckdb.connect(database=":memory:")
+        temp_dir=out/"duckdb_panel_temp"
+        temp_dir.mkdir(parents=True,exist_ok=True)
         try:
-            d=add_targets(panel,steps,horizon)
-            clf,reg,metrics=fit_models(d,horizon)
-            # Save only after the 59-input contract has been checked.
-            joblib.dump(clf,cp)
-            joblib.dump(reg,rp)
-            artifacts[horizon]={
-                "status":"CANDIDATE_READY",
-                "classifier":str(cp),
-                "regressor":str(rp),
-                "classifier_sha256":sha256(cp),
-                "regressor_sha256":sha256(rp),
-                "metrics":metrics,
-            }
-            del d, clf, reg
-            gc.collect()
-        except Exception as exc:
-            if cp.exists():
-                cp.unlink()
-            if rp.exists():
-                rp.unlink()
-            artifacts[horizon]={
-                "status":"BLOCKED",
-                "reason":f"{type(exc).__name__}: {exc}",
-            }
-            print(f"{horizon} training BLOCKED: {type(exc).__name__}: {exc}",flush=True)
-            gc.collect()
+            con.execute("PRAGMA threads=2")
+            con.execute("PRAGMA memory_limit='3GB'")
+            con.execute(f"SET temp_directory={_sql_string(temp_dir)}")
+            con.execute(
+                f"COPY (SELECT * FROM read_parquet('{shard_glob}', union_by_name=true)) "
+                f"TO {_sql_string(tmp_panel)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+            )
+            final_rows=int(con.execute(
+                f"SELECT COUNT(*) FROM read_parquet({_sql_string(tmp_panel)})"
+            ).fetchone()[0])
+            final_symbols=int(con.execute(
+                f"SELECT COUNT(DISTINCT symbol) FROM read_parquet({_sql_string(tmp_panel)})"
+            ).fetchone()[0])
+        finally:
+            con.close()
+        os.replace(tmp_panel,panel_path)
+        coverage=_feature_coverage_report_from_parquet(panel_path)
+        readiness={
+            "rows":coverage["rows"],"symbols":coverage["symbols"],
+            "mean_feature_non_null_pct":coverage["mean_non_missing_pct"],
+            "feature_columns_missing_before_readiness":[],
+            "features_with_zero_observations":coverage["features_with_zero_observations"],
+            "feature_coverage":coverage,
+            "panel_build_mode":"symbol-batched-resumable",
+            "training_gate":{
+                "minimum_observations":100,
+                "minimum_fraction_of_applicable_rows":0.005,
+                "description":"Each feature must have real observations in the applicable training cohort; missingness is preserved.",
+            },
+        }
+        _atomic_json(readiness_path,readiness)
+        panel_meta={
+            "stage":"panel","status":"COMPLETE",
+            "created_at":pd.Timestamp.now(tz="UTC").isoformat(),
+            "panel_path":str(panel_path),
+            "panel_rows":final_rows,
+            "panel_symbols":final_symbols,
+            "feature_count":len(FEATURES_59),
+            "feature_contract_hash":input_signature["feature_contract_hash"],
+            "input_signature":input_signature,
+            "trainable_symbols":trainable,
+            "universe":{
+                k:roster.get(k) for k in (
+                    "universe_source","universe_as_of","universe_symbol_count",
+                    "symbols_with_bulk_history","trainable_symbol_count",
+                    "excluded_symbol_count","minimum_history_sessions",
+                )
+            },
+            "roster":{
+                "universe_symbol_count":roster["universe_symbol_count"],
+                "trainable_symbol_count":roster["trainable_symbol_count"],
+                "excluded_symbol_count":roster["excluded_symbol_count"],
+                "minimum_history_sessions":roster["minimum_history_sessions"],
+            },
+            "cash_master":str(cash_master),
+            "cash_source":"CANONICAL_IDENTITY_PRESERVED_RESEARCH_VIEW",
+            "delivery_root":str(delivery_root),
+            "delivery_signature":input_signature["delivery_tree"],
+            "fundamentals_report":fund_stage["fundamentals_report"],
+            "readiness_path":str(readiness_path),
+            "coverage":coverage,
+        }
+        _atomic_json(panel_meta_path,panel_meta)
+        _atomic_json(panel_state_path,{
+            **panel_state,"status":"COMPLETE",
+            "completed_at":pd.Timestamp.now(tz="UTC").isoformat(),
+            "panel_path":str(panel_path),"panel_rows":final_rows,
+        })
+        print(json.dumps({
+            "stage":"panel","status":"COMPLETE",
+            "rows":final_rows,"symbols":final_symbols,
+            "feature_coverage_mean_pct":coverage["mean_non_missing_pct"],
+            "zero_coverage_features":coverage["features_with_zero_observations"],
+            "panel_path":str(panel_path),
+            "next_commands":[
+                "--stage train-next-session",
+                "--stage train-3d",
+                "--stage train-5d",
+                "--stage train-7d",
+            ],
+        },indent=2,default=str),flush=True)
+        return
 
+    # Each train command handles one horizon only. Label construction and
+    # deterministic sampling are performed by DuckDB over the persisted panel;
+    # pandas only loads the bounded training sample.
+    stage_to_horizon={
+        "train-next-session":("next_session",1),
+        "train-3d":("3d",3),
+        "train-5d":("5d",5),
+        "train-7d":("7d",7),
+    }
+    if args.stage not in stage_to_horizon:
+        raise RuntimeError(f"Unexpected stage: {args.stage}")
+    panel_meta=_read_checkpoint(panel_meta_path,"panel")
+    if panel_meta.get("feature_count")!=len(FEATURES_59) or not panel_path.exists():
+        raise RuntimeError("Panel checkpoint feature contract/path is invalid; rebuild panel.")
+    if panel_meta.get("panel_rows")<=0:
+        raise RuntimeError("Persisted panel has zero rows; refusing to train.")
+    horizon,steps=stage_to_horizon[args.stage]
+    sample_path=out/"training_samples"/f"TRAINING_SAMPLE_{horizon}_2026.parquet"
+    sample_meta_path=out/"training_samples"/f"TRAINING_SAMPLE_{horizon}_2026.meta.json"
+    print(
+        f"TRAIN stage {horizon}: building bounded sample from {panel_meta['panel_rows']:,} persisted rows",
+        flush=True,
+    )
+    sample_stats=_prepare_training_sample(
+        panel_path,sample_path,horizon,steps,args.max_training_rows
+    )
+    _atomic_json(sample_meta_path,{
+        "stage":"training_sample","status":"COMPLETE",
+        "panel_input_signature":panel_meta["input_signature"],
+        "sample_path":str(sample_path),
+        **sample_stats,
+    })
+    frame=pd.read_parquet(sample_path)
+    missing=[c for c in FEATURES_59 if c not in frame.columns]
+    if missing:
+        raise RuntimeError(f"{horizon}: training sample missing features: {missing}")
+    clf,reg,metrics=fit_models(frame,horizon)
+    metrics["sampling"]={
+        **sample_stats,
+        "sample_meta_path":str(sample_meta_path),
+    }
+
+    cp=out/f"deployment_all_nse_{horizon}_multifactor59_classifier_2026.joblib"
+    rp=out/f"deployment_all_nse_{horizon}_multifactor59_regressor_2026.joblib"
+    joblib.dump(clf,cp)
+    joblib.dump(reg,rp)
+    artifact={
+        "status":"CANDIDATE_READY",
+        "classifier":str(cp),"regressor":str(rp),
+        "classifier_sha256":sha256(cp),"regressor_sha256":sha256(rp),
+        "metrics":metrics,
+        "training_sample":str(sample_path),
+    }
+
+    existing={}
+    if manifest_path.exists() and manifest_path.stat().st_size:
+        try:
+            existing=json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing={}
+    same_inputs=existing.get("panel_input_signature")==panel_meta.get("input_signature")
+    artifacts=existing.get("artifacts",{}) if same_inputs else {}
+    artifacts[horizon]=artifact
     manifest={
-        "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
+        "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v2",
         "promotion_status":"BRANCH_REPLACEMENT_ONLY",
-        "universe":universe,
-        "universe_symbol_count":int(roster_meta["universe_symbol_count"]),
-        "trainable_symbol_count":int(roster_meta["trainable_symbol_count"]),
-        "excluded_symbol_count":int(roster_meta["excluded_symbol_count"]),
-        "minimum_history_sessions":int(roster_meta["minimum_history_sessions"]),
-        "cash_data_source":bulk_source,
+        "universe":panel_meta["universe"],
+        **panel_meta["roster"],
+        "cash_data_source":panel_meta["cash_source"],
         "delivery_data_source":"NSE_OFFICIAL_SECURITY_WISE_DELIVERY_MTO",
         "delivery_root":str(delivery_root),
-        "delivery_row_count":int(delivery_rows if args.stage=="train" else stage_meta["delivery_rows"]),
-        "delivery_symbol_count":int(delivery_symbols if args.stage=="train" else stage_meta["delivery_symbols"]),
         "canonical_cash_master":str(cash_master),
-        "research_series_policy":["EQ","BE","BZ","SM","ST","SZ"],
-        "t0_excluded_from_delivery_research":True,
-        "trainable_symbols":trainable,
-        "feature_count":len(FEATURES_59),
-        "features":FEATURES_59,
-        "feature_contract_hash":input_sig["feature_contract_hash"],
+        "trainable_symbols":panel_meta["trainable_symbols"],
+        "feature_count":len(FEATURES_59),"features":FEATURES_59,
+        "feature_contract_hash":panel_meta["feature_contract_hash"],
         "artifacts":artifacts,
+        "panel_input_signature":panel_meta["input_signature"],
         "data_readiness_path":str(readiness_path),
-        "pit_policy":"Only observations at or before decision_timestamp are eligible. Missing information is not fabricated.",
+        "pit_policy":"Only observations available by the 15:30 IST session decision time are eligible; missing information is never fabricated.",
+        "sampling_policy":"DuckDB labels on full per-symbol chronology; cap ordinary pre-cutoff rows per symbol, preserve all 60-day holdout rows and positive news/events/F&O-observation rows.",
         "no_auto_orders":True,
         "branch_replacement_target":"production_delivery_model",
     }
-    manifest_path.write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
-    candidate_meta.write_text(json.dumps({
-        "input_signature":input_sig,
+    _atomic_json(manifest_path,manifest)
+    _atomic_json(candidate_meta,{
+        "panel_input_signature":panel_meta["input_signature"],
         "manifest_path":str(manifest_path),
-        "fundamentals_report":fund_report,
-    },indent=2,default=str),encoding="utf-8")
-    print(json.dumps(manifest,indent=2,default=str),flush=True)
+        "last_trained_horizon":horizon,
+        "training_sample_meta_path":str(sample_meta_path),
+        "promotion_status":"BRANCH_REPLACEMENT_ONLY",
+    })
+    del frame,clf,reg
+    gc.collect()
+    print(json.dumps({
+        "stage":args.stage,"status":"COMPLETE",
+        "horizon":horizon,"metrics":metrics,
+        "artifacts":artifacts[horizon],
+        "manifest_path":str(manifest_path),
+        "next_stages":[x for x in stage_to_horizon if x != args.stage],
+        "promotion_status":"BRANCH_REPLACEMENT_ONLY",
+    },indent=2,default=str),flush=True)
+
 if __name__=="__main__":
     main()
