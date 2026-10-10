@@ -88,6 +88,7 @@ jobs:
           tests/test_nse_index_daily_snapshot_fallback.py
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py
+          tests/test_prediction_validation_scorecard.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
