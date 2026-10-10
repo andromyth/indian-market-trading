@@ -10,6 +10,7 @@ scikit-learn==1.6.1
 joblib
 google-api-python-client
 google-auth
+google-auth-oauthlib
 yfinance
 duckdb
 lxml

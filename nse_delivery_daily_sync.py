@@ -47,9 +47,13 @@ def _candidate_dates(lookback_days: int) -> list[date]:
 
 
 def sync_delivery(lookback_days: int, sleep_seconds: float, retries: int) -> None:
-    cfg = drive_status()
-    if not cfg.get("configured") or cfg.get("reachable") is False:
-        raise RuntimeError(f"Google Drive authentication check failed: {cfg}")
+    cfg = drive_status(require_write=True)
+    if (
+        not cfg.get("configured")
+        or cfg.get("reachable") is False
+        or cfg.get("write_ready") is False
+    ):
+        raise RuntimeError(f"Google Drive read/write authentication check failed: {cfg}")
 
     store = GoogleDriveStore()
     LOCAL_ROOT.mkdir(parents=True, exist_ok=True)

@@ -35,6 +35,8 @@ jobs:
           data_fetcher.py
           indstocks_client.py
           indstocks_smoke_test.py
+          google_drive_oauth_login.py
+          persistent_store.py
           validate_canonical_cash_research_view.py
           colab_build_all_nse_delivery_multifactor_candidate.py
           colab_run_multifactor_upgrade.py
