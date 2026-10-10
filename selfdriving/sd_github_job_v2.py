@@ -319,17 +319,25 @@ def refresh_realised_outcomes(store, snapshots: list[tuple[date, Path]]) -> dict
     return merge_stats
 
 
-def _current_expected_reference_date() -> date | None:
-    from production_data_freshness_gate import expected_session_date
+def _current_expected_reference_date(now: datetime | None = None) -> date | None:
+    from production_data_freshness_gate import expected_session_date, previous_trading_day
     from selfdriving.sd_data_quality import is_nse_session_day
 
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    # The challenger is a pre-open prediction job. On a weekend or NSE holiday
-    # there is no session to predict, so do not interpret the prior close as a
-    # current-session prediction simply because it is the newest saved PIT.
+    ist = ZoneInfo("Asia/Kolkata")
+    if now is None:
+        now_ist = datetime.now(ist)
+    elif now.tzinfo is None:
+        now_ist = now.replace(tzinfo=ist)
+    else:
+        now_ist = now.astimezone(ist)
+
+    # Weekend/holiday runs can still prepare a forecast for the next NSE
+    # session. Use the latest completed exchange session as the reference date;
+    # freshness is still enforced against that exact PIT snapshot. The output
+    # separately records the next NSE session as target_session_date.
     if not is_nse_session_day(now_ist.date()):
-        return None
-    return expected_session_date(now_ist)
+        return previous_trading_day(now_ist.date())
+    return expected_session_date(now_ist) or previous_trading_day(now_ist.date())
 
 
 def _load_frame(path: Path) -> pd.DataFrame:
@@ -377,17 +385,22 @@ def main() -> int:
             "error": f"{type(exc).__name__}: {exc}",
         }
 
-    from selfdriving.sd_data_quality import build_input_audit, parse_pit_date
+    from selfdriving.sd_data_quality import (
+        build_input_audit, next_nse_session, parse_pit_date,
+    )
 
     expected_date = _current_expected_reference_date()
     observed_date = parse_pit_date(latest_pit.name) if latest_pit else None
+    target_session_date = next_nse_session(expected_date) if expected_date is not None else None
+    status["reference_session_date"] = expected_date.isoformat() if expected_date else None
+    status["target_session_date"] = target_session_date.isoformat() if target_session_date else None
     freshness_ok = expected_date is not None and observed_date == expected_date
     if expected_date is None:
         status["stages"]["snapshot_freshness"] = {
             "status": "SKIPPED",
             "expected_session_date": None,
             "observed_snapshot_date": observed_date.isoformat() if observed_date else None,
-            "reason": "No NSE reference session expected at the current clock time.",
+            "reason": "Could not resolve the latest completed NSE reference session.",
         }
     else:
         status["stages"]["snapshot_freshness"] = {
@@ -546,7 +559,15 @@ def main() -> int:
                     "audit": panel_audit,
                 }
             else:
+                if target_session_date is None:
+                    raise RuntimeError(
+                        "Could not resolve the next NSE session for this forecast."
+                    )
                 predictions = predict_stage(inference, registry_path)
+                # `date` stays the PIT reference/decision date. Store the future
+                # NSE target separately so a Saturday/Sunday run is not mistaken
+                # for a signal intended for the weekend itself.
+                predictions["target_session_date"] = target_session_date.isoformat()
 
                 # The first prediction for a symbol/date is immutable. A later
                 # rerun may enrich the audit, but cannot rewrite the issued signal.
@@ -575,6 +596,7 @@ def main() -> int:
                         if len(predictions) else {}
                     ),
                     "prediction_reference_date": str(predictions["date"].max()) if len(predictions) else None,
+                    "prediction_target_session_date": target_session_date.isoformat(),
                     "signals_are_decision_support_only": True,
                 }
 
