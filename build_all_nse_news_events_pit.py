@@ -21,6 +21,7 @@ import argparse
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,10 @@ def fetch_announcements(s: requests.Session, start: date, end: date, cache_dir: 
                 "to_date": b.strftime("%d-%m-%Y"),
             }, f"announcements {a}..{b}")
             if payload is None:
-                continue
+                raise RuntimeError(
+                    f"Refusing to publish partial PIT coverage: {label} request "
+                    f"for {a}..{b} failed after retries."
+                )
             cp.write_text(json.dumps(payload, default=str), encoding="utf-8")
         rr = records(payload)
         out.extend(rr)
@@ -297,7 +301,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drive-root", default=str(DEFAULT_ROOT))
     ap.add_argument("--start", default="2026-01-01")
-    ap.add_argument("--end", default="2026-10-03")
+    ap.add_argument("--end", default="", help="Coverage end date YYYY-MM-DD; defaults to today in Asia/Kolkata.")
     args = ap.parse_args()
 
     root = Path(args.drive_root)
@@ -308,7 +312,13 @@ def main():
     news_out.parent.mkdir(parents=True, exist_ok=True)
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
-    end = datetime.strptime(args.end, "%Y-%m-%d").date()
+    end = (
+        datetime.strptime(args.end, "%Y-%m-%d").date()
+        if args.end.strip()
+        else datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    )
+    if start > end:
+        raise ValueError(f"Invalid PIT coverage range: start={start} is after end={end}")
     universe = set(official_nse_symbols(force_refresh=False))
     print(f"ALL-NSE NEWS/EVENTS: universe={len(universe):,} range={start}..{end}", flush=True)
 
@@ -353,7 +363,12 @@ def main():
     manifest = {
         "source": "NSE_OFFICIAL_CORPORATE_ANNOUNCEMENTS_AND_ACTIONS",
         "universe_size": len(universe),
-        "requested_range": [args.start, args.end],
+        "requested_range": [start.isoformat(), end.isoformat()],
+        "coverage_start": start.isoformat(),
+        "coverage_end": end.isoformat(),
+        # Reaching this write means every date chunk returned a valid response;
+        # failed chunks raise and cannot silently produce a partial-coverage manifest.
+        "coverage_complete": True,
         "announcement_rows_fetched": len(ann),
         "corporate_action_rows_fetched": len(ca),
         "news_rows": int(len(news)),
