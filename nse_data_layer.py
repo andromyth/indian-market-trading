@@ -1207,6 +1207,38 @@ def _normalize_udiff_common_bhavcopy(frame: pd.DataFrame, trade_date: date) -> p
     return x.sort_values(["symbol", "date"]).drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
 
 
+def _sync_bulk_eod_to_drive(trade_date: date, parquet_path: Path, zip_path: Path) -> None:
+    """Persist the canonical EOD parquet and fail if that required upload fails."""
+    remote_dir = f"production_data/nse_official/bulk_eod/{trade_date:%Y/%m/%d}"
+
+    # Retain the source ZIP when possible, but the parquet is the required
+    # canonical artifact consumed by production and its freshness gate.
+    if zip_path.exists():
+        zip_result = _drive_upload(
+            zip_path,
+            f"{remote_dir}/{zip_path.name}",
+            "application/zip",
+        )
+        if not isinstance(zip_result, dict) or zip_result.get("status") != "OK":
+            detail = zip_result.get("error") if isinstance(zip_result, dict) else repr(zip_result)
+            print(
+                f"EOD ZIP Drive sync warning for {trade_date}: {detail}",
+                flush=True,
+            )
+
+    parquet_result = _drive_upload(
+        parquet_path,
+        f"{remote_dir}/{parquet_path.name}",
+        "application/octet-stream",
+    )
+    if not isinstance(parquet_result, dict) or parquet_result.get("status") != "OK":
+        detail = parquet_result.get("error") if isinstance(parquet_result, dict) else repr(parquet_result)
+        raise RuntimeError(
+            f"Required NSE EOD parquet was not persisted to Google Drive for "
+            f"{trade_date}: {detail}"
+        )
+
+
 def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False,
                            force_refresh: bool = False) -> pd.DataFrame:
     """Fetch one official NSE CM-UDiFF common bhavcopy containing all equity symbols.
@@ -1224,7 +1256,13 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
     parquet_path = out_dir / f"BhavCopy_NSE_CM_0_0_0_{key}_F_0000.parquet"
     zip_path = out_dir / f"BhavCopy_NSE_CM_0_0_0_{key}_F_0000.csv.zip"
     if parquet_path.exists() and parquet_path.stat().st_size > 0 and not force_refresh:
-        return pd.read_parquet(parquet_path)
+        cached = pd.read_parquet(parquet_path)
+        # A prior run may have written the local cache but failed to upload it.
+        # When Drive sync is requested, retry the canonical parquet upload even
+        # on the cache-hit path; otherwise gap repair can never heal that gap.
+        if sync_drive:
+            _sync_bulk_eod_to_drive(d, parquet_path, zip_path)
+        return cached
     url = NSE_CM_UDIFF_URL_TEMPLATE.format(date=key)
     # Archive endpoint is a direct static download; use one bounded attempt.
     _sleep_rate_limit(0.25)
@@ -1281,8 +1319,7 @@ def fetch_nse_eod_bhavcopy(trade_date: date | datetime, sync_drive: bool = False
         raise RuntimeError(f"NSE EOD bhavcopy parsed but yielded no equity rows for {key}")
     normalized.to_parquet(parquet_path, index=False)
     if sync_drive:
-        _drive_upload(zip_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{zip_path.name}", "application/zip")
-        _drive_upload(parquet_path, f"production_data/nse_official/bulk_eod/{d:%Y/%m/%d}/{parquet_path.name}", "application/octet-stream")
+        _sync_bulk_eod_to_drive(d, parquet_path, zip_path)
     if BULK_EOD_MANIFEST.exists():
         try:
             m = json.loads(BULK_EOD_MANIFEST.read_text())

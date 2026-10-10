@@ -82,7 +82,7 @@ jobs:
               --sync-drive
           fi
 
-      - name: Persist NSE index context for model compilation
+      - name: Persist NSE index context for model compilation (best effort)
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -90,11 +90,40 @@ jobs:
           GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
         run: |
           python - <<'PY'
-          from datetime import date, timedelta
-          from nse_data_layer import fetch_index_history
-          end = date.today()
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from nse_bulk_eod_ingest import business_days
+          from nse_data_layer import fetch_index_history, nse_last_diagnostic
+
+          today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          sessions = list(business_days(today - timedelta(days=14), today))
+          if not sessions:
+              print("INDEX_CONTEXT_SKIPPED: no NSE trading session resolved")
+              raise SystemExit(0)
+
+          # Do not request a future/weekend endpoint date from the UTC runner.
+          end = sessions[-1]
           start = end - timedelta(days=10)
+          failures = []
           for symbol in ("^NSEI", "^NSEBANK"):
-              df = fetch_index_history(symbol, start, end, sync_drive=True)
-              print(symbol, "rows", len(df))
+              try:
+                  df = fetch_index_history(symbol, start, end, sync_drive=True)
+                  print(symbol, "rows", len(df), "date_range", start, end)
+              except Exception as exc:
+                  failures.append(symbol)
+                  print(
+                      "INDEX_CONTEXT_WARNING:",
+                      symbol,
+                      type(exc).__name__,
+                      str(exc),
+                      "diagnostic=",
+                      nse_last_diagnostic(),
+                  )
+
+          if failures:
+              print(
+                  "INDEX_CONTEXT_INCOMPLETE:",
+                  ",".join(failures),
+                  "- EOD archive sync is independent; a later run will retry index context.",
+              )
           PY
