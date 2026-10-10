@@ -35,6 +35,15 @@ def normalize_symbol(value: object) -> str:
     return symbol
 
 
+def is_nse_session_day(day: date) -> bool:
+    """Return whether a date is a weekday not listed in the repository's NSE holidays."""
+    try:
+        from production_data_freshness_gate import HOLIDAYS
+    except Exception:
+        HOLIDAYS = set()
+    return day.weekday() < 5 and day not in HOLIDAYS
+
+
 def next_nse_session(day: date) -> date:
     """Next weekday excluding the repository's known official NSE holidays."""
     try:
