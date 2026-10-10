@@ -98,3 +98,32 @@ def test_eod_sync_raises_if_required_drive_parquet_upload_fails(monkeypatch, tmp
         call[1].endswith("/BhavCopy_NSE_CM_0_0_0_20261007_F_0000.parquet")
         for call in calls
     )
+
+
+def test_cached_local_eod_parquet_retries_drive_upload(monkeypatch, tmp_path):
+    day = date(2026, 10, 7)
+    monkeypatch.setattr(nse_data_layer, "BULK_EOD_ROOT", tmp_path)
+    parquet_path = (
+        tmp_path
+        / f"{day:%Y}"
+        / f"{day:%m}"
+        / f"{day:%d}"
+        / f"BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.parquet"
+    )
+    parquet_path.parent.mkdir(parents=True)
+    parquet_path.write_bytes(b"cached-parquet-placeholder")
+    cached_frame = object()
+    monkeypatch.setattr(nse_data_layer.pd, "read_parquet", lambda path: cached_frame)
+    uploaded = []
+    monkeypatch.setattr(
+        nse_data_layer,
+        "_sync_bulk_eod_to_drive",
+        lambda trade_date, parquet, archive: uploaded.append((trade_date, parquet, archive)),
+    )
+
+    result = nse_data_layer.fetch_nse_eod_bhavcopy(day, sync_drive=True)
+
+    assert result is cached_frame
+    assert len(uploaded) == 1
+    assert uploaded[0][0] == day
+    assert uploaded[0][1] == parquet_path
