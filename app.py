@@ -757,9 +757,13 @@ if interface_mode == "Live Test":
                     now_ist.to_pydatetime()
                 )
                 observed_reference_date = parse_reference_date(result.get("date"))
-                if observed_reference_date != expected_reference_date:
+                if (
+                    str(result.get("prediction_status", "")).upper() == "PASS"
+                    and observed_reference_date != expected_reference_date
+                ):
                     # A successful inference on a stale PIT snapshot must not
-                    # appear as a current BUY/SELL recommendation.
+                    # appear as a current BUY/SELL recommendation. Preserve
+                    # ERROR/ABSTAIN/BLOCKED states so the guard never hides them.
                     result["prediction_status"] = "STALE"
                     result["signal"] = "STALE"
                     result["signal_reason"] = (
