@@ -93,6 +93,7 @@ jobs:
           tests/test_delivery_validation_active_model.py
           tests/test_delivery_policy_precision_gate.py
           tests/test_delivery_policy_date_block_holdout.py
+          tests/test_delivery_policy_active_model_filter.py
           tests/test_intraday_multihorizon_validation.py
           tests/test_market_watchlist.py
 
