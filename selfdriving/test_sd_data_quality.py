@@ -87,14 +87,14 @@ class RealisedReturnTests(unittest.TestCase):
             rows.append(row)
         pit = pd.DataFrame(rows)
         panel = pd.DataFrame([
-            {"symbol": "AAA", "g_inr_z": 0.2, "news_sent_ewm": 0.3, "volume_ratio": 1.2},
-            {"symbol": "BBB", "g_inr_z": float("nan"), "news_sent_ewm": float("nan"), "volume_ratio": 1.1},
+            {"symbol": "AAA", "g_inr_z": 0.2, "g_usdinr_z1": 0.2, "news_sent_ewm": 0.3, "volume_ratio": 1.2},
+            {"symbol": "BBB", "g_inr_z": float("nan"), "g_usdinr_z1": float("nan"), "news_sent_ewm": float("nan"), "volume_ratio": 1.1},
         ])
         report = build_input_audit(
             pit, panel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
             expected_date=date(2026, 10, 9),
             observed_date=date(2026, 10, 9),
-            active_champion_features=["g_inr_z", "news_sent_ewm", "volume_ratio"],
+            active_champion_features=["g_usdinr_z1", "news_sent_ewm", "volume_ratio"],
             active_champion_status="READY",
             active_champion_file="delivery_excess_test.joblib",
             now=pd.Timestamp("2026-10-10T00:00:00Z"),
@@ -103,7 +103,8 @@ class RealisedReturnTests(unittest.TestCase):
         self.assertEqual(model["status"], "READY")
         self.assertEqual(model["feature_count"], 3)
         self.assertTrue(model["usd_inr"]["selected_by_active_champion"])
-        self.assertEqual(model["usd_inr"]["selected_feature_current_coverage_pct"], 50.0)
+        self.assertEqual(model["usd_inr"]["selected_feature_names"], ["g_usdinr_z1"])
+        self.assertEqual(model["usd_inr"]["selected_feature_mean_non_null_pct"], 50.0)
         self.assertEqual(report["stockwise_source_coverage"]["symbols_with_active_champion_coverage_at_least_60pct"], 1)
         stock = {row["symbol"]: row for row in report["stockwise_input_readiness"]}
         self.assertEqual(stock["AAA"]["active_champion_feature_non_null_pct"], 100.0)
