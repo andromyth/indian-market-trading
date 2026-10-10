@@ -1,0 +1,37 @@
+name: Beta V2 data-quality tests
+
+on:
+  push:
+    paths:
+      - "selfdriving/sd_data_quality.py"
+      - "selfdriving/sd_github_job_v2.py"
+      - "selfdriving/test_sd_data_quality.py"
+      - ".github/workflows/autonomous_delivery_cycle_v2.yml"
+      - ".github/workflows/beta-v2-data-quality-ci.yml"
+  pull_request:
+    paths:
+      - "selfdriving/sd_data_quality.py"
+      - "selfdriving/sd_github_job_v2.py"
+      - "selfdriving/test_sd_data_quality.py"
+      - ".github/workflows/autonomous_delivery_cycle_v2.yml"
+      - ".github/workflows/beta-v2-data-quality-ci.yml"
+
+jobs:
+  data-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+      - name: Compile autonomous data pipeline
+        run: |
+          python -m py_compile \
+            selfdriving/sd_data_quality.py \
+            selfdriving/sd_github_job_v2.py
+      - name: Test point-in-time outcome reconstruction
+        run: python -m unittest selfdriving.test_sd_data_quality
