@@ -112,7 +112,7 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
         out["validation_reason"] = "Target actual bar is not persisted yet."
         return out
 
-    nearest_position = int(np.argmin(np.where(eligible, delta, np.inf)))
+    nearest_position = int(np.argmin(np.where(eligible, delta_seconds, np.inf)))
     actual_ts = frame.index[nearest_position]
     actual_price = float(frame["close"].iloc[nearest_position])
     alignment_seconds=float((actual_ts-target_ts).total_seconds())
