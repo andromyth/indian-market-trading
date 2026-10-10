@@ -1132,25 +1132,101 @@ def merge_optional(panel):
         if pieces:
             out = pd.concat(pieces, ignore_index=True)
         fa = pd.to_datetime(out.get("fundamental_available_at"), errors="coerce", utc=True)
-        valid = fa.notna() & fa.le(out["decision_timestamp"])
-        # A parsed filing proves availability when one exists. No as-of row is
-        # not enough to assert "no filing": the symbol may be absent from the
-        # filing catalog or its filings may have failed parsing.
-        out["fundamentals_available"] = pd.Series(
-            np.where(valid, 1.0, np.nan), index=out.index, dtype="float64"
-        )
+        parsed_valid = fa.notna() & fa.le(out["decision_timestamp"])
         out["fundamental_age_days"] = np.nan
-        out.loc[valid, "fundamental_age_days"] = (
-            out.loc[valid, "decision_timestamp"] - fa.loc[valid]
+        out.loc[parsed_valid, "fundamental_age_days"] = (
+            out.loc[parsed_valid, "decision_timestamp"] - fa.loc[parsed_valid]
         ).dt.total_seconds() / 86400.0
         out["fundamental_stale_90d"] = pd.Series(
-            np.where(valid, (out["fundamental_age_days"] > 90).astype(float), np.nan),
+            np.where(parsed_valid, (out["fundamental_age_days"] > 90).astype(float), np.nan),
             index=out.index, dtype="float64",
         )
         out["fundamental_stale_180d"] = pd.Series(
-            np.where(valid, (out["fundamental_age_days"] > 180).astype(float), np.nan),
+            np.where(parsed_valid, (out["fundamental_age_days"] > 180).astype(float), np.nan),
             index=out.index, dtype="float64",
         )
+
+        # Join a complete index of eligible NSE filing publication timestamps.
+        # This separates a genuinely absent-as-of filing (known 0) from an
+        # available filing that did not parse (unknown NaN, fail closed).
+        availability_meta = {}
+        try:
+            if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size:
+                availability_meta = json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
+        except Exception as exc:
+            audit["fundamental_availability_meta_error"] = f"{type(exc).__name__}: {exc}"
+        availability_path = FUND_AVAILABILITY
+        if (
+            availability_meta.get("coverage_complete") is True
+            and availability_path.exists()
+            and availability_path.stat().st_size > 0
+        ):
+            availability = pd.read_parquet(availability_path)
+            availability["symbol"] = availability["symbol"].map(normalize_symbol)
+            availability["fundamental_available_at"] = pd.to_datetime(
+                availability["fundamental_available_at"], errors="coerce", utc=True
+            )
+            availability = availability.dropna(
+                subset=["symbol", "fundamental_available_at"]
+            ).copy()
+            availability["decision_timestamp"] = availability["fundamental_available_at"]
+            availability = availability.rename(
+                columns={"fundamental_available_at": "catalog_filing_available_at"}
+            )
+            out = merge_pit_layer(
+                out,
+                availability[["symbol", "decision_timestamp", "catalog_filing_available_at"]],
+                ["catalog_filing_available_at"],
+                "fundamental_catalog",
+            )
+            local_dates = (
+                pd.to_datetime(out["decision_timestamp"], errors="coerce", utc=True)
+                .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).dt.normalize()
+            )
+            cov_start = pd.to_datetime(availability_meta.get("coverage_start"), errors="coerce")
+            cov_end = pd.to_datetime(availability_meta.get("coverage_end"), errors="coerce")
+            in_catalog_window = pd.Series(False, index=out.index)
+            if pd.notna(cov_start) and pd.notna(cov_end):
+                in_catalog_window = (
+                    local_dates.ge(cov_start.normalize())
+                    & local_dates.le(cov_end.normalize())
+                )
+            latest_catalog = pd.to_datetime(
+                out.get("catalog_filing_available_at"), errors="coerce", utc=True
+            )
+            known_no_filing = in_catalog_window & latest_catalog.isna()
+            latest_filing_parsed = (
+                in_catalog_window
+                & latest_catalog.notna()
+                & parsed_valid
+                & fa.ge(latest_catalog)
+            )
+            out["fundamentals_available"] = pd.Series(
+                np.where(known_no_filing, 0.0, np.where(latest_filing_parsed, 1.0, np.nan)),
+                index=out.index, dtype="float64",
+            )
+            out = out.drop(columns=["catalog_filing_available_at"], errors="ignore")
+            audit["fundamental_availability_index"] = {
+                **availability_meta,
+                "exists": True,
+                "rows": int(len(availability)),
+                "symbols": int(availability["symbol"].nunique()),
+                "known_no_filing_rows": int(known_no_filing.sum()),
+                "parsed_asof_filing_rows": int(latest_filing_parsed.sum()),
+                "unknown_or_parse_gap_rows": int(
+                    (~known_no_filing & ~latest_filing_parsed).sum()
+                ),
+            }
+        else:
+            out["fundamentals_available"] = pd.Series(
+                np.where(parsed_valid, 1.0, np.nan), index=out.index, dtype="float64"
+            )
+            audit["fundamental_availability_index"] = {
+                "exists": False,
+                "coverage_complete": False,
+                "path": str(availability_path),
+                "reason": "No verified complete NSE filing-availability index; absence remains unknown.",
+            }
         # Ensure every fundamental contract column exists, but do not fabricate
         # numeric accounting values when NSE/XBRL did not publish/parse them.
         for column in [
