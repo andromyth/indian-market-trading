@@ -32,6 +32,7 @@ jobs:
           python -m py_compile
           multifactor_data_layer_v2.py
           nse_data_layer.py
+          data_fetcher.py
           indstocks_client.py
           indstocks_smoke_test.py
           validate_canonical_cash_research_view.py
