@@ -146,5 +146,68 @@ class EntrypointImportTests(unittest.TestCase):
 
 
 
+
+class BetaV2SourceEdgeCaseTests(unittest.TestCase):
+    def test_news_published_after_last_decision_remains_unknown(self):
+        from selfdriving.sd_news_features import build_news_features, score_news_frame
+
+        raw = pd.DataFrame([{
+            "symbol": "AAA",
+            "published_at": "2026-10-10T05:00:00Z",
+            "text": "Company reports quarterly operational update",
+        }])
+        scored = score_news_frame(raw)
+        decisions = pd.DataFrame({
+            "symbol": ["AAA"],
+            "decision_timestamp": pd.to_datetime(["2026-10-09T10:00:00Z"], utc=True),
+        })
+        result = build_news_features(scored, decisions)
+        self.assertEqual(len(result), 1)
+        for column in (
+            "news_cnt_1",
+            "news_sent_ewm",
+            "news_cnt_ewm",
+            "news_available",
+            "mkt_news_sent_ewm",
+            "mkt_news_cnt_ewm",
+        ):
+            self.assertTrue(pd.isna(result.loc[0, column]), msg=column)
+
+    def test_realised_returns_exclude_rows_from_older_source_dates(self):
+        from selfdriving import sd_github_job_v2 as beta_v2
+
+        first_day = date(2026, 10, 8)
+        second_day = date(2026, 10, 9)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous_root = beta_v2.ROOT
+            beta_v2.ROOT = root
+            try:
+                first = root / "DELIVERY_PIT_FEATURES_2026-10-08.parquet"
+                second = root / "DELIVERY_PIT_FEATURES_2026-10-09.parquet"
+                pd.DataFrame([
+                    {"symbol": "AAA", "date": "2026-10-08", "close": 100.0},
+                    {"symbol": "BBB", "date": "2026-10-07", "close": 50.0},
+                ]).to_parquet(first, index=False)
+                pd.DataFrame([
+                    {"symbol": "AAA", "date": "2026-10-09", "close": 110.0},
+                    {"symbol": "BBB", "date": "2026-10-09", "close": 55.0},
+                ]).to_parquet(second, index=False)
+
+                stats = beta_v2.refresh_realised_outcomes(
+                    None, [(first_day, first), (second_day, second)]
+                )
+                realised = pd.read_parquet(root / "BETA_V2_DELIVERY_REALISED_RETURNS.parquet")
+                self.assertEqual(stats["status"], "WARN")
+                self.assertEqual(stats["rows_excluded_nonmatching_filename_date"], 1)
+                self.assertEqual(stats["derived_rows"], 1)
+                self.assertEqual(len(realised), 1)
+                self.assertEqual(realised.iloc[0]["symbol"], "AAA")
+                self.assertAlmostEqual(float(realised.iloc[0]["y_return"]), 0.10, places=8)
+            finally:
+                beta_v2.ROOT = previous_root
+
+
+
 if __name__ == "__main__":
     unittest.main()
