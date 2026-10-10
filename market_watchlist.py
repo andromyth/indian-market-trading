@@ -228,7 +228,7 @@ def fetch_watchlist_articles(
             pool.submit(_fetch_source, source, now_utc): source
             for source in WATCHLIST_SOURCES
         }
-        for future in as_completed(futures, timeout=12):
+        for future in as_completed(futures):
             try:
                 sources.append(future.result())
             except Exception as exc:
