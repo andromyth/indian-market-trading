@@ -18,6 +18,8 @@ REMOTE_SOURCES = {
     "events": "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
     "news_events_manifest": "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
     "fundamentals": "corporate/pit_fundamentals_all_nse_2025_2026.parquet",
+    "fundamental_availability": "corporate/pit_fundamental_availability_2025_2026.parquet",
+    "fundamental_availability_meta": "corporate/pit_fundamental_availability_2025_2026.meta.json",
 }
 MIN_HISTORY = 60
 
