@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 from persistent_store import GoogleDriveStore
 from prediction_ledger import load_records, load_validation_records
+from prediction_validation import ValidationConfig, validation_status_for_sample_count
 
 REMOTE="features/daily/DELIVERY_VALIDATION_DIAGNOSTICS.json"
 LOCAL=Path("/tmp/DELIVERY_VALIDATION_DIAGNOSTICS.json")
@@ -59,13 +60,16 @@ def main():
         x=x[x["validation_status"].eq("VALIDATED")].copy()
         x["decision_timestamp"]=pd.to_datetime(x["decision_timestamp"],errors="coerce",utc=True)
         x=x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").drop_duplicates("prediction_id",keep="last")
-        minimum_samples_required = 7
-        history_sufficient = len(x) >= minimum_samples_required
+        all_validated = _evaluate(x)
+        minimum_samples_required = ValidationConfig().minimum_health_samples
+        scored_samples = int(all_validated.get("samples", 0))
+        history_sufficient = scored_samples >= minimum_samples_required
         report.update({
-          "status":"PASS" if history_sufficient else "INSUFFICIENT_HISTORY",
+          "status":validation_status_for_sample_count(scored_samples, minimum_samples_required),
           "history_sufficient":bool(history_sufficient),
           "minimum_samples_required":minimum_samples_required,
-          "all_validated":_evaluate(x),
+          "scored_samples":scored_samples,
+          "all_validated":all_validated,
           "recent_30":_evaluate(x.tail(30)),
           "recent_60":_evaluate(x.tail(60)),
           "recent_120":_evaluate(x.tail(120)),
