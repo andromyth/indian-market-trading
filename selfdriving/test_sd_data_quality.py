@@ -1,5 +1,9 @@
 """Unit tests for autonomous point-in-time data auditing."""
 from datetime import date
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 import pandas as pd
@@ -117,6 +121,29 @@ class RealisedReturnTests(unittest.TestCase):
 
     def test_known_trading_session_calendar_skips_weekend(self):
         self.assertEqual(next_nse_session(date(2026, 10, 9)), date(2026, 10, 12))
+
+
+
+class EntrypointImportTests(unittest.TestCase):
+    def test_beta_v2_script_can_import_root_modules_from_outside_repo(self):
+        script = Path(__file__).resolve().with_name("sd_github_job_v2.py")
+        code = (
+            "import runpy; "
+            f"runpy.run_path({str(script)!r}, run_name='beta_v2_import_check'); "
+            "import persistent_store; print('ROOT_MODULE_IMPORT_OK')"
+        )
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("ROOT_MODULE_IMPORT_OK", result.stdout)
+
 
 
 if __name__ == "__main__":
