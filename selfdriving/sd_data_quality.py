@@ -182,6 +182,9 @@ def build_input_audit(
     observed_date: date | None,
     realised_update: dict | None = None,
     source_status: dict | None = None,
+    active_champion_features: list[str] | None = None,
+    active_champion_status: str | None = None,
+    active_champion_file: str | None = None,
     now: pd.Timestamp | None = None,
 ) -> dict:
     """Create JSON-safe stockwise/source-integrity diagnostics; never imputes data."""
@@ -240,6 +243,87 @@ def build_input_audit(
         for name, cols in groups.items()
     }
 
+    # Audit the feature contract the registered challenger actually loads,
+    # separately from the locked 59-feature source snapshot.
+    active_features = list(dict.fromkeys(str(x) for x in (active_champion_features or []) if str(x)))
+    audit_panel = panel.copy()
+    rank_source = []
+    if any(feature.endswith("_csr") for feature in active_features) and not audit_panel.empty:
+        try:
+            from selfdriving.sd_walkforward import add_cross_sectional_ranks
+            from selfdriving.sd_cycle import RANK_SOURCE
+            rank_source = list(RANK_SOURCE)
+            audit_panel = add_cross_sectional_ranks(audit_panel, rank_source)
+        except Exception as exc:
+            warnings.append(f"ACTIVE_MODEL_RANK_FEATURE_AUDIT_FAILED:{type(exc).__name__}")
+
+    active_feature_groups = {
+        "price_volume_delivery": [
+            feature for feature in active_features
+            if feature.startswith((
+                "ret_", "rsi", "atr", "ma", "volume", "delivery",
+                "range_", "body_", "up_bar",
+            )) or feature.endswith("_csr")
+        ],
+        "nse_market_context": [
+            feature for feature in active_features
+            if feature.startswith(("market_", "relative_ret_"))
+        ],
+        "global_market_fx": [feature for feature in active_features if feature.startswith("g_")],
+        "scored_news": [
+            feature for feature in active_features
+            if feature.startswith(("news_", "mkt_news_"))
+        ],
+        "corporate_events": [feature for feature in active_features if feature.startswith("event_")],
+        "fno": [feature for feature in active_features if feature.startswith("fno_")],
+        "fundamentals": [
+            feature for feature in active_features
+            if feature.startswith(("fundamental_", "fund_"))
+        ],
+    }
+    present_active_features = [feature for feature in active_features if feature in audit_panel.columns]
+    missing_active_features = [feature for feature in active_features if feature not in audit_panel.columns]
+    active_numeric = (
+        audit_panel[present_active_features].apply(pd.to_numeric, errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ) if present_active_features and not audit_panel.empty else pd.DataFrame()
+    )
+    active_contract_status = str(active_champion_status or ("READY" if active_features else "NO_CHAMPION"))
+    active_model_contract = {
+        "status": active_contract_status,
+        "model_file": active_champion_file,
+        "feature_count": len(active_features),
+        "feature_names": active_features,
+        "missing_columns_in_current_panel": missing_active_features,
+        "feature_groups": {},
+        "current_panel_feature_coverage": _coverage(audit_panel, active_features),
+        "usd_inr": {
+            "feature_name": "g_inr_z",
+            "available_in_current_panel": (
+                bool(audit_panel["g_inr_z"].notna().any())
+                if "g_inr_z" in audit_panel.columns else False
+            ),
+            "selected_by_active_champion": "g_inr_z" in active_features,
+            "selected_feature_current_coverage_pct": (
+                round(float(pd.to_numeric(audit_panel["g_inr_z"], errors="coerce").notna().mean() * 100), 3)
+                if "g_inr_z" in active_features and "g_inr_z" in audit_panel.columns and len(audit_panel)
+                else 0.0
+            ),
+        },
+    }
+    for group_name, names in active_feature_groups.items():
+        active_model_contract["feature_groups"][group_name] = {
+            "selected_feature_count": len(names),
+            "selected_features": names,
+            "current_coverage": _coverage(audit_panel, names),
+        }
+    if active_contract_status == "NO_CHAMPION":
+        warnings.append("BETA_V2_NO_CHAMPION_REGISTERED")
+    elif active_contract_status != "READY":
+        warnings.append(f"BETA_V2_CHAMPION_CONTRACT_{active_contract_status}")
+    if missing_active_features:
+        warnings.append("ACTIVE_CHAMPION_FEATURES_MISSING_FROM_CURRENT_PANEL")
+
     lowest_coverage = []
     if not pit.empty and "symbol" in pit.columns:
         numeric_features = [c for c in FEATURES_59 if c in pit.columns]
@@ -291,8 +375,8 @@ def build_input_audit(
 
     panel_by_symbol = {}
     panel_symbol_count = 0
-    if not panel.empty and "symbol" in panel.columns:
-        px = panel.copy()
+    if not audit_panel.empty and "symbol" in audit_panel.columns:
+        px = audit_panel.copy()
         px["__symbol"] = px["symbol"].map(normalize_symbol)
         px = px.drop_duplicates("__symbol", keep="last")
         panel_by_symbol = {str(row["__symbol"]): row for _, row in px.iterrows()}
@@ -315,7 +399,7 @@ def build_input_audit(
         ]
         fno_columns = [column for column in pit_x.columns if column.startswith("fno_")]
         fundamental_columns = [column for column in pit_x.columns if column.startswith(("fundamental_", "fund_"))]
-        for idx, row in pit_x.iterrows():
+        for row_position, (idx, row) in enumerate(pit_x.iterrows()):
             symbol = str(row["__symbol"])
             live_row = panel_by_symbol.get(symbol)
             global_present = [
@@ -326,9 +410,21 @@ def build_input_audit(
                 column for column in scored_news_columns
                 if live_row is not None and column in live_row.index and pd.notna(live_row[column])
             ]
+            active_pct = None
+            if active_features:
+                if live_row is None:
+                    active_pct = 0.0
+                else:
+                    active_non_null = sum(
+                        feature in live_row.index and pd.notna(live_row[feature])
+                        for feature in active_features
+                    )
+                    active_pct = round(active_non_null / len(active_features) * 100, 3)
             stockwise_input_readiness.append({
                 "symbol": symbol,
-                "model_feature_non_null_pct": round(float(coverage_by_index.loc[idx] * 100), 3),
+                "model_feature_non_null_pct": round(float(coverage_by_index.iloc[row_position] * 100), 3),
+                "locked_59_feature_non_null_pct": round(float(coverage_by_index.iloc[row_position] * 100), 3),
+                "active_champion_feature_non_null_pct": active_pct,
                 "daily_volume_ratio_known": bool(pd.notna(row.get("volume_ratio", np.nan))),
                 "daily_volume_zscore_known": bool(pd.notna(row.get("volume_z20", np.nan))),
                 "delivery_features_known": _any_known(row, delivery_columns),
@@ -359,6 +455,11 @@ def build_input_audit(
         "symbols_with_any_global_features": sum(row["global_features_present"] > 0 for row in stockwise_input_readiness),
         "symbols_with_scored_news_features": sum(row["scored_news_features_present"] > 0 for row in stockwise_input_readiness),
         "panel_symbols": panel_symbol_count,
+        "symbols_with_active_champion_coverage_at_least_60pct": sum(
+            row["active_champion_feature_non_null_pct"] is not None
+            and row["active_champion_feature_non_null_pct"] >= 60.0
+            for row in stockwise_input_readiness
+        ),
     }
 
     global_duplicate_rows = (
@@ -492,6 +593,7 @@ def build_input_audit(
             "lowest_feature_coverage_symbols": lowest_coverage,
         },
         "feature_groups": group_coverage,
+        "active_model_contract": active_model_contract,
         "stockwise_source_coverage": stockwise_source_coverage,
         "stockwise_input_readiness": stockwise_input_readiness,
         "volume": volume_audit,

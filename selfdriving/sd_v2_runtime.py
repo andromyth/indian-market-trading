@@ -122,6 +122,7 @@ def beta_status() -> dict[str, Any]:
         news_audit = audit.get("news", {}) or {}
         fno_audit = audit.get("fno", {}) or {}
         snapshot_audit = audit.get("snapshot", {}) or {}
+        active_model_audit = audit.get("active_model_contract", {}) or {}
         out["data_audit"] = {
             "overall_status": audit.get("overall_status", "UNKNOWN"),
             "generated_at_utc": audit.get("generated_at_utc"),
@@ -137,6 +138,16 @@ def beta_status() -> dict[str, Any]:
             },
             "stockwise_source_coverage": audit.get("stockwise_source_coverage", {}),
             "feature_groups": audit.get("feature_groups", {}),
+            "active_model_contract": {
+                "status": active_model_audit.get("status", "UNKNOWN"),
+                "model_file": active_model_audit.get("model_file"),
+                "feature_count": active_model_audit.get("feature_count"),
+                "feature_names": active_model_audit.get("feature_names", []),
+                "missing_columns_in_current_panel": active_model_audit.get("missing_columns_in_current_panel", []),
+                "feature_groups": active_model_audit.get("feature_groups", {}),
+                "current_panel_feature_coverage": active_model_audit.get("current_panel_feature_coverage", {}),
+                "usd_inr": active_model_audit.get("usd_inr", {}),
+            },
             "volume": audit.get("volume", {}),
             "global_market_fx": {
                 "rows": global_audit.get("rows"),

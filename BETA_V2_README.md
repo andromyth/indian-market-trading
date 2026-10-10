@@ -51,6 +51,8 @@ The first signal issued for each symbol/reference-date is retained during reruns
 
 The Colab trainer reads the same Beta V2 global-cues and RSS-news archives updated by the daily job. Its source manifest fingerprints the base panel plus global, news and F&O inputs; when those sources change, stale enriched-panel caches are discarded before retraining. Use `--force-rebuild-panel` to request an explicit rebuild.
 
+The audit separately records the **registered champion's actual feature list** and its per-feature/per-stock coverage. This distinguishes three states that must not be conflated: a source was downloaded, a transformed feature is present/populated, and the currently registered model actually selected that feature. In particular, `active_model_contract.usd_inr.selected_by_active_champion` states whether `g_inr_z` is among the champion's fitted features; `available_in_current_panel` reports data availability independently. If there is no registered champion, the audit explicitly reports `NO_CHAMPION` rather than claiming these inputs are used by a live Beta V2 model.
+
 Global USD/INR, other global series and scored-news features are still subject to point-in-time availability and Beta V2 coverage/date gates. The RSS archive starts when the autonomous collector begins seeing headlines; missing historical headlines are not fabricated. Richer source presence alone does not mean the trained challenger uses every group. Inspect `status_data_audit.json` and the training manifest before interpreting a prediction. These changes do not alter or promote the locked production model.
 
 ## Validation status

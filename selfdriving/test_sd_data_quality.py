@@ -77,6 +77,38 @@ class RealisedReturnTests(unittest.TestCase):
         self.assertEqual(report["stockwise_source_coverage"]["symbols_with_usdinr_feature"], 1)
         self.assertEqual(report["stockwise_source_coverage"]["symbols_with_daily_volume_ratio"], 2)
 
+    def test_audit_distinguishes_available_inputs_from_active_champion_features(self):
+        from multifactor_data_layer_v2 import FEATURES_59
+
+        rows = []
+        for symbol in ("AAA", "BBB"):
+            row = {"symbol": symbol, "close": 100.0, "volume": 1000.0, "production_data_quality_gate": True}
+            row.update({feature: 0.1 for feature in FEATURES_59})
+            rows.append(row)
+        pit = pd.DataFrame(rows)
+        panel = pd.DataFrame([
+            {"symbol": "AAA", "g_inr_z": 0.2, "news_sent_ewm": 0.3, "volume_ratio": 1.2},
+            {"symbol": "BBB", "g_inr_z": float("nan"), "news_sent_ewm": float("nan"), "volume_ratio": 1.1},
+        ])
+        report = build_input_audit(
+            pit, panel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            expected_date=date(2026, 10, 9),
+            observed_date=date(2026, 10, 9),
+            active_champion_features=["g_inr_z", "news_sent_ewm", "volume_ratio"],
+            active_champion_status="READY",
+            active_champion_file="delivery_excess_test.joblib",
+            now=pd.Timestamp("2026-10-10T00:00:00Z"),
+        )
+        model = report["active_model_contract"]
+        self.assertEqual(model["status"], "READY")
+        self.assertEqual(model["feature_count"], 3)
+        self.assertTrue(model["usd_inr"]["selected_by_active_champion"])
+        self.assertEqual(model["usd_inr"]["selected_feature_current_coverage_pct"], 50.0)
+        self.assertEqual(report["stockwise_source_coverage"]["symbols_with_active_champion_coverage_at_least_60pct"], 1)
+        stock = {row["symbol"]: row for row in report["stockwise_input_readiness"]}
+        self.assertEqual(stock["AAA"]["active_champion_feature_non_null_pct"], 100.0)
+        self.assertAlmostEqual(stock["BBB"]["active_champion_feature_non_null_pct"], 33.333, places=2)
+
     def test_nse_session_guard_skips_weekends_and_known_holidays(self):
         self.assertTrue(is_nse_session_day(date(2026, 10, 12)))
         self.assertFalse(is_nse_session_day(date(2026, 10, 10)))
