@@ -80,6 +80,14 @@ from persistent_store import (
     load_persistent_1m,
 )
 
+try:
+    from indstocks_client import (
+        configured as _indstocks_configured,
+        historical_1m as _indstocks_historical_1m,
+    )
+except Exception:
+    _indstocks_configured = _indstocks_historical_1m = None
+
 st.set_page_config(page_title="Indian Market Trading", layout="wide")
 
 interface_mode = st.sidebar.radio(
@@ -499,8 +507,56 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=20, show_spinner=False)
 def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
-    """Get live 1-minute bars with an ordered, fail-fast provider chain."""
+    """Get live 1-minute bars with broker-first routing when INDstocks is configured."""
     root = str(symbol).replace(".NS", "").replace(".BO", "").upper()
+
+    # Prefer the authenticated broker feed for live model input when configured.
+    # The official NSE chart and persistent cache remain fallbacks if the broker
+    # cannot authenticate or return usable candles.
+    if _indstocks_configured is not None and _indstocks_historical_1m is not None:
+        try:
+            if _indstocks_configured():
+                broker_frame = _indstocks_historical_1m(root, days=3)
+                if broker_frame is not None and not broker_frame.empty:
+                    persist_needed = True
+                    try:
+                        now = pd.Timestamp.now(tz="Asia/Kolkata")
+                        existing = load_persistent_1m(
+                            root,
+                            start=(now - pd.Timedelta(days=3)),
+                            end=now,
+                        )
+                        if existing is not None and not existing.empty:
+                            existing_last = pd.Timestamp(existing.index.max())
+                            broker_last = pd.Timestamp(broker_frame.index.max())
+                            if existing_last.tzinfo is None:
+                                existing_last = existing_last.tz_localize("Asia/Kolkata")
+                            else:
+                                existing_last = existing_last.tz_convert("Asia/Kolkata")
+                            if broker_last.tzinfo is None:
+                                broker_last = broker_last.tz_localize("Asia/Kolkata")
+                            else:
+                                broker_last = broker_last.tz_convert("Asia/Kolkata")
+                            persist_needed = (
+                                broker_last > existing_last + pd.Timedelta(seconds=30)
+                                or len(broker_frame) > len(existing)
+                            )
+                    except Exception:
+                        persist_needed = True
+                    if persist_needed:
+                        try:
+                            persist_1m_frame(
+                                root,
+                                broker_frame,
+                                source="INDstocks API live 1m",
+                                sync_drive=True,
+                            )
+                        except Exception:
+                            # A failed archive write must not discard good live model input.
+                            pass
+                    return broker_frame, "INDSTOCKS_API"
+        except Exception:
+            pass
 
     try:
         now = pd.Timestamp.now(tz="Asia/Kolkata")
