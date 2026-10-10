@@ -218,21 +218,58 @@ def _fund_parse(f):
                 inst_diff=abs((m["instant"]-target_end).total_seconds()/86400.0) if pd.notna(target_end) else 1e9
                 instant_ids.append((inst_diff,cid))
 
-        # For income/flow fields prefer the shortest clean duration ending on the
-        # filing period (normally the quarter) with non-empty facts. If there is
-        # no exact-period context, use the closest period-end duration.
-        duration_ids.sort(key=lambda x:(x[0],x[1]))
-        q={}
-        for diff_days,duration,cid in duration_ids:
-            if facts.get(cid):
-                q=facts[cid]
-                break
+        flow_groups = [
+            FUND_FIELDS["fundamental_revenue"],
+            FUND_FIELDS["fundamental_pat"],
+            FUND_FIELDS["fundamental_eps"],
+            FUND_FIELDS["fundamental_finance_cost"],
+            ("ProfitBeforeTax", "ProfitLossFromOrdinaryActivitiesBeforeTax"),
+            ("DepreciationDepletionAndAmortisationExpense", "DepreciationAndAmortisationExpense", "Depreciation"),
+        ]
+        balance_groups = [
+            ("TotalEquity", "Equity", "EquityAttributableToOwnersOfParent", "OtherEquity", "Capital", "EquityShareCapital", "ReservesAndSurplus"),
+            ("TotalDebt", "Debt", "Borrowings", "BorrowingsCurrent", "BorrowingsNoncurrent"),
+            FUND_FIELDS["fundamental_cash"],
+        ]
 
-        bs={}
-        for diff_days,cid in sorted(instant_ids):
-            if facts.get(cid):
-                bs=facts[cid]
-                break
+        def context_score(cid, concept_groups):
+            values = facts.get(cid, {})
+            return sum(
+                any(name in values and np.isfinite(values[name]) for name in aliases)
+                for aliases in concept_groups
+            )
+
+        # Prefer the reporting period closest to the filing's period_end and
+        # score contexts by how many required concepts they actually contain.
+        # The old code selected the first context with ANY numeric fact, which
+        # often chose a context unrelated to Revenue/PAT/EPS and left the
+        # locked financial features empty despite parseable facts in other
+        # dimension-free contexts in the same filing.
+        duration_ids.sort(
+            key=lambda item: (item[0], abs(item[1] - 90.0), -context_score(item[2], flow_groups))
+        )
+        best_diff = min((item[0] for item in duration_ids), default=1e9)
+        near_period = [item for item in duration_ids if item[0] <= best_diff + 3.0]
+        quarterly = [item for item in near_period if 45.0 <= item[1] <= 130.0]
+        flow_candidates = quarterly or near_period
+        flow_candidates.sort(
+            key=lambda item: (-context_score(item[2], flow_groups), abs(item[1] - 90.0), item[0])
+        )
+        q = {}
+        for _, _, cid in flow_candidates:
+            for name, value in facts.get(cid, {}).items():
+                q.setdefault(name, value)
+
+        instant_ids.sort(
+            key=lambda item: (item[0], -context_score(item[1], balance_groups))
+        )
+        best_instant_diff = min((item[0] for item in instant_ids), default=1e9)
+        near_instant = [item for item in instant_ids if item[0] <= best_instant_diff + 3.0]
+        near_instant.sort(key=lambda item: (-context_score(item[1], balance_groups), item[0]))
+        bs = {}
+        for _, cid in near_instant:
+            for name, value in facts.get(cid, {}).items():
+                bs.setdefault(name, value)
 
         def pick(d,names):
             for n in names:
