@@ -16,6 +16,7 @@ REMOTE_SOURCES = {
     "fno": "production_data/nse_official/fno/fno_daily_features_2026.parquet",
     "news": "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
     "events": "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+    "news_events_manifest": "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
     "fundamentals": "corporate/pit_fundamentals_all_nse_2025_2026.parquet",
 }
 MIN_HISTORY = 60
