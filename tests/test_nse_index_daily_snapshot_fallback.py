@@ -97,3 +97,22 @@ def test_fetch_index_history_uses_official_snapshot_after_api_json_failure(
 
     assert len(result) == 3
     assert result["source"].eq("NSE_OFFICIAL_DAILY_SNAPSHOT").all()
+
+
+def test_parse_actual_nse_daily_snapshot_closing_header():
+    payload = (
+        "Index Name,Index Date,Open,High,Low,Closing,Points Change,Change(%),"
+        "Volume,Turnover,P/E,P/B,Div Yield\n"
+        "NIFTY 50,13-May-2026,22000,22100,21900,22050,50,0.2,123,456,20,3,1.2\n"
+        "NIFTY BANK,13-May-2026,48000,48200,47800,48100,100,0.2,456,789,15,2,0.8\n"
+    ).encode("utf-8")
+
+    frame = layer._parse_index_daily_snapshot(
+        payload,
+        "^NSEI",
+        date(2026, 5, 13),
+    )
+
+    assert len(frame) == 1
+    assert float(frame.loc[0, "close"]) == 22050.0
+    assert frame.loc[0, "source"] == "NSE_OFFICIAL_DAILY_SNAPSHOT"
