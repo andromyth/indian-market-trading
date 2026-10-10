@@ -161,8 +161,13 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
         ((x["signal"].astype(str).str.upper()=="BUY") & x["actual_direction_d1"].astype(str).str.upper().eq("UP"))
         | ((x["signal"].astype(str).str.upper()=="SELL") & x["actual_direction_d1"].astype(str).str.upper().eq("DOWN"))
     )
+    required_samples = ValidationConfig().minimum_health_samples
+    history_sufficient = len(valid_matches) >= required_samples
     return {
-        "status": "PASS" if len(x) else "NO_DATA",
+        "status": "PASS" if history_sufficient else "INSUFFICIENT_HISTORY",
+        "history_sufficient": bool(history_sufficient),
+        "required_scored_predictions": int(required_samples),
+        "scored_predictions": int(len(valid_matches)),
         "completed_predictions": int(len(x)),
         "directional_accuracy_7_predictions": float(valid_matches.mean()) if len(valid_matches) else None,
         "mean_absolute_percentage_price_error": float(mae) if pd.notna(mae) else None,
