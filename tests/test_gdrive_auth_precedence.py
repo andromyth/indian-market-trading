@@ -34,6 +34,8 @@ def test_service_account_preferred_when_legacy_oauth_token_also_present(monkeypa
     assert cfg["auth_method"] == "service_account"
     assert cfg["client_email"] == service_info["client_email"]
     assert cfg["root_folder_id"] == "test-root-folder-id"
+    assert cfg["oauth_write_token_info"]["refresh_token"] == oauth_info["refresh_token"]
+    assert cfg["oauth_write_configured"] is True
 
 
 def test_oauth_remains_supported_when_no_service_account_is_configured(monkeypatch):
