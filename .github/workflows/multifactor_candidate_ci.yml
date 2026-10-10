@@ -82,6 +82,7 @@ jobs:
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
           tests/test_market_session_guard.py
+          tests/test_gdrive_auth_precedence.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
