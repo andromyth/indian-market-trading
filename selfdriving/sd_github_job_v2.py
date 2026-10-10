@@ -168,6 +168,10 @@ def pull_sources(store) -> dict:
             f"{REMOTE_BASE}/ledger/predictions.parquet",
             ROOT / "ledger/predictions.parquet",
         ),
+        "ledger_history": (
+            f"{REMOTE_BASE}/ledger/predictions_history.parquet",
+            ROOT / "ledger/predictions_history.parquet",
+        ),
     }
 
     result = {}
