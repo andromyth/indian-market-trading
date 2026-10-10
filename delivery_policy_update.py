@@ -16,6 +16,10 @@ MIN_SAMPLES=80
 MIN_TUNING_ACTIONS=20
 MIN_HOLDOUT_ACTIONS=30
 TARGET_HOLDOUT_PRECISION=0.80
+ACTIVE_DELIVERY_MODEL_VERSIONS = {
+    "2026-all-nse-delivery-multifactor-59-replacement-v1",
+    "2026-all-nse-delivery-multifactor-59-candidate-v2",
+}
 MIN_UNIQUE_SESSIONS=20
 MIN_HOLDOUT_SESSIONS=5
 
@@ -108,22 +112,35 @@ def _join():
     p=pd.DataFrame(load_records()); v=pd.DataFrame(load_validation_records())
     if p.empty or v.empty or "prediction_id" not in p.columns or "prediction_id" not in v.columns: return pd.DataFrame()
     p=p[p["mode"].astype(str).str.lower().eq("delivery")].copy()
-    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","production_data_quality_gate","production_data_quality_score","decision_engine_version"]
+    # Fail closed: records from the old pilot/engine must not train or validate
+    # policy thresholds for the active ALL-NSE 59-feature production model.
+    if "model_version" not in p.columns:
+        return pd.DataFrame()
+    p["model_version"] = p["model_version"].astype(str)
+    p = p[p["model_version"].isin(ACTIVE_DELIVERY_MODEL_VERSIONS)].copy()
+    if p.empty:
+        return pd.DataFrame()
+    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","production_data_quality_gate","production_data_quality_score","model_version","decision_engine_version"]
     p=p[[c for c in keep if c in p.columns]]
     keepv=["prediction_id","actual_direction_d1","validation_status","actual_d1_return"]
     v=v[[c for c in keepv if c in v.columns]]
     x=p.merge(v,on="prediction_id",how="inner")
     x=x[x["validation_status"].eq("VALIDATED")].copy()
-    if "production_data_quality_gate" in x.columns:
-        x=x[x["production_data_quality_gate"].map(_gate_pass)].copy()
+    if "production_data_quality_gate" not in x.columns:
+        return pd.DataFrame()
+    x=x[x["production_data_quality_gate"].map(_gate_pass)].copy()
     x["decision_timestamp"]=pd.to_datetime(x["decision_timestamp"],errors="coerce",utc=True)
     return x.dropna(subset=["decision_timestamp","probability_up_next_session","predicted_return_next_session","actual_direction_d1"]).sort_values("decision_timestamp").drop_duplicates("prediction_id",keep="last")
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--min-samples",type=int,default=MIN_SAMPLES); args=ap.parse_args()
     existing=_load_existing(); data=_join()
-    if len(data)<args.min_samples:
-        out={**existing,"status":"INSUFFICIENT_HISTORY","samples":int(len(data)),"updated_at":datetime.now(timezone.utc).isoformat(),"method":"date-blocked-walk-forward-policy-tuning"}
+    if len(data) < args.min_samples:
+        no_active_model = data.empty
+        out={**existing,"status":"NO_ACTIVE_MODEL_DATA" if no_active_model else "INSUFFICIENT_HISTORY",
+             "samples":int(len(data)),"updated_at":datetime.now(timezone.utc).isoformat(),
+             "method":"date-blocked-walk-forward-policy-tuning",
+             "reason":"No validated, quality-approved rows from the active ALL-NSE 59-feature Delivery model." if no_active_model else "Validated active-model history is below the minimum required for policy evaluation."}
         LOCAL_POLICY.write_text(json.dumps(out,indent=2,default=str),encoding="utf-8")
         print(json.dumps(out,indent=2)); return
     split_frames, session_count, holdout_session_count = _date_block_split(data)
