@@ -262,6 +262,95 @@ def build_input_audit(
     if len(pit) and volume_audit["volume_ratio_coverage_pct"] < 60:
         warnings.append("LOW_DAILY_VOLUME_FEATURE_COVERAGE")
 
+    def _row_value(row: pd.Series | None, column: str):
+        if row is None or column not in row.index or pd.isna(row[column]):
+            return None
+        value = row[column]
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return float(value) if np.isfinite(value) else None
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        return str(value)
+
+    def _any_known(row: pd.Series | None, columns: list[str]) -> bool:
+        return bool(row is not None and any(
+            column in row.index and pd.notna(row[column]) for column in columns
+        ))
+
+    panel_by_symbol = {}
+    panel_symbol_count = 0
+    if not panel.empty and "symbol" in panel.columns:
+        px = panel.copy()
+        px["__symbol"] = px["symbol"].map(normalize_symbol)
+        px = px.drop_duplicates("__symbol", keep="last")
+        panel_by_symbol = {str(row["__symbol"]): row for _, row in px.iterrows()}
+        panel_symbol_count = len(panel_by_symbol)
+
+    stockwise_input_readiness = []
+    if not pit.empty and "symbol" in pit.columns:
+        pit_x = pit.copy()
+        pit_x["__symbol"] = pit_x["symbol"].map(normalize_symbol)
+        numeric_features = [column for column in FEATURES_59 if column in pit_x.columns]
+        feature_matrix = pit_x[numeric_features].apply(pd.to_numeric, errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ) if numeric_features else pd.DataFrame(index=pit_x.index)
+        coverage_by_index = feature_matrix.notna().mean(axis=1) if numeric_features else pd.Series(0.0, index=pit_x.index)
+        global_columns = groups["global_market_fx"]
+        scored_news_columns = groups["scored_news"]
+        delivery_columns = [
+            "delivery_pct", "delivery_pct_change_1", "delivery_pct_ratio20",
+            "delivery_pct_z20", "delivery_qty_ratio20", "delivery_qty_z20",
+        ]
+        fno_columns = [column for column in pit_x.columns if column.startswith("fno_")]
+        fundamental_columns = [column for column in pit_x.columns if column.startswith(("fundamental_", "fund_"))]
+        for idx, row in pit_x.iterrows():
+            symbol = str(row["__symbol"])
+            live_row = panel_by_symbol.get(symbol)
+            global_present = [
+                column for column in global_columns
+                if live_row is not None and column in live_row.index and pd.notna(live_row[column])
+            ]
+            news_present = [
+                column for column in scored_news_columns
+                if live_row is not None and column in live_row.index and pd.notna(live_row[column])
+            ]
+            stockwise_input_readiness.append({
+                "symbol": symbol,
+                "model_feature_non_null_pct": round(float(coverage_by_index.loc[idx] * 100), 3),
+                "daily_volume_ratio_known": bool(pd.notna(row.get("volume_ratio", np.nan))),
+                "daily_volume_zscore_known": bool(pd.notna(row.get("volume_z20", np.nan))),
+                "delivery_features_known": _any_known(row, delivery_columns),
+                "news_feature_known": _any_known(live_row, ["news_cnt_1", "news_sent_ewm", "news_available"]),
+                "news_available_flag": _row_value(live_row, "news_available"),
+                "scored_news_features_present": len(news_present),
+                "scored_news_features_expected": len(scored_news_columns),
+                "event_feature_known": _any_known(row, ["event_available", "event_high_impact"]),
+                "event_available_flag": _row_value(row, "event_available"),
+                "fno_features_known": _any_known(live_row, fno_columns + ["fno_beta_observed"]),
+                "fundamental_features_known": _any_known(row, fundamental_columns + ["fundamental_age_days"]),
+                "global_features_present": len(global_present),
+                "global_features_expected": len(global_columns),
+                "usd_inr_feature_available": bool(
+                    live_row is not None and "g_inr_z" in live_row.index and pd.notna(live_row["g_inr_z"])
+                ),
+            })
+
+    stockwise_source_coverage = {
+        "symbols_in_pit": len(stockwise_input_readiness),
+        "symbols_with_usdinr_feature": sum(bool(row["usd_inr_feature_available"]) for row in stockwise_input_readiness),
+        "symbols_with_daily_volume_ratio": sum(bool(row["daily_volume_ratio_known"]) for row in stockwise_input_readiness),
+        "symbols_with_delivery_features": sum(bool(row["delivery_features_known"]) for row in stockwise_input_readiness),
+        "symbols_with_known_news_features": sum(bool(row["news_feature_known"]) for row in stockwise_input_readiness),
+        "symbols_with_event_features": sum(bool(row["event_feature_known"]) for row in stockwise_input_readiness),
+        "symbols_with_fno_features": sum(bool(row["fno_features_known"]) for row in stockwise_input_readiness),
+        "symbols_with_fundamental_features": sum(bool(row["fundamental_features_known"]) for row in stockwise_input_readiness),
+        "symbols_with_any_global_features": sum(row["global_features_present"] > 0 for row in stockwise_input_readiness),
+        "symbols_with_scored_news_features": sum(row["scored_news_features_present"] > 0 for row in stockwise_input_readiness),
+        "panel_symbols": panel_symbol_count,
+    }
+
     global_audit = {
         "rows": int(len(global_cues)),
         "series": sorted(global_cues["key"].dropna().astype(str).str.lower().unique().tolist()) if "key" in global_cues.columns else [],
@@ -357,6 +446,8 @@ def build_input_audit(
             "lowest_feature_coverage_symbols": lowest_coverage,
         },
         "feature_groups": group_coverage,
+        "stockwise_source_coverage": stockwise_source_coverage,
+        "stockwise_input_readiness": stockwise_input_readiness,
         "volume": volume_audit,
         "global_market_fx": global_audit,
         "news": news_audit,
