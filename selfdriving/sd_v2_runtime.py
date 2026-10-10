@@ -64,6 +64,30 @@ def _ensure(remote: str, local: Path) -> Path:
     return local
 
 
+def _load_optional_parquet(
+    remotes: tuple[str, ...],
+    local: Path,
+) -> tuple[pd.DataFrame, str]:
+    """Load an optional Drive-backed parquet with legacy-path fallback.
+
+    Returns the loaded frame and a provenance label. A genuinely absent optional
+    archive becomes an empty frame so the feature builder can flag NO_DATA;
+    authentication, transport, and corrupt-file errors still propagate.
+    """
+    if local.exists() and local.stat().st_size > 0:
+        return pd.read_parquet(local), "LOCAL_CACHE"
+
+    for remote in remotes:
+        try:
+            _download(remote, local)
+            if local.exists() and local.stat().st_size > 0:
+                return pd.read_parquet(local), remote
+        except FileNotFoundError:
+            continue
+
+    return pd.DataFrame(), "MISSING"
+
+
 def beta_status() -> dict[str, Any]:
     out: dict[str, Any] = {
         "version": "2026-10-06-beta-v2",
@@ -192,12 +216,24 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
                 _, done = dl.next_chunk()
 
     pit = pd.read_parquet(pit_local)
+    global_source = "PROVIDED"
+    news_source = "PROVIDED"
     if global_cues is None:
-        gp = _ensure(f"{REMOTE_ROOT}/global_cues.parquet", CACHE / "global_cues.parquet")
-        global_cues = pd.read_parquet(gp)
+        global_cues, global_source = _load_optional_parquet(
+            (
+                f"{REMOTE_ROOT}/global_cues.parquet",
+                "selfdriving/global_cues.parquet",
+            ),
+            CACHE / "global_cues.parquet",
+        )
     if raw_news is None:
-        npth = _ensure(f"{REMOTE_ROOT}/raw_news.parquet", CACHE / "raw_news.parquet")
-        raw_news = pd.read_parquet(npth)
+        raw_news, news_source = _load_optional_parquet(
+            (
+                f"{REMOTE_ROOT}/raw_news.parquet",
+                "selfdriving/raw_news.parquet",
+            ),
+            CACHE / "raw_news.parquet",
+        )
     if fno_daily is None:
         try:
             fp = _ensure(
@@ -231,6 +267,8 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
     pred = predict_stage(inference, registry_root)
     row = pred.iloc[0].to_dict()
     row["prediction_status"] = "PASS"
+    audit["global_source"] = global_source
+    audit["news_source"] = news_source
     row["beta_v2_audit"] = audit
     return row
 
