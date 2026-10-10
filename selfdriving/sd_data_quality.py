@@ -13,7 +13,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-PIT_NAME_RE = re.compile(r"^DELIVERY_PIT_FEATURES_(20\\d{2}-\\d{2}-\\d{2})\\.parquet$")
+PIT_NAME_RE = re.compile(r"^DELIVERY_PIT_FEATURES_(20\d{2}-\d{2}-\d{2})\.parquet$")
 GLOBAL_MAX_AGE_DAYS = 5.0
 
 
