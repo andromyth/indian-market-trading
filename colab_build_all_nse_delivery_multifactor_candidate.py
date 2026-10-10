@@ -835,7 +835,6 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         out.loc[covered, "fno_available"], errors="coerce"
     ).fillna(0.0)
 
-    source_date_rows = int(pd.to_datetime(pd.read_parquet(path)["date"], errors="coerce").nunique())
     return out, {
         "exists": True,
         "path": str(path),
@@ -1053,26 +1052,6 @@ def merge_optional(panel):
                 out[column] = np.nan
 
     out = attach_readiness_flags(out)
-    # Make source absence and source non-applicability distinct. Existing
-    # per-row observations/readiness states are left intact.
-    out["fno_source_date_coverage"] = 0.0
-    if fno_audit.get("exists") and fno_audit.get("covered_target_sessions", 0):
-        fno_dates = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
-        # A target session is source-covered even when this particular symbol
-        # has no derivative rows. Other sessions remain unknown.
-        covered_set = set()
-        if path.exists() and path.stat().st_size > 0:
-            source = pd.read_parquet(path, columns=["date"])
-            sessions = sorted(pd.to_datetime(source["date"], errors="coerce").dropna().dt.normalize().unique())
-            target_sessions = pd.to_datetime(panel["date"], errors="coerce").dt.normalize().dropna().unique()
-            next_map = {pd.Timestamp(target_sessions[i]): pd.Timestamp(target_sessions[i + 1]) for i in range(len(target_sessions) - 1)}
-            covered_set = {next_map[d] for d in sessions if d in next_map}
-        out["fno_source_date_coverage"] = fno_dates.isin(covered_set).astype(float)
-        out.loc[~fno_dates.isin(covered_set), "fno_available"] = np.nan
-        out.loc[fno_dates.isin(covered_set), "fno_available"] = pd.to_numeric(
-            out.loc[fno_dates.isin(covered_set), "fno_available"], errors="coerce"
-        ).fillna(0.0)
-
     audit["feature_coverage"] = feature_coverage_report(out)
     return out, audit
 
