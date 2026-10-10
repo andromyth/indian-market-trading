@@ -379,6 +379,10 @@ INDEX_HISTORY_NAMES = {
     "^NSEBANK": "NIFTY BANK",
 }
 INDEX_NORMALIZED_ROOT = NORMALIZED_ROOT / "indices"
+INDEX_DAILY_SNAPSHOT_ROOT = INDEX_NORMALIZED_ROOT / "daily_snapshots"
+INDEX_DAILY_SNAPSHOT_URL_TEMPLATE = (
+    "https://nsearchives.nseindia.com/content/indices/ind_close_all_{date}.csv"
+)
 
 
 def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.DataFrame:
@@ -427,8 +431,16 @@ def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.Da
         x["volume"] = pd.to_numeric(x["volume"].astype(str).str.replace(",", "", regex=False), errors="coerce")
 
     x["symbol"] = str(requested_index).upper()
-    x["source"] = "NSE_OFFICIAL_INDEX_HISTORY"
-    x["provenance"] = "nseindia.com /api/historicalOR/indicesHistory"
+    if "source" not in x.columns:
+        x["source"] = "NSE_OFFICIAL_INDEX_HISTORY"
+    else:
+        x["source"] = x["source"].fillna("NSE_OFFICIAL_INDEX_HISTORY").astype(str)
+    if "provenance" not in x.columns:
+        x["provenance"] = "nseindia.com /api/historicalOR/indicesHistory"
+    else:
+        x["provenance"] = x["provenance"].fillna(
+            "nseindia.com /api/historicalOR/indicesHistory"
+        ).astype(str)
     x = x.dropna(subset=["date", "open", "high", "low", "close"])
     return (
         x[["symbol","date","open","high","low","close","volume","source","provenance"]]
@@ -740,7 +752,26 @@ def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end:
         try:
             cached = pd.read_parquet(cache_path)
             if _coverage_ok(cached, start_d, end_d):
+                if sync_drive:
+                    folder = root.replace("^", "").replace("/", "_")
+                    result = _drive_upload(
+                        cache_path,
+                        f"production_data/nse_official/indices/{folder}/{cache_path.name}",
+                        "application/octet-stream",
+                    )
+                    if not isinstance(result, dict) or result.get("status") != "OK":
+                        detail = (
+                            result.get("error")
+                            if isinstance(result, dict)
+                            else repr(result)
+                        )
+                        raise RuntimeError(
+                            f"Google Drive index-cache persistence failed for "
+                            f"{root} {start_d}..{end_d}: {detail}"
+                        )
                 return cached
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
@@ -834,6 +865,261 @@ def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end:
 
 
 
+def _parse_index_daily_snapshot(
+    payload: bytes,
+    index_symbol: str,
+    snapshot_date: date,
+) -> pd.DataFrame:
+    """Parse one official NSE Daily Snapshot CSV into benchmark OHLC rows."""
+    try:
+        raw = pd.read_csv(io.BytesIO(payload), dtype=str)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Official NSE Daily Snapshot CSV could not be parsed for {snapshot_date}"
+        ) from exc
+    if raw.empty:
+        return pd.DataFrame()
+
+    def _key(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+    column_map = {_key(col): col for col in raw.columns}
+
+    def _pick(*names: str) -> str | None:
+        for name in names:
+            hit = column_map.get(name)
+            if hit is not None:
+                return hit
+        return None
+
+    name_col = _pick("indexname")
+    date_col = _pick("indexdate", "date")
+    open_col = _pick("openindexvalue", "open")
+    high_col = _pick("highindexvalue", "high")
+    low_col = _pick("lowindexvalue", "low")
+    close_col = _pick("closingindexvalue", "closeindexvalue", "close")
+    volume_col = _pick("volume", "sharestraded")
+
+    required = {
+        "Index Name": name_col,
+        "Index Date": date_col,
+        "Open Index Value": open_col,
+        "High Index Value": high_col,
+        "Low Index Value": low_col,
+        "Closing Index Value": close_col,
+    }
+    missing = [label for label, value in required.items() if value is None]
+    if missing:
+        raise RuntimeError(
+            "Official NSE Daily Snapshot has an unexpected CSV schema; "
+            f"missing columns={missing}, received={list(raw.columns)}"
+        )
+
+    target_name = INDEX_HISTORY_NAMES[str(index_symbol).strip().upper()].upper()
+    names = (
+        raw[name_col].fillna("").astype(str).str.strip().str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+    )
+    dates = pd.to_datetime(raw[date_col], format="%d-%b-%Y", errors="coerce")
+    remaining = dates.isna()
+    if remaining.any():
+        dates.loc[remaining] = pd.to_datetime(
+            raw.loc[remaining, date_col],
+            errors="coerce",
+            dayfirst=True,
+        )
+    expected = pd.Timestamp(snapshot_date).normalize()
+    mask = names.eq(target_name) & dates.dt.normalize().eq(expected)
+    selected = raw.loc[mask].copy()
+    if selected.empty:
+        return pd.DataFrame()
+
+    def _number(column: str) -> pd.Series:
+        return pd.to_numeric(
+            selected[column].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+
+    normalized = pd.DataFrame({
+        "EOD_TIMESTAMP": dates.loc[mask].dt.strftime("%d-%b-%Y").to_numpy(),
+        "EOD_OPEN_INDEX_VAL": _number(open_col).to_numpy(),
+        "EOD_HIGH_INDEX_VAL": _number(high_col).to_numpy(),
+        "EOD_LOW_INDEX_VAL": _number(low_col).to_numpy(),
+        "EOD_CLOSE_INDEX_VAL": _number(close_col).to_numpy(),
+    })
+    if volume_col is not None:
+        normalized["volume"] = _number(volume_col).to_numpy()
+    out = _normalize_index_history(normalized, target_name)
+    if out.empty:
+        return out
+    out["symbol"] = str(index_symbol).strip().upper()
+    out["source"] = "NSE_OFFICIAL_DAILY_SNAPSHOT"
+    out["provenance"] = (
+        "nsearchives.nseindia.com/content/indices/"
+        f"ind_close_all_{snapshot_date:%d%m%Y}.csv"
+    )
+    return out
+
+
+def _fetch_index_history_from_daily_snapshots(
+    index_symbol: str,
+    start: date | datetime,
+    end: date | datetime,
+    sync_drive: bool = False,
+) -> pd.DataFrame:
+    """Recover official NSE index history from Daily Snapshot CSV archives.
+
+    This path is used only when the historical-index JSON endpoint is unusable.
+    It uses NSE's own end-of-day snapshot files, validates actual dates/coverage,
+    caches each downloaded CSV locally, and persists the normalized benchmark
+    parquet to Drive when requested. It never substitutes third-party prices
+    or estimated index values.
+    """
+    root = str(index_symbol).strip().upper()
+    if root not in INDEX_HISTORY_NAMES:
+        raise ValueError(f"Unsupported NSE benchmark: {index_symbol}")
+
+    start_d = pd.Timestamp(start).date()
+    end_d = pd.Timestamp(end).date()
+    if end_d < start_d:
+        raise ValueError("end date cannot be before start date")
+
+    INDEX_DAILY_SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+    frames: list[pd.DataFrame] = []
+    diagnostics: list[str] = []
+    consecutive_errors = 0
+
+    # Daily Snapshot files are published for exchange sessions; weekday holiday
+    # gaps are expected and simply appear as unavailable dates.
+    for ts in pd.date_range(start_d, end_d, freq="B"):
+        day = ts.date()
+        csv_path = INDEX_DAILY_SNAPSHOT_ROOT / f"ind_close_all_{day:%d%m%Y}.csv"
+        frame = pd.DataFrame()
+
+        if csv_path.exists() and csv_path.stat().st_size > 0:
+            try:
+                frame = _parse_index_daily_snapshot(
+                    csv_path.read_bytes(),
+                    root,
+                    day,
+                )
+            except Exception as exc:
+                diagnostics.append(f"{day}: bad local cache ({type(exc).__name__})")
+                frame = pd.DataFrame()
+
+        if frame.empty:
+            url = INDEX_DAILY_SNAPSHOT_URL_TEMPLATE.format(date=f"{day:%d%m%Y}")
+            try:
+                _sleep_rate_limit(0.45)
+                response = _session().get(
+                    url,
+                    headers={
+                        "Accept": "text/csv,text/plain,application/octet-stream,*/*",
+                        "Referer": f"{NSE_BASE}/all-reports",
+                    },
+                    timeout=(4, 12),
+                )
+                if response.status_code == 404:
+                    # Weekday exchange holidays do not have a daily snapshot.
+                    continue
+                response.raise_for_status()
+                frame = _parse_index_daily_snapshot(
+                    response.content,
+                    root,
+                    day,
+                )
+                if frame.empty:
+                    raise RuntimeError(
+                        f"no {INDEX_HISTORY_NAMES[root]} row for {day} in official snapshot"
+                    )
+                csv_path.write_bytes(response.content)
+                consecutive_errors = 0
+            except Exception as exc:
+                diagnostics.append(f"{day}: {type(exc).__name__}: {exc}")
+                consecutive_errors += 1
+                if consecutive_errors >= 5:
+                    diagnostics.append("stopped after five consecutive archive errors")
+                    break
+                continue
+
+        if not frame.empty:
+            frames.append(frame)
+            consecutive_errors = 0
+
+    if not frames:
+        detail = "; ".join(diagnostics[-5:]) or "no official daily snapshot files found"
+        raise RuntimeError(
+            f"Official NSE Daily Snapshot fallback returned no usable "
+            f"{INDEX_HISTORY_NAMES[root]} rows for {start_d}..{end_d}; {detail}"
+        )
+
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+    dates = pd.to_datetime(combined["date"], errors="coerce").dropna()
+    span_days = max(1, (end_d - start_d).days)
+    minimum_rows = (
+        max(30, int((span_days * 5 / 7) * 0.50))
+        if span_days >= 90
+        else 1
+    )
+    if (
+        dates.empty
+        or dates.min().date() > start_d + timedelta(days=10)
+        or dates.max().date() < end_d
+        or len(dates) < minimum_rows
+    ):
+        detail = "; ".join(diagnostics[-5:]) or "archive did not cover the requested range"
+        actual = (
+            f"{dates.min().date()}..{dates.max().date()}"
+            if not dates.empty
+            else "no dates"
+        )
+        raise RuntimeError(
+            f"Official NSE Daily Snapshot coverage incomplete for "
+            f"{INDEX_HISTORY_NAMES[root]}: requested={start_d}..{end_d}, "
+            f"actual={actual}, rows={len(dates)}, required_rows={minimum_rows}; "
+            f"{detail}"
+        )
+
+    folder = root.replace("^", "").replace("/", "_")
+    cache_dir = INDEX_NORMALIZED_ROOT / folder
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{start_d:%Y%m%d}_{end_d:%Y%m%d}.parquet"
+    combined.to_parquet(cache_path, index=False)
+
+    if sync_drive:
+        remote_path = (
+            f"production_data/nse_official/indices/{folder}/{cache_path.name}"
+        )
+        result = _drive_upload(
+            cache_path,
+            remote_path,
+            "application/octet-stream",
+        )
+        if not isinstance(result, dict) or result.get("status") != "OK":
+            detail = (
+                result.get("error")
+                if isinstance(result, dict)
+                else repr(result)
+            )
+            raise RuntimeError(
+                f"Official NSE index history was recovered but Google Drive "
+                f"persistence failed for {root} {start_d}..{end_d}: {detail}"
+            )
+
+    print(
+        f"OFFICIAL INDEX FALLBACK: source=NSE_DAILY_SNAPSHOT "
+        f"symbol={root} rows={len(combined)} "
+        f"date_range={dates.min().date()}..{dates.max().date()}",
+        flush=True,
+    )
+    return combined
+
+
 def fetch_index_history(
     index_symbol: str,
     start: date | datetime,
@@ -925,7 +1211,32 @@ def fetch_index_history(
         except Exception:
             pass
 
-        raise api_exc
+        # 4) NSE's official Daily Snapshot CSV archive is an independent
+        # first-party source for daily index OHLC when the JSON API is blocked
+        # or returns an HTML/non-JSON anti-bot response.
+        snapshot_exc = None
+        try:
+            snapshot_frame = _fetch_index_history_from_daily_snapshots(
+                root,
+                start_d,
+                end_d,
+                sync_drive=sync_drive,
+            )
+            if _drive_coverage_ok(snapshot_frame):
+                return snapshot_frame
+            snapshot_exc = RuntimeError(
+                f"Official NSE Daily Snapshot frame did not cover {start_d}..{end_d}"
+            )
+        except Exception as exc:
+            snapshot_exc = exc
+
+        raise RuntimeError(
+            f"NSE index history unavailable for {INDEX_HISTORY_NAMES[root]} "
+            f"{start_d}..{end_d}. Historical API failure: "
+            f"{type(api_exc).__name__}: {api_exc}. Official Daily Snapshot "
+            f"fallback failure: {type(snapshot_exc).__name__}: {snapshot_exc}. "
+            f"Last NSE diagnostic: {nse_last_diagnostic()}"
+        ) from api_exc
 
 
 
