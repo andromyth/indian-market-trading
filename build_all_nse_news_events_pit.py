@@ -378,7 +378,30 @@ def main():
         "pit_rule": "NSE broadcast/announcement or corporate-action availability timestamp; backward PIT merge",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    (cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_path = cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Colab writes directly to the mounted Drive. In GitHub Actions, persist
+    # the validated files via the configured Drive connector so the downstream
+    # Delivery refresh consumes the same source files instead of ephemeral CI files.
+    if not str(root).startswith("/content/drive/MyDrive/"):
+        from persistent_store import GoogleDriveStore
+        store = GoogleDriveStore()
+        store.upload_or_update(
+            news_out,
+            "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
+            mime_type="application/octet-stream",
+        )
+        store.upload_or_update(
+            event_out,
+            "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+            mime_type="application/octet-stream",
+        )
+        store.upload_or_update(
+            manifest_path,
+            "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
+            mime_type="application/json",
+        )
     print(json.dumps(manifest, indent=2), flush=True)
 
 
