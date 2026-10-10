@@ -29,6 +29,8 @@ FUND_PARSER_VERSION="2026-10-10-context-coverage-v4"
 FUND_CATALOG_CACHE=BASE/"corporate/nse_integrated_filing_catalog_2025_2026.json"
 FUND_BROAD=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
 FUND_BROAD_META=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.meta.json"
+FUND_AVAILABILITY=BASE/"corporate/pit_fundamental_availability_2025_2026.parquet"
+FUND_AVAILABILITY_META=BASE/"corporate/pit_fundamental_availability_2025_2026.meta.json"
 FUND_FILING_CACHE=BASE/"corporate/pit_fundamentals_filing_cache_2025_2026_v4.parquet"
 FUND_CACHE=BASE/"corporate/xbrl_cache/all_nse_2025_2026"
 CANDIDATE_META_NAME="CANDIDATE_BUILD_META_2026.json"
@@ -88,13 +90,14 @@ def _catalog_all(force_refresh=False):
             same_window=meta.get("from_date")==from_date and meta.get("to_date")==to_date
             fetched=datetime.fromisoformat(meta["fetched_at"]).replace(tzinfo=timezone.utc) if meta.get("fetched_at") else None
             fresh=fetched is not None and (datetime.now(timezone.utc)-fetched).total_seconds() < 24*3600
-            if same_window and fresh and isinstance(cached.get("data"),list):
+            if same_window and fresh and meta.get("coverage_complete") is True and isinstance(cached.get("data"),list):
                 print(f"fundamental catalog cache reused rows={len(cached['data']):,}", flush=True)
                 return cached["data"]
         except Exception:
             pass
 
     s=_fund_session(); out=[]; size=500
+    pagination_complete = False
     for page in range(1,401):
         params={"type":"Integrated Filing- Financials","index":"equities","from_date":from_date,"to_date":to_date,"page":page,"size":size}
         last=None
@@ -112,20 +115,28 @@ def _catalog_all(force_refresh=False):
         if last:
             raise last
         if not batch:
+            pagination_complete = True
             break
         out.extend(batch)
         if page%20==0:
             print(f"fundamental catalog pages={page} rows={len(out):,}", flush=True)
         if len(batch)<size:
+            pagination_complete = True
             break
+    if not pagination_complete:
+        raise RuntimeError("NSE integrated-filing catalog did not reach a verified terminal page; refusing to mark coverage complete.")
 
     FUND_CATALOG_CACHE.parent.mkdir(parents=True,exist_ok=True)
     from datetime import datetime, timezone
     FUND_CATALOG_CACHE.write_text(json.dumps({
         "meta":{
-            "cache_version":"1",
+            "cache_version":"2",
             "from_date":from_date,
             "to_date":to_date,
+            "coverage_start":"2025-01-01",
+            "coverage_end":today.isoformat(),
+            "coverage_complete":True,
+            "pagination_complete":True,
             "fetched_at":datetime.now(timezone.utc).isoformat(),
             "rows":len(out),
         },
