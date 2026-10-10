@@ -1063,31 +1063,61 @@ def add_targets(panel,steps,name):
     x[f"target_up_{name}"]=(x[f"target_return_{name}"]>0).astype(int)
     return x.dropna(subset=[f"target_return_{name}"])
 
-def fit_models(frame,horizon):
-    cutoff=frame["decision_timestamp"].max()-pd.Timedelta(days=60); tr=frame[frame["decision_timestamp"]<cutoff]; te=frame[frame["decision_timestamp"]>=cutoff]
-    if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique()<2: raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
-    Xtr=tr[FEATURES_59].apply(pd.to_numeric,errors="coerce").replace([np.inf,-np.inf],np.nan)
-    Xte=te[FEATURES_59].apply(pd.to_numeric,errors="coerce").replace([np.inf,-np.inf],np.nan)
-    yreg=tr[f"target_return_{horizon}"].replace([np.inf,-np.inf],np.nan)
-    good=yreg.notna()
-    Xtr=Xtr.loc[good]
-    yreg=yreg.loc[good]
-    yclf=tr.loc[good,f"target_up_{horizon}"].astype(int)
-    if Xtr.empty or yclf.nunique()<2:
+def fit_models(frame, horizon):
+    cutoff = frame["decision_timestamp"].max() - pd.Timedelta(days=60)
+    tr = frame[frame["decision_timestamp"] < cutoff]
+    te = frame[frame["decision_timestamp"] >= cutoff]
+    if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique() < 2:
+        raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
+
+    Xtr = tr[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    Xte = te[FEATURES_59].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    yreg = tr[f"target_return_{horizon}"].replace([np.inf, -np.inf], np.nan)
+    good = yreg.notna()
+    Xtr = Xtr.loc[good]
+    yreg = yreg.loc[good]
+    yclf = tr.loc[good, f"target_up_{horizon}"].astype(int)
+    if Xtr.empty or yclf.nunique() < 2:
         raise RuntimeError(f"{horizon}: finite training set is insufficient after non-finite-value cleanup")
-    clf=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("scale",StandardScaler(with_mean=False)),("model",LogisticRegression(C=.5,class_weight="balanced",solver="lbfgs",max_iter=2500,random_state=42))])
-    reg=Pipeline([("imputer",SimpleImputer(strategy="median",add_indicator=True,keep_empty_features=True)),("model",HistGradientBoostingRegressor(max_iter=180,learning_rate=.04,max_leaf_nodes=19,l2_regularization=2.0,random_state=42))])
-    clf.fit(Xtr,tr[f"target_up_{horizon}"].astype(int))
-    reg.fit(Xtr,tr[f"target_return_{horizon}"].astype(float))
-    for fitted in (clf,reg):
-        imp=fitted.named_steps.get("imputer")
-        learned=int(getattr(imp,"n_features_in_",0)) if imp is not None else 0
-        if not learned and imp is not None and getattr(imp,"statistics_",None) is not None:
-            learned=int(len(imp.statistics_))
-        if learned!=len(FEATURES_59):
+
+    # Prevent a nominal 59-column model where one or more inputs were never
+    # observed in training and therefore cannot contribute a learned signal.
+    coverage = assert_training_feature_coverage(
+        Xtr, FEATURES_59, min_observations=100, min_fraction=0.005
+    )
+    clf = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
+        ("scale", StandardScaler(with_mean=False)),
+        ("model", LogisticRegression(C=.5, class_weight="balanced", solver="lbfgs", max_iter=2500, random_state=42)),
+    ])
+    reg = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
+        ("model", HistGradientBoostingRegressor(max_iter=180, learning_rate=.04, max_leaf_nodes=19, l2_regularization=2.0, random_state=42)),
+    ])
+    # Fit both targets on the exact same clean-label rows.
+    clf.fit(Xtr, yclf)
+    reg.fit(Xtr, yreg.astype(float))
+    for fitted in (clf, reg):
+        imp = fitted.named_steps.get("imputer")
+        learned = int(getattr(imp, "n_features_in_", 0)) if imp is not None else 0
+        if not learned and imp is not None and getattr(imp, "statistics_", None) is not None:
+            learned = int(len(imp.statistics_))
+        if learned != len(FEATURES_59):
             raise RuntimeError(f"{horizon}: fitted model contract has {learned} original features; expected {len(FEATURES_59)}")
-    p=clf.predict_proba(Xte)[:,1]; pr=reg.predict(Xte); y=te[f"target_up_{horizon}"].to_numpy()
-    return clf,reg,{"train_rows":int(len(tr)),"holdout_rows":int(len(te)),"holdout_accuracy":float(np.mean((p>=.5)==y)),"mean_abs_return_error":float(np.mean(np.abs(pr-te[f"target_return_{horizon}"].to_numpy()))),"holdout_mean_readiness_pct":float(te["data_readiness_score"].mean()*100)}
+
+    p = clf.predict_proba(Xte)[:, 1]
+    pr = reg.predict(Xte)
+    y = te[f"target_up_{horizon}"].to_numpy()
+    return clf, reg, {
+        "train_rows": int(len(Xtr)),
+        "holdout_rows": int(len(te)),
+        "holdout_accuracy": float(np.mean((p >= .5) == y)),
+        "mean_abs_return_error": float(np.mean(np.abs(pr - te[f"target_return_{horizon}"].to_numpy()))),
+        "holdout_mean_readiness_pct": float(te["data_readiness_score"].mean() * 100),
+        "training_feature_coverage_mean_pct": coverage["mean_non_missing_pct"],
+        "training_feature_coverage_gate": "PASS",
+        "training_feature_coverage_minimum_rows": coverage["minimum_observations_required"],
+    }
 
 def _candidate_input_signature(cash_master,bulk,trainable,fund_report):
     optional=[
@@ -1100,6 +1130,7 @@ def _candidate_input_signature(cash_master,bulk,trainable,fund_report):
         "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
         "feature_contract_hash":hashlib.sha256(json.dumps(FEATURES_59,separators=(",",":")).encode()).hexdigest(),
         "feature_count":len(FEATURES_59),
+        "training_feature_coverage_gate":"v1-min-100-and-0.5pct",
         "cash_master":str(cash_master),
         "cash_master_size":int(cash_master.stat().st_size) if cash_master.exists() else 0,
         "cash_master_mtime_ns":int(cash_master.stat().st_mtime_ns) if cash_master.exists() else 0,
@@ -1222,9 +1253,26 @@ def main():
             pass
 
     panel,audit=merge_optional(make_panel(bulk,trainable,delivery=delivery))
+    source_coverage = feature_coverage_report(panel)
+    print(
+        "59-feature data coverage: "
+        f"mean_non_missing={source_coverage['mean_non_missing_pct']:.3f}% "
+        f"zero_coverage={source_coverage['features_with_zero_observations']} "
+        f"missing_columns={source_coverage['features_missing_as_columns']}",
+        flush=True,
+    )
     (out/"DATA_READINESS_REPORT_2026.json").write_text(
-        json.dumps({"universe":universe,"readiness":readiness_report(panel),"optional_sources":audit},
-                   indent=2,default=str),
+        json.dumps({
+            "universe": universe,
+            "readiness": readiness_report(panel),
+            "feature_coverage": source_coverage,
+            "optional_sources": audit,
+            "feature_training_gate": {
+                "minimum_observations": 100,
+                "minimum_fraction_of_training_rows": 0.005,
+                "description": "Each of the 59 features must have enough real observations in the training fold; sparse per-security values may remain missing and be imputed, but never fabricate values.",
+            },
+        }, indent=2, default=str),
         encoding="utf-8",
     )
     panel.to_parquet(out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet",index=False)
