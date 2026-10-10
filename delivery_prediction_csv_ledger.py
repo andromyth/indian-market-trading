@@ -210,6 +210,7 @@ def project_next_session_ohlc(
         history,
     )
 
+
 def _error_pct(actual: Any, predicted: Any) -> float:
     a = _safe_float(actual)
     p = _safe_float(predicted)
