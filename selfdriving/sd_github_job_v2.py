@@ -421,7 +421,12 @@ def main() -> int:
             "status": "BLOCKED",
             "reason": "No official NSE Delivery PIT snapshot found in Drive.",
         }
-    elif expected_date is not None and not freshness_ok:
+    elif expected_date is None:
+        status["stages"]["inference"] = {
+            "status": "BLOCKED",
+            "reason": "No NSE reference session is expected now; no signal was generated.",
+        }
+    elif not freshness_ok:
         status["stages"]["inference"] = {
             "status": "BLOCKED",
             "reason": (
