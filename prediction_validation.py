@@ -22,6 +22,15 @@ class ValidationConfig:
     minimum_health_samples: int = 7
 
 
+def validation_status_for_sample_count(sample_count: int, minimum_samples: int = 7) -> str:
+    """Return PASS only when enough completed, scored outcomes exist."""
+    count = max(0, int(sample_count))
+    required = max(1, int(minimum_samples))
+    if count == 0:
+        return "NO_DATA"
+    return "PASS" if count >= required else "INSUFFICIENT_HISTORY"
+
+
 def _norm_history(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     if not isinstance(x.index, pd.DatetimeIndex):
@@ -161,8 +170,13 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
         ((x["signal"].astype(str).str.upper()=="BUY") & x["actual_direction_d1"].astype(str).str.upper().eq("UP"))
         | ((x["signal"].astype(str).str.upper()=="SELL") & x["actual_direction_d1"].astype(str).str.upper().eq("DOWN"))
     )
+    required_samples = ValidationConfig().minimum_health_samples
+    history_sufficient = len(valid_matches) >= required_samples
     return {
-        "status": "PASS" if len(x) else "NO_DATA",
+        "status": validation_status_for_sample_count(len(valid_matches), required_samples),
+        "history_sufficient": bool(history_sufficient),
+        "required_scored_predictions": int(required_samples),
+        "scored_predictions": int(len(valid_matches)),
         "completed_predictions": int(len(x)),
         "directional_accuracy_7_predictions": float(valid_matches.mean()) if len(valid_matches) else None,
         "mean_absolute_percentage_price_error": float(mae) if pd.notna(mae) else None,
