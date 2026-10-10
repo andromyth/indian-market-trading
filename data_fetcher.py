@@ -34,6 +34,17 @@ except Exception:
     DhanConfig = None
     historical_daily = historical_intraday = resolve_equity_symbol = get_access_token = None
 
+try:
+    from indstocks_client import (
+        configured as indstocks_configured,
+        historical as indstocks_historical,
+        historical_1m as indstocks_historical_1m,
+        latest_price as indstocks_latest_price,
+    )
+except Exception:
+    indstocks_configured = indstocks_historical = None
+    indstocks_historical_1m = indstocks_latest_price = None
+
 NEWS_FEEDS = [
     "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
     "https://www.moneycontrol.com/rss/marketreports.xml",
@@ -342,6 +353,18 @@ def fetch_live_intraday_1m(symbol: str, days: int = 3) -> tuple[pd.DataFrame, st
     if not ticker.endswith(".NS"):
         ticker = f"{ticker}.NS"
 
+    # INDstocks broker API is preferred for authenticated one-minute candles
+    # when configured. Public NSE/yfinance sources remain fallback paths.
+    if indstocks_configured is not None and indstocks_historical_1m is not None:
+        try:
+            if indstocks_configured():
+                broker_frame = indstocks_historical_1m(ticker, days=days)
+                broker_frame = _normalize_historical_frame(broker_frame)
+                if not broker_frame.empty:
+                    return broker_frame, "INDSTOCKS_API"
+        except Exception:
+            pass
+
     if _dhan_configured() and DhanConfig is not None and historical_intraday is not None:
         try:
             cfg = DhanConfig.from_env()
@@ -482,6 +505,27 @@ def get_historical(symbol: str, period: str = "1y", interval: str = "1d", force_
         except Exception:
             pass
 
+    if indstocks_configured is not None and indstocks_historical is not None and is_nse:
+        try:
+            if indstocks_configured():
+                days = _period_days(period)
+                end_dt = dt.datetime.now(IST)
+                if iv in {"1m", "1min", "1minute"}:
+                    days = min(days, 7)
+                elif iv in {"2m", "3m", "4m", "5m", "10m", "15m", "30m", "60m", "1h", "120m", "180m", "240m"}:
+                    days = min(days, 15 if iv in {"60m", "1h", "120m", "180m", "240m"} else 7)
+                else:
+                    days = min(days, 365)
+                broker_start = end_dt - dt.timedelta(days=max(1, days))
+                broker_frame = indstocks_historical(
+                    symbol, broker_start, end_dt, interval=iv, max_calls=2
+                )
+                broker_frame = _normalize_historical_frame(broker_frame)
+                if not broker_frame.empty:
+                    return broker_frame
+        except Exception:
+            pass
+
     if _dhan_configured() and is_nse:
         try:
             df = _dhan_history(symbol, period, interval)
@@ -520,6 +564,15 @@ def get_latest_price(symbol: str) -> float | None:
             value = quote.get("priceInfo", {}).get("lastPrice")
             if value is not None:
                 return float(value)
+        except Exception:
+            pass
+    # Use the authenticated broker quote after the official NSE quote attempt.
+    if indstocks_configured is not None and indstocks_latest_price is not None:
+        try:
+            if indstocks_configured():
+                broker_price = indstocks_latest_price(symbol)
+                if broker_price is not None:
+                    return float(broker_price)
         except Exception:
             pass
     if _dhan_configured() and str(symbol).upper().endswith(".NS"):

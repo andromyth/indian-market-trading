@@ -32,6 +32,9 @@ jobs:
           python -m py_compile
           multifactor_data_layer_v2.py
           nse_data_layer.py
+          data_fetcher.py
+          indstocks_client.py
+          indstocks_smoke_test.py
           validate_canonical_cash_research_view.py
           colab_build_all_nse_delivery_multifactor_candidate.py
           colab_run_multifactor_upgrade.py
@@ -73,6 +76,7 @@ jobs:
           tests/test_identity_preserved_cash_rebuild.py
           tests/test_canonical_cash_data_layer.py
           tests/test_selfdriving_v2.py
+          tests/test_indstocks_client.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
