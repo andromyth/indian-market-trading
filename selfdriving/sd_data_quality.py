@@ -154,6 +154,7 @@ def _coverage(frame: pd.DataFrame, cols: list[str]) -> dict:
     return {
         "feature_count": len(present),
         "row_coverage_pct": round(float(numeric.notna().any(axis=1).mean() * 100), 3),
+        "mean_feature_non_null_pct": round(float(numeric.notna().mean().mean() * 100), 3),
         "feature_coverage_pct": {
             column: round(float(numeric[column].notna().mean() * 100), 3)
             for column in present
@@ -477,7 +478,7 @@ def build_input_audit(
             "symbols": int(symbols.nunique()) if len(symbols) else 0,
             "duplicate_symbol_rows": dupes,
             "missing_locked_features": missing_features,
-            "mean_row_feature_non_null_pct": feature_coverage.get("row_coverage_pct"),
+            "mean_feature_non_null_pct": feature_coverage.get("mean_feature_non_null_pct"),
             "production_quality_gate_pct": gate_pct,
             "lowest_feature_coverage_symbols": lowest_coverage,
         },
