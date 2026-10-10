@@ -77,6 +77,7 @@ jobs:
           tests/test_canonical_cash_data_layer.py
           tests/test_selfdriving_v2.py
           tests/test_indstocks_client.py
+          tests/test_global_cues_datetime_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
 
       - name: Run deployment smoke test
