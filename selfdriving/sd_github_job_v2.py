@@ -387,6 +387,33 @@ def main() -> int:
             "error": "No PIT snapshot was available to audit or score.",
         }
 
+    active_champion_features = []
+    active_champion_status = "NO_CHAMPION"
+    active_champion_file = None
+    registry_file = registry_path / "registry.json"
+    if registry_file.exists() and registry_file.stat().st_size:
+        try:
+            registry_state = json.loads(registry_file.read_text(encoding="utf-8"))
+            champion = registry_state.get("champion") or {}
+            active_champion_file = str(champion.get("file", "")).strip() or None
+            if active_champion_file:
+                bundle_path = registry_path / active_champion_file
+                if not bundle_path.exists() or not bundle_path.stat().st_size:
+                    active_champion_status = "MISSING_BUNDLE"
+                else:
+                    import joblib
+                    bundle = joblib.load(bundle_path)
+                    active_champion_features = list(getattr(bundle, "features", []) or [])
+                    active_champion_status = "READY" if active_champion_features else "EMPTY_FEATURE_CONTRACT"
+            else:
+                active_champion_status = "NO_CHAMPION"
+        except Exception as exc:
+            active_champion_status = f"LOAD_ERROR:{type(exc).__name__}"
+            status["stages"]["active_model_contract"] = {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     try:
         audit_report = build_input_audit(
             pit,
@@ -402,6 +429,9 @@ def main() -> int:
                 "global_refresh": status["stages"].get("global_cues", {}),
                 "news_refresh": status["stages"].get("news", {}),
             },
+            active_champion_features=active_champion_features,
+            active_champion_status=active_champion_status,
+            active_champion_file=active_champion_file,
         )
         audit_status = "ERROR" if audit_report["hard_failures"] else (
             "WARN" if audit_report["warnings"] else "PASS"
