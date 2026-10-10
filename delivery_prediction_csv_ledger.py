@@ -37,6 +37,15 @@ def _safe_float(value: Any) -> float:
         return np.nan
 
 
+def load_eod_history() -> pd.DataFrame:
+    """Load the local NSE EOD archive once for batch prediction callers.
+
+    Batch callers should load this once per process and reuse the result,
+    rather than rescanning/re-reading every daily Parquet file for each symbol.
+    """
+    return _load_eod()
+
+
 def _load_eod() -> pd.DataFrame:
     parts: list[pd.DataFrame] = []
     rx = re.compile(r"BhavCopy_NSE_CM_0_0_0_(\d{8})_F_0000\.parquet$", re.I)
@@ -185,19 +194,22 @@ def project_next_session_ohlc(
     reference_date: str,
     reference_close: Any,
     predicted_close: Any,
+    eod_history: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Public wrapper used by the Delivery prediction cycle and CSV ledger.
 
     It uses the same statistical OHLC methodology as the Streamlit Delivery
     display, based only on completed sessions before the reference date.
     """
+    history = _load_eod() if eod_history is None else eod_history
     return _project_ohlc(
         symbol,
         reference_date,
         reference_close,
         predicted_close,
-        _load_eod(),
+        history,
     )
+
 
 def _error_pct(actual: Any, predicted: Any) -> float:
     a = _safe_float(actual)

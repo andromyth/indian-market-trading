@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from all_nse_delivery_model import _load_models, _signal_policy, _safe_float
-from delivery_prediction_csv_ledger import project_next_session_ohlc
+from delivery_prediction_csv_ledger import load_eod_history, project_next_session_ohlc
 from prediction_ledger import append_predictions
 
 
@@ -160,6 +160,18 @@ def main() -> int:
     trainable_count = int(manifest.get("trainable_symbol_count", len(x)))
     excluded_count = int(manifest.get("excluded_symbol_count", max(0, universe_count - trainable_count)))
 
+    # Read the daily EOD archive only once. Re-reading and concatenating all
+    # Parquet files for every symbol made this step scale as symbols x files.
+    ohlc_history = load_eod_history()
+    if not ohlc_history.empty and "symbol" in ohlc_history.columns:
+        ohlc_history_by_symbol = {
+            str(symbol).strip().upper(): history
+            for symbol, history in ohlc_history.groupby("symbol", sort=False)
+        }
+    else:
+        ohlc_history_by_symbol = {}
+    empty_ohlc_history = ohlc_history.iloc[0:0]
+
     records: list[dict[str, Any]] = []
     for i, row in x.iterrows():
         symbol = str(row["symbol"])
@@ -236,11 +248,15 @@ def main() -> int:
         records[-1]["predicted_high"] = np.nan
         records[-1]["predicted_low"] = np.nan
         records[-1]["ohlc_prediction_method"] = ""
+        symbol_history = ohlc_history_by_symbol.get(
+            symbol.strip().upper(), empty_ohlc_history
+        )
         ohlc = project_next_session_ohlc(
             symbol,
             snapshot_date,
             row.get("close", np.nan),
             records[-1]["predicted_price_next_session"],
+            eod_history=symbol_history,
         )
         if ohlc.get("status") == "PASS":
             records[-1]["predicted_open"] = _safe_float(ohlc.get("predicted_open"))
