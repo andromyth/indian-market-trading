@@ -1714,7 +1714,8 @@ def _prepare_training_sample(
     if max_training_rows < 1000:
         raise ValueError("--max-training-rows must be at least 1000.")
     sample_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_dir = Path("/content") / f"indian_market_duckdb_tmp_{horizon}"
+    import tempfile
+    temp_dir = Path(tempfile.gettempdir()) / f"indian_market_duckdb_tmp_{horizon}"
     temp_dir.mkdir(parents=True, exist_ok=True)
     panel_sql = _sql_string(panel_path)
     temp_sql = _sql_string(temp_dir)
