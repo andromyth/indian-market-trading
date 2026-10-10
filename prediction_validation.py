@@ -22,6 +22,15 @@ class ValidationConfig:
     minimum_health_samples: int = 7
 
 
+def validation_status_for_sample_count(sample_count: int, minimum_samples: int = 7) -> str:
+    """Return PASS only when enough completed, scored outcomes exist."""
+    count = max(0, int(sample_count))
+    required = max(1, int(minimum_samples))
+    if count == 0:
+        return "NO_DATA"
+    return "PASS" if count >= required else "INSUFFICIENT_HISTORY"
+
+
 def _norm_history(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     if not isinstance(x.index, pd.DatetimeIndex):
@@ -164,7 +173,7 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
     required_samples = ValidationConfig().minimum_health_samples
     history_sufficient = len(valid_matches) >= required_samples
     return {
-        "status": "PASS" if history_sufficient else "INSUFFICIENT_HISTORY",
+        "status": validation_status_for_sample_count(len(valid_matches), required_samples),
         "history_sufficient": bool(history_sufficient),
         "required_scored_predictions": int(required_samples),
         "scored_predictions": int(len(valid_matches)),
