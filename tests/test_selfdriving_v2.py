@@ -9,6 +9,7 @@ from selfdriving.sd_intraday_v2 import (
 )
 from selfdriving.sd_registry import GateRules, gate
 from selfdriving.sd_v2_panel import add_delivery_targets
+from selfdriving.sd_github_job_v2 import _update_forecast_ledger
 
 
 def test_beta_v2_delivery_target_uses_next_observed_session():
@@ -93,3 +94,57 @@ def test_beta_v2_gate_requires_valid_champion_pair():
     )
     assert decision["promote"] is False
     assert any("paired comparison" in x for x in decision["reasons"])
+
+
+
+def test_delivery_forecast_revision_replaces_current_and_archives_prior(tmp_path):
+    from datetime import date
+
+    ledger = tmp_path / "predictions.parquet"
+    history = tmp_path / "predictions_history.parquet"
+    inference = pd.DataFrame({"symbol": ["ABC"], "feature_x": [1.0]})
+    first_prediction = pd.DataFrame([{
+        "symbol": "ABC",
+        "date": pd.Timestamp("2026-10-09"),
+        "p": 0.70,
+        "signal": "BUY",
+        "model_file": "champion.joblib",
+        "feature_coverage": 1.0,
+    }])
+
+    current, first_status = _update_forecast_ledger(
+        first_prediction, inference, ["feature_x"], ledger, history, date(2026, 10, 12)
+    )
+    assert len(current) == 1
+    assert current.iloc[0]["signal"] == "BUY"
+    assert first_status["new_or_revised_forecasts"] == 1
+    assert first_status["unchanged_forecasts"] == 0
+    assert not history.exists() or pd.read_parquet(history).empty
+
+    # Same features and score are idempotent: no duplicate forecast and no
+    # additional scored sample is created by an identical scheduled rerun.
+    current, repeat_status = _update_forecast_ledger(
+        first_prediction, inference, ["feature_x"], ledger, history, date(2026, 10, 12)
+    )
+    assert len(current) == 1
+    assert repeat_status["unchanged_forecasts"] == 1
+    assert repeat_status["superseded_versions_archived"] == 0
+    assert not history.exists() or pd.read_parquet(history).empty
+
+    # A new input fingerprint and changed model output supersede, rather than
+    # erase or double-count, the earlier issued recommendation.
+    changed_inference = pd.DataFrame({"symbol": ["ABC"], "feature_x": [2.0]})
+    revised_prediction = first_prediction.copy()
+    revised_prediction.loc[0, "p"] = 0.52
+    revised_prediction.loc[0, "signal"] = "HOLD"
+    current, revised_status = _update_forecast_ledger(
+        revised_prediction, changed_inference, ["feature_x"], ledger, history, date(2026, 10, 12)
+    )
+    assert len(current) == 1
+    assert current.iloc[0]["signal"] == "HOLD"
+    assert revised_status["new_or_revised_forecasts"] == 1
+    assert revised_status["superseded_versions_archived"] == 1
+    prior = pd.read_parquet(history)
+    assert len(prior) == 1
+    assert prior.iloc[0]["signal"] == "BUY"
+    assert prior.iloc[0]["revision_status"] == "SUPERSEDED"

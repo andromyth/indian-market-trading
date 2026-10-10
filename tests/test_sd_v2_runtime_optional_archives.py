@@ -79,3 +79,31 @@ def test_optional_parquet_does_not_hide_drive_transport_errors(monkeypatch, tmp_
         assert "Drive permission or transport failure" in str(exc)
     else:
         raise AssertionError("Transport failures must not be silently treated as missing optional data")
+
+def test_runtime_cache_is_reused_only_for_matching_drive_version(tmp_path):
+    local = tmp_path / "global_cues.parquet"
+    local.write_bytes(b"validated-parquet-bytes")
+    metadata = {
+        "id": "file-1",
+        "name": "global_cues.parquet",
+        "mimeType": "application/octet-stream",
+        "size": str(local.stat().st_size),
+        "modifiedTime": "2026-10-10T10:00:00.000Z",
+        "md5Checksum": "checksum-1",
+    }
+
+    # Without a sidecar, existing local bytes cannot be assumed fresh.
+    assert runtime._cache_matches_remote(local, metadata) is False
+
+    runtime._cache_metadata_path(local).write_text(
+        __import__("json").dumps(runtime._remote_signature(metadata)),
+        encoding="utf-8",
+    )
+    assert runtime._cache_matches_remote(local, metadata) is True
+
+    changed_version = {**metadata, "modifiedTime": "2026-10-10T10:05:00.000Z"}
+    assert runtime._cache_matches_remote(local, changed_version) is False
+
+    changed_size = {**metadata, "size": str(local.stat().st_size + 1)}
+    assert runtime._cache_matches_remote(local, changed_size) is False
+

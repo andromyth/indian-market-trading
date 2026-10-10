@@ -796,6 +796,8 @@ if interface_mode == "Live Test":
                     if pd.notna(coverage) else "—"
                 ),
                 "Reference date": str(result.get("date") or "—"),
+                "Target session": str(result.get("target_session_date") or "—"),
+                "Forecast as-of (UTC)": str(result.get("forecast_as_of_utc") or "—"),
                 "Model": str(result.get("model_file") or "—"),
                 "Reason": str(
                     result.get("signal_reason")
@@ -824,6 +826,23 @@ if interface_mode == "Live Test":
                 width="stretch",
                 hide_index=True,
             )
+            dated_results = [
+                result for result in beta_delivery_results.values()
+                if str(result.get("prediction_status", "")).upper() == "PASS"
+            ]
+            if dated_results:
+                current = dated_results[0]
+                cutoff = current.get("feature_cutoff_timestamp")
+                st.caption(
+                    "Forecast target: "
+                    + str(current.get("target_session_date") or "not resolved")
+                    + " · recalculated at "
+                    + str(current.get("forecast_as_of_utc") or "unknown UTC time")
+                    + " · model information cutoff: "
+                    + str(cutoff or "not available")
+                    + ". The current model remains point-in-time: newer post-cutoff news/global inputs "
+                    "require a separately trained and validated pre-open feature contract before they can affect its signal."
+                )
 
         if beta_delivery_errors:
             with st.expander("Beta V2 Delivery runtime errors", expanded=True):

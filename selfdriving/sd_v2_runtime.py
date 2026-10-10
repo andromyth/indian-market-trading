@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,36 +34,108 @@ def _drive():
     return GoogleDriveStore()
 
 
-def _download(remote: str, local: Path) -> None:
-    from googleapiclient.http import MediaIoBaseDownload
+def _remote_signature(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Stable Drive file identity used to detect source updates without redownloading it."""
+    return {
+        key: metadata.get(key)
+        for key in ("id", "name", "mimeType", "size", "modifiedTime", "md5Checksum")
+    }
 
+
+def _cache_metadata_path(local: Path) -> Path:
+    return local.with_name(local.name + ".drive-meta.json")
+
+
+def _cache_matches_remote(local: Path, metadata: dict[str, Any]) -> bool:
+    """Return True only when the local bytes are known to match this Drive version."""
+    if not local.exists() or local.stat().st_size == 0:
+        return False
+    try:
+        saved = json.loads(_cache_metadata_path(local).read_text(encoding="utf-8"))
+        if saved != _remote_signature(metadata):
+            return False
+        remote_size = metadata.get("size")
+        return remote_size is None or int(remote_size) == local.stat().st_size
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _resolve_remote_file(remote: str):
     store = _drive()
-    parts = remote.strip("/").split("/")
+    parts = [part for part in remote.strip("/").split("/") if part]
+    if not parts:
+        raise FileNotFoundError(remote)
     parent = store.root_id
+    folder_mime = "application/vnd.google-apps.folder"
     for part in parts[:-1]:
-        hit = store._find_child(parent, part)
+        hit = store._find_child(parent, part, folder_mime)
         if not hit:
             raise FileNotFoundError(remote)
         parent = hit["id"]
     hit = store._find_child(parent, parts[-1])
     if not hit:
         raise FileNotFoundError(remote)
+    metadata = store.service.files().get(
+        fileId=hit["id"],
+        fields="id,name,mimeType,size,modifiedTime,md5Checksum",
+    ).execute()
+    return store, metadata
+
+
+def _download(remote: str, local: Path) -> None:
+    """Refresh a Drive-backed cache when the remote file version has changed.
+
+    Mutable data archives and same-named PIT snapshots are checked on every
+    inference request. An unchanged remote file costs only a metadata lookup;
+    changed bytes are downloaded to a temporary file and atomically replaced.
+    A missing or unreachable remote source is never silently replaced by stale
+    local data.
+    """
+    store, metadata = _resolve_remote_file(remote)
+    if _cache_matches_remote(local, metadata):
+        return
+
+    from googleapiclient.http import MediaIoBaseDownload
 
     local.parent.mkdir(parents=True, exist_ok=True)
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(
-        buf,
-        store.service.files().get_media(fileId=hit["id"]),
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=local.name + ".", suffix=".tmp", dir=str(local.parent)
     )
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    local.write_bytes(buf.getvalue())
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            downloader = MediaIoBaseDownload(
+                fh,
+                store.service.files().get_media(fileId=metadata["id"]),
+            )
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        if Path(temporary_name).stat().st_size == 0:
+            raise RuntimeError(f"Drive source downloaded as an empty file: {remote}")
+        os.replace(temporary_name, local)
+
+        sidecar = _cache_metadata_path(local)
+        sidecar_fd, sidecar_tmp = tempfile.mkstemp(
+            prefix=sidecar.name + ".", suffix=".tmp", dir=str(sidecar.parent)
+        )
+        try:
+            with os.fdopen(sidecar_fd, "w", encoding="utf-8") as fh:
+                json.dump(_remote_signature(metadata), fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(sidecar_tmp, sidecar)
+        finally:
+            if os.path.exists(sidecar_tmp):
+                os.unlink(sidecar_tmp)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def _ensure(remote: str, local: Path) -> Path:
-    if not local.exists() or local.stat().st_size == 0:
-        _download(remote, local)
+    # Metadata is rechecked even when local bytes exist. This is critical for
+    # current PIT snapshots, the model registry and mutable global/news/F&O files.
+    _download(remote, local)
     return local
 
 
@@ -68,23 +143,19 @@ def _load_optional_parquet(
     remotes: tuple[str, ...],
     local: Path,
 ) -> tuple[pd.DataFrame, str]:
-    """Load an optional Drive-backed parquet with legacy-path fallback.
+    """Load the newest available Drive version, with legacy-path fallback.
 
-    Returns the loaded frame and a provenance label. A genuinely absent optional
-    archive becomes an empty frame so the feature builder can flag NO_DATA;
-    authentication, transport, and corrupt-file errors still propagate.
+    A missing optional archive becomes NO_DATA. Permission, transport, and
+    corrupt-file errors still propagate rather than being hidden as missing.
     """
-    if local.exists() and local.stat().st_size > 0:
-        return pd.read_parquet(local), "LOCAL_CACHE"
-
     for remote in remotes:
         try:
             _download(remote, local)
-            if local.exists() and local.stat().st_size > 0:
-                return pd.read_parquet(local), remote
+            if not local.exists() or local.stat().st_size == 0:
+                raise RuntimeError(f"Drive source is empty after download: {remote}")
+            return pd.read_parquet(local), remote
         except FileNotFoundError:
             continue
-
     return pd.DataFrame(), "MISSING"
 
 
@@ -271,18 +342,9 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
 
     latest = files[0]
     pit_local = CACHE / str(latest["name"])
-    if not pit_local.exists():
-        from googleapiclient.http import MediaIoBaseDownload
-        pit_local.parent.mkdir(parents=True, exist_ok=True)
-        with pit_local.open("wb") as fh:
-            dl = MediaIoBaseDownload(
-                fh,
-                store.service.files().get_media(fileId=latest["id"]),
-            )
-            done = False
-            while not done:
-                _, done = dl.next_chunk()
-
+    # A same-named PIT file may be repaired/rebuilt for the same reference date.
+    # Check its Drive version instead of trusting the existence of local bytes.
+    _download(f"features/daily/{latest['name']}", pit_local)
     pit = pd.read_parquet(pit_local)
     global_source = "PROVIDED"
     news_source = "PROVIDED"
@@ -335,6 +397,25 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
     pred = predict_stage(inference, registry_root)
     row = pred.iloc[0].to_dict()
     row["prediction_status"] = "PASS"
+
+    # Expose the target, actual calculation time, and model input cutoff.
+    # The existing champion was trained on prior-session point-in-time rows,
+    # so current post-close news/global data is not backfilled into that row.
+    reference = pd.to_datetime(row.get("date"), errors="coerce")
+    if pd.notna(reference):
+        from .sd_data_quality import next_nse_session
+        next_session = next_nse_session(reference.date())
+        row["target_session_date"] = (
+            next_session.isoformat() if next_session is not None else None
+        )
+    else:
+        row["target_session_date"] = None
+    row["forecast_as_of_utc"] = datetime.now(timezone.utc).isoformat()
+    cutoff = inference.iloc[0].get("decision_timestamp")
+    row["feature_cutoff_timestamp"] = (
+        pd.Timestamp(cutoff).isoformat() if cutoff is not None and not pd.isna(cutoff) else None
+    )
+
     audit["global_source"] = global_source
     audit["news_source"] = news_source
     row["beta_v2_audit"] = audit
