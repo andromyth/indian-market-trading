@@ -298,7 +298,7 @@ def main():
     panel["production_data_quality_score"]=panel[readiness_cols].apply(pd.to_numeric,errors="coerce").notna().sum(axis=1)/len(readiness_cols)
     panel["production_feature_coverage"] = panel[FEATURES_59].apply(
         pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], pd.NA).notna().mean(axis=1)
+    ).replace([float("inf"), float("-inf")], float("nan")).notna().mean(axis=1)
     panel["production_feature_non_missing_count"] = panel[FEATURES_59].apply(
         pd.to_numeric, errors="coerce"
     ).replace([float("inf"), float("-inf")], pd.NA).notna().sum(axis=1)
