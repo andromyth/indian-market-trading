@@ -32,6 +32,7 @@ jobs:
           python -m py_compile
           multifactor_data_layer_v2.py
           nse_data_layer.py
+          nse_bulk_eod_ingest.py
           data_fetcher.py
           indstocks_client.py
           indstocks_smoke_test.py
@@ -83,6 +84,7 @@ jobs:
           tests/test_global_cues_datetime_precision.py
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
+          tests/test_nse_eod_archive_presence.py
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py
 

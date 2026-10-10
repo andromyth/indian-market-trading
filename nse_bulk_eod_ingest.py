@@ -52,6 +52,7 @@ NSE_EQUITY_HOLIDAYS_BY_YEAR = {
 }
 
 DATE_RE = re.compile(r"(20\d{6})", re.I)
+EOD_PARQUET_RE = re.compile(r"^BhavCopy_NSE_CM_0_0_0_(\d{8})_F_0000\.parquet$", re.I)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ARCHIVE_FOLDER_PATHS = (
     "production_data/nse_official/bulk_eod",
@@ -216,19 +217,22 @@ def _collect_dates_under_folder(
         for item in children:
             name = str(item.get("name") or "")
             if item.get("mimeType") == FOLDER_MIME:
+                # A date-named folder is only a container, not proof that its
+                # canonical parquet archive exists. Always inspect its contents.
                 next_ancestors = ancestors + [name]
-                folder_date = _date_from_text(name) or _date_from_path_parts(next_ancestors)
-                if folder_date:
-                    found.add(folder_date)
-                    # A dated folder already proves the archive date. Do not
-                    # recursively enumerate all files beneath that date.
-                    continue
                 queue.append((item["id"], next_ancestors, depth + 1))
                 continue
 
-            item_date = _date_from_text(name) or _date_from_path_parts(ancestors)
-            if item_date:
-                found.add(item_date)
+            # Count only the exact persisted parquet filename checked by the
+            # production freshness gate. A dated folder or ZIP alone is not
+            # enough to claim the EOD session is ready.
+            match = EOD_PARQUET_RE.fullmatch(name)
+            if not match:
+                continue
+            try:
+                found.add(datetime.strptime(match.group(1), "%Y%m%d").date())
+            except ValueError:
+                continue
 
         if api_calls % 25 == 0:
             print(
@@ -326,7 +330,7 @@ def _remote_bhavcopy_dates(store: GoogleDriveStore) -> set[date]:
             for item in resp.get("files", []):
                 if item.get("mimeType") == FOLDER_MIME:
                     continue
-                match = DATE_RE.search(str(item.get("name") or ""))
+                match = EOD_PARQUET_RE.fullmatch(str(item.get("name") or ""))
                 if not match:
                     continue
                 try:
