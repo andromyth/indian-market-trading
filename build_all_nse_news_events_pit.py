@@ -228,7 +228,7 @@ def build_layers(ann_rows, action_rows, universe: set[str], start: date, end: da
         if not sym or sym not in universe:
             continue
         text = text_of(r)
-        ts = parse_ts(pick(r, "broadcastDate", "BROADCAST_DATE", "broadcastDateTime", "BROADCAST_DATE_TIME", "an_dt", "date"), start)
+        ts = parse_ts(pick(r, "broadcastDate", "BROADCAST_DATE", "broadcastDateTime", "BROADCAST_DATE_TIME", "an_dt", "date"), None)
         if pd.isna(ts):
             continue
         subject = str(pick(r, "subject", "SUBJECT", "desc", "DESCRIPTION", "eventDescription", "EVENT_DESCRIPTION") or "").strip()
