@@ -94,3 +94,84 @@ def test_training_sample_labels_before_sampling_and_preserves_holdout(tmp_path):
     assert stats["deterministic_history_sample"] > 0
     assert stats["sample_rows_total"] < stats["labelled_population_rows"]
     assert stats["sampling_policy"].startswith("all 60-day holdout rows")
+
+
+def test_fundamental_catalog_logs_pages_and_writes_complete_cache(tmp_path, monkeypatch, capsys):
+    cache_path = tmp_path / "catalog.json"
+    monkeypatch.setattr(candidate, "FUND_CATALOG_CACHE", cache_path)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {
+                        "type": "Integrated Filing- Financials",
+                        "symbol": "ABC",
+                        "xbrl": "https://example.test/abc.xbrl",
+                    },
+                    {
+                        "type": "Integrated Filing- Financials",
+                        "symbol": "XYZ",
+                        "xbrl": "https://example.test/xyz.xbrl",
+                    },
+                ]
+            }
+
+    class Session:
+        def get(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(candidate, "_fund_session", lambda: Session())
+
+    rows = candidate._catalog_all(force_refresh=True)
+    meta = json.loads(cache_path.read_text(encoding="utf-8"))["meta"]
+    output = capsys.readouterr().out
+
+    assert len(rows) == 2
+    assert meta["coverage_complete"] is True
+    assert meta["pagination_complete"] is True
+    assert "requesting page=1" in output
+    assert "page=1 complete" in output
+
+
+def test_fundamental_catalog_saves_failed_page_and_resumes(tmp_path, monkeypatch, capsys):
+    cache_path = tmp_path / "catalog.json"
+    monkeypatch.setattr(candidate, "FUND_CATALOG_CACHE", cache_path)
+
+    class BrokenSession:
+        def get(self, *args, **kwargs):
+            raise TimeoutError("simulated NSE timeout")
+
+    monkeypatch.setattr(candidate, "_fund_session", lambda: BrokenSession())
+
+    import pytest
+    with pytest.raises(RuntimeError, match="partial checkpoint saved"):
+        candidate._catalog_all(force_refresh=True)
+
+    partial_path = cache_path.with_name(cache_path.stem + ".partial.json")
+    partial = json.loads(partial_path.read_text(encoding="utf-8"))
+    assert partial["meta"]["coverage_complete"] is False
+    assert partial["meta"]["next_page"] == 1
+    assert "simulated NSE timeout" in capsys.readouterr().out
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"type": "Integrated Filing- Financials", "symbol": "ABC"}]}
+
+    class WorkingSession:
+        def get(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(candidate, "_fund_session", lambda: WorkingSession())
+    rows = candidate._catalog_all(force_refresh=True)
+    output = capsys.readouterr().out
+    assert len(rows) == 1
+    assert "resuming partial NSE filing catalog" in output
+    assert json.loads(cache_path.read_text(encoding="utf-8"))["meta"]["coverage_complete"] is True
+    assert not partial_path.exists()
