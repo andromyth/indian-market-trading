@@ -5,7 +5,10 @@ on:
     paths:
       - "selfdriving/sd_data_quality.py"
       - "selfdriving/sd_github_job_v2.py"
+      - "selfdriving/sd_v2_runtime.py"
+      - "COLAB_SD_V2_RETRAIN.py"
       - "selfdriving/test_sd_data_quality.py"
+      - "BETA_V2_README.md"
       - ".github/workflows/autonomous_delivery_cycle_v2.yml"
       - ".github/workflows/beta-v2-data-quality-ci.yml"
   pull_request:
@@ -32,6 +35,8 @@ jobs:
         run: |
           python -m py_compile \
             selfdriving/sd_data_quality.py \
-            selfdriving/sd_github_job_v2.py
+            selfdriving/sd_github_job_v2.py \
+            selfdriving/sd_v2_runtime.py \
+            COLAB_SD_V2_RETRAIN.py
       - name: Test point-in-time outcome reconstruction
         run: python -m unittest selfdriving.test_sd_data_quality
