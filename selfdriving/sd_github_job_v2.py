@@ -613,6 +613,9 @@ def main() -> int:
         status["persistence_errors"] = persistence_errors
         status["runtime_errors"] = runtime_errors + [persistence_errors[-1]]
 
+    # Retain the final local report even if uploading status_cycle.json itself failed.
+    # The GitHub Actions workflow can attach this local copy as a run artifact.
+    status_path.write_text(json.dumps(status, indent=2, default=str), encoding="utf-8")
     print(json.dumps(status, indent=2, default=str))
     return 1 if status["runtime_errors"] else 0
 
