@@ -979,6 +979,13 @@ def merge_optional(panel):
                 out[column] = np.nan
         audit["events"] = {"exists": False, "rows": 0, "freshness_days": 7}
 
+    # Ensure the contract flags exist even when a complete source returned
+    # zero rows for the requested window. Values remain NaN until verified
+    # source coverage authorizes a known-zero state.
+    for column in ("news_available", "event_available", "event_high_impact"):
+        if column not in out.columns:
+            out[column] = np.nan
+
     # Fill "no recent item" with zero only inside a successfully fetched,
     # explicitly recorded coverage window and only after a seven-day warm-up.
     # Outside that window, or after a failed/partial source build, retain NaN.
