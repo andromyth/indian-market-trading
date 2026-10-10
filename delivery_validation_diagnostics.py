@@ -15,6 +15,9 @@ REMOTE="features/daily/DELIVERY_VALIDATION_DIAGNOSTICS.json"
 LOCAL=Path("/tmp/DELIVERY_VALIDATION_DIAGNOSTICS.json")
 
 DIAGNOSTICS_SCHEMA_VERSION = "2.0"
+MIN_TARGET_VALIDATION_SAMPLES = 80
+MIN_TARGET_ACTIONS = 30
+TARGET_ACTION_PRECISION = 0.80
 ACTIVE_DELIVERY_MODEL_VERSIONS = {
     "2026-all-nse-delivery-multifactor-59-replacement-v1",
     "2026-all-nse-delivery-multifactor-59-candidate-v2",
@@ -68,13 +71,17 @@ def _gate_pass(value) -> bool:
 
 
 def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
-    minimum = int(ValidationConfig().minimum_health_samples)
+    rolling_health_minimum = int(ValidationConfig().minimum_health_samples)
+    minimum = MIN_TARGET_VALIDATION_SAMPLES
     report = {
         "diagnostics_schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "NO_DATA",
         "status_scope": "quality-approved predictions from the active ALL-NSE 59-feature Delivery model",
         "minimum_samples_required": minimum,
+        "minimum_rolling_health_samples": rolling_health_minimum,
+        "target_action_precision": TARGET_ACTION_PRECISION,
+        "minimum_target_actions": MIN_TARGET_ACTIONS,
         "active_model_versions_expected": sorted(ACTIVE_DELIVERY_MODEL_VERSIONS),
         "history_sufficient": False,
         "active_model_scored_samples": 0,
@@ -130,13 +137,12 @@ def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
     elif quality_count == 0:
         status = "NO_QUALITY_APPROVED_DATA"
         diagnosis = "Active-model outcomes exist, but none passed the production data-quality gate. Do not claim accuracy; repair PIT/data-readiness gates first."
+    elif quality_count < minimum:
+        status = "INSUFFICIENT_HISTORY"
+        diagnosis = f"Only {quality_count} quality-approved active-model outcomes are available; at least {minimum} are required for policy evaluation. Seven outcomes can support short rolling monitoring, but not a reliable 80-90% accuracy claim."
     else:
-        status = validation_status_for_sample_count(quality_count, minimum)
-        diagnosis = (
-            "Continue prospective OOS monitoring; only activate changes that beat a later chronological holdout."
-            if status == "PASS"
-            else f"Only {quality_count} quality-approved active-model outcomes are available; at least {minimum} are required before a status can pass."
-        )
+        status = "OOS_HISTORY_AVAILABLE_TARGET_UNPROVEN"
+        diagnosis = "Sufficient sample history exists to evaluate the policy, but this diagnostic is not itself a sealed holdout. Require the OOS-gated policy updater's later chronological holdout before claiming the 80% target."
 
     quality_all = x.loc[x["production_data_quality_gate"].map(_gate_pass)] if "production_data_quality_gate" in x.columns else x.iloc[0:0]
     report.update({
@@ -153,6 +159,12 @@ def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
         "legacy_model_metrics_diagnostic_only": legacy_metrics,
         "active_model_all_quality_states": active_metrics,
         "quality_approved_all_versions_diagnostic_only": _evaluate(quality_all),
+        "action_precision_target_met_on_monitoring_sample": bool(
+            quality_metrics.get("action_precision") is not None
+            and (quality_metrics.get("buy_count", 0) + quality_metrics.get("sell_count", 0)) >= MIN_TARGET_ACTIONS
+            and quality_metrics["action_precision"] >= TARGET_ACTION_PRECISION
+        ),
+        "target_interpretation": "Monitoring precision is descriptive only; target success must be demonstrated by a later chronological holdout with enough BUY/SELL actions.",
         "legacy_models_seen": sorted(set(legacy["model_version"].dropna().astype(str))) if "model_version" in legacy.columns else [],
         "active_models_seen": sorted(set(active["model_version"].dropna().astype(str))) if "model_version" in active.columns else [],
         "decision_engines": sorted(set(x["decision_engine_version"].dropna().astype(str))) if "decision_engine_version" in x.columns else [],
