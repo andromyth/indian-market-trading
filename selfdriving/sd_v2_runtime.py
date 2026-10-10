@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -396,6 +397,25 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
     pred = predict_stage(inference, registry_root)
     row = pred.iloc[0].to_dict()
     row["prediction_status"] = "PASS"
+
+    # Expose the target, actual calculation time, and model input cutoff.
+    # The existing champion was trained on prior-session point-in-time rows,
+    # so current post-close news/global data is not backfilled into that row.
+    reference = pd.to_datetime(row.get("date"), errors="coerce")
+    if pd.notna(reference):
+        from .sd_data_quality import next_nse_session
+        next_session = next_nse_session(reference.date())
+        row["target_session_date"] = (
+            next_session.isoformat() if next_session is not None else None
+        )
+    else:
+        row["target_session_date"] = None
+    row["forecast_as_of_utc"] = datetime.now(timezone.utc).isoformat()
+    cutoff = inference.iloc[0].get("decision_timestamp")
+    row["feature_cutoff_timestamp"] = (
+        pd.Timestamp(cutoff).isoformat() if cutoff is not None and not pd.isna(cutoff) else None
+    )
+
     audit["global_source"] = global_source
     audit["news_source"] = news_source
     row["beta_v2_audit"] = audit
