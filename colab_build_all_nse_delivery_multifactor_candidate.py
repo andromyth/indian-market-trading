@@ -1173,12 +1173,19 @@ def merge_optional(panel):
             availability = availability.rename(
                 columns={"fundamental_available_at": "catalog_filing_available_at"}
             )
-            out = merge_pit_layer(
-                out,
-                availability[["symbol", "decision_timestamp", "catalog_filing_available_at"]],
-                ["catalog_filing_available_at"],
-                "fundamental_catalog",
-            )
+            if availability.empty:
+                out["catalog_filing_available_at"] = pd.NaT
+            else:
+                out = merge_pit_layer(
+                    out,
+                    availability[["symbol", "decision_timestamp", "catalog_filing_available_at"]],
+                    ["catalog_filing_available_at"],
+                    "fundamental_catalog",
+                )
+            # merge_pit_layer groups by symbol and concatenates rows, so re-read
+            # parsed availability from the merged frame to maintain row alignment.
+            fa = pd.to_datetime(out.get("fundamental_available_at"), errors="coerce", utc=True)
+            parsed_valid = fa.notna() & fa.le(out["decision_timestamp"])
             local_dates = (
                 pd.to_datetime(out["decision_timestamp"], errors="coerce", utc=True)
                 .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).dt.normalize()
