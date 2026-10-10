@@ -1,10 +1,11 @@
 """Unit tests for autonomous point-in-time data auditing."""
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -122,6 +123,16 @@ class RealisedReturnTests(unittest.TestCase):
     def test_known_trading_session_calendar_skips_weekend(self):
         self.assertEqual(next_nse_session(date(2026, 10, 9)), date(2026, 10, 12))
 
+
+
+    def test_weekend_run_uses_last_completed_session_and_next_session_target(self):
+        from selfdriving.sd_github_job_v2 import _current_expected_reference_date
+
+        saturday = datetime(2026, 10, 10, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+        sunday = datetime(2026, 10, 11, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        self.assertEqual(_current_expected_reference_date(saturday), date(2026, 10, 9))
+        self.assertEqual(_current_expected_reference_date(sunday), date(2026, 10, 9))
+        self.assertEqual(next_nse_session(_current_expected_reference_date(saturday)), date(2026, 10, 12))
 
 
 class EntrypointImportTests(unittest.TestCase):
