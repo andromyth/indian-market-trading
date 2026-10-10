@@ -351,12 +351,19 @@ def build_input_audit(
         "panel_symbols": panel_symbol_count,
     }
 
+    global_duplicate_rows = (
+        int(global_cues.duplicated(["key", "date"], keep=False).sum())
+        if {"key", "date"}.issubset(global_cues.columns) else 0
+    )
     global_audit = {
         "rows": int(len(global_cues)),
         "series": sorted(global_cues["key"].dropna().astype(str).str.lower().unique().tolist()) if "key" in global_cues.columns else [],
+        "duplicate_key_date_rows": global_duplicate_rows,
         "latest_available_by_series": {},
         "integrated_feature_coverage": _coverage(panel, groups["global_market_fx"]),
     }
+    if global_duplicate_rows:
+        warnings.append("DUPLICATE_GLOBAL_SERIES_DATE_ROWS")
     if not global_cues.empty and {"key", "available_at"}.issubset(global_cues.columns):
         gx = global_cues.copy()
         gx["available_at"] = pd.to_datetime(gx["available_at"], errors="coerce", utc=True)
@@ -384,14 +391,21 @@ def build_input_audit(
     elif "usdinr" not in global_audit["series"]:
         warnings.append("USDINR_SERIES_MISSING_FROM_ARCHIVE")
 
+    news_duplicate_rows = (
+        int(raw_news.duplicated(["symbol", "published_at", "text"], keep=False).sum())
+        if {"symbol", "published_at", "text"}.issubset(raw_news.columns) else 0
+    )
     news_audit = {
         "rows": int(len(raw_news)),
         "symbols": int(raw_news["symbol"].map(normalize_symbol).nunique()) if "symbol" in raw_news.columns else 0,
         "market_wide_rows": int(raw_news["symbol"].astype(str).str.upper().eq("MARKET").sum()) if "symbol" in raw_news.columns else 0,
+        "duplicate_headline_rows": news_duplicate_rows,
         "latest_first_seen_at": None,
         "rows_first_seen_last_24h": 0,
         "integrated_feature_coverage": _coverage(panel, groups["scored_news"]),
     }
+    if news_duplicate_rows:
+        warnings.append("DUPLICATE_NEWS_HEADLINE_ROWS")
     if not raw_news.empty and "published_at" in raw_news.columns:
         nts = pd.to_datetime(raw_news["published_at"], errors="coerce", utc=True).dropna()
         if len(nts):
@@ -405,12 +419,19 @@ def build_input_audit(
     else:
         warnings.append("RSS_ARCHIVE_MISSING_OR_EMPTY")
 
+    fno_duplicate_rows = (
+        int(fno_daily.duplicated(["symbol", "date"], keep=False).sum())
+        if {"symbol", "date"}.issubset(fno_daily.columns) else 0
+    )
     fno_audit = {
         "rows": int(len(fno_daily)),
         "symbols": int(fno_daily["symbol"].map(normalize_symbol).nunique()) if "symbol" in fno_daily.columns else 0,
+        "duplicate_symbol_date_rows": fno_duplicate_rows,
         "latest_trade_date": None,
         "integrated_feature_coverage": _coverage(panel, groups["fno"]),
     }
+    if fno_duplicate_rows:
+        warnings.append("DUPLICATE_FNO_SYMBOL_DATE_ROWS")
     if not fno_daily.empty and "date" in fno_daily.columns:
         fdates = pd.to_datetime(fno_daily["date"], errors="coerce").dropna()
         if len(fdates):
@@ -429,6 +450,21 @@ def build_input_audit(
     else:
         gate_pct = None
         warnings.append("PIT_PRODUCTION_QUALITY_GATE_MISSING")
+
+    global_refresh = source_status.get("global_refresh", {}) if isinstance(source_status, dict) else {}
+    failed_series = global_refresh.get("failed_series", {}) if isinstance(global_refresh, dict) else {}
+    if isinstance(failed_series, dict) and len(failed_series) > max(1, len(global_audit["series"]) // 2):
+        warnings.append("MORE_THAN_HALF_GLOBAL_SERIES_FAILED_CURRENT_REFRESH")
+
+    news_refresh = source_status.get("news_refresh", {}) if isinstance(source_status, dict) else {}
+    dead_feeds = news_refresh.get("dead_feeds", []) if isinstance(news_refresh, dict) else []
+    try:
+        from selfdriving.sd_news_collect import FEEDS
+        feed_count = len(FEEDS)
+    except Exception:
+        feed_count = 0
+    if feed_count and len(dead_feeds) >= feed_count:
+        warnings.append("ALL_RSS_FEEDS_EMPTY_OR_FAILED_DURING_CURRENT_REFRESH")
 
     report = {
         "audit_version": "2026-10-10-v1",
