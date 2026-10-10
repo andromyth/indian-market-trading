@@ -34,6 +34,7 @@ jobs:
           nse_data_layer.py
           nse_bulk_eod_ingest.py
           data_fetcher.py
+          market_watchlist.py
           indstocks_client.py
           indstocks_smoke_test.py
           google_drive_oauth_login.py
@@ -89,6 +90,7 @@ jobs:
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py
           tests/test_prediction_validation_scorecard.py
+          tests/test_market_watchlist.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
