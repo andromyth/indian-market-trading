@@ -2,8 +2,10 @@ name: Beta V2 self-driving daily cycle
 
 on:
   workflow_dispatch:
+  # 07:15 IST on weekdays, after the overnight production refresh retries.
+  # The runner also verifies the expected prior NSE session and refuses stale PIT.
   schedule:
-    - cron: "30 14 * * 1-5"
+    - cron: "45 1 * * 1-5"
 
 jobs:
   beta-v2-cycle:
