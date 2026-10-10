@@ -56,6 +56,7 @@ jobs:
           validate_identity_preserved_cash_master.py
           deployment_smoke_test.py
           app.py
+          market_session_guard.py
           COLAB_RUN_FNO_REPAIR_V2_20261003.py
           selfdriving/sd_v2_panel.py
           selfdriving/sd_intraday_v2.py
@@ -80,6 +81,7 @@ jobs:
           tests/test_global_cues_datetime_precision.py
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
+          tests/test_market_session_guard.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
