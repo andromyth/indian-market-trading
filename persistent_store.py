@@ -305,7 +305,11 @@ def gdrive_config() -> dict:
     except Exception:
         pass
 
-    if oauth_json:
+    # Prefer a configured service account over user OAuth tokens. GitHub Actions
+    # may contain a legacy/expired OAuth refresh token alongside the long-lived
+    # service-account JSON; selecting OAuth first makes the valid service account
+    # unreachable and breaks unattended Drive jobs with invalid_grant.
+    if oauth_json and not service_json:
         try:
             oauth_info = json.loads(oauth_json)
         except Exception as exc:
