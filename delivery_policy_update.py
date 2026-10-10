@@ -16,6 +16,12 @@ MIN_SAMPLES=80
 MIN_TUNING_ACTIONS=20
 MIN_HOLDOUT_ACTIONS=30
 TARGET_HOLDOUT_PRECISION=0.80
+ACTIVE_DELIVERY_MODEL_VERSIONS = {
+    "2026-all-nse-delivery-multifactor-59-replacement-v1",
+    "2026-all-nse-delivery-multifactor-59-candidate-v2",
+}
+MIN_UNIQUE_SESSIONS=20
+MIN_HOLDOUT_SESSIONS=5
 
 def _load_existing():
     try:
@@ -57,29 +63,95 @@ def _precision(df,buy,sell,min_ret):
     return {"precision":float(successes/actions),"wilson_lower_95":_wilson_lower_bound(successes,actions),
             "actions":actions,"coverage":float(action.mean())}
 
+def _gate_pass(value) -> bool:
+    """Parse serialized quality-gate values safely; the string 'False' is false."""
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "pass", "ready"}
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _date_block_split(data: pd.DataFrame, train_fraction: float = 0.70):
+    """Split by NSE session date so one session cannot leak across tune/holdout."""
+    if data.empty or "decision_timestamp" not in data.columns:
+        return None, 0, 0
+    x = data.copy()
+    ts = pd.to_datetime(x["decision_timestamp"], errors="coerce", utc=True)
+    valid = ts.notna()
+    x = x.loc[valid].copy()
+    ts = ts.loc[valid]
+    if x.empty:
+        return None, 0, 0
+    x["_session_date"] = ts.dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d")
+    dates = sorted(x["_session_date"].dropna().unique().tolist())
+    if len(dates) < MIN_UNIQUE_SESSIONS:
+        return None, len(dates), 0
+    split_idx = int(len(dates) * train_fraction)
+    hold_count = len(dates) - split_idx
+    if hold_count < MIN_HOLDOUT_SESSIONS:
+        return None, len(dates), hold_count
+    split_idx = min(max(1, split_idx), len(dates) - MIN_HOLDOUT_SESSIONS)
+    tune_dates, hold_dates = set(dates[:split_idx]), set(dates[split_idx:])
+    tune = x[x["_session_date"].isin(tune_dates)].drop(columns=["_session_date"])
+    hold = x[x["_session_date"].isin(hold_dates)].drop(columns=["_session_date"])
+    if tune.empty or hold.empty:
+        return None, len(dates), len(hold_dates)
+    # The assertion is deliberately explicit: all rows from a session belong
+    # wholly to tuning OR holdout, never both.
+    assert set(tune_dates).isdisjoint(hold_dates)
+    return (tune, hold), len(dates), len(hold_dates)
+
+
 def _join():
     p=pd.DataFrame(load_records()); v=pd.DataFrame(load_validation_records())
     if p.empty or v.empty or "prediction_id" not in p.columns or "prediction_id" not in v.columns: return pd.DataFrame()
     p=p[p["mode"].astype(str).str.lower().eq("delivery")].copy()
-    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","production_data_quality_gate","production_data_quality_score","decision_engine_version"]
+    # Fail closed: records from the old pilot/engine must not train or validate
+    # policy thresholds for the active ALL-NSE 59-feature production model.
+    if "model_version" not in p.columns:
+        return pd.DataFrame()
+    p["model_version"] = p["model_version"].astype(str)
+    p = p[p["model_version"].isin(ACTIVE_DELIVERY_MODEL_VERSIONS)].copy()
+    if p.empty:
+        return pd.DataFrame()
+    keep=["prediction_id","symbol","decision_timestamp","probability_up_next_session","predicted_return_next_session","data_readiness_score","production_data_quality_gate","production_data_quality_score","model_version","decision_engine_version"]
     p=p[[c for c in keep if c in p.columns]]
     keepv=["prediction_id","actual_direction_d1","validation_status","actual_d1_return"]
     v=v[[c for c in keepv if c in v.columns]]
     x=p.merge(v,on="prediction_id",how="inner")
     x=x[x["validation_status"].eq("VALIDATED")].copy()
-    if "production_data_quality_gate" in x.columns:
-        x=x[x["production_data_quality_gate"].fillna(False).astype(bool)].copy()
+    if "production_data_quality_gate" not in x.columns:
+        return pd.DataFrame()
+    x=x[x["production_data_quality_gate"].map(_gate_pass)].copy()
     x["decision_timestamp"]=pd.to_datetime(x["decision_timestamp"],errors="coerce",utc=True)
     return x.dropna(subset=["decision_timestamp","probability_up_next_session","predicted_return_next_session","actual_direction_d1"]).sort_values("decision_timestamp").drop_duplicates("prediction_id",keep="last")
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--min-samples",type=int,default=MIN_SAMPLES); args=ap.parse_args()
     existing=_load_existing(); data=_join()
-    if len(data)<args.min_samples:
-        out={**existing,"status":"INSUFFICIENT_HISTORY","samples":int(len(data)),"updated_at":datetime.now(timezone.utc).isoformat(),"method":"walk-forward-policy-tuning"}
+    if len(data) < args.min_samples:
+        no_active_model = data.empty
+        out={**existing,"status":"NO_ACTIVE_MODEL_DATA" if no_active_model else "INSUFFICIENT_HISTORY",
+             "samples":int(len(data)),"updated_at":datetime.now(timezone.utc).isoformat(),
+             "method":"date-blocked-walk-forward-policy-tuning",
+             "reason":"No validated, quality-approved rows from the active ALL-NSE 59-feature Delivery model." if no_active_model else "Validated active-model history is below the minimum required for policy evaluation."}
         LOCAL_POLICY.write_text(json.dumps(out,indent=2,default=str),encoding="utf-8")
         print(json.dumps(out,indent=2)); return
-    split=max(1,int(len(data)*0.70)); tune=data.iloc[:split]; hold=data.iloc[split:]
+    split_frames, session_count, holdout_session_count = _date_block_split(data)
+    if split_frames is None:
+        out={**existing,"status":"INSUFFICIENT_SESSION_HISTORY","samples":int(len(data)),
+             "unique_sessions":int(session_count),"holdout_sessions_available":int(holdout_session_count),
+             "minimum_unique_sessions":MIN_UNIQUE_SESSIONS,"minimum_holdout_sessions":MIN_HOLDOUT_SESSIONS,
+             "updated_at":datetime.now(timezone.utc).isoformat(),"method":"date-blocked-walk-forward-policy-tuning"}
+        LOCAL_POLICY.write_text(json.dumps(out,indent=2,default=str),encoding="utf-8")
+        print(json.dumps(out,indent=2)); return
+    tune, hold = split_frames
     cb=float(existing.get("buy_probability_threshold",DEFAULT["buy_probability_threshold"]))
     cs=float(existing.get("sell_probability_threshold",DEFAULT["sell_probability_threshold"]))
     cr=float(existing.get("min_expected_return",DEFAULT["min_expected_return"]))
