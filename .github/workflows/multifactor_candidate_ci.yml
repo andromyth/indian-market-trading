@@ -90,6 +90,7 @@ jobs:
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py
           tests/test_prediction_validation_scorecard.py
+          tests/test_delivery_validation_active_model.py
           tests/test_delivery_policy_precision_gate.py
           tests/test_intraday_multihorizon_validation.py
           tests/test_market_watchlist.py
