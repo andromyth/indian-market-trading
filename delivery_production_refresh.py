@@ -302,7 +302,7 @@ def main():
     ).replace([float("inf"), float("-inf")], float("nan")).notna().mean(axis=1)
     panel["production_feature_non_missing_count"] = panel[FEATURES_59].apply(
         pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], pd.NA).notna().sum(axis=1)
+    ).replace([float("inf"), float("-inf")], float("nan")).notna().sum(axis=1)
     panel["production_core_ready"]=(
         pd.to_numeric(panel["ready_market_price"],errors="coerce").eq(1)&
         pd.to_numeric(panel["ready_market_context"],errors="coerce").eq(1)
