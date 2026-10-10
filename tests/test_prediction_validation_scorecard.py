@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from prediction_validation import rolling_7day_scorecard
+from prediction_validation import rolling_7day_scorecard, validation_status_for_sample_count
 
 
 def _validation_rows(count: int, missing_direction_match_at: int | None = None) -> pd.DataFrame:
@@ -42,3 +42,8 @@ def test_seven_rows_with_one_unscored_outcome_remain_insufficient() -> None:
     assert score["status"] == "INSUFFICIENT_HISTORY"
     assert score["completed_predictions"] == 7
     assert score["scored_predictions"] == 6
+
+def test_shared_history_status_gate_requires_minimum_sample_count() -> None:
+    assert validation_status_for_sample_count(0, 7) == "NO_DATA"
+    assert validation_status_for_sample_count(3, 7) == "INSUFFICIENT_HISTORY"
+    assert validation_status_for_sample_count(7, 7) == "PASS"
