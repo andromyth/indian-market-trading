@@ -958,7 +958,7 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "path": str(path),
         "rows": int(len(f)),
         "symbols": int(f["symbol"].nunique()),
-        "source_dates": source_date_rows,
+        "source_dates": len(source_dates),
         "first_source_date": str(min(source_dates).date()) if source_dates else None,
         "last_source_date": str(max(source_dates).date()) if source_dates else None,
         "covered_target_sessions": len(covered_target_dates),
