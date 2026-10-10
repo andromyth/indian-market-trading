@@ -415,8 +415,9 @@ def _load_filing_cache():
         return pd.DataFrame()
 
 def _save_filing_cache(cache):
-    FUND_FILING_CACHE.parent.mkdir(parents=True,exist_ok=True)
-    cache.to_parquet(FUND_FILING_CACHE,index=False)
+    # Atomic checkpoint: an interrupted Colab session must never leave a
+    # half-written filing cache that destroys the progress from prior batches.
+    _atomic_parquet(cache, FUND_FILING_CACHE)
 
 def _parse_one_cached(f):
     key=_funding_key(f)
@@ -530,17 +531,41 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False,ma
     )
 
     new_rows=[]
+    processed=0
+    parsed_checkpointed=0
+
+    def flush_filing_checkpoint():
+        nonlocal filing_cache, new_rows, parsed_checkpointed
+        if not new_rows:
+            return
+        chunk=pd.DataFrame(new_rows)
+        parsed_checkpointed += int(chunk.get("parse_status",pd.Series(dtype=str)).eq("parsed").sum())
+        if filing_cache.empty:
+            filing_cache=chunk
+        else:
+            filing_cache=pd.concat([filing_cache,chunk],ignore_index=True)
+        filing_cache=filing_cache.drop_duplicates("filing_key",keep="last")
+        _save_filing_cache(filing_cache)
+        new_rows=[]
+        print(
+            f"fundamentals checkpoint saved: processed={processed:,}/{len(missing):,}; "
+            f"new_parsed={parsed_checkpointed:,}; cache_rows={len(filing_cache):,}",
+            flush=True,
+        )
+
     if missing:
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
             futs=[ex.submit(_parse_one_cached,f) for f in missing]
             for i,fut in enumerate(as_completed(futs),1):
                 new_rows.append(fut.result())
-                if i%500==0:
-                    parsed_now=sum(r.get("parse_status")=="parsed" for r in new_rows)
-                    print(f"fundamentals parse={i:,}/{len(missing):,} new_parsed={parsed_now:,}",flush=True)
+                processed=i
+                # Persist every 25 filings. If Colab disconnects, a later run
+                # can reuse parsed/failed cache entries instead of losing the
+                # entire current refresh.
+                if len(new_rows)>=25:
+                    flush_filing_checkpoint()
+        flush_filing_checkpoint()
 
-    if new_rows:
-        filing_cache=pd.concat([filing_cache,pd.DataFrame(new_rows)],ignore_index=True)
     if not filing_cache.empty:
         filing_cache=filing_cache.drop_duplicates("filing_key",keep="last")
         _save_filing_cache(filing_cache)
@@ -1717,7 +1742,7 @@ def _prepare_training_sample(
                     ) AS _future_close
                 FROM read_parquet({panel_sql})
             )
-            SELECT *,
+            SELECT * EXCLUDE (_future_close),
                 _future_close / NULLIF(TRY_CAST(close AS DOUBLE), 0) - 1.0 AS "{horizon_ret}",
                 CASE WHEN _future_close / NULLIF(TRY_CAST(close AS DOUBLE), 0) - 1.0 > 0
                      THEN 1 ELSE 0 END AS "{horizon_up}"
@@ -1774,8 +1799,8 @@ def _prepare_training_sample(
             FROM sampled GROUP BY _sample_role
         """).fetchdf()
         sample_stats = {
-            str(row._sample_role): int(row.rows)
-            for row in counts.itertuples(index=False)
+            str(item["_sample_role"]): int(item["rows"])
+            for item in counts.to_dict("records")
         }
         sample_stats.update({
             "horizon": horizon,
@@ -2002,7 +2027,6 @@ def main():
             )
             # Preserve the exact 59-column contract. Missing source values stay
             # NaN, and the coverage report/gate—not fabricated zeros—decides readiness.
-            panel=attach_readiness_flags(panel)
             _atomic_parquet(panel,shard_path)
             import pyarrow.parquet as pq
             shard_rows=int(pq.ParquetFile(shard_path).metadata.num_rows)
