@@ -1173,7 +1173,7 @@ def fit_models(frame, horizon):
         "holdout_mean_readiness_pct": float(te["data_readiness_score"].mean() * 100),
         "training_feature_coverage_mean_pct": coverage["mean_non_missing_pct"],
         "training_feature_coverage_gate": "PASS",
-        "training_feature_coverage_minimum_rows": coverage["minimum_observations_required"],
+        "training_feature_coverage_minimum_rows_floor": coverage["minimum_observations_required_floor"],
     }
 
 def _candidate_input_signature(cash_master,bulk,trainable,fund_report):
