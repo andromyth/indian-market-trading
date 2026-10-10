@@ -10,7 +10,15 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
+import sys
 from zoneinfo import ZoneInfo
+
+# Running this file as `python selfdriving/sd_github_job_v2.py` puts only the
+# selfdriving directory on sys.path. Add the repository root so root-level
+# project modules (for example persistent_store.py) are importable in Actions.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 
