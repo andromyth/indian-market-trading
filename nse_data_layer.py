@@ -897,7 +897,9 @@ def _parse_index_daily_snapshot(
     open_col = _pick("openindexvalue", "open")
     high_col = _pick("highindexvalue", "high")
     low_col = _pick("lowindexvalue", "low")
-    close_col = _pick("closingindexvalue", "closeindexvalue", "close")
+    # NSE's actual Daily Snapshot report uses the header "Closing"; alternate
+    # exports may label the same column "Closing Index Value".
+    close_col = _pick("closing", "closingindexvalue", "closeindexvalue", "close")
     volume_col = _pick("volume", "sharestraded")
 
     required = {
@@ -988,11 +990,28 @@ def _fetch_index_history_from_daily_snapshots(
     frames: list[pd.DataFrame] = []
     diagnostics: list[str] = []
     consecutive_errors = 0
+    weekdays = list(pd.date_range(start_d, end_d, freq="B"))
+    scanned_days = 0
 
     # Daily Snapshot files are published for exchange sessions; weekday holiday
-    # gaps are expected and simply appear as unavailable dates.
-    for ts in pd.date_range(start_d, end_d, freq="B"):
+    # gaps are expected and simply appear as unavailable dates. Emit progress so
+    # a historical recovery cannot look like a hung PIT panel build.
+    print(
+        f"OFFICIAL INDEX FALLBACK START: symbol={root} "
+        f"range={start_d}..{end_d} weekdays={len(weekdays)}",
+        flush=True,
+    )
+    for ts in weekdays:
         day = ts.date()
+        scanned_days += 1
+        if scanned_days == 1 or scanned_days % 10 == 0:
+            print(
+                f"OFFICIAL INDEX FALLBACK SCAN: symbol={root} "
+                f"date={day} progress={scanned_days}/{len(weekdays)} "
+                f"valid_sessions={sum(len(part) for part in frames)} "
+                f"errors={len(diagnostics)}",
+                flush=True,
+            )
         csv_path = INDEX_DAILY_SNAPSHOT_ROOT / f"ind_close_all_{day:%d%m%Y}.csv"
         frame = pd.DataFrame()
 
