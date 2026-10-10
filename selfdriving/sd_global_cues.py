@@ -124,13 +124,24 @@ def attach_global_features(panel: pd.DataFrame, long: pd.DataFrame, max_age_days
     `g_inr_z`. Rows with no available bar (or stale) get NaN, not zero.
     """
     x = panel.copy()
-    x["decision_timestamp"] = pd.to_datetime(x["decision_timestamp"], utc=True)
+    # Parquet/pandas versions may infer datetime64[us, UTC] for one source and
+    # datetime64[ns, UTC] for another. merge_asof requires identical key dtypes,
+    # so enforce nanosecond UTC precision on both sides of every as-of join.
+    x["decision_timestamp"] = (
+        pd.to_datetime(x["decision_timestamp"], errors="coerce", utc=True)
+        .astype("datetime64[ns, UTC]")
+    )
     order = np.argsort(x["decision_timestamp"].to_numpy(), kind="stable")
     base = x.iloc[order].reset_index(drop=True)
     feats = per_series_features(long, series)
     z_cols = {}
     for key, f in feats.items():
         f = f.copy()
+        f["available_at"] = (
+            pd.to_datetime(f["available_at"], errors="coerce", utc=True)
+            .astype("datetime64[ns, UTC]")
+        )
+        f = f.dropna(subset=["available_at"]).sort_values("available_at")
         f["_avail"] = f["available_at"]
         m = pd.merge_asof(base[["decision_timestamp"]], f, left_on="decision_timestamp",
                           right_on="available_at", direction="backward")
