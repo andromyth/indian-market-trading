@@ -961,18 +961,22 @@ def merge_optional(panel):
             high = events[
                 pd.to_numeric(events["event_high_impact"], errors="coerce").eq(1)
             ][["symbol", "decision_timestamp", "event_high_impact"]].copy()
-            high = high.rename(columns={"event_high_impact": "recent_high_impact"})
-            out = merge_pit_layer(
-                out, high, ["recent_high_impact"], "high_impact_events",
-                max_age=freshness,
-            )
-            out["event_high_impact"] = pd.to_numeric(
-                out.get("event_high_impact"), errors="coerce"
-            ).fillna(0.0).where(
-                out.get("recent_high_impact").isna(),
-                out.get("recent_high_impact"),
-            )
-            out = out.drop(columns=["recent_high_impact"], errors="ignore")
+            if not high.empty:
+                high = high.rename(columns={"event_high_impact": "recent_high_impact"})
+                out = merge_pit_layer(
+                    out, high, ["recent_high_impact"], "high_impact_events",
+                    max_age=freshness,
+                )
+                recent_high = pd.to_numeric(out["recent_high_impact"], errors="coerce")
+                current_high = pd.to_numeric(out["event_high_impact"], errors="coerce")
+                # If either independent stream has a recent high-impact event,
+                # preserve it. If both are unknown, remain unknown until the
+                # source coverage window authorizes a known-zero flag.
+                out["event_high_impact"] = current_high.where(
+                    recent_high.isna(),
+                    np.maximum(current_high.fillna(0.0), recent_high),
+                )
+                out = out.drop(columns=["recent_high_impact"], errors="ignore")
         audit["events"] = {
             "exists": True, "rows": int(len(events)),
             "symbols": int(events["symbol"].nunique()),
