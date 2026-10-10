@@ -1343,6 +1343,8 @@ def _candidate_input_signature(cash_master,bulk,trainable,fund_report):
         BASE/"processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
         BASE/"production_data/nse_official/fno/fno_daily_features_2026.parquet",
         BASE/"processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
+        FUND_AVAILABILITY,
+        FUND_AVAILABILITY_META,
         BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet",
     ]
     sig={
