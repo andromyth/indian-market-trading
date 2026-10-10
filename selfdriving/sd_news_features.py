@@ -99,8 +99,12 @@ def build_news_features(scored: pd.DataFrame, decisions: pd.DataFrame,
     Rows from MARKET (symbol == 'MARKET') become market-wide features.
     """
     d = decisions[["symbol", "decision_timestamp"]].copy()
-    d["decision_timestamp"] = pd.to_datetime(d["decision_timestamp"], utc=True)
-    cal = pd.DatetimeIndex(sorted(d["decision_timestamp"].unique())).tz_convert("UTC")
+    d["decision_timestamp"] = pd.to_datetime(
+        d["decision_timestamp"], errors="coerce", utc=True
+    ).astype("datetime64[ns, UTC]")
+    cal = pd.DatetimeIndex(
+        sorted(d["decision_timestamp"].dropna().unique())
+    ).astype("datetime64[ns, UTC]").tz_convert("UTC")
     out = d.copy()
     feat_cols = ["news_cnt_1", "news_sent_1", "news_sent_ewm", "news_cnt_ewm",
                  "news_impact_ewm", "news_novelty_1", "news_available"]

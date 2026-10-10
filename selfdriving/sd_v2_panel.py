@@ -50,6 +50,10 @@ def normalize_delivery_panel(panel: pd.DataFrame) -> pd.DataFrame:
             x["decision_timestamp"], errors="coerce", utc=True
         )
 
+    # Parquet readers may return UTC datetimes at ns or us precision.
+    # Normalize the canonical point-in-time join key everywhere in Beta V2.
+    x["decision_timestamp"] = x["decision_timestamp"].astype("datetime64[ns, UTC]")
+
     for c in ("open", "high", "low", "close", "volume"):
         if c in x.columns:
             x[c] = pd.to_numeric(x[c], errors="coerce")
@@ -115,6 +119,10 @@ def merge_beta_fno(panel: pd.DataFrame, fno_daily: pd.DataFrame) -> tuple[pd.Dat
     f["decision_timestamp"] = (
         f["date"] + pd.Timedelta(days=1, hours=9, minutes=15)
     ).dt.tz_localize("Asia/Kolkata").dt.tz_convert("UTC")
+    # Keep the right side of the as-of join identical to the canonical panel key.
+    f["decision_timestamp"] = pd.to_datetime(
+        f["decision_timestamp"], errors="coerce", utc=True
+    ).astype("datetime64[ns, UTC]")
 
     keep = [
         "symbol", "decision_timestamp",
