@@ -460,7 +460,7 @@ def _bootstrap_cache_from_broad(filing_cache):
     except Exception:
         return filing_cache
 
-def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
+def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False,max_workers=2):
     catalog=_catalog_all(force_refresh=force_refresh)
     availability_report = _build_fundamental_availability(catalog, symbols)
     print(
@@ -531,7 +531,7 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
 
     new_rows=[]
     if missing:
-        with ThreadPoolExecutor(max_workers=16) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
             futs=[ex.submit(_parse_one_cached,f) for f in missing]
             for i,fut in enumerate(as_completed(futs),1):
                 new_rows.append(fut.result())
@@ -1392,119 +1392,241 @@ def _candidate_artifacts_complete(out):
     return True
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument(
-        "--cash-master",
-        default=DEFAULT_CASH_MASTER,
-        help="Canonical identity-preserved NSE cash master. This is the authoritative training input.",
-    )
-    ap.add_argument("--bulk-root",default=DEFAULT_BULK, help="Legacy official bulk-EOD fallback; unused unless --allow-bulk-fallback is set.")
-    ap.add_argument(
-        "--allow-bulk-fallback",
-        action="store_true",
-        help="Explicitly allow the older official bulk-EOD view when the canonical cash master is unavailable.",
-    )
+    ap=argparse.ArgumentParser(description="Build the ALL-NSE 59-feature Delivery candidate in memory-controlled stages.")
+    ap.add_argument("--cash-master",default=DEFAULT_CASH_MASTER,
+                    help="Canonical identity-preserved NSE cash master.")
+    ap.add_argument("--bulk-root",default=DEFAULT_BULK,
+                    help="Legacy official bulk-EOD fallback; unused unless --allow-bulk-fallback is set.")
+    ap.add_argument("--allow-bulk-fallback",action="store_true",
+                    help="Explicitly allow the older official bulk-EOD view when the canonical cash master is unavailable.")
     ap.add_argument("--delivery-root",default=str(DEFAULT_DELIVERY_ROOT),
                     help="Persisted official NSE Security-wise Delivery Position files.")
     ap.add_argument("--out",default=DEFAULT_OUT)
     ap.add_argument("--min-history",type=int,default=60)
     ap.add_argument("--refresh-fundamentals",action="store_true")
     ap.add_argument("--retry-failed-fundamentals",action="store_true")
+    ap.add_argument("--fundamental-workers",type=int,default=2,
+                    help="Maximum concurrent XBRL parsers; use a low value in memory-constrained Colab.")
     ap.add_argument("--refresh-universe",action="store_true")
     ap.add_argument("--force-rebuild-candidate",action="store_true")
+    ap.add_argument("--stage",choices=("all","fundamentals","panel","train"),default="all",
+                    help="Run all stages or only the fundamentals refresh, PIT panel build, or model training stage.")
     args=ap.parse_args()
+
+    if args.fundamental_workers < 1:
+        raise ValueError("--fundamental-workers must be >= 1")
+
+    import gc
 
     out=Path(args.out)
     out.mkdir(parents=True,exist_ok=True)
     cash_master=Path(args.cash_master)
-    if cash_master.exists() and cash_master.stat().st_size>0:
-        print(f"Using canonical identity-preserved NSE cash master: {cash_master}",flush=True)
-        bulk=load_canonical_cash_research_history(cash_master)
-        bulk_source="CANONICAL_IDENTITY_PRESERVED_RESEARCH_VIEW"
-    elif args.allow_bulk_fallback:
-        bulk_root=Path(args.bulk_root)
-        print(f"WARNING: canonical cash master unavailable; using explicit official bulk-EOD fallback: {bulk_root}",flush=True)
-        bulk=load_bulk(bulk_root)
-        bulk_source="OFFICIAL_BULK_EOD_FALLBACK"
-    else:
-        raise FileNotFoundError(
-            f"Canonical NSE cash master missing or empty: {cash_master}. "
-            "Use --allow-bulk-fallback only for a deliberate non-canonical run."
-        )
-    if bulk.empty:
-        raise RuntimeError("Canonical NSE cash research view is empty")
-    roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
-    trainable=list(roster["trainable_symbols"])
-
-    delivery_root = Path(args.delivery_root)
-    delivery = load_delivery_history(
-        delivery_root,
-        symbols=trainable,
-        start=bulk["date"].min(),
-        end=bulk["date"].max(),
-    )
-    print(
-        f"Using persisted NSE delivery layer: {delivery_root}; "
-        f"rows={len(delivery):,}; symbols={delivery['symbol'].nunique() if not delivery.empty else 0:,}",
-        flush=True,
-    )
-
-    fund_report=_ensure_broad_fundamentals(
-        trainable,
-        force_refresh=args.refresh_fundamentals,
-        retry_failed=args.retry_failed_fundamentals,
-    )
-
-    universe={
-        "universe_source":roster.get("universe_source"),
-        "universe_as_of":roster.get("universe_as_of"),
-        "universe_symbol_count":int(roster["universe_symbol_count"]),
-        "symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),
-        "trainable_symbol_count":int(roster["trainable_symbol_count"]),
-        "excluded_symbol_count":int(roster["excluded_symbol_count"]),
-        "minimum_history_sessions":int(roster["minimum_history_sessions"]),
-    }
-
-    input_sig=_candidate_input_signature(cash_master,bulk,trainable,fund_report)
-    input_sig["cash_source"]=bulk_source
-    input_sig["delivery_root"]=str(delivery_root)
-    input_sig["delivery_rows"]=int(len(delivery))
-    input_sig["delivery_symbols"]=int(delivery["symbol"].nunique()) if not delivery.empty else 0
+    panel_path=out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
+    readiness_path=out/"DATA_READINESS_REPORT_2026.json"
+    stage_meta_path=out/"CANDIDATE_STAGE_META_2026.json"
     candidate_meta=out/CANDIDATE_META_NAME
-    if not args.force_rebuild_candidate and not args.refresh_fundamentals and candidate_meta.exists() and _candidate_artifacts_complete(out):
-        try:
-            old=json.loads(candidate_meta.read_text(encoding="utf-8"))
-            if old.get("input_signature")==input_sig:
-                print("CANDIDATE BUILD REUSED; inputs and feature contract unchanged.",flush=True)
-                return
-        except Exception:
-            pass
+    manifest_path=out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
 
-    panel,audit=merge_optional(make_panel(bulk,trainable,delivery=delivery))
-    source_coverage = feature_coverage_report(panel)
-    print(
-        "59-feature data coverage: "
-        f"mean_non_missing={source_coverage['mean_non_missing_pct']:.3f}% "
-        f"zero_coverage={source_coverage['features_with_zero_observations']} "
-        f"missing_columns={source_coverage['features_missing_as_columns']}",
-        flush=True,
-    )
-    (out/"DATA_READINESS_REPORT_2026.json").write_text(
-        json.dumps({
-            "universe": universe,
-            "readiness": readiness_report(panel),
-            "feature_coverage": source_coverage,
-            "optional_sources": audit,
-            "feature_training_gate": {
-                "minimum_observations": 100,
-                "minimum_fraction_of_training_rows": 0.005,
-                "description": "Each of the 59 features must have enough real observations in the training fold; sparse per-security values may remain missing and be imputed, but never fabricate values.",
-            },
-        }, indent=2, default=str),
-        encoding="utf-8",
-    )
-    panel.to_parquet(out/"ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet",index=False)
+    # TRAIN is deliberately isolated from the large cash/delivery source tables.
+    # It loads only the persisted PIT panel plus small stage metadata.
+    if args.stage=="train":
+        if not panel_path.exists() or panel_path.stat().st_size==0:
+            raise FileNotFoundError(
+                f"Persisted PIT panel missing: {panel_path}. Run --stage panel first."
+            )
+        if not stage_meta_path.exists() or stage_meta_path.stat().st_size==0:
+            raise FileNotFoundError(
+                f"Stage metadata missing: {stage_meta_path}. Run --stage panel first."
+            )
+        stage_meta=json.loads(stage_meta_path.read_text(encoding="utf-8"))
+        if stage_meta.get("feature_count") != len(FEATURES_59):
+            raise RuntimeError("Stage metadata feature-count contract mismatch; rebuild the panel stage.")
+        panel=pd.read_parquet(panel_path)
+        if panel.empty:
+            raise RuntimeError("Persisted PIT panel is empty; refusing to train.")
+        missing_features=[c for c in FEATURES_59 if c not in panel.columns]
+        if missing_features:
+            raise RuntimeError(f"Persisted PIT panel is missing contract features: {missing_features}")
+        if int(stage_meta.get("panel_rows",-1)) != len(panel):
+            raise RuntimeError("Persisted PIT panel row-count does not match stage metadata.")
+        input_sig=stage_meta["input_signature"]
+        fund_report=stage_meta["fundamentals_report"]
+        universe=stage_meta["universe"]
+        roster_meta=stage_meta["roster"]
+        trainable=stage_meta["trainable_symbols"]
+        bulk_source=stage_meta["cash_source"]
+        delivery_root=Path(stage_meta["delivery_root"])
+        delivery_rows=int(stage_meta["delivery_rows"])
+        delivery_symbols=int(stage_meta["delivery_symbols"])
+        cash_master=Path(stage_meta["cash_master"])
+        print(
+            f"TRAIN stage loaded persisted PIT panel: rows={len(panel):,}; "
+            f"symbols={panel['symbol'].nunique() if 'symbol' in panel.columns else 0:,}; "
+            f"features={len(FEATURES_59)}",
+            flush=True,
+        )
+    else:
+        if cash_master.exists() and cash_master.stat().st_size>0:
+            print(f"Using canonical identity-preserved NSE cash master: {cash_master}",flush=True)
+            bulk=load_canonical_cash_research_history(cash_master)
+            bulk_source="CANONICAL_IDENTITY_PRESERVED_RESEARCH_VIEW"
+        elif args.allow_bulk_fallback:
+            bulk_root=Path(args.bulk_root)
+            print(f"WARNING: canonical cash master unavailable; using explicit official bulk-EOD fallback: {bulk_root}",flush=True)
+            bulk=load_bulk(bulk_root)
+            bulk_source="OFFICIAL_BULK_EOD_FALLBACK"
+        else:
+            raise FileNotFoundError(
+                f"Canonical NSE cash master missing or empty: {cash_master}. "
+                "Use --allow-bulk-fallback only for a deliberate non-canonical run."
+            )
+        if bulk.empty:
+            raise RuntimeError("Canonical NSE cash research view is empty")
 
+        roster=training_roster(bulk,min_history=args.min_history,force_refresh=args.refresh_universe)
+        trainable=list(roster["trainable_symbols"])
+
+        # FUNDAMENTALS runs without loading delivery history or retaining the
+        # full cash master in RAM. Raw XBRL downloads and parse caches persist in Drive.
+        if args.stage=="fundamentals":
+            print(
+                f"FUNDAMENTALS stage: trainable_symbols={len(trainable):,}; "
+                f"workers={args.fundamental_workers}; persistent_root={BASE}",
+                flush=True,
+            )
+            del bulk, roster
+            gc.collect()
+            fund_report=_ensure_broad_fundamentals(
+                trainable,
+                force_refresh=args.refresh_fundamentals,
+                retry_failed=args.retry_failed_fundamentals,
+                max_workers=args.fundamental_workers,
+            )
+            print(json.dumps({
+                "stage":"fundamentals",
+                "status":"COMPLETE",
+                "report":fund_report,
+                "next_command":"--stage panel --force-rebuild-candidate",
+            },indent=2,default=str),flush=True)
+            return
+
+        delivery_root=Path(args.delivery_root)
+        delivery=load_delivery_history(
+            delivery_root,
+            symbols=trainable,
+            start=bulk["date"].min(),
+            end=bulk["date"].max(),
+        )
+        print(
+            f"Using persisted NSE delivery layer: {delivery_root}; "
+            f"rows={len(delivery):,}; symbols={delivery['symbol'].nunique() if not delivery.empty else 0:,}",
+            flush=True,
+        )
+
+        fund_report=_ensure_broad_fundamentals(
+            trainable,
+            force_refresh=args.refresh_fundamentals,
+            retry_failed=args.retry_failed_fundamentals,
+            max_workers=args.fundamental_workers,
+        )
+
+        universe={
+            "universe_source":roster.get("universe_source"),
+            "universe_as_of":roster.get("universe_as_of"),
+            "universe_symbol_count":int(roster["universe_symbol_count"]),
+            "symbols_with_bulk_history":int(roster["symbols_with_bulk_history"]),
+            "trainable_symbol_count":int(roster["trainable_symbol_count"]),
+            "excluded_symbol_count":int(roster["excluded_symbol_count"]),
+            "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+        }
+
+        input_sig=_candidate_input_signature(cash_master,bulk,trainable,fund_report)
+        input_sig["cash_source"]=bulk_source
+        input_sig["delivery_root"]=str(delivery_root)
+        input_sig["delivery_rows"]=int(len(delivery))
+        input_sig["delivery_symbols"]=int(delivery["symbol"].nunique()) if not delivery.empty else 0
+        roster_meta={
+            "universe_symbol_count":int(roster["universe_symbol_count"]),
+            "trainable_symbol_count":int(roster["trainable_symbol_count"]),
+            "excluded_symbol_count":int(roster["excluded_symbol_count"]),
+            "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+        }
+
+        if (
+            args.stage=="all"
+            and not args.force_rebuild_candidate
+            and not args.refresh_fundamentals
+            and candidate_meta.exists()
+            and _candidate_artifacts_complete(out)
+        ):
+            try:
+                old=json.loads(candidate_meta.read_text(encoding="utf-8"))
+                if old.get("input_signature")==input_sig:
+                    print("CANDIDATE BUILD REUSED; inputs and feature contract unchanged.",flush=True)
+                    return
+            except Exception:
+                pass
+
+        # PANEL stage writes its outputs and exits before training. This gives
+        # Colab a clean process boundary between large panel joins and model fit.
+        panel,audit=merge_optional(make_panel(bulk,trainable,delivery=delivery))
+        source_coverage=feature_coverage_report(panel)
+        print(
+            "59-feature data coverage: "
+            f"mean_non_missing={source_coverage['mean_non_missing_pct']:.3f}% "
+            f"zero_coverage={source_coverage['features_with_zero_observations']} "
+            f"missing_columns={source_coverage['features_missing_as_columns']}",
+            flush=True,
+        )
+        readiness_path.write_text(
+            json.dumps({
+                "universe":universe,
+                "readiness":readiness_report(panel),
+                "feature_coverage":source_coverage,
+                "optional_sources":audit,
+                "feature_training_gate":{
+                    "minimum_observations":100,
+                    "minimum_fraction_of_training_rows":0.005,
+                    "description":"Each of the 59 features must have enough real observations in the training fold; sparse per-security values may remain missing and be imputed, but never fabricate values.",
+                },
+            },indent=2,default=str),
+            encoding="utf-8",
+        )
+        panel.to_parquet(panel_path,index=False)
+        stage_meta={
+            "stage_version":1,
+            "panel_path":str(panel_path),
+            "panel_rows":int(len(panel)),
+            "feature_count":len(FEATURES_59),
+            "feature_contract_hash":input_sig["feature_contract_hash"],
+            "input_signature":input_sig,
+            "fundamentals_report":fund_report,
+            "universe":universe,
+            "roster":roster_meta,
+            "trainable_symbols":trainable,
+            "cash_source":bulk_source,
+            "cash_master":str(cash_master),
+            "delivery_root":str(delivery_root),
+            "delivery_rows":int(len(delivery)),
+            "delivery_symbols":int(delivery["symbol"].nunique()) if not delivery.empty else 0,
+        }
+        stage_meta_path.write_text(json.dumps(stage_meta,indent=2,default=str),encoding="utf-8")
+        print(
+            f"PANEL stage saved: rows={len(panel):,}; path={panel_path}; "
+            f"metadata={stage_meta_path}",
+            flush=True,
+        )
+        del bulk, delivery
+        gc.collect()
+        if args.stage=="panel":
+            print(
+                "PANEL STAGE COMPLETE. Run --stage train in a separate cell.",
+                flush=True,
+            )
+            return
+
+    # Model fitting is a separate stage when requested. At that point Colab
+    # reloads only the persisted PIT panel rather than the raw cash/delivery tables.
     artifacts={}
     for horizon,steps in (("next_session",1),("3d",3),("5d",5),("7d",7)):
         cp=out/f"deployment_all_nse_{horizon}_multifactor59_classifier_2026.joblib"
@@ -1523,6 +1645,8 @@ def main():
                 "regressor_sha256":sha256(rp),
                 "metrics":metrics,
             }
+            del d, clf, reg
+            gc.collect()
         except Exception as exc:
             if cp.exists():
                 cp.unlink()
@@ -1532,20 +1656,22 @@ def main():
                 "status":"BLOCKED",
                 "reason":f"{type(exc).__name__}: {exc}",
             }
+            print(f"{horizon} training BLOCKED: {type(exc).__name__}: {exc}",flush=True)
+            gc.collect()
 
     manifest={
         "engine_version":"2026-all-nse-delivery-multifactor-59-replacement-v1",
         "promotion_status":"BRANCH_REPLACEMENT_ONLY",
         "universe":universe,
-        "universe_symbol_count":int(roster["universe_symbol_count"]),
-        "trainable_symbol_count":int(roster["trainable_symbol_count"]),
-        "excluded_symbol_count":int(roster["excluded_symbol_count"]),
-        "minimum_history_sessions":int(roster["minimum_history_sessions"]),
+        "universe_symbol_count":int(roster_meta["universe_symbol_count"]),
+        "trainable_symbol_count":int(roster_meta["trainable_symbol_count"]),
+        "excluded_symbol_count":int(roster_meta["excluded_symbol_count"]),
+        "minimum_history_sessions":int(roster_meta["minimum_history_sessions"]),
         "cash_data_source":bulk_source,
         "delivery_data_source":"NSE_OFFICIAL_SECURITY_WISE_DELIVERY_MTO",
         "delivery_root":str(delivery_root),
-        "delivery_row_count":int(len(delivery)),
-        "delivery_symbol_count":int(delivery["symbol"].nunique()) if not delivery.empty else 0,
+        "delivery_row_count":int(delivery_rows if args.stage=="train" else stage_meta["delivery_rows"]),
+        "delivery_symbol_count":int(delivery_symbols if args.stage=="train" else stage_meta["delivery_symbols"]),
         "canonical_cash_master":str(cash_master),
         "research_series_policy":["EQ","BE","BZ","SM","ST","SZ"],
         "t0_excluded_from_delivery_research":True,
@@ -1554,21 +1680,17 @@ def main():
         "features":FEATURES_59,
         "feature_contract_hash":input_sig["feature_contract_hash"],
         "artifacts":artifacts,
-        "data_readiness_path":str(out/"DATA_READINESS_REPORT_2026.json"),
+        "data_readiness_path":str(readiness_path),
         "pit_policy":"Only observations at or before decision_timestamp are eligible. Missing information is not fabricated.",
         "no_auto_orders":True,
         "branch_replacement_target":"production_delivery_model",
     }
-    (out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json").write_text(
-        json.dumps(manifest,indent=2,default=str),
-        encoding="utf-8",
-    )
+    manifest_path.write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
     candidate_meta.write_text(json.dumps({
         "input_signature":input_sig,
-        "manifest_path":str(out/"ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"),
+        "manifest_path":str(manifest_path),
         "fundamentals_report":fund_report,
     },indent=2,default=str),encoding="utf-8")
     print(json.dumps(manifest,indent=2,default=str),flush=True)
-
 if __name__=="__main__":
     main()
