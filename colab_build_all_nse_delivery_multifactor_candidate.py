@@ -1748,9 +1748,20 @@ def _panel_source_signature(
 
 
 def _feature_coverage_report_from_parquet(path: Path) -> dict:
+    """Calculate feature coverage without keeping 59 distinct-value hash sets in RAM."""
     import duckdb
+    import tempfile
 
     p = str(path).replace("'", "''")
+    temp_dir = Path(tempfile.gettempdir()) / "indian_market_feature_coverage_duckdb"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_sql = "'" + str(temp_dir).replace("'", "''") + "'"
+
+    # Keep the working set below Colab's common ~1.8 GiB process limit and let
+    # DuckDB spill temporary state to local /tmp if required. The previous
+    # single aggregate contained 59 COUNT(DISTINCT ...) expressions, which
+    # built many large hash sets concurrently and failed after all panel
+    # checkpoints had already been written.
     expressions = ["COUNT(*) AS rows", "COUNT(DISTINCT symbol) AS symbols"]
     for i, name in enumerate(FEATURES_59):
         q = '"' + name.replace('"', '""') + '"'
@@ -1758,31 +1769,44 @@ def _feature_coverage_report_from_parquet(path: Path) -> dict:
         expressions.append(
             f"SUM(CASE WHEN {v} IS NOT NULL AND isfinite({v}) THEN 1 ELSE 0 END) AS obs_{i}"
         )
-        expressions.append(
-            f"COUNT(DISTINCT CASE WHEN {v} IS NOT NULL AND isfinite({v}) THEN {v} ELSE NULL END) AS uniq_{i}"
-        )
+
     con = duckdb.connect(database=":memory:")
     try:
-        con.execute("PRAGMA threads=2")
-        con.execute("PRAGMA memory_limit='2GB'")
+        con.execute("PRAGMA threads=1")
+        con.execute("PRAGMA memory_limit='1GB'")
+        con.execute("PRAGMA preserve_insertion_order=false")
+        con.execute(f"SET temp_directory={temp_sql}")
+
+        # One lightweight pass computes row/symbol totals and per-feature
+        # observation counts. Exact distinct counts are then calculated one
+        # feature at a time so their hash tables do not accumulate together.
         row = con.execute(
             f"SELECT {', '.join(expressions)} FROM read_parquet('{p}')"
         ).fetchone()
+        n_rows = int(row[0] or 0)
+        n_symbols = int(row[1] or 0)
+        features = {}
+
+        for i, name in enumerate(FEATURES_59):
+            observed = int(row[2 + i] or 0)
+            q = '"' + name.replace('"', '""') + '"'
+            v = f"TRY_CAST({q} AS DOUBLE)"
+            unique = int(con.execute(
+                f"SELECT COUNT(DISTINCT CASE "
+                f"WHEN {v} IS NOT NULL AND isfinite({v}) THEN {v} "
+                f"ELSE NULL END) FROM read_parquet('{p}')"
+            ).fetchone()[0] or 0)
+            features[name] = {
+                "column_missing_from_frame": False,
+                "non_missing_rows": observed,
+                "missing_rows": n_rows - observed,
+                "non_missing_pct": round(100.0 * observed / n_rows, 3) if n_rows else 0.0,
+                "unique_non_missing_values": unique,
+                "zero_coverage": observed == 0,
+            }
     finally:
         con.close()
-    n_rows = int(row[0] or 0)
-    features = {}
-    for i, name in enumerate(FEATURES_59):
-        observed = int(row[2 + 2 * i] or 0)
-        unique = int(row[3 + 2 * i] or 0)
-        features[name] = {
-            "column_missing_from_frame": False,
-            "non_missing_rows": observed,
-            "missing_rows": n_rows - observed,
-            "non_missing_pct": round(100.0 * observed / n_rows, 3) if n_rows else 0.0,
-            "unique_non_missing_values": unique,
-            "zero_coverage": observed == 0,
-        }
+
     return {
         "rows": n_rows,
         "feature_count": len(FEATURES_59),
@@ -1794,10 +1818,9 @@ def _feature_coverage_report_from_parquet(path: Path) -> dict:
             c for c, v in features.items() if v["zero_coverage"]
         ],
         "features": features,
-        "symbols": int(row[1] or 0),
-        "method": "streaming DuckDB aggregation over persisted panel parquet",
+        "symbols": n_symbols,
+        "method": "memory-bounded DuckDB aggregation over persisted panel parquet; distinct counts computed one feature at a time",
     }
-
 
 def _sql_string(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
