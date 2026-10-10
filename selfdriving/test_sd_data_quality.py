@@ -4,7 +4,10 @@ import unittest
 
 import pandas as pd
 
-from selfdriving.sd_data_quality import (\n    build_input_audit, derive_realised_returns, merge_realised_returns,\n    next_nse_session, parse_pit_date,\n)
+from selfdriving.sd_data_quality import (
+    build_input_audit, derive_realised_returns, merge_realised_returns,
+    next_nse_session, parse_pit_date,
+)
 
 
 def snap(rows):
