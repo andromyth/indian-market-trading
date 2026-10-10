@@ -391,7 +391,11 @@ def main() -> int:
             expected_date=expected_date,
             observed_date=observed_date,
             realised_update=status["stages"].get("realised_outcomes", {}),
-            source_status=pull_status,
+            source_status={
+                "drive_sources": pull_status,
+                "global_refresh": status["stages"].get("global_cues", {}),
+                "news_refresh": status["stages"].get("news", {}),
+            },
         )
         audit_status = "ERROR" if audit_report["hard_failures"] else (
             "WARN" if audit_report["warnings"] else "PASS"
