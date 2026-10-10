@@ -96,11 +96,76 @@ def _catalog_all(force_refresh=False):
         except Exception:
             pass
 
-    s=_fund_session(); out=[]; size=500
+    # Stage B can be quiet for several minutes if NSE times out, so report the
+    # source window, cache status, every page attempt, and bounded retry failures.
+    FUND_CATALOG_CACHE.parent.mkdir(parents=True,exist_ok=True)
+    partial_path = FUND_CATALOG_CACHE.with_name(
+        FUND_CATALOG_CACHE.stem + ".partial.json"
+    )
+    size=500
+    out=[]
+    first_page=1
+    if partial_path.exists() and partial_path.stat().st_size>0:
+        try:
+            partial=json.loads(partial_path.read_text(encoding="utf-8"))
+            meta=partial.get("meta",{})
+            if (
+                meta.get("from_date")==from_date
+                and meta.get("to_date")==to_date
+                and meta.get("coverage_complete") is not True
+                and isinstance(partial.get("data"),list)
+            ):
+                out=partial["data"]
+                first_page=max(1,int(meta.get("next_page",1)))
+                print(
+                    f"resuming partial NSE filing catalog: page={first_page}; "
+                    f"checkpoint_rows={len(out):,}; window={from_date}..{to_date}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"partial NSE filing catalog ignored: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    if first_page==1 and not out:
+        print(
+            f"starting NSE integrated-filing catalog: window={from_date}..{to_date}; "
+            f"page_size={size}; source={NSE_IF_API}",
+            flush=True,
+        )
+
+    def save_partial(next_page, status="PARTIAL"):
+        payload={
+            "meta":{
+                "cache_version":"3",
+                "from_date":from_date,
+                "to_date":to_date,
+                "coverage_start":"2025-01-01",
+                "coverage_end":today.isoformat(),
+                "coverage_complete":False,
+                "pagination_complete":False,
+                "status":status,
+                "next_page":int(next_page),
+                "checkpointed_at":datetime.now(timezone.utc).isoformat(),
+                "rows":len(out),
+            },
+            "data":out,
+        }
+        tmp=partial_path.with_name(partial_path.name+".tmp")
+        tmp.write_text(json.dumps(payload,default=str),encoding="utf-8")
+        os.replace(tmp,partial_path)
+
+    s=_fund_session()
     pagination_complete = False
-    for page in range(1,401):
+    pages_done=first_page-1
+    for page in range(first_page,401):
         params={"type":"Integrated Filing- Financials","index":"equities","from_date":from_date,"to_date":to_date,"page":page,"size":size}
+        print(
+            f"NSE filing catalog: requesting page={page}; rows_collected={len(out):,}",
+            flush=True,
+        )
         last=None
+        request_started=time.monotonic()
         for attempt in range(3):
             try:
                 rr=s.get(NSE_IF_API,params=params,timeout=30)
@@ -111,26 +176,48 @@ def _catalog_all(force_refresh=False):
                 break
             except Exception as exc:
                 last=exc
+                print(
+                    f"NSE filing catalog page={page} attempt={attempt+1}/3 failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
                 time.sleep(1.0*(attempt+1))
         if last:
-            raise last
+            save_partial(page,status="REQUEST_FAILED")
+            raise RuntimeError(
+                f"NSE filing catalog stopped at page {page}; partial checkpoint saved "
+                f"to {partial_path}. Original error: {type(last).__name__}: {last}"
+            ) from last
+        elapsed=time.monotonic()-request_started
         if not batch:
             pagination_complete = True
+            print(
+                f"NSE filing catalog terminal page={page}; elapsed={elapsed:.1f}s; "
+                f"total_rows={len(out):,}",
+                flush=True,
+            )
             break
         out.extend(batch)
-        if page%20==0:
-            print(f"fundamental catalog pages={page} rows={len(out):,}", flush=True)
+        pages_done=page
+        print(
+            f"NSE filing catalog page={page} complete; returned={len(batch):,}; "
+            f"total_rows={len(out):,}; elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+        # If a Colab session closes mid-ingestion, resume from the next verified
+        # page instead of discarding the entire partial catalogue.
+        save_partial(page+1)
         if len(batch)<size:
             pagination_complete = True
             break
     if not pagination_complete:
+        save_partial(pages_done+1,status="PAGINATION_LIMIT")
         raise RuntimeError("NSE integrated-filing catalog did not reach a verified terminal page; refusing to mark coverage complete.")
 
-    FUND_CATALOG_CACHE.parent.mkdir(parents=True,exist_ok=True)
     from datetime import datetime, timezone
-    FUND_CATALOG_CACHE.write_text(json.dumps({
+    complete_payload={
         "meta":{
-            "cache_version":"2",
+            "cache_version":"3",
             "from_date":from_date,
             "to_date":to_date,
             "coverage_start":"2025-01-01",
@@ -141,8 +228,15 @@ def _catalog_all(force_refresh=False):
             "rows":len(out),
         },
         "data":out,
-    },default=str),encoding="utf-8")
-    print(f"fundamental catalog rows={len(out):,}", flush=True)
+    }
+    complete_tmp=FUND_CATALOG_CACHE.with_name(FUND_CATALOG_CACHE.name+".tmp")
+    complete_tmp.write_text(json.dumps(complete_payload,default=str),encoding="utf-8")
+    os.replace(complete_tmp,FUND_CATALOG_CACHE)
+    try:
+        partial_path.unlink()
+    except FileNotFoundError:
+        pass
+    print(f"fundamental catalog rows={len(out):,}; pages={pages_done-first_page+1:,}", flush=True)
     return out
 
 def _fund_filings(catalog,symbols,max_each=8):
