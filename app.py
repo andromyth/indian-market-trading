@@ -79,6 +79,11 @@ from persistent_store import (
     sync_pending as persistent_sync_pending,
     load_persistent_1m,
 )
+from market_session_guard import (
+    latest_completed_nse_session,
+    nse_session_label,
+    parse_reference_date,
+)
 
 try:
     from indstocks_client import (
@@ -685,14 +690,7 @@ if interface_mode == "Live Test":
         ) + 1
 
     now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
-    if now_ist.hour < 9 or (now_ist.hour == 9 and now_ist.minute < 15):
-        session_label = "PRE-OPEN / BEFORE REGULAR SESSION"
-    elif now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute > 30):
-        session_label = "MARKET CLOSED"
-    elif now_ist.hour == 15 and now_ist.minute == 30:
-        session_label = "REGULAR SESSION CLOSE"
-    else:
-        session_label = "REGULAR SESSION OPEN"
+    session_label = nse_session_label(now_ist.to_pydatetime())
 
     st.title("Indian Market — Live Test")
     st.caption(
@@ -749,12 +747,27 @@ if interface_mode == "Live Test":
                 continue
 
             try:
-                beta_delivery_results[sym] = beta_delivery_predict(
+                result = dict(beta_delivery_predict(
                     sym,
                     None,
                     None,
                     None,
+                ))
+                expected_reference_date = latest_completed_nse_session(
+                    now_ist.to_pydatetime()
                 )
+                observed_reference_date = parse_reference_date(result.get("date"))
+                if observed_reference_date != expected_reference_date:
+                    # A successful inference on a stale PIT snapshot must not
+                    # appear as a current BUY/SELL recommendation.
+                    result["prediction_status"] = "STALE"
+                    result["signal"] = "STALE"
+                    result["signal_reason"] = (
+                        "STALE_REFERENCE_DATE: reference "
+                        f"{observed_reference_date or 'missing'}; expected "
+                        f"{expected_reference_date} from the latest completed NSE session"
+                    )
+                beta_delivery_results[sym] = result
             except Exception as exc:
                 beta_delivery_errors[sym] = {
                     "symbol": sym,
@@ -789,6 +802,18 @@ if interface_mode == "Live Test":
             })
 
         st.subheader("Beta V2 Delivery — next-session directional signal")
+        stale_symbols = [
+            str(sym) for sym, result in beta_delivery_results.items()
+            if str(result.get("prediction_status", "")).upper() == "STALE"
+        ]
+        if stale_symbols:
+            expected_ref = latest_completed_nse_session(now_ist.to_pydatetime())
+            st.warning(
+                "STALE DATA — current BUY/SELL signals are blocked for "
+                + ", ".join(stale_symbols)
+                + f". Latest completed NSE session expected: {expected_ref}. "
+                "Repair/update the Delivery point-in-time snapshot before using these predictions."
+            )
         if table_rows:
             st.dataframe(
                 pd.DataFrame(table_rows),
