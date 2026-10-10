@@ -537,6 +537,19 @@ def _live_5m_price_frame(symbol: str) -> tuple[pd.DataFrame, str]:
     try:
         fallback, source = fetch_live_intraday_1m(root, days=3)
         if fallback is not None and not fallback.empty:
+            # Persist authenticated broker candles when INDstocks is the
+            # selected fallback, preserving daily partitions and Drive copies.
+            if source == "INDSTOCKS_API":
+                try:
+                    persist_1m_frame(
+                        root,
+                        fallback,
+                        source="INDstocks API historical 1m",
+                        sync_drive=True,
+                    )
+                except Exception:
+                    # Persistence failure must not invalidate a usable live frame.
+                    pass
             return fallback, source
     except Exception:
         pass
