@@ -283,11 +283,6 @@ def build_input_audit(
     }
     present_active_features = [feature for feature in active_features if feature in audit_panel.columns]
     missing_active_features = [feature for feature in active_features if feature not in audit_panel.columns]
-    active_numeric = (
-        audit_panel[present_active_features].apply(pd.to_numeric, errors="coerce").replace(
-            [np.inf, -np.inf], np.nan
-        ) if present_active_features and not audit_panel.empty else pd.DataFrame()
-    )
     active_contract_status = str(active_champion_status or ("READY" if active_features else "NO_CHAMPION"))
     active_model_contract = {
         "status": active_contract_status,
