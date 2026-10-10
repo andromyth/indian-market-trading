@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, hashlib, json, os, threading, time, xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import requests
 import joblib
 import numpy as np
@@ -24,11 +25,11 @@ DEFAULT_BULK=str(BASE/"production_data/nse_official/bulk_eod")
 DEFAULT_CASH_MASTER=str(BASE/"production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet")
 DEFAULT_OUT=str(BASE/"models/all_nse_delivery_multifactor_replacement_2026")
 
-FUND_PARSER_VERSION="2026-10-02-period-context-v3"
+FUND_PARSER_VERSION="2026-10-10-context-coverage-v4"
 FUND_CATALOG_CACHE=BASE/"corporate/nse_integrated_filing_catalog_2025_2026.json"
 FUND_BROAD=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
 FUND_BROAD_META=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.meta.json"
-FUND_FILING_CACHE=BASE/"corporate/pit_fundamentals_filing_cache_2025_2026_v3.parquet"
+FUND_FILING_CACHE=BASE/"corporate/pit_fundamentals_filing_cache_2025_2026_v4.parquet"
 FUND_CACHE=BASE/"corporate/xbrl_cache/all_nse_2025_2026"
 CANDIDATE_META_NAME="CANDIDATE_BUILD_META_2026.json"
 NSE_HOME="https://www.nseindia.com/"
@@ -77,11 +78,14 @@ def _fn(x):
 def _fl(tag): return str(tag).split("}",1)[-1].split(":",1)[-1]
 def _catalog_all(force_refresh=False):
     from datetime import datetime, timezone
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    from_date = "01-01-2025"
+    to_date = today.strftime("%d-%m-%Y")
     if not force_refresh and FUND_CATALOG_CACHE.exists() and FUND_CATALOG_CACHE.stat().st_size>0:
         try:
             cached=json.loads(FUND_CATALOG_CACHE.read_text(encoding="utf-8"))
             meta=cached.get("meta",{})
-            same_window=meta.get("from_date")=="01-01-2025" and meta.get("to_date")=="30-09-2026"
+            same_window=meta.get("from_date")==from_date and meta.get("to_date")==to_date
             fetched=datetime.fromisoformat(meta["fetched_at"]).replace(tzinfo=timezone.utc) if meta.get("fetched_at") else None
             fresh=fetched is not None and (datetime.now(timezone.utc)-fetched).total_seconds() < 24*3600
             if same_window and fresh and isinstance(cached.get("data"),list):
@@ -92,7 +96,7 @@ def _catalog_all(force_refresh=False):
 
     s=_fund_session(); out=[]; size=500
     for page in range(1,401):
-        params={"type":"Integrated Filing- Financials","index":"equities","from_date":"01-01-2025","to_date":"30-09-2026","page":page,"size":size}
+        params={"type":"Integrated Filing- Financials","index":"equities","from_date":from_date,"to_date":to_date,"page":page,"size":size}
         last=None
         for attempt in range(3):
             try:
@@ -120,8 +124,8 @@ def _catalog_all(force_refresh=False):
     FUND_CATALOG_CACHE.write_text(json.dumps({
         "meta":{
             "cache_version":"1",
-            "from_date":"01-01-2025",
-            "to_date":"30-09-2026",
+            "from_date":from_date,
+            "to_date":to_date,
             "fetched_at":datetime.now(timezone.utc).isoformat(),
             "rows":len(out),
         },
@@ -431,7 +435,11 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
         except Exception:
             pass
 
-    filing_cache=_bootstrap_cache_from_broad(_load_filing_cache())
+    # The parser version was advanced because the old context selector chose
+    # the first numeric XBRL context rather than the contexts containing the
+    # actual revenue/PAT/EPS/balance-sheet concepts. Reparse cached source XML
+    # using the v4 parser; do not relabel old derived values as current parses.
+    filing_cache=_load_filing_cache()
     cached_keys=set(filing_cache["filing_key"].astype(str)) if not filing_cache.empty else set()
     selected_by_key={_funding_key(f):f for f in filings}
     missing=[f for k,f in selected_by_key.items() if k not in cached_keys]
