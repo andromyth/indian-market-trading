@@ -30,9 +30,9 @@ jobs:
         run: |
           python - <<'PY'
           from persistent_store import drive_status
-          s = drive_status(); print(s)
-          if not s.get('configured') or s.get('reachable') is False:
-              raise SystemExit('Google Drive authentication check failed')
+          s = drive_status(require_write=True); print(s)
+          if not s.get('configured') or s.get('reachable') is False or s.get('write_ready') is False:
+              raise SystemExit('Google Drive read/write preflight failed: ' + str(s.get('reason', 'write authorization is not ready')))
           PY
 
       # Each step below pulls its parquet from Drive, appends today's data, and uploads it back,
