@@ -341,13 +341,16 @@ def historical(
             required = {"ts", "o", "h", "l", "c", "v"}
             if required.issubset(df.columns):
                 idx = pd.to_datetime(pd.to_numeric(df["ts"], errors="coerce"), unit="s", utc=True).dt.tz_convert(IST)
+                # Use arrays rather than indexed Series: otherwise pandas
+                # aligns the original integer row index with the DatetimeIndex
+                # and silently turns every OHLCV cell into NaN.
                 frame = pd.DataFrame(
                     {
-                        "Open": pd.to_numeric(df["o"], errors="coerce"),
-                        "High": pd.to_numeric(df["h"], errors="coerce"),
-                        "Low": pd.to_numeric(df["l"], errors="coerce"),
-                        "Close": pd.to_numeric(df["c"], errors="coerce"),
-                        "Volume": pd.to_numeric(df["v"], errors="coerce"),
+                        "Open": pd.to_numeric(df["o"], errors="coerce").to_numpy(),
+                        "High": pd.to_numeric(df["h"], errors="coerce").to_numpy(),
+                        "Low": pd.to_numeric(df["l"], errors="coerce").to_numpy(),
+                        "Close": pd.to_numeric(df["c"], errors="coerce").to_numpy(),
+                        "Volume": pd.to_numeric(df["v"], errors="coerce").to_numpy(),
                     },
                     index=pd.DatetimeIndex(idx, name="Datetime"),
                 )
