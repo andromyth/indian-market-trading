@@ -134,7 +134,7 @@ def _catalog_all(force_refresh=False):
     print(f"fundamental catalog rows={len(out):,}", flush=True)
     return out
 
-def _fund_filings(catalog,symbols,max_each=4):
+def _fund_filings(catalog,symbols,max_each=8):
     rows=[]
     for r in catalog:
         if str(r.get("type","")).strip().lower()!="integrated filing- financials": continue
@@ -961,10 +961,18 @@ def merge_optional(panel):
             high = events[
                 pd.to_numeric(events["event_high_impact"], errors="coerce").eq(1)
             ][["symbol", "decision_timestamp", "event_high_impact"]].copy()
+            high = high.rename(columns={"event_high_impact": "recent_high_impact"})
             out = merge_pit_layer(
-                out, high, ["event_high_impact"], "high_impact_events",
+                out, high, ["recent_high_impact"], "high_impact_events",
                 max_age=freshness,
             )
+            out["event_high_impact"] = pd.to_numeric(
+                out.get("event_high_impact"), errors="coerce"
+            ).fillna(0.0).where(
+                out.get("recent_high_impact").isna(),
+                out.get("recent_high_impact"),
+            )
+            out = out.drop(columns=["recent_high_impact"], errors="ignore")
         audit["events"] = {
             "exists": True, "rows": int(len(events)),
             "symbols": int(events["symbol"].nunique()),
