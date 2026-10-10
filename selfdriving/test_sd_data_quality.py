@@ -6,7 +6,7 @@ import pandas as pd
 
 from selfdriving.sd_data_quality import (
     build_input_audit, derive_realised_returns, merge_realised_returns,
-    next_nse_session, parse_pit_date,
+    is_nse_session_day, next_nse_session, parse_pit_date,
 )
 
 
@@ -76,6 +76,11 @@ class RealisedReturnTests(unittest.TestCase):
         self.assertEqual(len(report["stockwise_input_readiness"]), 2)
         self.assertEqual(report["stockwise_source_coverage"]["symbols_with_usdinr_feature"], 1)
         self.assertEqual(report["stockwise_source_coverage"]["symbols_with_daily_volume_ratio"], 2)
+
+    def test_nse_session_guard_skips_weekends_and_known_holidays(self):
+        self.assertTrue(is_nse_session_day(date(2026, 10, 12)))
+        self.assertFalse(is_nse_session_day(date(2026, 10, 10)))
+        self.assertFalse(is_nse_session_day(date(2026, 10, 20)))
 
     def test_known_trading_session_calendar_skips_weekend(self):
         self.assertEqual(next_nse_session(date(2026, 10, 9)), date(2026, 10, 12))
