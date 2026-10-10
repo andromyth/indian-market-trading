@@ -128,6 +128,53 @@ def feature_coverage_report(
     }
 
 
+def session_close_timestamp_utc(values: pd.Series) -> pd.Series:
+    """Convert session dates to the actual 15:30 Asia/Kolkata decision clock in UTC."""
+    ts = pd.to_datetime(values, errors="coerce")
+    if ts.dt.tz is None:
+        local_dates = ts.dt.normalize().dt.tz_localize("Asia/Kolkata")
+    else:
+        local_dates = ts.dt.tz_convert("Asia/Kolkata").dt.normalize()
+    return (local_dates + pd.Timedelta(hours=15, minutes=30)).dt.tz_convert("UTC")
+
+
+def assert_training_feature_coverage(
+    frame: pd.DataFrame,
+    features: Iterable[str] = FEATURES_59,
+    *,
+    min_observations: int = 100,
+    min_fraction: float = 0.005,
+) -> dict:
+    """Fail candidate training if any locked feature is effectively unobserved.
+
+    This is a data-availability gate, not a demand that every security have every
+    factor. Per-security non-applicability remains NaN and is left for the fitted
+    imputer. Across the training cohort, however, every feature must have enough
+    real observations to be estimable rather than silently becoming a constant.
+    """
+    feature_order = list(features)
+    report = feature_coverage_report(frame, feature_order)
+    minimum_required = max(int(min_observations), int(np.ceil(len(frame) * float(min_fraction))))
+    blocked = {
+        name: detail
+        for name, detail in report["features"].items()
+        if detail["non_missing_rows"] < minimum_required
+    }
+    report["minimum_observations_required"] = minimum_required
+    report["blocked_features"] = blocked
+    report["passed"] = not blocked
+    if blocked:
+        details = ", ".join(
+            f"{name}={info['non_missing_rows']}/{report['rows']} ({info['non_missing_pct']:.3f}%)"
+            for name, info in blocked.items()
+        )
+        raise RuntimeError(
+            "59-feature candidate blocked: feature observations are insufficient "
+            f"(required >= {minimum_required} rows, at least {float(min_fraction)*100:.2f}% of cohort): {details}"
+        )
+    return report
+
+
 def _available_from_values(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
     present=[c for c in cols if c in frame.columns]
     if not present:
