@@ -745,8 +745,8 @@ def _auto_watch_intraday(symbol: str) -> dict:
 
 
 if interface_mode == "Live Test":
-    st.title("Indian Market Watch")
-    st.caption("Daily, source-attributed stock ideas with separate Delivery and Intraday model forecasts. Decision support only — no orders are placed.")
+    st.title("Stocks to Watch")
+    st.caption("Automatic daily shortlist from recent market coverage, with separate model forecasts for Delivery and Intraday. No orders are placed.")
 
     refresh_col, note_col = st.columns([1, 3])
     with refresh_col:
@@ -758,24 +758,6 @@ if interface_mode == "Live Test":
         ) + 1
 
     refresh_revision = int(st.session_state.get("watchlist_refresh_revision", 0))
-    watch_now = pd.Timestamp.now(tz="Asia/Kolkata")
-    try:
-        from production_data_freshness_gate import HOLIDAYS
-        known_holidays = set(HOLIDAYS)
-    except Exception:
-        known_holidays = set()
-    watch_target = resolve_watch_target_session(watch_now.to_pydatetime(), known_holidays)
-    session_open = (
-        watch_now.weekday() < 5
-        and watch_now.date() not in known_holidays
-        and pd.Timestamp("09:15").time() <= watch_now.time() <= pd.Timestamp("15:30").time()
-    )
-
-    top = st.columns(4)
-    top[0].metric("Market", "OPEN" if session_open else "CLOSED")
-    top[1].metric("Watchlist session", watch_target.strftime("%a, %d %b %Y"))
-    top[2].metric("IST", watch_now.strftime("%H:%M:%S"))
-    top[3].metric("Refresh cycle", "60 sec" if session_open else "10 min")
 
     st.info(
         "Stocks are selected from recent market coverage across Moneycontrol, Economic Times, "
@@ -788,6 +770,23 @@ if interface_mode == "Live Test":
     # 20 seconds; explicit Refresh clears caches immediately.
     @st.fragment(run_every="60s")
     def _render_daily_market_watch():
+        watch_now = pd.Timestamp.now(tz="Asia/Kolkata")
+        try:
+            from production_data_freshness_gate import HOLIDAYS
+            known_holidays = set(HOLIDAYS)
+        except Exception:
+            known_holidays = set()
+        watch_target = resolve_watch_target_session(watch_now.to_pydatetime(), known_holidays)
+        session_open = (
+            watch_now.weekday() < 5
+            and watch_now.date() not in known_holidays
+            and pd.Timestamp("09:15").time() <= watch_now.time() <= pd.Timestamp("15:30").time()
+        )
+        top = st.columns(4)
+        top[0].metric("Market", "OPEN" if session_open else "CLOSED")
+        top[1].metric("Watchlist session", watch_target.strftime("%a, %d %b %Y"))
+        top[2].metric("IST", watch_now.strftime("%H:%M:%S"))
+        top[3].metric("Auto-refresh", "Every 60 sec")
         data = _today_stock_watchlist()
         stock_rows = data.get("stocks", []) or []
         sources = data.get("sources", []) or []
