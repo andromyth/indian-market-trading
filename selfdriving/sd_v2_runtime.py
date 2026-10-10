@@ -111,6 +111,63 @@ def beta_status() -> dict[str, Any]:
         out["intraday"] = json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         out["intraday"] = {"status": "NOT_TRAINED", "error": f"{type(exc).__name__}: {exc}"}
+
+    # This file is small enough to refresh on each cache miss. Unlike a PIT
+    # snapshot, it is mutable status and must not stay stale in a long-lived app.
+    try:
+        audit_path = CACHE / "status_data_audit.json"
+        _download(f"{REMOTE_ROOT}/status_data_audit.json", audit_path)
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        global_audit = audit.get("global_market_fx", {}) or {}
+        news_audit = audit.get("news", {}) or {}
+        fno_audit = audit.get("fno", {}) or {}
+        snapshot_audit = audit.get("snapshot", {}) or {}
+        out["data_audit"] = {
+            "overall_status": audit.get("overall_status", "UNKNOWN"),
+            "generated_at_utc": audit.get("generated_at_utc"),
+            "expected_reference_date": audit.get("expected_reference_date"),
+            "observed_reference_date": audit.get("observed_reference_date"),
+            "snapshot_fresh": audit.get("snapshot_fresh"),
+            "snapshot": {
+                "rows": snapshot_audit.get("rows"),
+                "symbols": snapshot_audit.get("symbols"),
+                "duplicate_symbol_rows": snapshot_audit.get("duplicate_symbol_rows"),
+                "mean_feature_non_null_pct": snapshot_audit.get("mean_feature_non_null_pct"),
+                "production_quality_gate_pct": snapshot_audit.get("production_quality_gate_pct"),
+            },
+            "stockwise_source_coverage": audit.get("stockwise_source_coverage", {}),
+            "feature_groups": audit.get("feature_groups", {}),
+            "volume": audit.get("volume", {}),
+            "global_market_fx": {
+                "rows": global_audit.get("rows"),
+                "series": global_audit.get("series", []),
+                "duplicate_key_date_rows": global_audit.get("duplicate_key_date_rows"),
+                "integrated_feature_coverage": global_audit.get("integrated_feature_coverage", {}),
+                "latest_available_by_series": global_audit.get("latest_available_by_series", {}),
+            },
+            "news": {
+                "rows": news_audit.get("rows"),
+                "symbols": news_audit.get("symbols"),
+                "duplicate_headline_rows": news_audit.get("duplicate_headline_rows"),
+                "latest_first_seen_at": news_audit.get("latest_first_seen_at"),
+                "rows_first_seen_last_24h": news_audit.get("rows_first_seen_last_24h"),
+                "integrated_feature_coverage": news_audit.get("integrated_feature_coverage", {}),
+            },
+            "fno": {
+                "rows": fno_audit.get("rows"),
+                "symbols": fno_audit.get("symbols"),
+                "duplicate_symbol_date_rows": fno_audit.get("duplicate_symbol_date_rows"),
+                "latest_trade_date": fno_audit.get("latest_trade_date"),
+                "integrated_feature_coverage": fno_audit.get("integrated_feature_coverage", {}),
+            },
+            "hard_failures": audit.get("hard_failures", []),
+            "warnings": audit.get("warnings", []),
+        }
+    except Exception as exc:
+        out["data_audit"] = {
+            "overall_status": "NOT_AVAILABLE",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     return out
 
 

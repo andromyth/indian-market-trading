@@ -38,6 +38,21 @@ the current 5-minute Intraday production model.
 - `.github/workflows/autonomous_delivery_cycle_v2.yml`: weekday scheduled beta cycle plus manual dispatch.
 - Existing candidate CI is configured to run on `beta_version2`.
 
+## Autonomous data controls (2026-10-10)
+
+The Beta V2 weekday job runs at 07:15 IST, after the overnight Production PIT refresh retry window. Before scoring, it checks that the newest saved PIT filename matches the latest completed NSE session expected by the repository's session calendar. Missing or stale PIT data blocks inference and makes the Actions run fail visibly.
+
+Each run updates and saves:
+- `selfdriving/beta_version2/status_data_audit.json`: point-in-time PIT date, locked-feature coverage, lowest-coverage and full stockwise coverage, volume/Delivery features, scored-news and event availability, F&O coverage, global series availability, USD/INR availability and age, duplicate source rows, and source refresh failures.
+- `selfdriving/beta_version2/BETA_V2_DELIVERY_REALISED_RETURNS.parquet`: next-session close-to-close outcomes reconstructed from consecutive official NSE PIT snapshots. A missing NSE session is skipped rather than mislabeled as a one-session result.
+- `selfdriving/beta_version2/status_cycle.json`: pull, source-refresh, audit, inference, and validation results.
+
+The first signal issued for each symbol/reference-date is retained during reruns. Data corrections can refresh the realised outcome table, but do not silently rewrite the already-issued prediction.
+
+The Colab trainer reads the same Beta V2 global-cues and RSS-news archives updated by the daily job. Its source manifest fingerprints the base panel plus global, news and F&O inputs; when those sources change, stale enriched-panel caches are discarded before retraining. Use `--force-rebuild-panel` to request an explicit rebuild.
+
+Global USD/INR, other global series and scored-news features are still subject to point-in-time availability and Beta V2 coverage/date gates. The RSS archive starts when the autonomous collector begins seeing headlines; missing historical headlines are not fabricated. Richer source presence alone does not mean the trained challenger uses every group. Inspect `status_data_audit.json` and the training manifest before interpreting a prediction. These changes do not alter or promote the locked production model.
+
 ## Validation status
 The branch changes the architecture and wiring, but no claim of improved predictive accuracy is made until the
 Delivery and Intraday challengers are actually trained on the available historical data and pass out-of-sample gates.

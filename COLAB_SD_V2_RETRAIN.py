@@ -6,7 +6,9 @@ CPU-only Colab runtimes. It never changes production model artefacts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import duckdb
@@ -38,6 +40,26 @@ def load_optional(path: Path) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
     return pd.read_parquet(path)
+
+
+def file_fingerprint(path: Path, hash_content: bool = False) -> dict:
+    """Capture source identity so enriched-panel caches cannot silently go stale."""
+    if not path.exists() or not path.is_file():
+        return {"path": str(path), "exists": False}
+    stat = path.stat()
+    result = {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+    if hash_content:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        result["sha256"] = digest.hexdigest()
+    return result
 
 
 def parquet_stats(path: Path) -> dict:
@@ -258,6 +280,11 @@ def main() -> int:
         default=DEFAULT_LOOKBACK_SESSIONS,
         help="Recent sessions used for OOS training. Must be >= 422; all symbols remain included.",
     )
+    ap.add_argument(
+        "--force-rebuild-panel",
+        action="store_true",
+        help="Rebuild the cached enriched Beta V2 panel even when source fingerprints match.",
+    )
     args = ap.parse_args()
 
     if args.lookback_sessions < MIN_WALKFORWARD_SESSIONS:
@@ -333,8 +360,10 @@ def main() -> int:
     else:
         full_base = source_panel
 
-    global_path = base / "selfdriving/global_cues.parquet"
-    news_path = base / "selfdriving/raw_news.parquet"
+    # These paths are the same archives updated by the Beta V2 daily job.
+    # Do not train from the older legacy selfdriving/ copies.
+    global_path = base / "selfdriving/beta_version2/global_cues.parquet"
+    news_path = base / "selfdriving/beta_version2/raw_news.parquet"
     fno_path = base / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
 
     global_cues = load_optional(global_path)
@@ -343,6 +372,37 @@ def main() -> int:
 
     beta_full = out / f"BETA_V2_DELIVERY_PANEL_{args.lookback_sessions}S_FULL.parquet"
     beta_parts = out / "beta_panel_parts"
+    source_manifest_path = out / "BETA_V2_PANEL_SOURCE_MANIFEST.json"
+
+    fingerprint_payload = {
+        "schema": "beta-v2-panel-source-contract-2026-10-10-v1",
+        "lookback_sessions": int(args.lookback_sessions),
+        "base_panel": file_fingerprint(source_panel, hash_content=False),
+        "global_cues": file_fingerprint(global_path, hash_content=True),
+        "raw_news": file_fingerprint(news_path, hash_content=True),
+        "fno_daily": file_fingerprint(fno_path, hash_content=True),
+    }
+    signature = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    previous_manifest = {}
+    if source_manifest_path.exists():
+        try:
+            previous_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            previous_manifest = {}
+    cache_exists = beta_full.exists() or beta_parts.exists()
+    source_signature_changed = previous_manifest.get("signature_sha256") != signature
+    if args.force_rebuild_panel or (cache_exists and source_signature_changed):
+        if beta_full.exists():
+            beta_full.unlink()
+        if beta_parts.exists():
+            shutil.rmtree(beta_parts)
+        print(
+            "Beta V2 enriched-panel cache invalidated because source fingerprints changed "
+            "or --force-rebuild-panel was requested.",
+            flush=True,
+        )
 
     if beta_full.exists() and beta_full.stat().st_size > 0:
         beta_stats = parquet_stats(beta_full)
@@ -379,6 +439,18 @@ def main() -> int:
             fno_daily,
             lookback_sessions=args.lookback_sessions,
         )
+
+    source_manifest = {
+        **fingerprint_payload,
+        "signature_sha256": signature,
+        "generated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "enriched_panel": str(beta_full),
+        "enriched_panel_size_bytes": int(beta_full.stat().st_size),
+    }
+    source_manifest_path.write_text(
+        json.dumps(source_manifest, indent=2, default=str),
+        encoding="utf-8",
+    )
 
     # Do not load the entire multi-million-row Beta panel for model fitting.
     # Keep all NSE symbols but use a recent, contiguous session window for
@@ -427,6 +499,8 @@ def main() -> int:
         "training_rows": int(len(training)),
         "inference_rows": int(len(inference)),
         "realised_rows": int(len(realised)),
+        "panel_source_signature": signature,
+        "panel_source_manifest": str(source_manifest_path),
         "groups": result.get("groups"),
         "gate": result.get("gate"),
         "thresholds": result.get("thresholds"),
