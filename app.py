@@ -84,11 +84,41 @@ try:
     from indstocks_client import (
         configured as _indstocks_configured,
         historical_1m as _indstocks_historical_1m,
+        latest_quote as _indstocks_latest_quote,
+        historical_1m as _indstocks_test_history,
+        profile as _indstocks_profile,
     )
 except Exception:
     _indstocks_configured = _indstocks_historical_1m = None
+    _indstocks_latest_quote = _indstocks_test_history = _indstocks_profile = None
 
 st.set_page_config(page_title="Indian Market Trading", layout="wide")
+
+# On-demand, read-only connectivity check. It runs only when clicked and
+# deliberately does not display account profile fields or credentials.
+st.sidebar.subheader("INDstocks API")
+if st.sidebar.button("Test INDstocks connection", key="indstocks_connection_test"):
+    if _indstocks_configured is None or not _indstocks_configured():
+        st.sidebar.error("INDstocks credentials are not configured in Streamlit Secrets.")
+    elif _indstocks_profile is None or _indstocks_latest_quote is None or _indstocks_test_history is None:
+        st.sidebar.error("INDstocks client could not be loaded. Check the deployment logs.")
+    else:
+        try:
+            with st.spinner("Checking INDstocks authentication and read-only market data..."):
+                _indstocks_profile()  # Authentication smoke test; never display profile details.
+                _indstocks_quote_test = _indstocks_latest_quote("RELIANCE.NS")
+                _indstocks_candles_test = _indstocks_test_history("RELIANCE.NS", days=1)
+            st.sidebar.success("Authentication and quote API: PASS")
+            st.sidebar.metric("RELIANCE latest quote", f"₹{float(_indstocks_quote_test['live_price']):,.2f}")
+            if _indstocks_candles_test is not None and not _indstocks_candles_test.empty:
+                _indstocks_last_bar = pd.Timestamp(_indstocks_candles_test.index.max())
+                st.sidebar.success(f"Historical 1-minute candles: PASS ({len(_indstocks_candles_test)} rows)")
+                st.sidebar.caption(f"Most recent candle timestamp: {_indstocks_last_bar}")
+            else:
+                st.sidebar.warning("Authentication and quote passed, but no one-minute candles were returned for the last day.")
+            st.sidebar.caption("Read-only test only. No orders are placed.")
+        except Exception as _indstocks_test_error:
+            st.sidebar.error(f"INDstocks check failed: {_indstocks_test_error}")
 
 interface_mode = st.sidebar.radio(
     "Interface",
@@ -906,6 +936,7 @@ if interface_mode == "Live Test":
                     source_label = {
                         "NSE_OFFICIAL_CHART": "NSE official",
                         "PERSISTENT_LOCAL_CACHE": "persistent local cache",
+                        "INDSTOCKS_API": "INDstocks API",
                         "DHAN": "Dhan",
                         "YAHOO_FINANCE": "Yahoo Finance",
                         "YFINANCE": "yfinance",
