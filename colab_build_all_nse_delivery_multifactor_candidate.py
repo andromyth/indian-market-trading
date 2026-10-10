@@ -851,60 +851,140 @@ def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     }
 
 def merge_optional(panel):
-    out=panel.copy(); audit={}
+    out = panel.copy()
+    audit = {}
+    fno_columns = [
+        "fno_pcr", "fno_oi_change", "fno_iv_change", "fno_available",
+        "fno_fut_close", "fno_fut_basis", "fno_fut_return", "fno_fut_oi",
+    ]
 
-    # Broad NSE F&O takes precedence over the legacy three-stock PIT pilot.
-    # The pilot is retained on Drive for historical reproducibility but is not
-    # merged into the ALL-NSE candidate because doing so would create a mixed
-    # provenance layer.
+    # The derivatives join is exact by next exchange session. It never carries
+    # yesterday's F&O figures into later sessions without a source observation.
     out, fno_audit = _merge_broad_fno_pit(out)
     audit["fno"] = fno_audit
 
-    sources=[
-      ("news",BASE/"processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",["news_available"]),
-      ("events",BASE/"processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",["event_available","event_high_impact"]),
-    ]
-    for kind,path,cols in sources:
-        layer=load_optional_layer(path)
-        if layer.empty:
-            audit[kind]={"exists":False,"rows":0}
-            continue
-        out=merge_pit_layer(out,layer,cols,kind)
-        audit[kind]={"exists":True,"rows":int(len(layer)),"symbols":int(layer["symbol"].nunique())}
+    # A complete source manifest is required before missing per-symbol events
+    # can truthfully mean zero. File existence alone is not source coverage.
+    source_manifest_path = (
+        BASE / "processed/pit_replay/nse_all_universe_raw_2026/"
+        "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    )
+    source_manifest = {}
+    try:
+        if source_manifest_path.exists() and source_manifest_path.stat().st_size > 0:
+            source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        audit["news_events_manifest_error"] = f"{type(exc).__name__}: {exc}"
+
+    coverage_complete = source_manifest.get("coverage_complete") is True
+    coverage_start = pd.to_datetime(source_manifest.get("coverage_start"), errors="coerce")
+    coverage_end = pd.to_datetime(source_manifest.get("coverage_end"), errors="coerce")
+    if pd.isna(coverage_start) or pd.isna(coverage_end):
+        coverage_complete = False
+    audit["news_events_coverage"] = {
+        "manifest_path": str(source_manifest_path),
+        "coverage_complete": bool(coverage_complete),
+        "coverage_start": str(coverage_start.date()) if pd.notna(coverage_start) else None,
+        "coverage_end": str(coverage_end.date()) if pd.notna(coverage_end) else None,
+    }
+
+    news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
+    events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
+    news = load_optional_layer(news_path)
+    events = load_optional_layer(events_path)
+
+    # These flags mean "at least one announcement/event in the last 7 days",
+    # not "this symbol ever had a row in the archive". Old news must expire.
+    freshness = pd.Timedelta(days=7)
+    if not news.empty and "news_available" in news.columns:
+        out = merge_pit_layer(out, news, ["news_available"], "news", max_age=freshness)
+        audit["news"] = {
+            "exists": True, "rows": int(len(news)),
+            "symbols": int(news["symbol"].nunique()),
+            "freshness_days": 7,
+        }
+    else:
+        if "news_available" not in out.columns:
+            out["news_available"] = np.nan
+        audit["news"] = {"exists": False, "rows": 0, "freshness_days": 7}
+
+    if not events.empty and "event_available" in events.columns:
+        out = merge_pit_layer(out, events, ["event_available"], "events", max_age=freshness)
+        # High-impact status is independent of the latest low-impact event:
+        # join only high-impact observations, so any such event stays active for
+        # the freshness window even if a later low-impact event was published.
+        if "event_high_impact" in events.columns:
+            high = events[
+                pd.to_numeric(events["event_high_impact"], errors="coerce").eq(1)
+            ][["symbol", "decision_timestamp", "event_high_impact"]].copy()
+            out = merge_pit_layer(
+                out, high, ["event_high_impact"], "high_impact_events",
+                max_age=freshness,
+            )
+        audit["events"] = {
+            "exists": True, "rows": int(len(events)),
+            "symbols": int(events["symbol"].nunique()),
+            "high_impact_rows": int(
+                pd.to_numeric(events.get("event_high_impact"), errors="coerce").eq(1).sum()
+            ) if "event_high_impact" in events else 0,
+            "freshness_days": 7,
+        }
+    else:
+        for column in ("event_available", "event_high_impact"):
+            if column not in out.columns:
+                out[column] = np.nan
+        audit["events"] = {"exists": False, "rows": 0, "freshness_days": 7}
+
+    # Fill "no recent item" with zero only inside a successfully fetched,
+    # explicitly recorded coverage window and only after a seven-day warm-up.
+    # Outside that window, or after a failed/partial source build, retain NaN.
+    if coverage_complete and not out.empty:
+        local_dates = pd.to_datetime(out["decision_timestamp"], errors="coerce", utc=True).dt.tz_convert("Asia/Kolkata").dt.normalize().dt.tz_localize(None)
+        first_fully_covered_day = coverage_start.normalize() + pd.Timedelta(days=7)
+        known_window = (
+            local_dates.ge(first_fully_covered_day)
+            & local_dates.le(coverage_end.normalize())
+        )
+        for column in ("news_available", "event_available", "event_high_impact"):
+            if column in out.columns:
+                out.loc[known_window, column] = pd.to_numeric(
+                    out.loc[known_window, column], errors="coerce"
+                ).fillna(0.0)
+        audit["news_events_coverage"]["known_zero_rows"] = int(known_window.sum())
+    else:
+        audit["news_events_coverage"]["known_zero_rows"] = 0
 
     # ONLY the broad ALL-NSE PIT fundamentals layer is accepted here.
     # Never silently fall back to the legacy three-stock pilot.
-    fp=BASE/"corporate/pit_fundamentals_all_nse_2025_2026.parquet"
-    fp=fp if fp.exists() and fp.stat().st_size>0 else None
+    fp = BASE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
+    fp = fp if fp.exists() and fp.stat().st_size > 0 else None
     if fp is not None:
-        f=pd.read_parquet(fp)
-        f["symbol"]=f["symbol"].map(normalize_symbol)
-        f["fundamental_available_at"]=pd.to_datetime(
-            f["fundamental_available_at"],errors="coerce",utc=True
+        f = pd.read_parquet(fp)
+        f["symbol"] = f["symbol"].map(normalize_symbol)
+        f["fundamental_available_at"] = pd.to_datetime(
+            f["fundamental_available_at"], errors="coerce", utc=True
         )
-        f["period_end"]=pd.to_datetime(
-            f.get("period_end"),errors="coerce",utc=True
-        ).dt.normalize() if "period_end" in f.columns else pd.NaT
-        f=f.dropna(subset=["symbol","fundamental_available_at"]).sort_values(
-            ["symbol","fundamental_available_at"]
+        f = f.dropna(subset=["symbol", "fundamental_available_at"]).sort_values(
+            ["symbol", "fundamental_available_at"]
         )
-        vals=[
-            "fundamental_revenue","fundamental_pat","fundamental_eps",
-            "fundamental_ebitda","fundamental_finance_cost",
-            "fundamental_total_equity","fundamental_total_debt","fundamental_cash",
-            "fund_revenue_growth","fund_pat_growth","fund_eps_growth",
-            "fund_ebitda_growth","fund_pat_margin","fund_debt_to_equity",
+        vals = [
+            "fundamental_revenue", "fundamental_pat", "fundamental_eps",
+            "fundamental_ebitda", "fundamental_finance_cost",
+            "fundamental_total_equity", "fundamental_total_debt", "fundamental_cash",
+            "fund_revenue_growth", "fund_pat_growth", "fund_eps_growth",
+            "fund_ebitda_growth", "fund_pat_margin", "fund_debt_to_equity",
             "fund_cash_to_debt",
         ]
-        pieces=[]
-        for sym,lp in out.groupby("symbol",sort=False):
-            rp=f[f["symbol"].eq(sym)]
+        pieces = []
+        for sym, lp in out.groupby("symbol", sort=False):
+            rp = f[f["symbol"].eq(sym)]
             if rp.empty:
                 pieces.append(lp)
                 continue
-            cols=["fundamental_available_at"]+[x for x in vals if x in rp.columns]
-            rp=rp[cols].drop_duplicates(["fundamental_available_at"],keep="last")
-            m=pd.merge_asof(
+            available_values = [x for x in vals if x in rp.columns]
+            cols = ["fundamental_available_at"] + available_values
+            rp = rp[cols].drop_duplicates(["fundamental_available_at"], keep="last")
+            m = pd.merge_asof(
                 lp.sort_values("decision_timestamp"),
                 rp.sort_values("fundamental_available_at"),
                 left_on="decision_timestamp",
@@ -914,37 +994,87 @@ def merge_optional(panel):
             )
             pieces.append(m)
         if pieces:
-            out=pd.concat(pieces,ignore_index=True)
-        # Fundamental readiness is based on the existence of an as-of filing,
-        # not on every optional accounting field being present.
-        fa=pd.to_datetime(out.get("fundamental_available_at"),errors="coerce",utc=True)
-        valid=fa.notna() & fa.le(out["decision_timestamp"])
-        out["fundamentals_available"]=valid.astype("Int8")
-        out["fundamental_age_days"]=np.nan
-        out.loc[valid,"fundamental_age_days"]=(
-            out.loc[valid,"decision_timestamp"]-fa.loc[valid]
-        ).dt.total_seconds()/86400.0
-        out["fundamental_stale_90d"]=pd.Series(
-            np.where(valid,(out["fundamental_age_days"]>90).astype(float),np.nan),
-            index=out.index,dtype="float64"
+            out = pd.concat(pieces, ignore_index=True)
+        fa = pd.to_datetime(out.get("fundamental_available_at"), errors="coerce", utc=True)
+        valid = fa.notna() & fa.le(out["decision_timestamp"])
+        out["fundamentals_available"] = valid.astype("Int8")
+        out["fundamental_age_days"] = np.nan
+        out.loc[valid, "fundamental_age_days"] = (
+            out.loc[valid, "decision_timestamp"] - fa.loc[valid]
+        ).dt.total_seconds() / 86400.0
+        out["fundamental_stale_90d"] = pd.Series(
+            np.where(valid, (out["fundamental_age_days"] > 90).astype(float), np.nan),
+            index=out.index, dtype="float64",
         )
-        out["fundamental_stale_180d"]=pd.Series(
-            np.where(valid,(out["fundamental_age_days"]>180).astype(float),np.nan),
-            index=out.index,dtype="float64"
+        out["fundamental_stale_180d"] = pd.Series(
+            np.where(valid, (out["fundamental_age_days"] > 180).astype(float), np.nan),
+            index=out.index, dtype="float64",
         )
-        audit["fundamentals"]={
-            "exists":True,
-            "path":str(fp),
-            "rows":int(len(f)),
-            "symbols":int(f["symbol"].nunique()),
+        # Ensure every fundamental contract column exists, but do not fabricate
+        # numeric accounting values when NSE/XBRL did not publish/parse them.
+        for column in [
+            "fundamental_revenue", "fundamental_pat", "fundamental_eps",
+            "fundamental_ebitda", "fundamental_finance_cost", "fundamental_total_equity",
+            "fundamental_total_debt", "fundamental_cash", "fund_revenue_growth",
+            "fund_pat_growth", "fund_eps_growth", "fund_ebitda_growth",
+            "fund_pat_margin", "fund_debt_to_equity", "fund_cash_to_debt",
+        ]:
+            if column not in out.columns:
+                out[column] = np.nan
+        audit["fundamentals"] = {
+            "exists": True, "path": str(fp), "rows": int(len(f)),
+            "symbols": int(f["symbol"].nunique()),
+            "feature_coverage": feature_coverage_report(out, [
+                "fundamental_revenue", "fundamental_pat", "fundamental_eps",
+                "fundamental_ebitda", "fundamental_finance_cost",
+                "fundamental_total_equity", "fundamental_total_debt", "fundamental_cash",
+                "fund_revenue_growth", "fund_pat_growth", "fund_eps_growth",
+                "fund_ebitda_growth", "fund_pat_margin", "fund_debt_to_equity",
+                "fund_cash_to_debt",
+            ]),
         }
     else:
-        audit["fundamentals"]={"exists":False,"rows":0}
-        out["fundamentals_available"]=pd.Series(np.zeros(len(out),dtype="Int8"),index=out.index)
-        out["fundamental_age_days"]=np.nan
-        out["fundamental_stale_90d"]=np.nan
-        out["fundamental_stale_180d"]=np.nan
-    return attach_readiness_flags(out),audit
+        audit["fundamentals"] = {
+            "exists": False, "rows": 0,
+            "error": "Broad PIT fundamentals source file is missing; readiness must remain unknown.",
+        }
+        out["fundamentals_available"] = pd.Series(np.nan, index=out.index, dtype="float64")
+        out["fundamental_age_days"] = np.nan
+        out["fundamental_stale_90d"] = np.nan
+        out["fundamental_stale_180d"] = np.nan
+        for column in [
+            "fundamental_revenue", "fundamental_pat", "fundamental_eps",
+            "fundamental_ebitda", "fundamental_finance_cost", "fundamental_total_equity",
+            "fundamental_total_debt", "fundamental_cash", "fund_revenue_growth",
+            "fund_pat_growth", "fund_eps_growth", "fund_ebitda_growth",
+            "fund_pat_margin", "fund_debt_to_equity", "fund_cash_to_debt",
+        ]:
+            if column not in out.columns:
+                out[column] = np.nan
+
+    out = attach_readiness_flags(out)
+    # Make source absence and source non-applicability distinct. Existing
+    # per-row observations/readiness states are left intact.
+    out["fno_source_date_coverage"] = 0.0
+    if fno_audit.get("exists") and fno_audit.get("covered_target_sessions", 0):
+        fno_dates = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+        # A target session is source-covered even when this particular symbol
+        # has no derivative rows. Other sessions remain unknown.
+        covered_set = set()
+        if path.exists() and path.stat().st_size > 0:
+            source = pd.read_parquet(path, columns=["date"])
+            sessions = sorted(pd.to_datetime(source["date"], errors="coerce").dropna().dt.normalize().unique())
+            target_sessions = pd.to_datetime(panel["date"], errors="coerce").dt.normalize().dropna().unique()
+            next_map = {pd.Timestamp(target_sessions[i]): pd.Timestamp(target_sessions[i + 1]) for i in range(len(target_sessions) - 1)}
+            covered_set = {next_map[d] for d in sessions if d in next_map}
+        out["fno_source_date_coverage"] = fno_dates.isin(covered_set).astype(float)
+        out.loc[~fno_dates.isin(covered_set), "fno_available"] = np.nan
+        out.loc[fno_dates.isin(covered_set), "fno_available"] = pd.to_numeric(
+            out.loc[fno_dates.isin(covered_set), "fno_available"], errors="coerce"
+        ).fillna(0.0)
+
+    audit["feature_coverage"] = feature_coverage_report(out)
+    return out, audit
 
 def add_targets(panel,steps,name):
     x=panel.sort_values(["symbol","decision_timestamp"]).copy()
