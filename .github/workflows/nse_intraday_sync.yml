@@ -42,10 +42,10 @@ jobs:
         run: |
           python - <<'PY'
           from persistent_store import drive_status
-          status = drive_status()
+          status = drive_status(require_write=True)
           print(status)
-          if not status.get("configured") or status.get("reachable") is False:
-              raise SystemExit("Google Drive authentication check failed")
+          if not status.get("configured") or status.get("reachable") is False or status.get("write_ready") is False:
+              raise SystemExit("Google Drive read/write preflight failed: " + str(status.get("reason", "write authorization is not ready")))
           PY
       - name: Capture full NSE universe
         env:
