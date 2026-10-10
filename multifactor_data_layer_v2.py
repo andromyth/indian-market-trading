@@ -154,23 +154,69 @@ def assert_training_feature_coverage(
     """
     feature_order = list(features)
     report = feature_coverage_report(frame, feature_order)
-    minimum_required = max(int(min_observations), int(np.ceil(len(frame) * float(min_fraction))))
-    blocked = {
-        name: detail
-        for name, detail in report["features"].items()
-        if detail["non_missing_rows"] < minimum_required
-    }
-    report["minimum_observations_required"] = minimum_required
+    base_population = int(len(frame))
+    scoped = {}
+    blocked = {}
+
+    # Numeric derivatives features are applicable only to rows for which a
+    # derivatives underlying was actually available. Fundamental values are
+    # measured among rows with an as-of filing. This prevents genuine
+    # non-applicability for a stock from hiding whether the feature source works.
+    for name, detail in report["features"].items():
+        mask = pd.Series(True, index=frame.index)
+        scope = "all_training_rows"
+        if name in GROUPS["fno"] and name != "fno_available" and "fno_available" in frame.columns:
+            availability = pd.to_numeric(frame["fno_available"], errors="coerce")
+            mask = availability.eq(1)
+            scope = "fno_applicable_rows"
+        elif name in GROUPS["fundamentals"] and "ready_fundamentals" in frame.columns:
+            mask = pd.to_numeric(frame["ready_fundamentals"], errors="coerce").eq(1)
+            scope = "rows_with_asof_fundamental"
+        elif name in GROUPS["market_price"] and "ready_market_price" in frame.columns:
+            mask = pd.to_numeric(frame["ready_market_price"], errors="coerce").eq(1)
+            scope = "market_price_ready_rows"
+        elif name in GROUPS["market_context"] and "ready_market_context" in frame.columns:
+            mask = pd.to_numeric(frame["ready_market_context"], errors="coerce").eq(1)
+            scope = "market_context_ready_rows"
+
+        scope_count = int(mask.sum())
+        if name not in frame.columns:
+            observed_in_scope = 0
+        else:
+            values = pd.to_numeric(frame[name], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            observed_in_scope = int(values.loc[mask].notna().sum())
+        minimum_required = max(
+            int(min_observations),
+            int(np.ceil(scope_count * float(min_fraction))),
+        )
+        scoped[name] = {
+            "scope": scope,
+            "scope_rows": scope_count,
+            "scope_pct_of_training_rows": round(100.0 * scope_count / base_population, 3) if base_population else 0.0,
+            "observed_rows_in_scope": observed_in_scope,
+            "observed_pct_of_scope": round(100.0 * observed_in_scope / scope_count, 3) if scope_count else 0.0,
+            "minimum_observations_required": minimum_required,
+        }
+        if observed_in_scope < minimum_required:
+            blocked[name] = {
+                **detail,
+                **scoped[name],
+            }
+
+    report["coverage_scope_by_feature"] = scoped
+    report["minimum_observations_required_floor"] = int(min_observations)
+    report["minimum_fraction_of_applicable_rows"] = float(min_fraction)
     report["blocked_features"] = blocked
     report["passed"] = not blocked
     if blocked:
         details = ", ".join(
-            f"{name}={info['non_missing_rows']}/{report['rows']} ({info['non_missing_pct']:.3f}%)"
+            f"{name}={info['observed_rows_in_scope']}/{info['scope_rows']} "
+            f"({info['observed_pct_of_scope']:.3f}% of {info['scope']})"
             for name, info in blocked.items()
         )
         raise RuntimeError(
-            "59-feature candidate blocked: feature observations are insufficient "
-            f"(required >= {minimum_required} rows, at least {float(min_fraction)*100:.2f}% of cohort): {details}"
+            "59-feature candidate blocked: features lack enough real training observations "
+            f"(floor={int(min_observations)}, threshold={float(min_fraction)*100:.2f}% of applicable rows): {details}"
         )
     return report
 
