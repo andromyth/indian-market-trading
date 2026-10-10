@@ -399,7 +399,7 @@ def _bootstrap_cache_from_broad(filing_cache):
 
 def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
     catalog=_catalog_all(force_refresh=force_refresh)
-    filings=_fund_filings(catalog,set(symbols),max_each=4)
+    filings=_fund_filings(catalog,set(symbols),max_each=8)
     if not filings:
         raise RuntimeError("ALL-NSE PIT fundamentals: no eligible NSE Integrated Filing records found")
 
