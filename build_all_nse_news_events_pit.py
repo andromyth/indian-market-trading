@@ -311,6 +311,14 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     news_out.parent.mkdir(parents=True, exist_ok=True)
 
+    previous_manifest = {}
+    previous_manifest_path = cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    try:
+        if previous_manifest_path.exists() and previous_manifest_path.stat().st_size:
+            previous_manifest = json.loads(previous_manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        previous_manifest = {}
+
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end = (
         datetime.strptime(args.end, "%Y-%m-%d").date()
@@ -360,14 +368,31 @@ def main():
     else:
         pd.DataFrame(columns=["symbol", "decision_timestamp", "event_available", "event_high_impact"]).to_parquet(event_out, index=False)
 
+    coverage_start = start
+    coverage_end = end
+    prior_start = pd.to_datetime(previous_manifest.get("coverage_start"), errors="coerce")
+    prior_end = pd.to_datetime(previous_manifest.get("coverage_end"), errors="coerce")
+    prior_complete = previous_manifest.get("coverage_complete") is True
+    adjacent_or_overlapping = (
+        prior_complete
+        and pd.notna(prior_start)
+        and pd.notna(prior_end)
+        and start <= (prior_end.date() + timedelta(days=1))
+        and end >= (prior_start.date() - timedelta(days=1))
+    )
+    if adjacent_or_overlapping:
+        coverage_start = min(start, prior_start.date())
+        coverage_end = max(end, prior_end.date())
+
     manifest = {
         "source": "NSE_OFFICIAL_CORPORATE_ANNOUNCEMENTS_AND_ACTIONS",
         "universe_size": len(universe),
         "requested_range": [start.isoformat(), end.isoformat()],
-        "coverage_start": start.isoformat(),
-        "coverage_end": end.isoformat(),
-        # Reaching this write means every date chunk returned a valid response;
-        # failed chunks raise and cannot silently produce a partial-coverage manifest.
+        "coverage_start": coverage_start.isoformat(),
+        "coverage_end": coverage_end.isoformat(),
+        "prior_coverage_extended": bool(adjacent_or_overlapping),
+        # Reaching this write means every requested date chunk returned a valid response.
+        # Coverage is extended only when the previous complete range overlaps/is adjacent.
         "coverage_complete": True,
         "announcement_rows_fetched": len(ann),
         "corporate_action_rows_fetched": len(ca),
