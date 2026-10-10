@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from persistent_store import gdrive_config
 
 
@@ -54,3 +56,21 @@ def test_oauth_remains_supported_when_no_service_account_is_configured(monkeypat
     assert cfg["configured"] is True
     assert cfg["auth_method"] == "oauth"
     assert cfg["oauth_token_info"]["refresh_token"] == "oauth-refresh-token"
+
+
+def test_service_account_writer_rejects_invalid_user_oauth_token(monkeypatch):
+    import persistent_store
+
+    store = persistent_store.GoogleDriveStore.__new__(persistent_store.GoogleDriveStore)
+    store.cfg = {
+        "auth_method": "service_account",
+        "oauth_write_token_info": {"refresh_token": "test-refresh-token"},
+    }
+    store._write_service = None
+
+    def rejected_oauth(_cfg):
+        raise ValueError("invalid_grant")
+
+    monkeypatch.setattr(persistent_store, "_drive_credentials", rejected_oauth)
+    with pytest.raises(RuntimeError, match="OAuth user token required to upload"):
+        store._get_write_service()
