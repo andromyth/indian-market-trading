@@ -157,6 +157,58 @@ def _fund_filings(catalog,symbols,max_each=8):
         g=g.sort_values(["consolidated","fundamental_available_at"],ascending=[False,False]); chosen.append(g.iloc[0].to_dict())
     d=pd.DataFrame(chosen).sort_values(["symbol","period_end","fundamental_available_at"])
     return d.groupby("symbol",sort=False,group_keys=False).tail(max_each).to_dict("records")
+
+def _build_fundamental_availability(catalog, symbols):
+    """Create the full eligible-filing availability index, independent of XBRL parse success."""
+    rows = []
+    wanted = set(map(normalize_symbol, symbols))
+    for item in catalog:
+        if str(item.get("type", "")).strip().lower() != "integrated filing- financials":
+            continue
+        symbol = normalize_symbol(item.get("symbol", ""))
+        url = str(item.get("xbrl") or "").strip()
+        period_end = _fd(item.get("qe_Date"))
+        available_at = _fd(item.get("broadcast_Date"))
+        consolidated = str(item.get("consolidated", "")).strip().lower() == "consolidated"
+        if symbol not in wanted or not url or pd.isna(period_end) or pd.isna(available_at):
+            continue
+        rows.append({
+            "symbol": symbol,
+            "period_end": period_end.normalize(),
+            "fundamental_available_at": available_at,
+            "consolidated": consolidated,
+        })
+    columns = ["symbol", "period_end", "fundamental_available_at", "consolidated"]
+    index = pd.DataFrame(rows, columns=columns)
+    if not index.empty:
+        index = index.sort_values(
+            ["symbol", "period_end", "consolidated", "fundamental_available_at"],
+            ascending=[True, True, False, False],
+        ).drop_duplicates(["symbol", "period_end"], keep="first")
+        index = index.sort_values(["symbol", "fundamental_available_at"]).reset_index(drop=True)
+    FUND_AVAILABILITY.parent.mkdir(parents=True, exist_ok=True)
+    index.to_parquet(FUND_AVAILABILITY, index=False)
+    catalog_manifest = {}
+    try:
+        cached = json.loads(FUND_CATALOG_CACHE.read_text(encoding="utf-8"))
+        catalog_manifest = cached.get("meta", {})
+    except Exception:
+        pass
+    report = {
+        "path": str(FUND_AVAILABILITY),
+        "rows": int(len(index)),
+        "symbols_with_eligible_filings": int(index["symbol"].nunique()) if not index.empty else 0,
+        "target_symbol_count": len(wanted),
+        "coverage_start": catalog_manifest.get("coverage_start"),
+        "coverage_end": catalog_manifest.get("coverage_end"),
+        "coverage_complete": catalog_manifest.get("coverage_complete") is True,
+        "source": "NSE_OFFICIAL_INTEGRATED_FILING_CATALOG",
+        "definition": "All eligible as-of financial filing timestamps from a completely paginated catalogue, independent of XBRL fact parse success.",
+    }
+    FUND_AVAILABILITY_META.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if not report["coverage_complete"]:
+        raise RuntimeError("Fundamental availability index cannot be trusted: filing catalogue coverage is incomplete.")
+    return report
 def _fund_cache(url):
     import hashlib
     return FUND_CACHE/(hashlib.sha256(url.encode()).hexdigest()[:24]+".xbrl")
@@ -410,6 +462,14 @@ def _bootstrap_cache_from_broad(filing_cache):
 
 def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
     catalog=_catalog_all(force_refresh=force_refresh)
+    availability_report = _build_fundamental_availability(catalog, symbols)
+    print(
+        f"fundamental availability index: rows={availability_report['rows']:,} "
+        f"symbols={availability_report['symbols_with_eligible_filings']:,}/"
+        f"{availability_report['target_symbol_count']:,} "
+        f"coverage={availability_report['coverage_start']}..{availability_report['coverage_end']}",
+        flush=True,
+    )
     filings=_fund_filings(catalog,set(symbols),max_each=8)
     if not filings:
         raise RuntimeError("ALL-NSE PIT fundamentals: no eligible NSE Integrated Filing records found")
@@ -420,7 +480,7 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
             meta=json.loads(FUND_BROAD_META.read_text(encoding="utf-8")) if FUND_BROAD_META.exists() else {}
             if meta and _broad_meta_matches(meta,sig):
                 print(f"fundamentals build reused from manifest; rows={int(meta.get('rows',0)):,}",flush=True)
-                return {"path":str(FUND_BROAD),"rebuilt":False,"cached":True,"symbols":int(meta.get("symbols",0)),"rows":int(meta.get("rows",0))}
+                return {"path":str(FUND_BROAD),"availability_path":str(FUND_AVAILABILITY),"availability_report":availability_report,"rebuilt":False,"cached":True,"symbols":int(meta.get("symbols",0)),"rows":int(meta.get("rows",0))}
             # One-time bootstrap for a broad file produced by the period-aware
             # parser before the persistent build metadata existed. This prevents
             # an immediate second full NSE/XBRL pass after a completed run.
@@ -441,7 +501,8 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
                         f"rows={len(old):,} symbols={old['symbol'].map(normalize_symbol).nunique():,}",
                         flush=True,
                     )
-                    return {"path":str(FUND_BROAD),"rebuilt":False,"cached":True,
+                    return {"path":str(FUND_BROAD),"availability_path":str(FUND_AVAILABILITY),
+                            "availability_report":availability_report,"rebuilt":False,"cached":True,
                             "symbols":int(boot["symbols"]),"rows":int(boot["rows"])}
         except Exception:
             pass
@@ -525,6 +586,7 @@ def _ensure_broad_fundamentals(symbols,force_refresh=False,retry_failed=False):
         **sig,
     }
     FUND_BROAD_META.write_text(json.dumps(report,indent=2,default=str),encoding="utf-8")
+    report["availability_index"] = availability_report
     print(json.dumps(report,indent=2,default=str),flush=True)
     return report
 
