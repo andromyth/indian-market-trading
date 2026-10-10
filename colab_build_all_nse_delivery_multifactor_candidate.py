@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 from delivery_training_universe import benchmark_for_symbol, training_roster
 from nse_data_layer import fetch_index_history, load_canonical_cash_research_history
 from nse_delivery_data_layer import DEFAULT_DELIVERY_ROOT, load_delivery_history
-from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report
+from multifactor_data_layer_v2 import FEATURES_59, assert_training_feature_coverage, attach_readiness_flags, feature_coverage_report, load_optional_layer, merge_pit_layer, normalize_symbol, readiness_report, session_close_timestamp_utc
 
 DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
 BASE = Path(os.getenv("INDIAN_MARKET_RESEARCH_ROOT", DEFAULT_BASE))
@@ -714,7 +714,7 @@ def make_panel(bulk, symbols, sort_output=True, delivery=None):
         z = z.merge(ctx, on="date", how="left")
         for n in (1, 6, 12):
             z[f"relative_ret_{n}"] = z[f"ret_{n}"] - z[f"market_ret_{n}"]
-        z["decision_timestamp"] = z["date"] + pd.Timedelta(hours=15, minutes=30)
+        z["decision_timestamp"] = session_close_timestamp_utc(z["date"])
         total_rows += len(z)
         parts.append(z)
         if i == 1 or i % 100 == 0 or i == total:
@@ -737,101 +737,118 @@ def make_panel(bulk, symbols, sort_output=True, delivery=None):
     return out
 
 def _merge_broad_fno_pit(panel: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Merge the broad NSE F&O UDiFF layer under an explicit next-trading-day PIT clock.
+    """Exact next-session join for official NSE derivatives data.
 
-    The source date is the F&O trade date. Its information becomes eligible at
-    the next trading session's 09:15, so a delivery decision at T 15:30 can only
-    consume F&O information from the prior trading session. This avoids same-day
-    EOD F&O leakage into the delivery model.
+    A source-day F&O row is available from the following exchange session at
+    09:15 IST. It must not be forward-filled to later dates. Missing symbols are
+    marked fno_available=0 only on target sessions for which a source-day
+    archive is actually present; other dates remain unknown (NaN).
     """
     path = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
+    fno_columns = [
+        "fno_pcr", "fno_oi_change", "fno_iv_change", "fno_available",
+        "fno_fut_close", "fno_fut_basis", "fno_fut_return", "fno_fut_oi",
+    ]
     if not path.exists() or path.stat().st_size == 0:
-        return panel, {"exists": False, "rows": 0, "symbols": 0, "pit_rule": "next_trading_day_09:15"}
+        out = panel.copy()
+        for column in fno_columns:
+            if column not in out.columns:
+                out[column] = np.nan
+        return out, {
+            "exists": False, "rows": 0, "symbols": 0,
+            "source_dates": 0, "covered_target_sessions": 0,
+            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+        }
 
     f = pd.read_parquet(path)
     if f.empty or not {"symbol", "date"}.issubset(f.columns):
-        return panel, {"exists": False, "rows": 0, "symbols": 0, "pit_rule": "next_trading_day_09:15"}
+        out = panel.copy()
+        for column in fno_columns:
+            if column not in out.columns:
+                out[column] = np.nan
+        return out, {
+            "exists": False, "rows": 0, "symbols": 0,
+            "source_dates": 0, "covered_target_sessions": 0,
+            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+        }
 
+    f = f.copy()
     f["symbol"] = f["symbol"].map(normalize_symbol)
     f["date"] = pd.to_datetime(f["date"], errors="coerce").dt.normalize()
     f = f.dropna(subset=["symbol", "date"]).copy()
+    # Keep a factual coverage map separately from per-symbol rows. If a date
+    # appears in the parsed official source archive, the archive is known for
+    # that session even for listed names with no derivative observations.
+    source_dates = sorted(pd.Timestamp(d).normalize() for d in f["date"].dropna().unique())
 
-    value_map = {
-        "fno_pcr": "fno_pcr",
-        "fno_oi_change": "fno_oi_change",
-        "fno_iv_change": "fno_iv_change",
-        "fno_available": "fno_available",
-        "fno_fut_close": "fno_fut_close",
-        "fno_fut_basis": "fno_fut_basis",
-        "fno_fut_return": "fno_fut_return",
-        "fno_fut_oi": "fno_fut_oi",
-    }
-    present = {src: dst for src, dst in value_map.items() if src in f.columns}
-    if not present:
-        return panel, {"exists": False, "rows": 0, "symbols": 0, "pit_rule": "next_trading_day_09:15"}
-
-    f = f.rename(columns=present)
-    keep = ["symbol", "date"] + list(present.values())
-    f = f[keep].drop_duplicates(["symbol", "date"], keep="last").copy()
-
-    # Use the candidate panel's actual trading sessions to determine the next
-    # session. This handles weekends and exchange holidays without assumptions.
-    panel_dates = (
-        pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
-        if "date" in panel.columns
-        else pd.to_datetime(panel["decision_timestamp"], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize()
-    )
-    sessions = pd.Series(sorted(panel_dates.dropna().unique()))
-    if sessions.empty:
-        return panel, {"exists": True, "rows": int(len(f)), "symbols": int(f["symbol"].nunique()), "pit_rule": "next_trading_day_09:15"}
-
-    next_session = pd.Series(sessions.to_numpy(), index=sessions.to_numpy()).shift(-1)
-    session_map = next_session.to_dict()
-    f["next_session_date"] = f["date"].map(session_map)
+    panel_dates = pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
+    session_values = sorted(pd.Timestamp(d).normalize() for d in panel_dates.dropna().unique())
+    next_session = {session_values[i]: session_values[i + 1] for i in range(len(session_values) - 1)}
+    f["next_session_date"] = f["date"].map(next_session)
     f = f.dropna(subset=["next_session_date"]).copy()
-    f["decision_timestamp"] = (
-        pd.to_datetime(f["next_session_date"]).dt.tz_localize("Asia/Kolkata")
-        .dt.tz_convert("UTC")
-        + pd.Timedelta(hours=0)
+    f["next_session_date"] = pd.to_datetime(f["next_session_date"], errors="coerce").dt.normalize()
+
+    covered_target_dates = {
+        next_session[d] for d in source_dates if d in next_session
+    }
+    if f.empty:
+        out = panel.copy()
+        for column in fno_columns:
+            if column not in out.columns:
+                out[column] = np.nan
+        return out, {
+            "exists": True, "rows": 0, "symbols": 0,
+            "source_dates": len(source_dates), "covered_target_sessions": len(covered_target_dates),
+            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+        }
+
+    value_map = {column: column for column in fno_columns if column in f.columns}
+    f = f.rename(columns=value_map)
+    for column in fno_columns:
+        if column not in f.columns:
+            f[column] = np.nan
+    # An observed underlying in the official derivatives archive is applicable
+    # even when some options/futures metrics cannot be calculated.
+    f["fno_available"] = pd.to_numeric(f["fno_available"], errors="coerce")
+    f["fno_available"] = f["fno_available"].fillna(1.0)
+    f = f[["symbol", "next_session_date"] + fno_columns]
+    f = f.sort_values(["symbol", "next_session_date"]).drop_duplicates(
+        ["symbol", "next_session_date"], keep="last"
     )
-    # Panel timestamps are represented as UTC in the PIT merger.  The source's
-    # next-session availability clock is 09:15 IST = 03:45 UTC.
-    f["decision_timestamp"] = (
-        pd.to_datetime(f["next_session_date"]).dt.tz_localize("Asia/Kolkata")
-        + pd.Timedelta(hours=9, minutes=15)
-    ).dt.tz_convert("UTC")
 
-    f = f.drop(columns=["date", "next_session_date"])
-    f = f.sort_values(["symbol", "decision_timestamp"])
-    f = f.drop_duplicates(["symbol", "decision_timestamp"], keep="last")
-
-    # The candidate panel may already contain the legacy three-stock F&O pilot
-    # columns. Remove those target columns before merging so the authoritative
-    # broad NSE layer lands on the canonical 59-feature names rather than being
-    # silently suffixed (for example, fno_pcr_broad_fno).
-    target_columns = [x for x in present.values() if x in panel.columns]
-    panel_for_merge = panel.drop(columns=target_columns, errors="ignore")
-
-    merged = merge_pit_layer(
-        panel_for_merge,
+    # The base panel should not contain the legacy three-stock pilot values.
+    out = panel.drop(columns=fno_columns, errors="ignore").copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out = out.merge(
         f,
-        [x for x in present.values()],
-        "broad_fno",
+        left_on=["symbol", "date"],
+        right_on=["symbol", "next_session_date"],
+        how="left",
+        validate="one_to_one",
+        suffixes=("", "_fno"),
     )
+    out = out.drop(columns=["next_session_date"], errors="ignore")
+    # Zero means a verified archive exists for this session but this symbol did
+    # not appear in the F&O underlyings. Uncovered dates stay unknown.
+    covered = out["date"].isin(covered_target_dates)
+    out.loc[covered, "fno_available"] = pd.to_numeric(
+        out.loc[covered, "fno_available"], errors="coerce"
+    ).fillna(0.0)
 
-    # Prefer the authoritative NSE UDiFF basis already calculated in the source.
-    if "fno_fut_basis" in merged.columns:
-        merged["fno_fut_basis"] = pd.to_numeric(merged["fno_fut_basis"], errors="coerce")
-
-    return merged, {
+    source_date_rows = int(pd.to_datetime(pd.read_parquet(path)["date"], errors="coerce").nunique())
+    return out, {
         "exists": True,
         "path": str(path),
         "rows": int(len(f)),
         "symbols": int(f["symbol"].nunique()),
-        "source": "NSE_OFFICIAL_FNO_UDIFF",
-        "pit_rule": "trade_date_fno_available_next_trading_day_09:15_IST",
+        "source_dates": source_date_rows,
+        "first_source_date": str(min(source_dates).date()) if source_dates else None,
+        "last_source_date": str(max(source_dates).date()) if source_dates else None,
+        "covered_target_sessions": len(covered_target_dates),
+        "covered_target_date_start": str(min(covered_target_dates).date()) if covered_target_dates else None,
+        "covered_target_date_end": str(max(covered_target_dates).date()) if covered_target_dates else None,
+        "pit_rule": "exact_symbol_and_next_session_date; source_trade_date_available_next_session_09:15_IST; no forward-fill",
     }
-
 
 def merge_optional(panel):
     out=panel.copy(); audit={}
