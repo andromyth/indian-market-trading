@@ -5,6 +5,8 @@ on:
     paths:
       - "selfdriving/sd_data_quality.py"
       - "selfdriving/sd_github_job_v2.py"
+      - "selfdriving/sd_news_features.py"
+      - "selfdriving/sd_v2_panel.py"
       - "selfdriving/sd_v2_runtime.py"
       - "COLAB_SD_V2_RETRAIN.py"
       - "selfdriving/test_sd_data_quality.py"

@@ -108,8 +108,9 @@ def build_news_features(scored: pd.DataFrame, decisions: pd.DataFrame,
     out = d.copy()
     feat_cols = ["news_cnt_1", "news_sent_1", "news_sent_ewm", "news_cnt_ewm",
                  "news_impact_ewm", "news_novelty_1", "news_available"]
+    market_feat_cols = ["mkt_news_sent_ewm", "mkt_news_cnt_ewm"]
     if scored is None or scored.empty or len(cal) == 0:
-        for c in feat_cols:
+        for c in feat_cols + market_feat_cols:
             out[c] = np.nan
         return out
 
@@ -122,7 +123,22 @@ def build_news_features(scored: pd.DataFrame, decisions: pd.DataFrame,
     s["bin"] = pos
     s = s[s["bin"] < len(cal)]  # published after the last decision: invisible
 
+    # A fresh headline archive can contain only items published after the most
+    # recent PIT decision (e.g. Saturday news after Friday's close). These rows
+    # are correctly invisible to that snapshot. Preserve unknown history as NaN
+    # rather than crashing on pd.concat([]) or inventing zero-news observations.
+    if s.empty:
+        for c in feat_cols + market_feat_cols:
+            out[c] = np.nan
+        return out
+
     def grid(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=[
+                "symbol", "decision_timestamp", "news_cnt_1", "news_sent_1",
+                "news_sent_ewm", "news_cnt_ewm", "news_impact_ewm",
+                "news_novelty_1", "news_recent5",
+            ])
         g = frame.groupby(["symbol", "bin"]).agg(
             cnt=("score", "size"), ssum=("score", "sum"),
             imp=("impact", "sum"), nov=("new", "mean")).reset_index()

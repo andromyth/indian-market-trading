@@ -10,7 +10,15 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
+import sys
 from zoneinfo import ZoneInfo
+
+# Running this file as `python selfdriving/sd_github_job_v2.py` puts only the
+# selfdriving directory on sys.path. Add the repository root so root-level
+# project modules (for example persistent_store.py) are importable in Actions.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 
@@ -248,19 +256,46 @@ def refresh_realised_outcomes(store, snapshots: list[tuple[date, Path]]) -> dict
         columns=["symbol", "date", "y_return"]
     )
     frames = []
+    excluded_nonmatching_date_rows = 0
+    excluded_invalid_date_rows = 0
+    skipped_snapshots = []
     for day, path in snapshots:
         frame = pd.read_parquet(path)
-        if "date" in frame.columns:
-            observed = pd.to_datetime(frame["date"], errors="coerce").dt.date.dropna()
-            if len(observed) and observed.nunique() != 1:
-                raise RuntimeError(
-                    f"PIT snapshot {path.name} contains multiple source dates: {sorted(map(str, observed.unique()))[:5]}"
-                )
-            if len(observed) and observed.iloc[0] != day:
-                raise RuntimeError(
-                    f"PIT snapshot date mismatch: filename={day}, parquet={observed.iloc[0]}"
-                )
-        frames.append((day, frame))
+        if frame.empty:
+            skipped_snapshots.append({
+                "snapshot_date": day.isoformat(),
+                "file": path.name,
+                "reason": "EMPTY_SNAPSHOT",
+            })
+            continue
+        if "date" not in frame.columns:
+            skipped_snapshots.append({
+                "snapshot_date": day.isoformat(),
+                "file": path.name,
+                "reason": "MISSING_ROW_DATE_COLUMN",
+                "rows": int(len(frame)),
+            })
+            continue
+
+        # A production PIT file is the latest available row per symbol. Illiquid
+        # names can legitimately still carry an earlier source date, so a file
+        # may contain more than one row date. Only rows whose own source date
+        # matches the canonical filename session are eligible for close-to-close
+        # realised outcomes. Stale rows are excluded, never relabelled.
+        row_dates = pd.to_datetime(frame["date"], errors="coerce").dt.date
+        eligible_mask = row_dates.eq(day)
+        excluded_nonmatching_date_rows += int((row_dates.notna() & ~eligible_mask).sum())
+        excluded_invalid_date_rows += int(row_dates.isna().sum())
+        eligible = frame.loc[eligible_mask].copy()
+        if eligible.empty:
+            skipped_snapshots.append({
+                "snapshot_date": day.isoformat(),
+                "file": path.name,
+                "reason": "NO_ROWS_MATCH_FILENAME_SESSION",
+                "rows": int(len(frame)),
+            })
+            continue
+        frames.append((day, eligible))
 
     fresh, gaps = derive_realised_returns(frames)
     merged, merge_stats = merge_realised_returns(old, fresh)
@@ -269,10 +304,17 @@ def refresh_realised_outcomes(store, snapshots: list[tuple[date, Path]]) -> dict
         merged.to_parquet(realised_path, index=False)
 
     merge_stats.update({
+        "status": "WARN" if (
+            excluded_nonmatching_date_rows or excluded_invalid_date_rows or skipped_snapshots or gaps
+        ) else "PASS",
+        "snapshot_files_seen": len(snapshots),
         "snapshot_count": len(frames),
         "snapshot_dates": [day.isoformat() for day, _ in frames],
+        "rows_excluded_nonmatching_filename_date": excluded_nonmatching_date_rows,
+        "rows_excluded_invalid_date": excluded_invalid_date_rows,
+        "snapshots_skipped": skipped_snapshots,
         "session_gaps_skipped": gaps,
-        "outcome_source": "consecutive_official_NSE_Delivery_PIT_snapshots",
+        "outcome_source": "consecutive_official_NSE_Delivery_PIT_snapshots_filtered_to_filename_session",
     })
     return merge_stats
 
