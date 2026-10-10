@@ -899,6 +899,189 @@ if interface_mode == "Live Test":
                 "suppresses signals when candles are older than five minutes. Missing model champions or data remain explicitly unavailable."
             )
 
+    st.divider()
+    st.subheader("Check a specific NSE stock")
+    st.caption(
+        "Search the official NSE equity list to run forecasts for a stock of your choice. "
+        "This lookup is independent of the automatic news-based shortlist above."
+    )
+
+    try:
+        lookup_universe = _searchable_nse_universe()
+    except Exception:
+        lookup_universe = pd.DataFrame()
+
+    lookup_options = []
+    if lookup_universe is not None and not lookup_universe.empty:
+        for row in lookup_universe.itertuples(index=False):
+            root = str(getattr(row, "symbol", "")).strip().upper()
+            company = str(getattr(row, "company", "")).strip()
+            if not root or root in {"NAN", "NONE"}:
+                continue
+            if not company or company.lower() == "nan":
+                lookup_options.append(root)
+            else:
+                lookup_options.append(f"{root} — {company}")
+
+    lookup_prompt = "— Select a stock —"
+    if lookup_options:
+        selected_lookup_label = st.selectbox(
+            "Find by NSE symbol or company name",
+            [lookup_prompt] + lookup_options,
+            key="live_specific_stock_select",
+            help="Click the field and type a symbol or company name to search the official NSE list.",
+        )
+        if st.button("Check selected stock", key="live_specific_stock_check", type="primary"):
+            if selected_lookup_label == lookup_prompt:
+                st.warning("Select a stock first.")
+            else:
+                selected_root = selected_lookup_label.split(" — ", 1)[0].strip().upper()
+                st.session_state["live_specific_stock_requested"] = selected_root
+                st.session_state["live_specific_stock_lookup_revision"] = int(
+                    st.session_state.get("live_specific_stock_lookup_revision", 0)
+                ) + 1
+    else:
+        st.info("The official NSE list is currently unavailable. You can still enter an NSE symbol below.")
+
+    with st.expander("Or enter an NSE symbol directly", expanded=not bool(lookup_options)):
+        with st.form("live_specific_stock_manual_form", clear_on_submit=False):
+            manual_lookup_text = st.text_input(
+                "NSE symbol",
+                placeholder="e.g. RELIANCE, TCS, TRENT",
+                key="live_specific_stock_manual_symbol",
+            )
+            manual_lookup_submit = st.form_submit_button("Check NSE symbol", width="stretch")
+        if manual_lookup_submit:
+            manual_value = str(manual_lookup_text or "").strip().upper()
+            if not manual_value:
+                st.warning("Enter an NSE symbol first.")
+            elif manual_value.endswith(".BO"):
+                st.warning("This lookup currently expects NSE symbols, not BSE-only tickers.")
+            else:
+                manual_full_symbol = normalize_symbol(manual_value)
+                if not manual_full_symbol.endswith(".NS"):
+                    st.warning("Enter an NSE equity symbol, such as TCS or RELIANCE.")
+                else:
+                    st.session_state["live_specific_stock_requested"] = manual_full_symbol[:-3]
+                    st.session_state["live_specific_stock_lookup_revision"] = int(
+                        st.session_state.get("live_specific_stock_lookup_revision", 0)
+                    ) + 1
+
+    requested_root = str(
+        st.session_state.get("live_specific_stock_requested", "")
+    ).strip().upper()
+    if requested_root:
+        requested_full_symbol = normalize_symbol(requested_root)
+        requested_company = requested_root
+        if lookup_universe is not None and not lookup_universe.empty:
+            company_match = lookup_universe.loc[
+                lookup_universe["symbol"].astype(str).str.upper().eq(requested_root)
+            ]
+            if not company_match.empty:
+                company_value = str(company_match.iloc[0].get("company", "")).strip()
+                if company_value and company_value.lower() != "nan":
+                    requested_company = company_value
+
+        st.markdown(f"### Individual forecast: {requested_root}")
+        st.caption(
+            f"{requested_company} · Requested independently of Stocks to Watch · "
+            "decision-support only; no orders are placed."
+        )
+        delivery_col, intraday_col = st.columns(2)
+
+        with delivery_col:
+            st.markdown("**Delivery · next NSE session**")
+            try:
+                lookup_revision = int(
+                    st.session_state.get("live_specific_stock_lookup_revision", 0)
+                )
+                delivery_lookup = _cached_watch_delivery_prediction(
+                    requested_full_symbol,
+                    lookup_revision,
+                )
+            except Exception as exc:
+                delivery_lookup = {
+                    "prediction_status": "ERROR",
+                    "signal": "UNAVAILABLE",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+
+            lookup_delivery_status = str(
+                delivery_lookup.get("prediction_status", "UNKNOWN")
+            ).upper()
+            lookup_delivery_signal = str(
+                delivery_lookup.get("signal") or lookup_delivery_status
+            )
+            lookup_p_up = pd.to_numeric(delivery_lookup.get("p"), errors="coerce")
+            st.metric("Delivery signal", lookup_delivery_signal)
+            st.caption(
+                f"Model status: {lookup_delivery_status} · P(UP): "
+                + (f"{float(lookup_p_up):.1%}" if pd.notna(lookup_p_up) else "not available")
+            )
+            st.caption(
+                f"Reference: {delivery_lookup.get('date') or '—'} · "
+                f"Target: {delivery_lookup.get('target_session_date') or '—'}"
+            )
+            if delivery_lookup.get("signal_reason") or delivery_lookup.get("reason"):
+                st.caption(str(
+                    delivery_lookup.get("signal_reason") or delivery_lookup.get("reason")
+                ))
+
+        with intraday_col:
+            st.markdown("**Intraday · +5 / +15 / +30 minutes**")
+            lookup_now = pd.Timestamp.now(tz="Asia/Kolkata")
+            try:
+                from production_data_freshness_gate import HOLIDAYS as _lookup_holidays
+                lookup_known_holidays = set(_lookup_holidays)
+            except Exception:
+                lookup_known_holidays = set()
+            lookup_session_open = (
+                lookup_now.weekday() < 5
+                and lookup_now.date() not in lookup_known_holidays
+                and pd.Timestamp("09:15").time() <= lookup_now.time() <= pd.Timestamp("15:30").time()
+            )
+            if not lookup_session_open:
+                st.metric("Intraday status", "WAITING")
+                st.caption("Fresh intraday signals are shown only during the regular NSE session.")
+            else:
+                try:
+                    intraday_lookup = _auto_watch_intraday(requested_full_symbol)
+                except Exception as exc:
+                    intraday_lookup = {
+                        "status": "ERROR",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                lookup_intraday_status = str(
+                    intraday_lookup.get("status", "UNKNOWN")
+                ).upper()
+                if lookup_intraday_status == "PASS":
+                    lookup_horizons = intraday_lookup.get("horizons", {}) or {}
+                    horizon_summary = []
+                    for horizon in (5, 15, 30):
+                        horizon_result = lookup_horizons.get(horizon, {}) or {}
+                        horizon_signal = str(horizon_result.get("signal") or "ABSTAIN")
+                        horizon_probability = pd.to_numeric(
+                            horizon_result.get("probability_up"), errors="coerce"
+                        )
+                        probability_label = (
+                            f" · P↑ {float(horizon_probability):.0%}"
+                            if pd.notna(horizon_probability) else ""
+                        )
+                        horizon_summary.append(
+                            f"+{horizon}m **{horizon_signal}**{probability_label}"
+                        )
+                    st.write("  |  ".join(horizon_summary))
+                    st.caption(
+                        f"Latest completed candle: {intraday_lookup.get('latest_candle_ist', '—')} · "
+                        f"source: {intraday_lookup.get('source', 'unknown')}"
+                    )
+                else:
+                    st.metric("Intraday status", lookup_intraday_status.replace("_", " "))
+                    st.caption(str(
+                        intraday_lookup.get("reason")
+                        or "Fresh validated intraday predictions are not available."
+                    ))
+
     _render_daily_market_watch()
     st.stop()
 
