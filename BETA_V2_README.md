@@ -40,7 +40,7 @@ the current 5-minute Intraday production model.
 
 ## Autonomous data controls (2026-10-10)
 
-The Beta V2 weekday job runs at 07:15 IST, after the overnight Production PIT refresh retry window. Before scoring, it checks that the newest saved PIT filename matches the latest completed NSE session expected by the repository's session calendar. Missing or stale PIT data blocks inference and makes the Actions run fail visibly.
+The Beta V2 weekday job runs at 07:15 IST, after the overnight Production PIT refresh retry window. Before scoring, it checks that the newest saved PIT filename matches the latest completed NSE reference session expected by the repository's session calendar. Missing or stale PIT data blocks inference and makes the Actions run fail visibly. Manual weekend/holiday runs use the latest completed session as the reference and explicitly stamp the next NSE trading session as `target_session_date`; they do not pretend the weekend is a market session. This permits a Friday-close forecast for Monday while preserving the reference date and preventing a stale-snapshot override.
 
 Each run updates and saves:
 - `selfdriving/beta_version2/status_data_audit.json`: point-in-time PIT date, locked-feature coverage, lowest-coverage and full stockwise coverage, volume/Delivery features, scored-news and event availability, F&O coverage, global series availability, USD/INR availability and age, duplicate source rows, and source refresh failures.
