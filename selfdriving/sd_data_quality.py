@@ -298,16 +298,38 @@ def build_input_audit(
         "feature_groups": {},
         "current_panel_feature_coverage": _coverage(audit_panel, active_features),
         "usd_inr": {
-            "feature_name": "g_inr_z",
-            "available_in_current_panel": (
-                bool(audit_panel["g_inr_z"].notna().any())
-                if "g_inr_z" in audit_panel.columns else False
+            "canonical_feature_name": "g_inr_z",
+            "recognized_feature_names": [
+                "g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1"
+            ],
+            "available_feature_names": [
+                feature for feature in ("g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1")
+                if feature in audit_panel.columns and pd.to_numeric(
+                    audit_panel[feature], errors="coerce"
+                ).notna().any()
+            ],
+            "selected_feature_names": [
+                feature for feature in ("g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1")
+                if feature in active_features
+            ],
+            "available_in_current_panel": any(
+                feature in audit_panel.columns and pd.to_numeric(
+                    audit_panel[feature], errors="coerce"
+                ).notna().any()
+                for feature in ("g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1")
             ),
-            "selected_by_active_champion": "g_inr_z" in active_features,
-            "selected_feature_current_coverage_pct": (
-                round(float(pd.to_numeric(audit_panel["g_inr_z"], errors="coerce").notna().mean() * 100), 3)
-                if "g_inr_z" in active_features and "g_inr_z" in audit_panel.columns and len(audit_panel)
-                else 0.0
+            "selected_by_active_champion": any(
+                feature in active_features
+                for feature in ("g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1")
+            ),
+            "selected_feature_mean_non_null_pct": (
+                _coverage(
+                    audit_panel,
+                    [
+                        feature for feature in active_features
+                        if feature in {"g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1"}
+                    ],
+                ).get("mean_feature_non_null_pct", 0.0)
             ),
         },
     }
@@ -438,14 +460,22 @@ def build_input_audit(
                 "fundamental_features_known": _any_known(row, fundamental_columns + ["fundamental_age_days"]),
                 "global_features_present": len(global_present),
                 "global_features_expected": len(global_columns),
-                "usd_inr_feature_available": bool(
-                    live_row is not None and "g_inr_z" in live_row.index and pd.notna(live_row["g_inr_z"])
+                "usd_inr_feature_available": _any_known(
+                    live_row, ["g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1"]
+                ),
+                "usd_inr_feature_selected_by_active_champion": any(
+                    feature in active_features
+                    for feature in ("g_inr_z", "g_usdinr_r1", "g_usdinr_r5", "g_usdinr_z1")
                 ),
             })
 
     stockwise_source_coverage = {
         "symbols_in_pit": len(stockwise_input_readiness),
         "symbols_with_usdinr_feature": sum(bool(row["usd_inr_feature_available"]) for row in stockwise_input_readiness),
+        "symbols_with_usdinr_selected_by_active_champion": sum(
+            bool(row["usd_inr_feature_selected_by_active_champion"])
+            for row in stockwise_input_readiness
+        ),
         "symbols_with_daily_volume_ratio": sum(bool(row["daily_volume_ratio_known"]) for row in stockwise_input_readiness),
         "symbols_with_delivery_features": sum(bool(row["delivery_features_known"]) for row in stockwise_input_readiness),
         "symbols_with_known_news_features": sum(bool(row["news_feature_known"]) for row in stockwise_input_readiness),
