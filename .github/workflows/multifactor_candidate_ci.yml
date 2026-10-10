@@ -52,6 +52,7 @@ jobs:
           model_health.py
           autonomous_engine.py
           delivery_production_refresh.py
+          build_all_nse_news_events_pit.py
           delivery_policy_update.py
           delivery_validation_diagnostics.py
           nse_fno_udiff_ingest.py
@@ -75,6 +76,7 @@ jobs:
         run: >
           pytest -q
           tests/test_multifactor_data_layer_v2.py
+          tests/test_59_feature_source_coverage.py
           tests/test_final_algorithm_data_readiness_v2.py
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py
