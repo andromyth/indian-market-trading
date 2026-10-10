@@ -91,11 +91,14 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from persistent_store import drive_status
-          status = drive_status()
+          status = drive_status(require_write=True)
           print(status)
           if not status.get("configured") or status.get("reachable") is False:
-              raise SystemExit("Google Drive authentication check failed")
-          print(f"Google Drive auth method: {status.get('auth_method')}")
+              raise SystemExit("Google Drive read/write authentication check failed")
+          if status.get("write_ready") is False:
+              raise SystemExit("Google Drive write authorization is not ready: " + str(status.get("reason")))
+          print(f"Google Drive read auth method: {status.get('auth_method')}")
+          print(f"Google Drive write auth method: {status.get('write_auth_method')}")
           PY
 
       - name: Fetch NSE data for target session
