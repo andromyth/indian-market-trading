@@ -4,3 +4,8 @@ data/prediction_ledger/
 # Local Google OAuth credentials - never commit
 credentials.json
 token.json
+
+# Fresh Google Drive user OAuth credentials; never commit
+google_drive_oauth_token.json
+client_secret*.json
+oauth_client_secret*.json
