@@ -86,10 +86,12 @@ def _date_block_split(data: pd.DataFrame, train_fraction: float = 0.70):
         return None, 0, 0
     x["_session_date"] = ts.dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d")
     dates = sorted(x["_session_date"].dropna().unique().tolist())
-    hold_count = max(0, len(dates) - int(len(dates) * train_fraction))
-    if len(dates) < MIN_UNIQUE_SESSIONS or hold_count < MIN_HOLDOUT_SESSIONS:
-        return None, len(dates), hold_count
+    if len(dates) < MIN_UNIQUE_SESSIONS:
+        return None, len(dates), 0
     split_idx = int(len(dates) * train_fraction)
+    hold_count = len(dates) - split_idx
+    if hold_count < MIN_HOLDOUT_SESSIONS:
+        return None, len(dates), hold_count
     split_idx = min(max(1, split_idx), len(dates) - MIN_HOLDOUT_SESSIONS)
     tune_dates, hold_dates = set(dates[:split_idx]), set(dates[split_idx:])
     tune = x[x["_session_date"].isin(tune_dates)].drop(columns=["_session_date"])
