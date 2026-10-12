@@ -1,0 +1,44 @@
+import numpy as np
+import pandas as pd
+
+from multifactor_data_layer_v2 import FEATURES_59
+from strict_delivery_walkforward_audit import policy_signals, prepare_labeled_panel, session_successors
+
+
+def test_successor_respects_weekend_special_session_and_missing_weekday():
+    sessions = pd.to_datetime(["2026-01-02", "2026-01-04", "2026-01-05", "2026-01-07"]).tolist()
+    successors, gaps = session_successors(sessions, set())
+    assert successors[pd.Timestamp("2026-01-02")] == pd.Timestamp("2026-01-04")
+    assert successors[pd.Timestamp("2026-01-04")] == pd.Timestamp("2026-01-05")
+    assert successors[pd.Timestamp("2026-01-05")] is None
+    assert any(g["missing_expected_session"] == "2026-01-06" for g in gaps)
+
+
+def test_panel_targets_exact_next_session_and_checks_decision_clock():
+    dates = pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09", "2026-01-12"])
+    rows = []
+    for symbol in ("AAA", "BBB"):
+        for idx, day in enumerate(dates):
+            row = {
+                "symbol": symbol, "date": day,
+                "decision_timestamp": (day + pd.Timedelta(hours=15, minutes=30)).tz_localize("Asia/Kolkata").tz_convert("UTC"),
+                "close": 100.0 + idx, "production_data_quality_gate": True,
+            }
+            row.update({feature: float(idx + 1) for feature in FEATURES_59})
+            rows.append(row)
+    labeled, report = prepare_labeled_panel(pd.DataFrame(rows), {pd.Timestamp("2026-01-12").date()})
+    assert len(labeled) == 10
+    assert report["duplicate_symbol_session_rows"] == 0
+    assert labeled["target_date"].gt(labeled["reference_date"]).all()
+    assert labeled["feature_coverage"].eq(1.0).all()
+
+
+def test_signals_abstain_when_quality_or_feature_gate_fails():
+    predictions = pd.DataFrame({
+        "probability_up": [0.8, 0.8, 0.2],
+        "predicted_return": [0.02, 0.02, -0.02],
+        "eligible_for_action": [True, False, True],
+    })
+    result = policy_signals(predictions, 0.6, 0.4, 0.0015)
+    assert result.tolist() == ["BUY", "ABSTAIN", "SELL"]
+    assert np.all(policy_signals(predictions, 0.6, 0.4, 0.0015, abstain_all=True) == "ABSTAIN")
