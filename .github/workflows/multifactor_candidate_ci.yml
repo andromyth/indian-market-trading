@@ -112,6 +112,7 @@ jobs:
           tests/test_market_watchlist.py
           tests/test_live_signal_guards.py
           tests/test_strict_delivery_walkforward.py
+          tests/test_delivery_production_refresh.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
