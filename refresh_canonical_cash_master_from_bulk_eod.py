@@ -199,7 +199,7 @@ def _read_identity_rows(archive: Path, expected_date: date) -> pd.DataFrame:
             f"Archive/date mismatch for {archive.name}: expected {expected_date}, got {actual_dates[:5]}"
         )
     rows = add_identity(rows)
-    rows["raw_archive"] = str(archive)
+    rows["raw_archive"] = archive.name
     rows = final_columns(rows)
     if rows["row_identity_key"].isna().any():
         raise RuntimeError(f"Archive generated null row identity keys: {archive.name}")
