@@ -267,6 +267,14 @@ def main() -> int:
 
     sync_drive = not args.no_sync_drive
     result = append_predictions(records, sync_drive=sync_drive)
+    # A successful process exit must mean today's production batch reached the
+    # shared ledger. A failed Drive upload is a hard failure so the hourly
+    # workflow retries instead of silently leaving the dashboard on stale data.
+    if sync_drive and result.get("status") == "APPENDED" and result.get("new_rows", 0) > 0 and not result.get("synced"):
+        raise RuntimeError(
+            "ALL-NSE Delivery batch was generated locally but was not synced "
+            f"to the persistent Google Drive ledger: {result}"
+        )
 
     signal_counts = pd.Series(signals).value_counts().to_dict()
     print("ALL-NSE DELIVERY PREDICTION CYCLE")
