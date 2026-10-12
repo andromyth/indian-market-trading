@@ -14,6 +14,20 @@ on:
       - "nse_delivery_daily_sync.py"
       - "production_data_freshness_gate.py"
       - "delivery_all_nse_prediction_cycle.py"
+      # Trigger the same end-to-end check when an ingestion or feature-builder
+      # dependency changes, not just when the top-level runner changes.
+      - "nse_data_layer.py"
+      - "nse_delivery_data_layer.py"
+      - "persistent_store.py"
+      - "multifactor_data_layer_v2.py"
+      - "delivery_training_universe.py"
+      - "selfdriving/sd_news_collect.py"
+      - "prediction_ledger.py"
+      - "prediction_validation.py"
+      - "validate_prediction_ledger.py"
+      - "delivery_prediction_csv_ledger.py"
+      - "delivery_validation_diagnostics.py"
+      - "delivery_policy_update.py"
 
   workflow_dispatch:
     inputs:
