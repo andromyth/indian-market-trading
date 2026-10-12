@@ -43,6 +43,95 @@ def _quote_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+REMOTE_MASTER = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
+REMOTE_META = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.meta.json"
+REMOTE_REPORT = "diagnostics/canonical_cash_master_validation/cash_master_incremental_refresh_latest.json"
+
+
+def _drive_file_id(store, remote_path: str) -> str | None:
+    parts = [part for part in remote_path.replace("\\\\", "/").split("/") if part]
+    if not parts:
+        return None
+    parent = store.root_id
+    folder_type = "application/vnd.google-apps.folder"
+    for part in parts[:-1]:
+        hit = store._find_child(parent, part, folder_type)
+        if not hit:
+            return None
+        parent = hit["id"]
+    hit = store._find_child(parent, parts[-1])
+    return hit.get("id") if hit else None
+
+
+def _drive_download(store, remote_path: str, local_path: Path) -> bool:
+    file_id = _drive_file_id(store, remote_path)
+    if not file_id:
+        return False
+    from googleapiclient.http import MediaIoBaseDownload
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_suffix(local_path.suffix + ".download.tmp")
+    with tmp_path.open("wb") as handle:
+        request = store.service.files().get_media(fileId=file_id)
+        downloader = MediaIoBaseDownload(handle, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    tmp_path.replace(local_path)
+    return local_path.exists() and local_path.stat().st_size > 0
+
+
+def _download_drive_archives(store, start: date, end: date, destination: Path) -> int:
+    """Download only dated official CM-UDiFF ZIPs needed for the refresh window."""
+    from googleapiclient.http import MediaIoBaseDownload
+    destination.mkdir(parents=True, exist_ok=True)
+    service = store.service
+    token = None
+    matching: dict[date, dict[str, Any]] = {}
+    while True:
+        response = service.files().list(
+            q="name contains 'BhavCopy_NSE_CM_0_0_0_' and name contains '.csv.zip' and trashed = false",
+            spaces="drive",
+            fields="nextPageToken,files(id,name,size,modifiedTime)",
+            pageSize=1000,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageToken=token,
+        ).execute()
+        for item in response.get("files", []):
+            match = ZIP_RE.search(str(item.get("name", "")))
+            if not match:
+                continue
+            try:
+                day = datetime.strptime(match.group(1), "%Y%m%d").date()
+            except ValueError:
+                continue
+            if start <= day <= end:
+                current = matching.get(day)
+                if current is None or str(item.get("modifiedTime", "")) > str(current.get("modifiedTime", "")):
+                    matching[day] = item
+        token = response.get("nextPageToken")
+        if not token:
+            break
+
+    downloaded = 0
+    for day, item in sorted(matching.items()):
+        target = destination / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}" / str(item["name"])
+        if target.exists() and target.stat().st_size == int(item.get("size") or 0):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_suffix(target.suffix + ".download.tmp")
+        with tmp_path.open("wb") as handle:
+            downloader = MediaIoBaseDownload(
+                handle, service.files().get_media(fileId=item["id"])
+            )
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        tmp_path.replace(target)
+        downloaded += 1
+    return downloaded
+
+
 def _master_stats(path: Path) -> dict[str, Any]:
     if not path.exists() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Identity-preserved cash master is missing/empty: {path}")
