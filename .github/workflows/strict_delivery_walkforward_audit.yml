@@ -2,6 +2,14 @@ name: Strict Delivery walk-forward and untouched-holdout audit
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "strict_delivery_walkforward_audit.py"
+      - "tests/test_strict_delivery_walkforward.py"
+      - ".github/workflows/strict_delivery_walkforward_audit.yml"
+      - ".github/workflows/multifactor_candidate_ci.yml"
   push:
     branches:
       - main
