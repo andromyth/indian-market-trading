@@ -36,6 +36,7 @@ from nse_data_layer import (
     fetch_nse_equity_universe,
 )
 from delivery_training_universe import benchmark_for_symbol
+from multifactor_data_layer_v2 import build_feature_matrix
 
 
 DRIVE_MODEL_ROOT = (
@@ -1450,18 +1451,12 @@ def predict_symbol(
 
     if not pit_row.empty:
 
-        feature_frame = pd.DataFrame([
-            {
-                col: (
-                    pit_row.iloc[0][col]
-                    if col in pit_row.columns
-                    else np.nan
-                )
-                for col in expected_features
-            }
-        ]).apply(
-            pd.to_numeric,
-            errors="coerce",
+        # Do not synthesize missing schema columns here. The snapshot builder
+        # owns the 59-column contract; a missing column indicates a broken
+        # artifact/schema and must fail visibly.
+        feature_frame = build_feature_matrix(
+            pit_row.iloc[[0]],
+            expected_features,
         )
 
         if list(feature_frame.columns) != expected_features:
@@ -1737,6 +1732,52 @@ def predict_symbol(
         history,
         market,
     )
+
+    # This legacy fallback intentionally calculates only price/volume and
+    # market-context features. Until it is enriched with the same persisted
+    # PIT layers as the production snapshot, it cannot honestly represent a
+    # complete 59-factor input. Never emit a model probability from this partial
+    # fallback; direct the caller to rebuild/serve the authoritative PIT row.
+    missing_optional_states = [
+        column for column in ("news_available", "event_available", "fno_available")
+        if column not in feature_frame.columns or pd.isna(feature_frame.iloc[0].get(column))
+    ]
+    fundamental_columns = [
+        "fundamental_revenue", "fundamental_pat", "fundamental_eps",
+        "fundamental_ebitda", "fundamental_finance_cost", "fundamental_total_equity",
+        "fundamental_total_debt", "fundamental_cash", "fund_revenue_growth",
+        "fund_pat_growth", "fund_eps_growth", "fund_ebitda_growth",
+        "fund_pat_margin", "fund_debt_to_equity", "fund_cash_to_debt",
+    ]
+    if not any(
+        column in feature_frame.columns and pd.notna(feature_frame.iloc[0].get(column))
+        for column in fundamental_columns
+    ):
+        missing_optional_states.append("fundamentals")
+    if missing_optional_states:
+        missing_features = [
+            column for column in feature_frame.columns
+            if pd.isna(pd.to_numeric(feature_frame.iloc[0].get(column), errors="coerce"))
+        ]
+        non_missing = int(feature_frame.notna().sum(axis=1).iloc[0])
+        return {
+            "symbol": root,
+            "prediction_status": "BLOCKED",
+            "reason": "PERSISTED_59_FEATURE_PIT_ROW_REQUIRED",
+            "signal": "HOLD",
+            "model_version": EXPECTED_ENGINE_VERSION,
+            "reference_session": str(pd.Timestamp(latest_date).date()),
+            "feature_source": "LIVE_CORE_FALLBACK_INCOMPLETE",
+            "feature_count": len(feature_frame.columns),
+            "non_missing_feature_count": non_missing,
+            "feature_non_missing_fraction": non_missing / float(max(1, len(feature_frame.columns))),
+            "missing_feature_names": missing_features,
+            "unknown_optional_sources": sorted(set(missing_optional_states)),
+            "production_data_quality_gate": False,
+            "probability_up_next_session": None,
+            "probability_down_next_session": None,
+            "predicted_return_next_session": None,
+        }
 
     clf, reg, manifest = _load_models()
 

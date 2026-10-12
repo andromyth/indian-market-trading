@@ -21,6 +21,7 @@ import argparse
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,10 @@ def fetch_announcements(s: requests.Session, start: date, end: date, cache_dir: 
                 "to_date": b.strftime("%d-%m-%Y"),
             }, f"announcements {a}..{b}")
             if payload is None:
-                continue
+                raise RuntimeError(
+                    f"Refusing to publish partial PIT coverage: {label} request "
+                    f"for {a}..{b} failed after retries."
+                )
             cp.write_text(json.dumps(payload, default=str), encoding="utf-8")
         rr = records(payload)
         out.extend(rr)
@@ -224,7 +228,7 @@ def build_layers(ann_rows, action_rows, universe: set[str], start: date, end: da
         if not sym or sym not in universe:
             continue
         text = text_of(r)
-        ts = parse_ts(pick(r, "broadcastDate", "BROADCAST_DATE", "broadcastDateTime", "BROADCAST_DATE_TIME", "an_dt", "date"), start)
+        ts = parse_ts(pick(r, "broadcastDate", "BROADCAST_DATE", "broadcastDateTime", "BROADCAST_DATE_TIME", "an_dt", "date"), None)
         if pd.isna(ts):
             continue
         subject = str(pick(r, "subject", "SUBJECT", "desc", "DESCRIPTION", "eventDescription", "EVENT_DESCRIPTION") or "").strip()
@@ -297,7 +301,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drive-root", default=str(DEFAULT_ROOT))
     ap.add_argument("--start", default="2026-01-01")
-    ap.add_argument("--end", default="2026-10-03")
+    ap.add_argument("--end", default="", help="Coverage end date YYYY-MM-DD; defaults to today in Asia/Kolkata.")
     args = ap.parse_args()
 
     root = Path(args.drive_root)
@@ -307,8 +311,22 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     news_out.parent.mkdir(parents=True, exist_ok=True)
 
+    previous_manifest = {}
+    previous_manifest_path = cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    try:
+        if previous_manifest_path.exists() and previous_manifest_path.stat().st_size:
+            previous_manifest = json.loads(previous_manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        previous_manifest = {}
+
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
-    end = datetime.strptime(args.end, "%Y-%m-%d").date()
+    end = (
+        datetime.strptime(args.end, "%Y-%m-%d").date()
+        if args.end.strip()
+        else datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    )
+    if start > end:
+        raise ValueError(f"Invalid PIT coverage range: start={start} is after end={end}")
     universe = set(official_nse_symbols(force_refresh=False))
     print(f"ALL-NSE NEWS/EVENTS: universe={len(universe):,} range={start}..{end}", flush=True)
 
@@ -350,10 +368,32 @@ def main():
     else:
         pd.DataFrame(columns=["symbol", "decision_timestamp", "event_available", "event_high_impact"]).to_parquet(event_out, index=False)
 
+    coverage_start = start
+    coverage_end = end
+    prior_start = pd.to_datetime(previous_manifest.get("coverage_start"), errors="coerce")
+    prior_end = pd.to_datetime(previous_manifest.get("coverage_end"), errors="coerce")
+    prior_complete = previous_manifest.get("coverage_complete") is True
+    adjacent_or_overlapping = (
+        prior_complete
+        and pd.notna(prior_start)
+        and pd.notna(prior_end)
+        and start <= (prior_end.date() + timedelta(days=1))
+        and end >= (prior_start.date() - timedelta(days=1))
+    )
+    if adjacent_or_overlapping:
+        coverage_start = min(start, prior_start.date())
+        coverage_end = max(end, prior_end.date())
+
     manifest = {
         "source": "NSE_OFFICIAL_CORPORATE_ANNOUNCEMENTS_AND_ACTIONS",
         "universe_size": len(universe),
-        "requested_range": [args.start, args.end],
+        "requested_range": [start.isoformat(), end.isoformat()],
+        "coverage_start": coverage_start.isoformat(),
+        "coverage_end": coverage_end.isoformat(),
+        "prior_coverage_extended": bool(adjacent_or_overlapping),
+        # Reaching this write means every requested date chunk returned a valid response.
+        # Coverage is extended only when the previous complete range overlaps/is adjacent.
+        "coverage_complete": True,
         "announcement_rows_fetched": len(ann),
         "corporate_action_rows_fetched": len(ca),
         "news_rows": int(len(news)),
@@ -363,7 +403,30 @@ def main():
         "pit_rule": "NSE broadcast/announcement or corporate-action availability timestamp; backward PIT merge",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    (cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_path = cache / "ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Colab writes directly to the mounted Drive. In GitHub Actions, persist
+    # the validated files via the configured Drive connector so the downstream
+    # Delivery refresh consumes the same source files instead of ephemeral CI files.
+    if not str(root).startswith("/content/drive/MyDrive/"):
+        from persistent_store import GoogleDriveStore
+        store = GoogleDriveStore()
+        store.upload_or_update(
+            news_out,
+            "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
+            mime_type="application/octet-stream",
+        )
+        store.upload_or_update(
+            event_out,
+            "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+            mime_type="application/octet-stream",
+        )
+        store.upload_or_update(
+            manifest_path,
+            "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
+            mime_type="application/json",
+        )
     print(json.dumps(manifest, indent=2), flush=True)
 
 

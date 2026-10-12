@@ -16,7 +16,10 @@ REMOTE_SOURCES = {
     "fno": "production_data/nse_official/fno/fno_daily_features_2026.parquet",
     "news": "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
     "events": "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
+    "news_events_manifest": "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
     "fundamentals": "corporate/pit_fundamentals_all_nse_2025_2026.parquet",
+    "fundamental_availability": "corporate/pit_fundamental_availability_2025_2026.parquet",
+    "fundamental_availability_meta": "corporate/pit_fundamental_availability_2025_2026.meta.json",
 }
 MIN_HISTORY = 60
 
@@ -232,7 +235,7 @@ def main():
     _stage("IMPORT PHASE: loading panel/model builder modules")
     from colab_build_all_nse_delivery_multifactor_candidate import make_panel,merge_optional
     from delivery_training_universe import training_roster,load_official_nse_universe
-    from multifactor_data_layer_v2 import FEATURES_59,attach_readiness_flags
+    from multifactor_data_layer_v2 import FEATURES_59, attach_readiness_flags, feature_coverage_report
     from nse_delivery_data_layer import load_delivery_history
     reference_date = (
         expected_date
@@ -282,26 +285,13 @@ def main():
     # Distinguish "source is present and this symbol has no applicable item"
     # from "the source pipeline itself is missing". The former is known state
     # (0); the latter remains NaN and is blocked by the production gate.
-    source_to_flag = {
-        "news": "ready_news",
-        "events": "ready_events",
-        "fno": "ready_fno",
-        "fundamentals": "ready_fundamentals",
-    }
-    for source, flag in source_to_flag.items():
-        if source_status.get(source) in {"LOCAL", "DOWNLOADED"} and flag in panel.columns:
-            panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
-
-    _stage("READINESS PHASE: attaching production data-quality flags")
+    _stage("READINESS PHASE: attaching source-aware production data-quality flags")
+    # A source file existing somewhere in Drive does not prove every date and
+    # every symbol has known coverage. Optional-source readiness zeros are set
+    # only by merge_optional() for verified covered dates; preserve NaN elsewhere
+    # so the production gate can block signals instead of claiming false readiness.
     panel=attach_readiness_flags(panel)
     _stage("READINESS PHASE DONE")
-
-    # A present source pipeline means missing per-symbol observations are a
-    # known no-data/not-applicable state. Apply this after readiness columns
-    # are created so the production gate does not confuse absence with unknown.
-    for source, flag in source_to_flag.items():
-        if source_status.get(source) in {"LOCAL", "DOWNLOADED"} and flag in panel.columns:
-            panel[flag] = pd.to_numeric(panel[flag], errors="coerce").fillna(0).astype("Int8")
 
     panel["decision_timestamp"]=pd.to_datetime(panel["decision_timestamp"],errors="coerce",utc=True)
     panel=panel.dropna(subset=["symbol","decision_timestamp"]).sort_values(["symbol","decision_timestamp"]).drop_duplicates("symbol",keep="last").reset_index(drop=True)
@@ -309,6 +299,12 @@ def main():
     if missing: raise RuntimeError(f"59-feature production panel missing columns: {missing}")
     readiness_cols=["ready_market_price","ready_market_context","ready_news","ready_events","ready_fno","ready_fundamentals"]
     panel["production_data_quality_score"]=panel[readiness_cols].apply(pd.to_numeric,errors="coerce").notna().sum(axis=1)/len(readiness_cols)
+    panel["production_feature_coverage"] = panel[FEATURES_59].apply(
+        pd.to_numeric, errors="coerce"
+    ).replace([float("inf"), float("-inf")], float("nan")).notna().mean(axis=1)
+    panel["production_feature_non_missing_count"] = panel[FEATURES_59].apply(
+        pd.to_numeric, errors="coerce"
+    ).replace([float("inf"), float("-inf")], float("nan")).notna().sum(axis=1)
     panel["production_core_ready"]=(
         pd.to_numeric(panel["ready_market_price"],errors="coerce").eq(1)&
         pd.to_numeric(panel["ready_market_context"],errors="coerce").eq(1)
@@ -341,6 +337,9 @@ def main():
         "minimum_history_sessions":MIN_HISTORY,
         "source_status":source_status,"eod_status":eod_status,"delivery_status":delivery_status,"live_rss_news":live_news_result,
         "source_audit":source_audit,"group_readiness":group_ready,
+        "feature_coverage":feature_coverage_report(panel),
+        "production_feature_coverage_pct":round(float(panel["production_feature_coverage"].mean()*100),3),
+        "production_rows_all_59_features":int(panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()),
         "production_data_quality_gate_pct":round(float(panel["production_data_quality_gate"].mean()*100),3),
         "ipo_policy":"Any current official NSE equity becomes eligible automatically after 60 clean sessions.",
         "model_weights_changed":False,"model_promotion_performed":False
