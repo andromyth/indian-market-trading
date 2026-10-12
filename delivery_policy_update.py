@@ -19,6 +19,7 @@ TARGET_HOLDOUT_PRECISION=0.80
 ACTIVE_DELIVERY_MODEL_VERSIONS = {
     "2026-all-nse-delivery-multifactor-59-replacement-v1",
     "2026-all-nse-delivery-multifactor-59-candidate-v2",
+    "2026-all-nse-delivery-multifactor-59-replacement-v2",
 }
 MIN_UNIQUE_SESSIONS=20
 MIN_HOLDOUT_SESSIONS=5

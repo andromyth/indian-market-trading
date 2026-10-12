@@ -56,6 +56,7 @@ jobs:
           delivery_policy_update.py
           delivery_validation_diagnostics.py
           delivery_all_nse_prediction_cycle.py
+          delivery_factor_weightage.py
           refresh_canonical_cash_master_from_bulk_eod.py
           audit_live_prediction_health.py
           backfill_missing_delivery_pit_snapshots.py
@@ -113,6 +114,7 @@ jobs:
           tests/test_live_signal_guards.py
           tests/test_strict_delivery_walkforward.py
           tests/test_delivery_production_refresh.py
+          tests/test_delivery_factor_weightage.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
