@@ -25,7 +25,7 @@ on:
 jobs:
   sync-nse-eod:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +82,19 @@ jobs:
               --sync-drive
           fi
 
+      - name: Incrementally refresh identity-preserved cash master from official UDiFF ZIPs
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          python -u refresh_canonical_cash_master_from_bulk_eod.py \
+            --use-google-drive \
+            --apply \
+            --lookback-calendar-days 30
+
       - name: Persist NSE index context for model compilation (best effort)
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -127,3 +140,13 @@ jobs:
                   "- EOD archive sync is independent; a later run will retry index context.",
               )
           PY
+
+      - name: Audit live market freshness and prediction outcomes (non-blocking)
+        continue-on-error: true
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python -u audit_live_prediction_health.py --drive-api

@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import balanced_accuracy_score, brier_score_loss, roc_auc_score
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -1439,9 +1440,15 @@ def add_targets(panel,steps,name):
     return x.dropna(subset=[f"target_return_{name}"])
 
 def fit_models(frame, horizon):
-    cutoff = frame["decision_timestamp"].max() - pd.Timedelta(days=60)
-    tr = frame[frame["decision_timestamp"] < cutoff]
-    te = frame[frame["decision_timestamp"] >= cutoff]
+    from purged_walk_forward import purged_chronological_split
+
+    tr, te, split_audit = purged_chronological_split(
+        frame,
+        decision_column="decision_timestamp",
+        target_column="_target_timestamp",
+        cutoff_days=60,
+    )
+    cutoff = pd.Timestamp(split_audit["cutoff_timestamp"])
     if tr.empty or te.empty or tr[f"target_up_{horizon}"].nunique() < 2:
         raise RuntimeError(f"{horizon}: insufficient chronological train/holdout data")
 
@@ -1482,12 +1489,46 @@ def fit_models(frame, horizon):
 
     p = clf.predict_proba(Xte)[:, 1]
     pr = reg.predict(Xte)
-    y = te[f"target_up_{horizon}"].to_numpy()
+    y = te[f"target_up_{horizon}"].to_numpy(dtype=int)
+    actual_returns = pd.to_numeric(te[f"target_return_{horizon}"], errors="coerce").to_numpy(dtype=float)
+    directional_pred = (p >= 0.5).astype(int)
+    buys = (p >= 0.60) & (pr > 0.0015)
+    sells = (p <= 0.40) & (pr < -0.0015)
+    actions = buys | sells
+    action_correct = (buys & (y == 1)) | (sells & (y == 0))
+    signed_action_returns = np.where(buys, actual_returns, np.where(sells, -actual_returns, np.nan))
+    auc = float(roc_auc_score(y, p)) if np.unique(y).size == 2 else None
+    balanced_acc = float(balanced_accuracy_score(y, directional_pred)) if np.unique(y).size == 2 else None
+    action_precision = float(action_correct[actions].mean()) if actions.any() else None
+    mean_signed_return = float(np.nanmean(signed_action_returns)) if actions.any() else None
     return clf, reg, {
         "train_rows": int(len(Xtr)),
         "holdout_rows": int(len(te)),
-        "holdout_accuracy": float(np.mean((p >= .5) == y)),
-        "mean_abs_return_error": float(np.mean(np.abs(pr - te[f"target_return_{horizon}"].to_numpy()))),
+        "holdout_cutoff_timestamp": str(cutoff),
+        "train_latest_target_timestamp": str(pd.to_datetime(tr["_target_timestamp"], utc=True).max()),
+        "holdout_first_decision_timestamp": str(pd.to_datetime(te["decision_timestamp"], utc=True).min()),
+        "purged_boundary_rows_in_fit_frame": int(split_audit["purged_boundary_rows"]),
+        "holdout_directional_accuracy_at_0_50": float(np.mean(directional_pred == y)),
+        "holdout_balanced_accuracy_at_0_50": balanced_acc,
+        "holdout_roc_auc": auc,
+        "holdout_brier_score": float(brier_score_loss(y, p)),
+        "holdout_positive_class_rate": float(np.mean(y == 1)),
+        "holdout_majority_class_baseline_accuracy": float(max(np.mean(y == 1), np.mean(y == 0))),
+        "signal_policy": {
+            "buy_probability_minimum": 0.60,
+            "sell_probability_maximum": 0.40,
+            "buy_minimum_predicted_return": 0.0015,
+            "sell_maximum_predicted_return": -0.0015,
+        },
+        "buy_count": int(buys.sum()),
+        "sell_count": int(sells.sum()),
+        "hold_count": int((~actions).sum()),
+        "action_coverage_pct": float(actions.mean() * 100),
+        "action_precision": action_precision,
+        "mean_gross_signed_action_return_pct": mean_signed_return * 100 if mean_signed_return is not None else None,
+        "break_even_round_trip_cost_bps": mean_signed_return * 10000 if mean_signed_return is not None else None,
+        "transaction_costs_included": False,
+        "mean_abs_return_error": float(np.mean(np.abs(pr - actual_returns))),
         "holdout_mean_readiness_pct": float(te["data_readiness_score"].mean() * 100),
         "training_feature_coverage_mean_pct": coverage["mean_non_missing_pct"],
         "training_feature_coverage_gate": "PASS",
@@ -1863,7 +1904,10 @@ def _prepare_training_sample(
                 SELECT {projection},
                     LEAD(TRY_CAST(close AS DOUBLE), {int(steps)}) OVER (
                         PARTITION BY symbol ORDER BY decision_timestamp
-                    ) AS _future_close
+                    ) AS _future_close,
+                    LEAD(decision_timestamp, {int(steps)}) OVER (
+                        PARTITION BY symbol ORDER BY decision_timestamp
+                    ) AS _target_timestamp
                 FROM read_parquet({panel_sql})
             )
             SELECT * EXCLUDE (_future_close),
@@ -1872,6 +1916,7 @@ def _prepare_training_sample(
                      THEN 1 ELSE 0 END AS "{horizon_up}"
             FROM ordered
             WHERE _future_close IS NOT NULL
+              AND _target_timestamp IS NOT NULL
               AND TRY_CAST(close AS DOUBLE) > 0
         """)
         max_labelled_ts = con.execute(
@@ -1881,8 +1926,20 @@ def _prepare_training_sample(
             raise RuntimeError(f"{horizon}: no rows have a valid {steps}-session future close.")
         cutoff = pd.Timestamp(max_labelled_ts) - pd.Timedelta(days=60)
         cutoff_literal = _sql_string(cutoff.to_pydatetime())
+        boundary_purged_rows = int(con.execute(
+            f"SELECT COUNT(*) FROM labelled "
+            f"WHERE decision_timestamp < {cutoff_literal} "
+            f"AND _target_timestamp >= {cutoff_literal}"
+        ).fetchone()[0] or 0)
+        train_eligible_rows = int(con.execute(
+            f"SELECT COUNT(*) FROM labelled "
+            f"WHERE decision_timestamp < {cutoff_literal} "
+            f"AND _target_timestamp < {cutoff_literal}"
+        ).fetchone()[0] or 0)
         train_symbols = int(con.execute(
-            f"SELECT COUNT(DISTINCT symbol) FROM labelled WHERE decision_timestamp < {cutoff_literal}"
+            f"SELECT COUNT(DISTINCT symbol) FROM labelled "
+            f"WHERE decision_timestamp < {cutoff_literal} "
+            f"AND _target_timestamp < {cutoff_literal}"
         ).fetchone()[0] or 0)
         if train_symbols <= 0:
             raise RuntimeError(f"{horizon}: no rows available before the chronological holdout.")
@@ -1904,7 +1961,9 @@ def _prepare_training_sample(
             UNION ALL
             SELECT *, 'preserved_rare_source_row' AS _sample_role
             FROM labelled
-            WHERE decision_timestamp < {cutoff_literal} AND ({rare_signal})
+            WHERE decision_timestamp < {cutoff_literal}
+              AND _target_timestamp < {cutoff_literal}
+              AND ({rare_signal})
             UNION ALL
             SELECT * EXCLUDE (_sample_rank), 'deterministic_history_sample' AS _sample_role
             FROM (
@@ -1914,6 +1973,7 @@ def _prepare_training_sample(
                 ) AS _sample_rank
                 FROM labelled
                 WHERE decision_timestamp < {cutoff_literal}
+                  AND _target_timestamp < {cutoff_literal}
                   AND NOT ({rare_signal})
             ) ordinary
             WHERE _sample_rank <= {quota}
@@ -1932,11 +1992,13 @@ def _prepare_training_sample(
             "chronological_cutoff": str(cutoff),
             "max_regular_training_rows": int(max_training_rows),
             "trainable_symbols_before_cutoff": train_symbols,
+            "pre_cutoff_train_eligible_rows": train_eligible_rows,
+            "purged_boundary_rows": boundary_purged_rows,
             "per_symbol_regular_row_quota": quota,
             "labelled_population_rows": int(con.execute("SELECT COUNT(*) FROM labelled").fetchone()[0]),
             "sample_rows_total": int(con.execute("SELECT COUNT(*) FROM sampled").fetchone()[0]),
-            "label_policy": "labels are calculated with full symbol histories before sampling; no sampled-row shift is used",
-            "sampling_policy": "all 60-day holdout rows and all rows with F&O observations or positive news/events are preserved; other pre-cutoff rows are deterministically sampled per symbol",
+            "label_policy": "future outcome timestamp is saved per symbol; training rows whose target timestamp reaches or crosses the holdout cutoff are purged before sampling",
+            "sampling_policy": "all 60-day holdout rows and all eligible pre-cutoff rows with F&O observations or positive news/events are preserved; ordinary eligible history is deterministically sampled per symbol; boundary-crossing labels are excluded",
         })
         con.execute(f"""
             COPY (SELECT * EXCLUDE (_sample_role) FROM sampled)
@@ -2351,7 +2413,7 @@ def main():
         "panel_input_signature":panel_meta["input_signature"],
         "data_readiness_path":str(readiness_path),
         "pit_policy":"Only observations available by the 15:30 IST session decision time are eligible; missing information is never fabricated.",
-        "sampling_policy":"DuckDB labels on full per-symbol chronology; cap ordinary pre-cutoff rows per symbol, preserve all 60-day holdout rows and positive news/events/F&O-observation rows.",
+        "sampling_policy":"DuckDB labels on full per-symbol chronology with per-row target timestamps; training observations whose targets reach/cross the 60-day holdout cutoff are purged before deterministic sampling; preserve all eligible holdout rows and rare-source training rows.",
         "no_auto_orders":True,
         "branch_replacement_target":"production_delivery_model",
     }
