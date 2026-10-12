@@ -419,7 +419,9 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
     manifest_path = work_root / REMOTE_DELIVERY_MANIFEST
     _drive_download(store, REMOTE_DELIVERY_MANIFEST, manifest_path)
     return readiness, readiness_root, manifest_path
-\n\ndef main() -> int:
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--drive-api",
