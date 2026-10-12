@@ -334,14 +334,18 @@ def main() -> int:
                 encoding="utf-8",
             )
             remote_report_path = f"features/daily/{report_path.name}"
-            upload_result = GoogleDriveStore().upload_or_update(
-                report_path, remote_report_path, mime_type="application/json"
-            )
+            if sync_drive:
+                upload_result = GoogleDriveStore().upload_or_update(
+                    report_path, remote_report_path, mime_type="application/json"
+                )
+                drive_action = upload_result.get("action")
+            else:
+                drive_action = "SKIPPED_NO_SYNC_DRIVE"
             print("FACTOR_WEIGHTAGE_AUDIT_PERSISTED:", json.dumps({
                 "local_path": str(report_path),
-                "remote_path": remote_report_path,
+                "remote_path": remote_report_path if sync_drive else None,
                 "symbols": len(factor_weightage_report.get("per_symbol_predictions", [])),
-                "drive_action": upload_result.get("action"),
+                "drive_action": drive_action,
             }, default=str), flush=True)
         except Exception as exc:
             # Diagnostics are deliberately non-blocking; signal and ledger
