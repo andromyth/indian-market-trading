@@ -71,7 +71,7 @@ def _bulk_archive_audit(master_latest: str | None) -> dict[str, Any]:
     dates = set()
     files_seen = 0
     for pattern in ("BhavCopy_NSE_CM_0_0_0_*_F_0000.parquet", "BhavCopy_NSE_CM_0_0_0_*_F_0000.csv.zip"):
-        for path in BULK_ROOT.rglob(pattern) if BULK_ROOT.exists() else []:
+        for path in (BULK_ROOT.rglob(pattern) if BULK_ROOT.exists() else []):
             day = _date_from_file(path)
             if day is not None:
                 files_seen += 1
