@@ -57,6 +57,7 @@ jobs:
           delivery_validation_diagnostics.py
           refresh_canonical_cash_master_from_bulk_eod.py
           audit_live_prediction_health.py
+          backfill_missing_delivery_pit_snapshots.py
           purged_walk_forward.py
           nse_fno_udiff_ingest.py
           nse_fno_applicability_snapshot.py
@@ -82,6 +83,7 @@ jobs:
           tests/test_purged_walk_forward.py
           tests/test_cash_master_incremental_refresh.py
           tests/test_bulk_eod_zip_recovery.py
+          tests/test_backfill_missing_delivery_pit_snapshots.py
           tests/test_multifactor_data_layer_v2.py
           tests/test_59_feature_source_coverage.py
           tests/test_candidate_pipeline_stages.py
