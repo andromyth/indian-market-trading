@@ -164,6 +164,53 @@ def _realised_delivery_diagnostics() -> dict[str, Any]:
         }
 
 
+def _intraday_outcome_coverage() -> dict[str, Any]:
+    """Distinguish intraday prediction logs from true 30-minute realised outcomes."""
+    try:
+        from prediction_ledger import load_records, load_validation_records
+        preds = pd.DataFrame(load_records())
+        vals = pd.DataFrame(load_validation_records())
+        if preds.empty:
+            return {"status": "NO_INTRADAY_PREDICTIONS", "prediction_count": 0}
+        mode = preds.get("mode", pd.Series("", index=preds.index)).astype(str).str.lower()
+        horizon = preds.get("prediction_horizon", pd.Series("", index=preds.index)).astype(str).str.lower()
+        intraday = preds.loc[mode.eq("intraday") | horizon.isin({"30m", "30min", "30_minutes"})].copy()
+        if intraday.empty:
+            return {"status": "NO_INTRADAY_PREDICTIONS", "prediction_count": 0}
+        fields = {
+            "realised_return": ["actual_return_30m", "actual_30m_return", "realized_return_30m", "realised_return_30m"],
+            "realised_direction": ["actual_direction_30m", "actual_30m_direction", "realized_direction_30m", "realised_direction_30m"],
+            "validation_status": ["validation_status"],
+        }
+        available = {kind: [name for name in names if name in vals.columns] for kind, names in fields.items()}
+        ids = set(intraday.get("prediction_id", pd.Series(dtype=str)).dropna().astype(str))
+        matched = vals.loc[vals.get("prediction_id", pd.Series(index=vals.index, dtype=str)).astype(str).isin(ids)].copy() if not vals.empty and "prediction_id" in vals.columns else pd.DataFrame()
+        target_outcome_available = bool(available["realised_return"] or available["realised_direction"])
+        validated_count = 0
+        if not matched.empty and "validation_status" in matched.columns:
+            validated_count = int(matched["validation_status"].astype(str).str.upper().eq("VALIDATED").sum())
+        return {
+            "status": "TARGET_ALIGNED_OUTCOMES_AVAILABLE" if target_outcome_available else "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR",
+            "intraday_prediction_count": int(len(intraday)),
+            "prediction_ids_available": int(len(ids)),
+            "validation_rows_matched_by_prediction_id": int(len(matched)),
+            "matched_validated_rows": validated_count,
+            "realised_30m_fields_found_in_validation_ledger": available["realised_return"] + available["realised_direction"],
+            "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
+            "accuracy_claim_allowed": False,
+            "note": (
+                "A 30-minute intraday score requires future 30-minute realised price outcomes matched to the exact prediction timestamp. "
+                "Delivery D+1 validation rows are not valid substitutes."
+            ),
+        }
+    except Exception as exc:
+        return {
+            "status": "AUDIT_FAILED",
+            "error": f"{type(exc).__name__}: {exc}",
+            "accuracy_claim_allowed": False,
+        }
+
+
 def _intraday_model_audit() -> dict[str, Any]:
     try:
         from production_model import model_status, model_target_contract
@@ -179,6 +226,7 @@ def main() -> int:
     pit = _latest_pit_readiness()
     delivery_manifest = _delivery_model_manifest()
     delivery_outcomes = _realised_delivery_diagnostics()
+    intraday_outcomes = _intraday_outcome_coverage()
     intraday = _intraday_model_audit()
 
     issues = []
@@ -197,6 +245,8 @@ def main() -> int:
         )
     if intraday.get("status") == "AUDIT_FAILED":
         issues.append("The certified intraday model manifest/target contract could not be verified.")
+    if intraday_outcomes.get("intraday_prediction_count", 0) and intraday_outcomes.get("status") == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR":
+        issues.append("Intraday predictions exist, but no target-aligned 30-minute realised-outcome validator was found in the validation ledger.")
 
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -211,6 +261,7 @@ def main() -> int:
         "delivery_model_manifest": delivery_manifest,
         "delivery_realised_outcome_diagnostics": delivery_outcomes,
         "intraday_model_audit": intraday,
+        "intraday_realised_outcome_coverage": intraday_outcomes,
         "issues": issues,
         "overall_status": "NEEDS_REPAIR_OR_MORE_VALIDATION" if issues else "NO_BLOCKER_FOUND_BY_STATIC_AUDIT",
         "limitations": [
