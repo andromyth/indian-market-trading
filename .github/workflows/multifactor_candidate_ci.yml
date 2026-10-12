@@ -69,6 +69,7 @@ jobs:
           selfdriving/sd_cycle.py
           selfdriving/sd_registry.py
           selfdriving/sd_github_job_v2.py
+          live_signal_guards.py
           COLAB_SD_V2_RETRAIN.py
           COLAB_SD_INTRADAY_V2_RETRAIN.py
 
@@ -99,6 +100,7 @@ jobs:
           tests/test_delivery_policy_active_model_filter.py
           tests/test_intraday_multihorizon_validation.py
           tests/test_market_watchlist.py
+          tests/test_live_signal_guards.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
