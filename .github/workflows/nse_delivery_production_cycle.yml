@@ -144,16 +144,6 @@ jobs:
           set -euo pipefail
           python -u production_data_freshness_gate.py --target-date "${{ steps.target.outputs.target_date }}"
 
-      - name: Backfill missed PIT snapshots for prior official NSE sessions
-        if: steps.target.outputs.target_date != ''
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          python -u backfill_missing_delivery_pit_snapshots.py \
-            --target-date "${{ steps.target.outputs.target_date }}" \
-            --lookback-calendar-days 14 \
-            --max-backfills-per-run 14
-
       - name: Build current-day PIT snapshot for next trading day
         if: steps.target.outputs.target_date != ''
         run: |
@@ -269,6 +259,19 @@ jobs:
         if: steps.target.outputs.target_date != ''
         run: python -m py_compile production_data_freshness_gate.py delivery_production_refresh.py backfill_missing_delivery_pit_snapshots.py delivery_all_nse_prediction_cycle.py delivery_prediction_csv_ledger.py prediction_ledger.py prediction_validation.py validate_prediction_ledger.py live_test_preflight.py all_nse_intraday_5m_model.py colab_build_all_nse_intraday_5m_multifactor.py intraday_5m_multihorizon_validation.py app.py delivery_policy_update.py delivery_validation_diagnostics.py
 
+      # Prioritize today's target PIT and next-session predictions before historical recovery.
+      # Bound catch-up time so a backlog cannot consume the whole production window.
+      - name: Backfill missed PIT snapshots for prior official NSE sessions
+        if: steps.target.outputs.target_date != ''
+        continue-on-error: true
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          python -u backfill_missing_delivery_pit_snapshots.py \
+            --target-date "${{ steps.target.outputs.target_date }}" \
+            --lookback-calendar-days 14 \
+            --max-backfills-per-run 14
+
       - name: Require recent NSE EOD, Delivery and PIT snapshot continuity
         if: steps.target.outputs.target_date != ''
         run: |
@@ -276,5 +279,5 @@ jobs:
           python -u backfill_missing_delivery_pit_snapshots.py \
             --target-date "${{ steps.target.outputs.target_date }}" \
             --lookback-calendar-days 14 \
-            --max-backfills-per-run 4 \
+            --max-backfills-per-run 14 \
             --audit-only
