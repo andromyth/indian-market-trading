@@ -396,29 +396,54 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
     _drive_download(store, REMOTE_DELIVERY_MANIFEST, manifest_path)
     return readiness, readiness_root, manifest_path
 \n\ndef main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--drive-api",
+        action="store_true",
+        help="Audit current Google Drive artifacts through the Drive API without downloading the full cash master.",
+    )
+    args = parser.parse_args()
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    master = _cash_master_audit()
-    bulk = _bulk_archive_audit(master.get("latest_date"))
-    pit = _latest_pit_readiness()
-    delivery_manifest = _delivery_model_manifest()
+    drive_store = None
+    work_root = None
+    temp_context = None
+
+    if args.drive_api:
+        from persistent_store import GoogleDriveStore
+        drive_store = GoogleDriveStore()
+        temp_context = tempfile.TemporaryDirectory(prefix="live-prediction-health-")
+        work_root = Path(temp_context.name)
+        master = _drive_cash_master_audit(drive_store, work_root)
+        bulk = _drive_bulk_archive_audit(drive_store, master.get("latest_date"))
+        _, pit_root, manifest_path = _prepare_drive_audit_inputs(drive_store, work_root)
+        pit = _latest_pit_readiness(pit_root)
+        delivery_manifest = _delivery_model_manifest(manifest_path)
+        report_path = work_root / "live_prediction_health_latest.json"
+    else:
+        master = _cash_master_audit()
+        bulk = _bulk_archive_audit(master.get("latest_date"))
+        pit = _latest_pit_readiness()
+        delivery_manifest = _delivery_model_manifest()
+        report_path = REPORT
+
     delivery_outcomes = _realised_delivery_diagnostics()
     intraday_outcomes = _intraday_outcome_coverage()
     intraday = _intraday_model_audit()
 
     issues = []
     if master.get("status") != "PASS":
-        issues.append("Canonical identity-preserved cash master is missing or has identity-integrity problems.")
+        issues.append("Canonical identity-preserved cash master is missing or its integrity metadata is unavailable/unapproved.")
     if bulk.get("master_lags_archives"):
         issues.append("Official EOD archives contain later dates than the canonical cash research master.")
     if pit.get("snapshot_date") and master.get("latest_date") and pit["snapshot_date"] < master["latest_date"]:
         issues.append("Latest Delivery PIT snapshot predates the canonical cash research master.")
+    if pit.get("status") == "NO_PIT_READINESS_REPORT":
+        issues.append("No Delivery PIT readiness report could be found.")
     if delivery_outcomes.get("status") in {
         "NO_ACTIVE_MODEL_DATA", "NO_QUALITY_APPROVED_DATA", "INSUFFICIENT_HISTORY",
         "INSUFFICIENT_SESSION_HISTORY", "AUDIT_FAILED", "NO_DATA",
     }:
-        issues.append(
-            "The live Delivery accuracy diagnostic has no adequate quality-approved active-model outcome history."
-        )
+        issues.append("The live Delivery accuracy diagnostic has no adequate quality-approved active-model outcome history.")
     if intraday.get("status") == "AUDIT_FAILED":
         issues.append("The certified intraday model manifest/target contract could not be verified.")
     if intraday_outcomes.get("intraday_prediction_count", 0) and intraday_outcomes.get("status") == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR":
@@ -427,6 +452,7 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "generated_at_ist": now.isoformat(),
+        "audit_source": "Google Drive API" if args.drive_api else "mounted Google Drive filesystem",
         "read_only": True,
         "model_weights_changed": False,
         "model_promotion_performed": False,
@@ -441,16 +467,28 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
         "issues": issues,
         "overall_status": "NEEDS_REPAIR_OR_MORE_VALIDATION" if issues else "NO_BLOCKER_FOUND_BY_STATIC_AUDIT",
         "limitations": [
-            "The report is only current when run against the mounted Drive files and persisted prediction/validation ledgers.",
+            "In Drive API mode, canonical master date/identity counts are taken from its write-validated metadata; the large master Parquet is not downloaded.",
+            "The report is only current when run against the live Drive files and persisted prediction/validation ledgers.",
             "Monitoring accuracy is not a sealed out-of-sample result; require later chronological holdout evidence before claiming a target precision.",
             "A clean archive/master date match proves freshness only, not predictive edge or profitability.",
         ],
     }
-    REPORT.parent.mkdir(parents=True, exist_ok=True)
-    REPORT.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    print(json.dumps(report, indent=2, default=str))
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if drive_store is not None:
+        result = drive_store.upload_or_update(
+            report_path,
+            REMOTE_HEALTH_REPORT,
+            mime_type="application/json",
+        )
+        report["drive_report_upload"] = result
+        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        print(json.dumps(report, indent=2, default=str))
+        if temp_context is not None:
+            temp_context.cleanup()
+    else:
+        print(json.dumps(report, indent=2, default=str))
     return 0 if not issues else 2
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
