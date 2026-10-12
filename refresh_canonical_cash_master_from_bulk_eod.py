@@ -15,6 +15,7 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
@@ -178,6 +179,7 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
 
 
 def main() -> int:
+    global BULK_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--master", default=str(MASTER))
     parser.add_argument("--bulk-root", default=str(BULK_ROOT))
@@ -187,13 +189,12 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="Write validated update to canonical master. Default is dry-run.")
     args = parser.parse_args()
 
-    global BULK_ROOT
     BULK_ROOT = Path(args.bulk_root)
     master = Path(args.master)
     before = _master_stats(master)
     if args.lookback_calendar_days < 1:
         raise ValueError("--lookback-calendar-days must be >= 1")
-    end_date = date.fromisoformat(args.end) if args.end else datetime.now().astimezone().date()
+    end_date = date.fromisoformat(args.end) if args.end else datetime.now(ZoneInfo("Asia/Kolkata")).date()
     default_start = date.fromisoformat(before["max_date"]) - timedelta(days=args.lookback_calendar_days)
     start_date = date.fromisoformat(args.start) if args.start else default_start
     if start_date > end_date:
