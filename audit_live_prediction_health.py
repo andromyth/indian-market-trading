@@ -476,13 +476,11 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     if drive_store is not None:
-        result = drive_store.upload_or_update(
+        drive_store.upload_or_update(
             report_path,
             REMOTE_HEALTH_REPORT,
             mime_type="application/json",
         )
-        report["drive_report_upload"] = result
-        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(json.dumps(report, indent=2, default=str))
         if temp_context is not None:
             temp_context.cleanup()
