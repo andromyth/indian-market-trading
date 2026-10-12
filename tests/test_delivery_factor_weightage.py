@@ -89,3 +89,15 @@ def test_weightage_audit_reports_separate_classifier_regressor_and_gate_measures
     assert report["data_quality_audit"]["gate_blocked_rows"] == int((~gate).sum())
     assert report["news_semantics"]["live_59_feature_inputs"] == ["news_available"]
     assert report["news_semantics"]["news_sentiment_directionally_modelled_by_this_contract"] is False
+
+
+
+def test_current_replacement_v2_engine_is_consistent_across_guarded_consumers():
+    from all_nse_delivery_model import EXPECTED_ENGINE_VERSIONS
+    from delivery_policy_update import ACTIVE_DELIVERY_MODEL_VERSIONS as POLICY_VERSIONS
+    from delivery_validation_diagnostics import ACTIVE_DELIVERY_MODEL_VERSIONS as VALIDATION_VERSIONS
+
+    current_engine = "2026-all-nse-delivery-multifactor-59-replacement-v2"
+    assert current_engine in EXPECTED_ENGINE_VERSIONS
+    assert current_engine in POLICY_VERSIONS
+    assert current_engine in VALIDATION_VERSIONS
