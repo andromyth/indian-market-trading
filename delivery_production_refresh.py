@@ -355,7 +355,7 @@ def main():
         "feature_coverage":feature_coverage_report(panel),
         "production_feature_coverage_pct":round(float(panel["production_feature_coverage"].mean()*100),3),
         "production_rows_all_59_features":int(panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()),
-        "production_data_quality_gate_pct":round(float(panel["production_data_quality_gate"].mean()*100),3),
+        "production_data_quality_gate_pct":readiness_summary(panel["production_data_quality_gate"])["ready_pct"],
         "ipo_policy":"Any current official NSE equity becomes eligible automatically after 60 clean sessions.",
         "model_weights_changed":False,"model_promotion_performed":False
     }
