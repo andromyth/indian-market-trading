@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import balanced_accuracy_score, brier_score_loss, roc_auc_score
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -1488,7 +1489,18 @@ def fit_models(frame, horizon):
 
     p = clf.predict_proba(Xte)[:, 1]
     pr = reg.predict(Xte)
-    y = te[f"target_up_{horizon}"].to_numpy()
+    y = te[f"target_up_{horizon}"].to_numpy(dtype=int)
+    actual_returns = pd.to_numeric(te[f"target_return_{horizon}"], errors="coerce").to_numpy(dtype=float)
+    directional_pred = (p >= 0.5).astype(int)
+    buys = (p >= 0.60) & (pr > 0.0015)
+    sells = (p <= 0.40) & (pr < -0.0015)
+    actions = buys | sells
+    action_correct = (buys & (y == 1)) | (sells & (y == 0))
+    signed_action_returns = np.where(buys, actual_returns, np.where(sells, -actual_returns, np.nan))
+    auc = float(roc_auc_score(y, p)) if np.unique(y).size == 2 else None
+    balanced_acc = float(balanced_accuracy_score(y, directional_pred)) if np.unique(y).size == 2 else None
+    action_precision = float(action_correct[actions].mean()) if actions.any() else None
+    mean_signed_return = float(np.nanmean(signed_action_returns)) if actions.any() else None
     return clf, reg, {
         "train_rows": int(len(Xtr)),
         "holdout_rows": int(len(te)),
@@ -1496,8 +1508,27 @@ def fit_models(frame, horizon):
         "train_latest_target_timestamp": str(pd.to_datetime(tr["_target_timestamp"], utc=True).max()),
         "holdout_first_decision_timestamp": str(pd.to_datetime(te["decision_timestamp"], utc=True).min()),
         "purged_boundary_rows_in_fit_frame": int(split_audit["purged_boundary_rows"]),
-        "holdout_accuracy": float(np.mean((p >= .5) == y)),
-        "mean_abs_return_error": float(np.mean(np.abs(pr - te[f"target_return_{horizon}"].to_numpy()))),
+        "holdout_directional_accuracy_at_0_50": float(np.mean(directional_pred == y)),
+        "holdout_balanced_accuracy_at_0_50": balanced_acc,
+        "holdout_roc_auc": auc,
+        "holdout_brier_score": float(brier_score_loss(y, p)),
+        "holdout_positive_class_rate": float(np.mean(y == 1)),
+        "holdout_majority_class_baseline_accuracy": float(max(np.mean(y == 1), np.mean(y == 0))),
+        "signal_policy": {
+            "buy_probability_minimum": 0.60,
+            "sell_probability_maximum": 0.40,
+            "buy_minimum_predicted_return": 0.0015,
+            "sell_maximum_predicted_return": -0.0015,
+        },
+        "buy_count": int(buys.sum()),
+        "sell_count": int(sells.sum()),
+        "hold_count": int((~actions).sum()),
+        "action_coverage_pct": float(actions.mean() * 100),
+        "action_precision": action_precision,
+        "mean_gross_signed_action_return_pct": mean_signed_return * 100 if mean_signed_return is not None else None,
+        "break_even_round_trip_cost_bps": mean_signed_return * 10000 if mean_signed_return is not None else None,
+        "transaction_costs_included": False,
+        "mean_abs_return_error": float(np.mean(np.abs(pr - actual_returns))),
         "holdout_mean_readiness_pct": float(te["data_readiness_score"].mean() * 100),
         "training_feature_coverage_mean_pct": coverage["mean_non_missing_pct"],
         "training_feature_coverage_gate": "PASS",
