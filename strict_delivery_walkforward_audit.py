@@ -17,6 +17,7 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -56,6 +57,69 @@ def parse_holidays() -> set[date]:
         except Exception:
             pass
     return out
+
+
+
+def summarize_production_inventory(inventory: dict[str, set[date]], target_date: date | None) -> dict[str, Any]:
+    """Summarize actual production archive/snapshot dates separately from the research panel."""
+    eod_dates = inventory.get("eod", set())
+    delivery_dates = inventory.get("delivery", set())
+    pit_dates = inventory.get("pit", set())
+    target = target_date.isoformat() if target_date is not None else None
+    eod_present = target_date in eod_dates if target_date is not None else None
+    delivery_present = target_date in delivery_dates if target_date is not None else None
+    pit_present = target_date in pit_dates if target_date is not None else None
+
+    if target_date is None:
+        status = "NO_NSE_SESSION_EXPECTED"
+    elif eod_present and delivery_present and pit_present:
+        status = "CURRENT_SESSION_PIT_AND_SOURCES_READY"
+    elif eod_present and delivery_present and not pit_present:
+        status = "CURRENT_SESSION_PIT_MISSING_SOURCES_READY"
+    else:
+        status = "CURRENT_SESSION_SOURCE_ARCHIVES_MISSING"
+
+    def latest(values: set[date]) -> str | None:
+        return max(values).isoformat() if values else None
+
+    return {
+        "status": status,
+        "target_session": target,
+        "target_eod_archive_present": eod_present,
+        "target_delivery_archive_present": delivery_present,
+        "target_pit_snapshot_present": pit_present,
+        "latest_eod_archive_date": latest(eod_dates),
+        "latest_delivery_archive_date": latest(delivery_dates),
+        "latest_production_pit_snapshot_date": latest(pit_dates),
+        "eod_archive_dates_seen": len(eod_dates),
+        "delivery_archive_dates_seen": len(delivery_dates),
+        "production_pit_snapshot_dates_seen": len(pit_dates),
+        "read_only": True,
+    }
+
+
+def audit_live_production_inventory(now: datetime | None = None) -> dict[str, Any]:
+    """Read current production archive/PIT filenames from Drive without modifying them."""
+    try:
+        from backfill_missing_delivery_pit_snapshots import load_drive_inventory
+        from persistent_store import GoogleDriveStore
+        from production_data_freshness_gate import expected_session_date
+
+        clock = now or datetime.now(ZoneInfo(IST))
+        target = expected_session_date(clock)
+        inventory = load_drive_inventory(GoogleDriveStore())
+        result = summarize_production_inventory(inventory, target)
+        result["checked_at_ist"] = clock.astimezone(ZoneInfo(IST)).isoformat()
+        result["source"] = "Google Drive production_data/nse_official and features/daily inventory"
+        result["research_panel_is_live_production_snapshot"] = False
+        return result
+    except Exception as exc:
+        return {
+            "status": "PRODUCTION_INVENTORY_AUDIT_ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+            "read_only": True,
+            "research_panel_is_live_production_snapshot": False,
+        }
 
 
 def safe_gate(value: Any) -> bool:
@@ -594,7 +658,11 @@ def render_summary(report):
         f"- Tuning separated from holdout: {cert['model_selection_and_threshold_tuning_separate_from_holdout']}",
         f"- Fully PIT-universe certified: {cert['certified_as_fully_unbiased_point_in_time_universe_oos']}",
         cert["reason"],
-        f"- Panel last session: {report['source_freshness']['panel_last_session']}; latest completed session expected: {report['source_freshness']['latest_completed_session_expected']}",
+        f"- Research panel last observed session: {report['source_freshness']['panel_last_session']} (historical research panel, not the live production snapshot).",
+        f"- Live production inventory status: {report.get('production_inventory', {}).get('status')}",
+        f"- Production target session: {report.get('production_inventory', {}).get('target_session')}",
+        f"- Latest persisted production PIT snapshot: {report.get('production_inventory', {}).get('latest_production_pit_snapshot_date')}",
+        f"- Target EOD/Delivery/PIT presence: {report.get('production_inventory', {}).get('target_eod_archive_present')} / {report.get('production_inventory', {}).get('target_delivery_archive_present')} / {report.get('production_inventory', {}).get('target_pit_snapshot_present')}",
         "", "Weights were not saved or promoted; no production registry, policy, prediction ledger, or Drive source was changed.",
     ]
     return "\n".join(lines) + "\n"
@@ -729,8 +797,14 @@ def run_audit(panel_path: Path, out: Path):
         "source_freshness": {
             "panel_last_session": last_date.isoformat(),
             "latest_completed_session_expected": expected_latest.isoformat() if hasattr(expected_latest, "isoformat") else str(expected_latest) if expected_latest is not None else None,
-            "panel_matches_latest_completed_session": bool(expected_latest is not None and last_date == pd.Timestamp(expected_latest).date()),
+            "panel_matches_latest_completed_session": None,
+            "interpretation": (
+                "The audited file is an aggregate historical research/training panel, not the dated live production PIT snapshot. "
+                "Its end date must not be used as a production-ingestion freshness verdict; see production_inventory."
+            ),
+            "research_panel_is_live_production_snapshot": False,
         },
+        "production_inventory": audit_live_production_inventory(now.to_pydatetime()),
         "strict_oos_certification": {
             "chronological_purged_holdout_executed": True,
             "model_selection_and_threshold_tuning_separate_from_holdout": True,
@@ -847,6 +921,7 @@ def main():
             "untouched_holdout": report["untouched_holdout"],
             "strict_oos_certification": report["strict_oos_certification"],
             "source_freshness": report["source_freshness"],
+            "production_inventory": report["production_inventory"],
         }, indent=2, default=str))
         return 0
     except Exception as exc:
