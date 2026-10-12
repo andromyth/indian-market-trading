@@ -27,6 +27,22 @@ MIN_HISTORY = 60
 def _stage(message: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] {message}", flush=True)
 
+
+def readiness_summary(values: pd.Series) -> dict[str, float | int]:
+    """Summarize a readiness column safely, including pandas nullable dtypes."""
+    series = pd.to_numeric(values, errors="coerce")
+    row_count = int(len(series))
+    denominator = max(row_count, 1)
+    known_count = int(series.notna().sum())
+    # Comparisons on nullable Float64/boolean Series can retain pd.NA. Count
+    # only explicit ones as ready; unknowns remain unknown, never ready.
+    ready_count = int(series.eq(1).fillna(False).sum())
+    return {
+        "known_pct": round(known_count * 100.0 / denominator, 3) if row_count else 0.0,
+        "ready_pct": round(ready_count * 100.0 / denominator, 3) if row_count else 0.0,
+        "unknown_rows": int(series.isna().sum()),
+    }
+
 def _store():
     from persistent_store import GoogleDriveStore
     return GoogleDriveStore()
@@ -325,8 +341,7 @@ def main():
     _stage("SNAPSHOT WRITE DONE")
     group_ready={}
     for c in readiness_cols:
-        s=pd.to_numeric(panel[c],errors="coerce")
-        group_ready[c]={"known_pct":round(float(s.notna().mean()*100),3),"ready_pct":round(float(s.eq(1).mean()*100),3),"unknown_rows":int(s.isna().sum())}
+        group_ready[c]=readiness_summary(panel[c])
     report={
         "generated_at_utc":datetime.now(timezone.utc).isoformat(),
         "snapshot":snap.name,"snapshot_date":str(latest_date),
