@@ -341,12 +341,12 @@ def build_factor_weightage_report(
             "gate_blocked_rows": int((~gate).sum()),
             "gate_pass_pct": round(float(gate.mean() * 100.0), 3) if len(gate) else 0.0,
             "directional_candidates_blocked_by_gate": int(blocked_candidates.sum()),
-            "final_signal_counts": pd.Series(final).value_counts().to_dict(),
+            "final_signal_counts": {str(k): int(v) for k, v in pd.Series(final).value_counts().to_dict().items()},
         },
         "prediction_outputs": {
             "mean_probability_up": round(float(np.nanmean(probability_up)), 6) if len(probability_up) else None,
             "mean_predicted_return_pct": round(float(np.nanmean(predicted_return) * 100.0), 6) if len(predicted_return) else None,
-            "raw_signal_counts_before_gate": pd.Series(raw).value_counts().to_dict(),
+            "raw_signal_counts_before_gate": {str(k): int(v) for k, v in pd.Series(raw).value_counts().to_dict().items()},
         },
         "methodology_warning": (
             "Feature-count shares are not learned importance. Classifier coefficient/logit diagnostics, "
@@ -354,6 +354,17 @@ def build_factor_weightage_report(
             "None should be treated as a probability of profit or a production source-weight until confirmed with "
             "purged out-of-sample grouped ablation and cost-aware validation."
         ),
+        "per_symbol_predictions": [
+            {
+                "symbol": str(symbol).strip().upper(),
+                "probability_up": round(float(probability_up[i]), 6) if np.isfinite(probability_up[i]) else None,
+                "predicted_return_pct": round(float(predicted_return[i]) * 100.0, 6) if np.isfinite(predicted_return[i]) else None,
+                "raw_signal_before_gate": str(raw[i]),
+                "final_signal": str(final[i]),
+                "quality_gate_pass": bool(gate[i]),
+            }
+            for i, symbol in enumerate(symbols)
+        ],
         "per_symbol_classifier_contributions": classifier_report.get("per_row", []),
         "per_symbol_regressor_sensitivity": regressor_report.get("per_row", []),
     }
