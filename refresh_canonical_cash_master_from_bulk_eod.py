@@ -374,9 +374,16 @@ def main() -> int:
     if start_date > end_date:
         raise ValueError(f"Start date {start_date} is after end date {end_date}")
 
+    drive_archive_audit = None
     drive_archives_downloaded = 0
     if drive_store is not None:
-        drive_archives_downloaded = _download_drive_archives(drive_store, start_date, end_date, BULK_ROOT)
+        drive_archive_audit = _download_drive_archives(
+            drive_store, start_date, end_date, BULK_ROOT
+        )
+        drive_archives_downloaded = (
+            int(drive_archive_audit["downloaded_from_drive"])
+            + len(drive_archive_audit["downloaded_directly_from_official_nse"])
+        )
     archives = _source_archives(start_date, end_date)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -385,6 +392,7 @@ def main() -> int:
         "bulk_root": str(BULK_ROOT),
         "drive_api_mode": drive_store is not None,
         "drive_archives_downloaded": drive_archives_downloaded,
+        "drive_archive_source_audit": drive_archive_audit,
         "source_window": {"start": str(start_date), "end": str(end_date)},
         "master_before": before,
         "official_archive_files_found": len(archives),
@@ -397,6 +405,16 @@ def main() -> int:
         "model_promotion_performed": False,
         "orders_placed": False,
     }
+    if drive_archive_audit and drive_archive_audit.get("missing_source_zip_dates"):
+        report["status"] = "BLOCKED_MISSING_ORIGINAL_ZIPS"
+        report["warnings"].append(
+            "One or more official CM-UDiFF ZIPs could not be recovered for dates whose EOD Parquet is already persisted. "
+            "The canonical master was not changed; retry after restoring official source archives."
+        )
+        _write_report(report_path, report, drive_store)
+        print(json.dumps(report, indent=2, default=str))
+        return 2
+
     if not archives:
         report["status"] = "BLOCKED_NO_OFFICIAL_ZIP_ARCHIVES"
         report["warnings"].append(
