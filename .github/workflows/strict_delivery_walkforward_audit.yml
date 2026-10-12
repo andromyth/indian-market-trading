@@ -31,8 +31,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install audit dependencies
+        run: pip install numpy pandas pyarrow scikit-learn==1.6.1 joblib duckdb google-api-python-client google-auth google-auth-oauthlib
       - name: Verify Google Drive read access
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
