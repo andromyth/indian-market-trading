@@ -95,6 +95,39 @@ def latest_completed_bar_status(
     return {**base, "ok": True, "status": "PASS", "reason": None}
 
 
+def target_session_is_underway(
+    target_session_date: Any,
+    now: Any = None,
+    holidays: Iterable[Any] = (),
+) -> bool:
+    """Return whether a forecast's target NSE session is currently in regular hours.
+
+    Used to prevent a prior-close Delivery forecast for today's session from
+    being shown as a current live BUY/SELL after the session has started.
+    """
+    now_ts = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    now_ts = now_ts.tz_localize(IST) if now_ts.tzinfo is None else now_ts.tz_convert(IST)
+
+    try:
+        target = pd.Timestamp(target_session_date).date()
+    except Exception:
+        return False
+    if target != now_ts.date() or now_ts.weekday() >= 5:
+        return False
+
+    holiday_dates = set()
+    for value in holidays:
+        try:
+            holiday_dates.add(pd.Timestamp(value).date())
+        except Exception:
+            continue
+    if target in holiday_dates:
+        return False
+
+    local_time = now_ts.time().replace(tzinfo=None)
+    return pd.Timestamp("09:15").time() <= local_time < pd.Timestamp("15:30").time()
+
+
 def assess_horizon_completeness(
     horizons: Mapping[Any, Mapping[str, Any]],
     required_horizons: Iterable[int] = (5, 15, 30),

@@ -53,7 +53,11 @@ from selfdriving.sd_v2_runtime import (
     beta_intraday_predict,
     beta_status,
 )
-from live_signal_guards import assess_horizon_completeness, latest_completed_bar_status
+from live_signal_guards import (
+    assess_horizon_completeness,
+    latest_completed_bar_status,
+    target_session_is_underway,
+)
 
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -658,6 +662,25 @@ def _cached_watch_delivery_prediction(symbol: str, refresh_revision: int) -> dic
                     f"Reference snapshot {observed_reference or 'missing'}; "
                     f"expected latest completed NSE session {expected_reference}."
                 )
+            else:
+                try:
+                    from production_data_freshness_gate import HOLIDAYS as _delivery_holidays
+                    known_delivery_holidays = set(_delivery_holidays)
+                except Exception:
+                    known_delivery_holidays = set()
+                if target_session_is_underway(
+                    result.get("target_session_date"),
+                    now,
+                    known_delivery_holidays,
+                ):
+                    result["prediction_status"] = "IN_PROGRESS"
+                    result["signal"] = "IN_PROGRESS"
+                    result["signal_reason"] = (
+                        "TARGET_SESSION_UNDERWAY: this next-session forecast uses the previous "
+                        "completed daily snapshot and does not include current-session price action. "
+                        "Do not treat it as a live BUY/SELL; check the separate intraday output "
+                        "only when stock and benchmark candles are fresh, or wait for the next PIT refresh."
+                    )
         return result
     except Exception as exc:
         return {

@@ -5,6 +5,7 @@ from live_signal_guards import (
     assess_horizon_completeness,
     feature_coverage_fraction,
     latest_completed_bar_status,
+    target_session_is_underway,
 )
 
 
@@ -68,3 +69,17 @@ def test_horizon_guard_does_not_mark_missing_champions_as_pass():
     }
     result = assess_horizon_completeness(horizons)
     assert result["status"] == "NO_VALIDATED_MODEL"
+
+
+
+def test_delivery_forecast_is_in_progress_only_during_its_target_session():
+    now = pd.Timestamp("2026-10-12 12:00:00", tz="Asia/Kolkata")
+    assert target_session_is_underway("2026-10-12", now) is True
+    assert target_session_is_underway("2026-10-13", now) is False
+
+
+def test_delivery_forecast_is_not_in_progress_before_open_or_on_holiday():
+    premarket = pd.Timestamp("2026-10-12 09:14:00", tz="Asia/Kolkata")
+    during = pd.Timestamp("2026-10-12 12:00:00", tz="Asia/Kolkata")
+    assert target_session_is_underway("2026-10-12", premarket) is False
+    assert target_session_is_underway("2026-10-12", during, holidays=["2026-10-12"]) is False
