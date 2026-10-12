@@ -80,43 +80,62 @@ def _drive_download(store, remote_path: str, local_path: Path) -> bool:
     return local_path.exists() and local_path.stat().st_size > 0
 
 
-def _download_drive_archives(store, start: date, end: date, destination: Path) -> int:
-    """Download only dated official CM-UDiFF ZIPs needed for the refresh window."""
+def _download_drive_archives(store, start: date, end: date, destination: Path) -> dict[str, Any]:
+    """Download official source ZIPs and repair missing ZIP copies when Parquet exists."""
     from googleapiclient.http import MediaIoBaseDownload
+    import io
+    import requests
+    from nse_data_layer import HEADERS, NSE_CM_UDIFF_URL_TEMPLATE
+
     destination.mkdir(parents=True, exist_ok=True)
     service = store.service
     token = None
     matching: dict[date, dict[str, Any]] = {}
+    parquet_dates: set[date] = set()
     while True:
-        response = service.files().list(
-            q="name contains 'BhavCopy_NSE_CM_0_0_0_' and name contains '.csv.zip' and trashed = false",
-            spaces="drive",
-            fields="nextPageToken,files(id,name,size,modifiedTime)",
-            pageSize=1000,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            pageToken=token,
-        ).execute()
+        params = {
+            "q": "name contains 'BhavCopy_NSE_CM_0_0_0_' and trashed = false",
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name,size,modifiedTime)",
+            "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if token:
+            params["pageToken"] = token
+        response = service.files().list(**params).execute()
         for item in response.get("files", []):
-            match = ZIP_RE.search(str(item.get("name", "")))
-            if not match:
+            name = str(item.get("name", ""))
+            match = ZIP_RE.search(name)
+            if match:
+                try:
+                    day = datetime.strptime(match.group(1), "%Y%m%d").date()
+                except ValueError:
+                    continue
+                if start <= day <= end:
+                    current = matching.get(day)
+                    if current is None or str(item.get("modifiedTime", "")) > str(current.get("modifiedTime", "")):
+                        matching[day] = item
                 continue
-            try:
-                day = datetime.strptime(match.group(1), "%Y%m%d").date()
-            except ValueError:
-                continue
-            if start <= day <= end:
-                current = matching.get(day)
-                if current is None or str(item.get("modifiedTime", "")) > str(current.get("modifiedTime", "")):
-                    matching[day] = item
+            parquet_match = re.search(r"_(\d{8})_F_0000\.parquet$", name, re.IGNORECASE)
+            if parquet_match:
+                try:
+                    day = datetime.strptime(parquet_match.group(1), "%Y%m%d").date()
+                except ValueError:
+                    continue
+                if start <= day <= end:
+                    parquet_dates.add(day)
         token = response.get("nextPageToken")
         if not token:
             break
 
-    downloaded = 0
+    downloaded_from_drive = 0
     for day, item in sorted(matching.items()):
         target = destination / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}" / str(item["name"])
-        if target.exists() and target.stat().st_size == int(item.get("size") or 0):
+        expected_size = int(item.get("size") or 0)
+        if target.exists() and target.stat().st_size > 0 and (
+            expected_size == 0 or target.stat().st_size == expected_size
+        ):
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = target.with_suffix(target.suffix + ".download.tmp")
@@ -128,8 +147,49 @@ def _download_drive_archives(store, start: date, end: date, destination: Path) -
             while not done:
                 _, done = downloader.next_chunk()
         tmp_path.replace(target)
-        downloaded += 1
-    return downloaded
+        downloaded_from_drive += 1
+
+    direct_download_dates = []
+    missing_source_zip_dates = []
+    for day in sorted(parquet_dates - set(matching)):
+        name = f"BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
+        target = destination / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        url = NSE_CM_UDIFF_URL_TEMPLATE.format(date=day.strftime("%Y%m%d"))
+        try:
+            response = requests.get(
+                url,
+                headers={**HEADERS, "Accept": "application/zip,text/plain,*/*"},
+                timeout=(4, 12),
+            )
+            response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                csv_members = [
+                    member for member in archive.namelist()
+                    if member.lower().endswith(".csv") and not member.endswith("/")
+                ]
+                if not csv_members:
+                    raise RuntimeError("official ZIP contains no CSV member")
+                if archive.testzip() is not None:
+                    raise RuntimeError("official ZIP has a corrupt member")
+            tmp_path = target.with_suffix(target.suffix + ".download.tmp")
+            tmp_path.write_bytes(response.content)
+            tmp_path.replace(target)
+            direct_download_dates.append(str(day))
+        except Exception as exc:
+            missing_source_zip_dates.append({
+                "date": str(day),
+                "url": url,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "downloaded_from_drive": downloaded_from_drive,
+        "downloaded_directly_from_official_nse": direct_download_dates,
+        "persisted_parquet_dates": sorted(str(d) for d in parquet_dates),
+        "source_zip_dates_found_in_drive": sorted(str(d) for d in matching),
+        "missing_source_zip_dates": missing_source_zip_dates,
+    }
 
 
 def _master_stats(path: Path) -> dict[str, Any]:
