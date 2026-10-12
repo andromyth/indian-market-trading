@@ -280,11 +280,31 @@ def main() -> int:
     parser.add_argument("--start", default="", help="First source date YYYY-MM-DD; defaults to master max date minus lookback.")
     parser.add_argument("--end", default="", help="Last source date YYYY-MM-DD; defaults to today's India date.")
     parser.add_argument("--lookback-calendar-days", type=int, default=30)
+    parser.add_argument("--use-google-drive", action="store_true", help="Use Drive API when the mounted Drive is unavailable.")
     parser.add_argument("--apply", action="store_true", help="Write validated update to canonical master. Default is dry-run.")
     args = parser.parse_args()
 
-    BULK_ROOT = Path(args.bulk_root)
-    master = Path(args.master)
+    master_arg, bulk_arg = Path(args.master), Path(args.bulk_root)
+    drive_mode = bool(args.use_google_drive or not master_arg.exists() or not bulk_arg.exists())
+    drive_store = None
+    drive_work_root = None
+    if drive_mode:
+        from persistent_store import GoogleDriveStore
+        drive_store = GoogleDriveStore()
+        drive_work_root = Path(tempfile.mkdtemp(prefix="cash-master-drive-refresh-"))
+        master = drive_work_root / MASTER.name
+        meta_path = drive_work_root / META.name
+        BULK_ROOT = drive_work_root / "bulk_eod"
+        report_path = drive_work_root / "cash_master_incremental_refresh_latest.json"
+        if not _drive_download(drive_store, REMOTE_MASTER, master):
+            raise FileNotFoundError(f"Could not download canonical master from Google Drive: {REMOTE_MASTER}")
+        _drive_download(drive_store, REMOTE_META, meta_path)
+    else:
+        master = master_arg
+        BULK_ROOT = bulk_arg
+        meta_path = master.with_suffix(".meta.json")
+        report_path = REPORT_PATH
+
     before = _master_stats(master)
     if args.lookback_calendar_days < 1:
         raise ValueError("--lookback-calendar-days must be >= 1")
@@ -294,12 +314,17 @@ def main() -> int:
     if start_date > end_date:
         raise ValueError(f"Start date {start_date} is after end date {end_date}")
 
+    drive_archives_downloaded = 0
+    if drive_store is not None:
+        drive_archives_downloaded = _download_drive_archives(drive_store, start_date, end_date, BULK_ROOT)
     archives = _source_archives(start_date, end_date)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "DRY_RUN" if not args.apply else "APPLY_REQUESTED",
         "master_path": str(master),
         "bulk_root": str(BULK_ROOT),
+        "drive_api_mode": drive_store is not None,
+        "drive_archives_downloaded": drive_archives_downloaded,
         "source_window": {"start": str(start_date), "end": str(end_date)},
         "master_before": before,
         "official_archive_files_found": len(archives),
@@ -310,6 +335,7 @@ def main() -> int:
         "write_performed": False,
         "model_weights_changed": False,
         "model_promotion_performed": False,
+        "orders_placed": False,
     }
     if not archives:
         report["status"] = "BLOCKED_NO_OFFICIAL_ZIP_ARCHIVES"
@@ -317,13 +343,12 @@ def main() -> int:
             "No official CM-UDiFF ZIP archives were found in the requested window. "
             "Do not rebuild from normalized symbol/date-only Parquet because it may have lost listing identity."
         )
-        REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        REPORT_PATH.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        _write_report(report_path, report, drive_store)
         print(json.dumps(report, indent=2, default=str))
         return 2
 
     parsed = []
-    with tempfile.TemporaryDirectory(prefix="cash-master-refresh-") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="cash-master-refresh-rows-") as tmp_dir:
         temp_root = Path(tmp_dir)
         for day, archive in archives:
             rows = _read_identity_rows(archive, day)
@@ -344,26 +369,27 @@ def main() -> int:
             report["incoming_min_date"] = str(pd.to_datetime(incoming["date"]).min().date())
             report["incoming_max_date"] = str(pd.to_datetime(incoming["date"]).max().date())
 
-            # Count candidate new listing/date keys without altering the master.
             con = duckdb.connect(database=":memory:")
             try:
+                inc_sql, master_sql = _sql_path(incoming_path), _sql_path(master)
                 new_keys = int(con.execute(f"""
                     SELECT COUNT(*) FROM (
                       SELECT DISTINCT i.row_identity_key
-                      FROM read_parquet({_sql_path(incoming_path)}) i
-                      LEFT JOIN read_parquet({_sql_path(master)}) m USING (row_identity_key)
+                      FROM read_parquet({inc_sql}) i
+                      LEFT JOIN read_parquet({master_sql}) m USING (row_identity_key)
                       WHERE m.row_identity_key IS NULL
                     )
                 """).fetchone()[0])
                 overlap = int(con.execute(f"""
                     SELECT COUNT(DISTINCT i.row_identity_key)
-                    FROM read_parquet({_sql_path(incoming_path)}) i
-                    INNER JOIN read_parquet({_sql_path(master)}) m USING (row_identity_key)
+                    FROM read_parquet({inc_sql}) i
+                    INNER JOIN read_parquet({master_sql}) m USING (row_identity_key)
                 """).fetchone()[0])
             finally:
                 con.close()
             report["new_identity_keys_estimate"] = new_keys
             report["overlapping_identity_keys_to_refresh"] = overlap
+
             if args.apply and (new_keys or overlap):
                 tmp_master = master.with_name(master.stem + ".incremental.tmp" + master.suffix)
                 if tmp_master.exists():
@@ -384,9 +410,9 @@ def main() -> int:
                 report["backup_path"] = str(backup)
                 report["merge"] = merged
                 report["master_after"] = after
-                report["metadata_path"] = str(META)
-                if META.exists():
-                    meta = json.loads(META.read_text(encoding="utf-8"))
+                report["metadata_path"] = str(meta_path)
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 else:
                     meta = {}
                 meta.update({
@@ -400,9 +426,9 @@ def main() -> int:
                     "min_date": after["min_date"],
                     "max_date": after["max_date"],
                     "duplicate_row_identity_keys": after["duplicate_identity_key_rows"],
-                    "master": str(master),
+                    "master": REMOTE_MASTER if drive_store is not None else str(master),
                 })
-                META.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+                meta_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
             elif args.apply:
                 report["status"] = "NO_CHANGES_NEEDED"
                 report["warnings"].append("All recent source identity keys already exist; master was not rewritten.")
@@ -412,11 +438,28 @@ def main() -> int:
                     "No write was performed. Review the source archive dates and identity-key counts, then rerun with --apply to update the canonical master."
                 )
 
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    print(json.dumps(report, indent=2, default=str))
-    return 0 if report["status"] in {"DRY_RUN_READY", "APPLIED_AND_VALIDATED", "NO_CHANGES_NEEDED"} else 2
+    if drive_store is not None:
+        try:
+            if args.apply and report.get("write_performed"):
+                report["drive_master_upload"] = drive_store.upload_or_update(
+                    master, REMOTE_MASTER, mime_type="application/octet-stream"
+                )
+                report["drive_metadata_upload"] = drive_store.upload_or_update(
+                    meta_path, REMOTE_META, mime_type="application/json"
+                )
+                report["status"] = "APPLIED_VALIDATED_AND_SYNCED"
+            _write_report(report_path, report, drive_store)
+        except Exception as exc:
+            report["status"] = "MASTER_UPLOAD_FAILED" if report.get("write_performed") else "DRIVE_REPORT_SYNC_FAILED"
+            report["drive_upload_error"] = f"{type(exc).__name__}: {exc}"
+            _write_report(report_path, report)
+            print(json.dumps(report, indent=2, default=str))
+            return 2
+    else:
+        _write_report(report_path, report)
 
+    print(json.dumps(report, indent=2, default=str))
+    return 0 if report["status"] in {"DRY_RUN_READY", "APPLIED_AND_VALIDATED", "APPLIED_VALIDATED_AND_SYNCED", "NO_CHANGES_NEEDED"} else 2
 
 if __name__ == "__main__":
     raise SystemExit(main())
