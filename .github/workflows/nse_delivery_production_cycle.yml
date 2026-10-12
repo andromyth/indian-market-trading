@@ -22,13 +22,13 @@ on:
         required: false
         default: ''
   # Post-market hourly retries. Each run fetches/repairs the completed NSE
-  # session, builds that session's PIT snapshot for the next trading day,
-  # validates the prior day's prediction against today's actual, and refreshes
-  # the CSV audit ledger.
+  # session, backfills recent missed PIT snapshots, builds the current session's
+  # PIT snapshot, generates the locked ALL-NSE 59-feature forecast for the next
+  # NSE session, validates prior forecasts, and refreshes the audit ledgers.
   #
   # 20:45-23:45 IST, 00:45-04:45 IST, 05:45-06:45 IST.
-  # The target session is the latest completed NSE session for the retry
-  # window; no prediction is generated here.
+  # Before close, the clock resolver pins the job to the latest completed
+  # session; after close, it advances to the session just completed.
   schedule:
     - cron: '15 15-18 * * 1-5'
     - cron: '15 19-23 * * 1-5'
