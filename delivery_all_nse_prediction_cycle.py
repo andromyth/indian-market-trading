@@ -143,7 +143,7 @@ def main() -> int:
     raw_gate = x["production_data_quality_gate"] if "production_data_quality_gate" in x.columns else pd.Series(False, index=x.index)
     gate = raw_gate.map(_as_bool_gate).to_numpy(dtype=bool)
 
-    signals = np.where(
+    raw_signals = np.where(
         (p_up >= buy_p) & (expected_return > min_expected_return),
         "BUY",
         np.where(
@@ -152,13 +152,60 @@ def main() -> int:
             "HOLD",
         ),
     )
-    signals = np.where(~gate & np.isin(signals, ["BUY", "SELL"]), "HOLD", signals)
+    signals = np.where(~gate & np.isin(raw_signals, ["BUY", "SELL"]), "HOLD", raw_signals)
 
     decision_ts = f"{snapshot_date}T15:30:00+05:30"
     model_version = str(manifest.get("engine_version", "2026-all-nse-delivery-multifactor-59-replacement-v1"))
     universe_count = int(manifest.get("universe_symbol_count", len(x)))
     trainable_count = int(manifest.get("trainable_symbol_count", len(x)))
     excluded_count = int(manifest.get("excluded_symbol_count", max(0, universe_count - trainable_count)))
+
+    # Diagnostic only: quantify the fitted model's input-group influence on this
+    # prediction batch. It does not modify model outputs or the BUY/SELL/HOLD policy.
+    factor_weightage_report = None
+    try:
+        from delivery_factor_weightage import build_factor_weightage_report
+        factor_weightage_report = build_factor_weightage_report(
+            classifier=clf,
+            regressor=reg,
+            matrix=matrix,
+            symbols=x["symbol"].astype(str).tolist(),
+            probability_up=p_up,
+            predicted_return=expected_return,
+            raw_signals=raw_signals,
+            final_signals=signals,
+            quality_gate=gate,
+            snapshot_date=snapshot_date,
+            prediction_date=prediction_for_date,
+            model_version=model_version,
+            signal_policy=policy,
+        )
+        classifier_summary = factor_weightage_report.get("classifier", {})
+        regressor_summary = factor_weightage_report.get("regressor", {})
+        print("FACTOR_WEIGHTAGE_AUDIT_SUMMARY:", __import__("json").dumps({
+            "status": factor_weightage_report.get("status"),
+            "snapshot_date": snapshot_date,
+            "prediction_for_date": prediction_for_date,
+            "classifier_group_mean_abs_logit_share_pct": {
+                name: detail.get("mean_per_symbol_abs_logit_share_pct")
+                for name, detail in classifier_summary.get("parameter_weightage", {}).items()
+            },
+            "classifier_coefficient_magnitude_share_pct": {
+                name: detail.get("coefficient_magnitude_share_pct")
+                for name, detail in classifier_summary.get("parameter_weightage", {}).items()
+            },
+            "regressor_tree_split_gain_share_pct": regressor_summary.get("tree_split_gain_share_pct"),
+            "regressor_group_counterfactual_share_pct": {
+                name: detail.get("mean_per_symbol_abs_counterfactual_share_pct")
+                for name, detail in regressor_summary.get("current_snapshot_group_sensitivity", {}).items()
+            },
+            "quality_gate": factor_weightage_report.get("data_quality_audit"),
+            "news_semantics": factor_weightage_report.get("news_semantics"),
+        }, default=str), flush=True)
+    except Exception as exc:
+        # Never suppress or modify a prediction because a separate introspection
+        # diagnostic failed. The normal persisted-prediction checks remain authoritative.
+        print(f"FACTOR_WEIGHTAGE_AUDIT_ERROR (non-blocking): {type(exc).__name__}: {exc}", flush=True)
 
     # Read the daily EOD archive only once. Re-reading and concatenating all
     # Parquet files for every symbol made this step scale as symbols x files.
@@ -275,6 +322,31 @@ def main() -> int:
             "ALL-NSE Delivery batch was generated locally but was not synced "
             f"to the persistent Google Drive ledger: {result}"
         )
+
+    if factor_weightage_report is not None:
+        try:
+            import json
+            from persistent_store import GoogleDriveStore
+            report_path = FEATURE_DIR / f"DELIVERY_FACTOR_WEIGHTAGE_AUDIT_{snapshot_date}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(factor_weightage_report, indent=2, default=str),
+                encoding="utf-8",
+            )
+            remote_report_path = f"features/daily/{report_path.name}"
+            upload_result = GoogleDriveStore().upload_or_update(
+                report_path, remote_report_path, mime_type="application/json"
+            )
+            print("FACTOR_WEIGHTAGE_AUDIT_PERSISTED:", json.dumps({
+                "local_path": str(report_path),
+                "remote_path": remote_report_path,
+                "symbols": len(factor_weightage_report.get("per_symbol_predictions", [])),
+                "drive_action": upload_result.get("action"),
+            }, default=str), flush=True)
+        except Exception as exc:
+            # Diagnostics are deliberately non-blocking; signal and ledger
+            # persistence were already handled independently above.
+            print(f"FACTOR_WEIGHTAGE_AUDIT_UPLOAD_ERROR (non-blocking): {type(exc).__name__}: {exc}", flush=True)
 
     signal_counts = pd.Series(signals).value_counts().to_dict()
     print("ALL-NSE DELIVERY PREDICTION CYCLE")
