@@ -372,6 +372,16 @@ def main() -> int:
             con = duckdb.connect(database=":memory:")
             try:
                 inc_sql, master_sql = _sql_path(incoming_path), _sql_path(master)
+                master_columns = [
+                    row[0] for row in con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet({master_sql})"
+                    ).fetchall()
+                ]
+                incoming_columns = [
+                    row[0] for row in con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet({inc_sql})"
+                    ).fetchall()
+                ]
                 new_keys = int(con.execute(f"""
                     SELECT COUNT(*) FROM (
                       SELECT DISTINCT i.row_identity_key
@@ -385,12 +395,28 @@ def main() -> int:
                     FROM read_parquet({inc_sql}) i
                     INNER JOIN read_parquet({master_sql}) m USING (row_identity_key)
                 """).fetchone()[0])
+                compared_columns = [
+                    name for name in master_columns
+                    if name in incoming_columns and name not in {"row_identity_key", "raw_archive"}
+                ]
+                differences = " OR ".join(
+                    f"i.{_quote_ident(name)} IS DISTINCT FROM m.{_quote_ident(name)}"
+                    for name in compared_columns
+                ) or "FALSE"
+                changed_keys = int(con.execute(f"""
+                    SELECT COUNT(DISTINCT i.row_identity_key)
+                    FROM read_parquet({inc_sql}) i
+                    INNER JOIN read_parquet({master_sql}) m USING (row_identity_key)
+                    WHERE {differences}
+                """).fetchone()[0])
             finally:
                 con.close()
             report["new_identity_keys_estimate"] = new_keys
-            report["overlapping_identity_keys_to_refresh"] = overlap
+            report["overlapping_identity_keys_seen"] = overlap
+            report["overlapping_identity_keys_changed_from_official_archive"] = changed_keys
+            report["compared_official_business_columns"] = compared_columns
 
-            if args.apply and (new_keys or overlap):
+            if args.apply and (new_keys or changed_keys):
                 tmp_master = master.with_name(master.stem + ".incremental.tmp" + master.suffix)
                 if tmp_master.exists():
                     tmp_master.unlink()
@@ -431,7 +457,7 @@ def main() -> int:
                 meta_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
             elif args.apply:
                 report["status"] = "NO_CHANGES_NEEDED"
-                report["warnings"].append("All recent source identity keys already exist; master was not rewritten.")
+                report["warnings"].append("No new identity keys or changed official business fields were found; the master was not rewritten.")
             else:
                 report["status"] = "DRY_RUN_READY"
                 report["warnings"].append(
