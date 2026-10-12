@@ -1,0 +1,59 @@
+name: Strict Delivery walk-forward and untouched-holdout audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "strict_delivery_walkforward_audit.py"
+      - "tests/test_strict_delivery_walkforward.py"
+      - ".github/workflows/strict_delivery_walkforward_audit.yml"
+      - ".github/workflows/multifactor_candidate_ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  run-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify Google Drive read access
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status(require_write=False)
+          print(status)
+          if not status.get("configured") or status.get("reachable") is False:
+              raise SystemExit("Google Drive read preflight failed: " + str(status.get("reason", "not reachable")))
+          PY
+      - name: Compile audit script
+        run: python -m py_compile strict_delivery_walkforward_audit.py
+      - name: Run strict walk-forward audit (read-only)
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: python -u strict_delivery_walkforward_audit.py --output-dir strict-delivery-audit-out
+      - name: Upload audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strict-delivery-walkforward-audit-${{ github.run_id }}
+          path: strict-delivery-audit-out/*
+          if-no-files-found: warn
+          retention-days: 30
