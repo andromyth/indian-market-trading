@@ -105,7 +105,92 @@ def session_successors(session_dates: list[pd.Timestamp], holidays: set[date]):
     return successors, gaps
 
 
-def prepare_labeled_panel(panel: pd.DataFrame, holidays: set[date]):
+def load_panel_symbol_sample(panel_path: Path, symbol_limit: int = 500):
+    """Read a deterministic symbol subset via DuckDB instead of materialising the full panel in pandas."""
+    import duckdb
+
+    if symbol_limit < 50:
+        raise ValueError("symbol_limit must be at least 50 for a useful cross-sectional audit.")
+    path_sql = "'" + str(panel_path).replace("'", "''") + "'"
+    work_temp = Path("/tmp/strict_delivery_audit_duckdb_tmp")
+    work_temp.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("PRAGMA threads=2")
+        con.execute("PRAGMA memory_limit='2GB'")
+        temp_sql = "'" + str(work_temp).replace("'", "''") + "'"
+        con.execute(f"SET temp_directory={temp_sql}")
+        description = con.execute(f"DESCRIBE SELECT * FROM read_parquet({path_sql})").fetchall()
+        columns = {str(row[0]) for row in description}
+        required = {"symbol", "date", "close", *FEATURES_59}
+        missing = sorted(required - columns)
+        if missing:
+            raise ValueError(f"Persisted panel missing required columns: {missing[:20]}")
+        symbol_expr = r"""REGEXP_REPLACE(UPPER(TRIM(CAST("symbol" AS VARCHAR))), '(\.NS|\.BO|-EQ|\.EQ)$', '')"""
+        full_meta = con.execute(f"""
+            SELECT COUNT(*) AS rows,
+                   COUNT(DISTINCT {symbol_expr}) AS symbols,
+                   COUNT(DISTINCT TRY_CAST("date" AS DATE)) AS sessions,
+                   MIN(TRY_CAST("date" AS DATE)) AS first_date,
+                   MAX(TRY_CAST("date" AS DATE)) AS last_date
+            FROM read_parquet({path_sql})
+        """).fetchone()
+        sessions = con.execute(f"""
+            SELECT DISTINCT TRY_CAST("date" AS DATE) AS session_date
+            FROM read_parquet({path_sql})
+            WHERE TRY_CAST("date" AS DATE) IS NOT NULL
+            ORDER BY session_date
+        """).fetchdf()["session_date"].tolist()
+        con.execute(f"""
+            CREATE TEMP TABLE audit_symbol_sample AS
+            WITH symbols AS (
+                SELECT DISTINCT {symbol_expr} AS symbol
+                FROM read_parquet({path_sql})
+                WHERE "symbol" IS NOT NULL
+            )
+            SELECT symbol FROM symbols
+            WHERE symbol <> ''
+            ORDER BY HASH(symbol), symbol
+            LIMIT {int(symbol_limit)}
+        """)
+        selected_symbols = [row[0] for row in con.execute(
+            "SELECT symbol FROM audit_symbol_sample ORDER BY symbol"
+        ).fetchall()]
+        use_columns = ["symbol", "date", "close"]
+        for optional in ("decision_timestamp", "production_data_quality_gate"):
+            if optional in columns:
+                use_columns.append(optional)
+        use_columns.extend(list(FEATURES_59))
+        projection = ", ".join('"' + name.replace('"', '""') + '"' for name in dict.fromkeys(use_columns))
+        panel = con.execute(f"""
+            SELECT {projection}
+            FROM read_parquet({path_sql})
+            WHERE {symbol_expr} IN (SELECT symbol FROM audit_symbol_sample)
+        """).fetchdf()
+        meta = {
+            "method": "deterministic symbol-hash sample read by DuckDB; no full wide-panel materialisation in pandas",
+            "full_panel_rows": int(full_meta[0] or 0),
+            "full_panel_symbols": int(full_meta[1] or 0),
+            "full_panel_sessions": int(full_meta[2] or 0),
+            "full_panel_first_date": str(full_meta[3]) if full_meta[3] else None,
+            "full_panel_last_date": str(full_meta[4]) if full_meta[4] else None,
+            "requested_symbol_limit": int(symbol_limit),
+            "sampled_symbol_count": int(len(selected_symbols)),
+            "sampled_symbols": selected_symbols,
+            "sampled_panel_rows": int(len(panel)),
+            "sample_fraction_of_symbols_pct": round(100.0 * len(selected_symbols) / max(1, int(full_meta[1] or 0)), 3),
+            "row_sampling": "all available dates for a deterministic symbol subset; no sampling based on outcome",
+        }
+        return panel, meta, sessions
+    finally:
+        con.close()
+
+
+def prepare_labeled_panel(
+    panel: pd.DataFrame,
+    holidays: set[date],
+    all_session_dates: list | None = None,
+):
     """Reconstruct raw close-to-close labels and validate the point-in-time clock."""
     if panel is None or panel.empty:
         raise ValueError("PIT panel is empty.")
@@ -133,7 +218,10 @@ def prepare_labeled_panel(panel: pd.DataFrame, holidays: set[date]):
             f"PIT panel has {duplicate_rows} rows in duplicated (symbol, date) groups; refusing arbitrary deduplication."
         )
 
-    sessions = sorted(pd.Timestamp(v).normalize() for v in x["reference_date"].unique())
+    sessions = sorted(
+        pd.Timestamp(v).normalize()
+        for v in (all_session_dates if all_session_dates is not None else x["reference_date"].unique())
+    )
     successors, gaps = session_successors(sessions, holidays)
     future = x[["symbol", "reference_date", "close"]].rename(
         columns={"reference_date": "target_date", "close": "actual_close"}
@@ -478,7 +566,9 @@ def render_summary(report):
         f"- Generated UTC: {report['generated_at_utc']}",
         f"- Input SHA-256: {report['input_panel_sha256']}",
         f"- Data range: {report['data']['first_observed_session']} to {report['data']['last_observed_session']}",
-        f"- Labeled rows: {report['data']['labeled_rows']:,}; symbols: {report['data']['symbols']:,}",
+        f"- Labeled rows: {report['data']['labeled_rows']:,}; sampled symbols: {report['data']['symbols']:,}",
+        f"- Source panel rows/symbols: {report['panel_sampling']['full_panel_rows']:,} / {report['panel_sampling']['full_panel_symbols']:,}",
+        f"- Stable symbol sample: {report['panel_sampling']['sampled_symbol_count']:,} ({report['panel_sampling']['sample_fraction_of_symbols_pct']}% of source symbols)",
         f"- Development sessions: {report['split']['development_sessions']}; holdout sessions: {report['split']['holdout_sessions']}",
         f"- Holdout cutoff: {report['split']['holdout_start_reference_date']}",
         f"- Training label purge passed: {report['split']['training_targets_strictly_before_holdout']}",
@@ -511,12 +601,21 @@ def render_summary(report):
 
 
 def run_audit(panel_path: Path, out: Path):
-    print(f"READ PANEL: path={panel_path}; bytes={panel_path.stat().st_size:,}", flush=True)
-    panel = pd.read_parquet(panel_path)
-    print(f"READ PANEL COMPLETE: rows={len(panel):,}; columns={len(panel.columns):,}", flush=True)
-    labeled, stats = prepare_labeled_panel(panel, parse_holidays())
+    print(f"SELECT SYMBOL SAMPLE: path={panel_path}; bytes={panel_path.stat().st_size:,}", flush=True)
+    panel, panel_sample, all_session_dates = load_panel_symbol_sample(panel_path, symbol_limit=500)
+    print(
+        f"PANEL SAMPLE READY: full_rows={panel_sample['full_panel_rows']:,}; "
+        f"full_symbols={panel_sample['full_panel_symbols']:,}; sampled_symbols={panel_sample['sampled_symbol_count']:,}; "
+        f"sampled_rows={panel_sample['sampled_panel_rows']:,}",
+        flush=True,
+    )
+    labeled, stats = prepare_labeled_panel(panel, parse_holidays(), all_session_dates=all_session_dates)
     del panel
-    print(f"LABEL BUILD COMPLETE: labeled_rows={len(labeled):,}; symbols={labeled['symbol'].nunique():,}; sessions={labeled['reference_date'].nunique():,}", flush=True)
+    print(
+        f"LABEL BUILD COMPLETE: labeled_rows={len(labeled):,}; "
+        f"sampled_symbols={labeled['symbol'].nunique():,}; sessions={labeled['reference_date'].nunique():,}",
+        flush=True,
+    )
     sessions = sorted(pd.Timestamp(v).normalize() for v in labeled["reference_date"].unique())
     if len(sessions) < 100:
         raise ValueError(f"Need at least 100 labeled sessions; found {len(sessions)}.")
@@ -607,6 +706,7 @@ def run_audit(panel_path: Path, out: Path):
             "sampling": "fixed-seed per-reference-session sampling",
         },
         "data": stats,
+        "panel_sampling": panel_sample,
         "split": {
             "method": "chronological 80/20 session split, with target-date purge at cutoff",
             "holdout_start_reference_date": holdout_start.date().isoformat(),
