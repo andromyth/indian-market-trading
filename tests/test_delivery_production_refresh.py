@@ -29,3 +29,14 @@ def test_readiness_summary_empty_input_has_deterministic_zero_percentages():
         "ready_pct": 0.0,
         "unknown_rows": 0,
     }
+
+
+
+def test_readiness_summary_all_unknown_nullable_boolean_values_are_not_ready():
+    values = pd.Series([pd.NA, pd.NA], dtype="boolean")
+
+    assert readiness_summary(values) == {
+        "known_pct": 0.0,
+        "ready_pct": 0.0,
+        "unknown_rows": 2,
+    }
