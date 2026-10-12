@@ -69,6 +69,24 @@ def _cash_master_audit() -> dict[str, Any]:
         con.close()
 
 
+def _expected_missing_sessions(master_latest: str | None, available_dates: set[date]) -> tuple[list[str], int]:
+    if not master_latest or not available_dates:
+        return [], 0
+    latest_archive = max(available_dates)
+    start = date.fromisoformat(master_latest) + timedelta(days=1)
+    if start > latest_archive:
+        return [], 0
+    try:
+        from nse_bulk_eod_ingest import business_days
+        expected = list(business_days(start, latest_archive))
+    except Exception:
+        expected = [
+            day.date()
+            for day in pd.date_range(start, latest_archive, freq="B")
+        ]
+    return [d.isoformat() for d in expected if d not in available_dates], len(expected)
+
+
 def _bulk_archive_audit(master_latest: str | None) -> dict[str, Any]:
     dates = set()
     files_seen = 0
@@ -80,6 +98,7 @@ def _bulk_archive_audit(master_latest: str | None) -> dict[str, Any]:
                 dates.add(day)
     ordered = sorted(dates)
     later = [str(d) for d in ordered if master_latest and str(d) > master_latest]
+    missing_sessions, expected_sessions_checked = _expected_missing_sessions(master_latest, dates)
     return {
         "root": str(BULK_ROOT),
         "files_with_parseable_dates": files_seen,
@@ -88,7 +107,9 @@ def _bulk_archive_audit(master_latest: str | None) -> dict[str, Any]:
         "latest_archive_date": str(ordered[-1]) if ordered else None,
         "dates_later_than_cash_master": later,
         "master_lags_archives": bool(later),
-        "status": "STALE_MASTER" if later else ("NO_ARCHIVES" if not ordered else "NO_LATER_ARCHIVES_FOUND"),
+        "expected_sessions_checked_after_master_date": expected_sessions_checked,
+        "missing_expected_archive_dates": missing_sessions,
+        "status": "ARCHIVE_GAP" if missing_sessions else ("STALE_MASTER" if later else ("NO_ARCHIVES" if not ordered else "NO_LATER_ARCHIVES_FOUND")),
     }
 
 
@@ -358,6 +379,7 @@ def _drive_bulk_archive_audit(store, master_latest: str | None) -> dict[str, Any
             file_count += 1
     ordered = sorted(dates)
     later = [str(d) for d in ordered if master_latest and str(d) > master_latest]
+    missing_sessions, expected_sessions_checked = _expected_missing_sessions(master_latest, dates)
     return {
         "source": "Google Drive file listing",
         "files_with_parseable_dates": file_count,
@@ -366,7 +388,9 @@ def _drive_bulk_archive_audit(store, master_latest: str | None) -> dict[str, Any
         "latest_archive_date": str(ordered[-1]) if ordered else None,
         "dates_later_than_cash_master": later,
         "master_lags_archives": bool(later),
-        "status": "STALE_MASTER" if later else ("NO_ARCHIVES" if not ordered else "NO_LATER_ARCHIVES_FOUND"),
+        "expected_sessions_checked_after_master_date": expected_sessions_checked,
+        "missing_expected_archive_dates": missing_sessions,
+        "status": "ARCHIVE_GAP" if missing_sessions else ("STALE_MASTER" if later else ("NO_ARCHIVES" if not ordered else "NO_LATER_ARCHIVES_FOUND")),
     }
 
 
@@ -435,6 +459,8 @@ def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any],
         issues.append("Canonical identity-preserved cash master is missing or its integrity metadata is unavailable/unapproved.")
     if bulk.get("master_lags_archives"):
         issues.append("Official EOD archives contain later dates than the canonical cash research master.")
+    if bulk.get("missing_expected_archive_dates"):
+        issues.append("One or more expected NSE trading-session archives are missing after the canonical cash master date.")
     if pit.get("snapshot_date") and master.get("latest_date") and pit["snapshot_date"] < master["latest_date"]:
         issues.append("Latest Delivery PIT snapshot predates the canonical cash research master.")
     if pit.get("status") == "NO_PIT_READINESS_REPORT":
