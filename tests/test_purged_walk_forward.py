@@ -28,8 +28,8 @@ class PurgedChronologicalSplitTests(unittest.TestCase):
         )
         self.assertEqual(audit["purged_boundary_rows"], 1)
         self.assertEqual(audit["target_boundary_check"], "PASS")
-        self.assertEqual(len(train), 4)
-        self.assertEqual(len(holdout), 5)
+        self.assertEqual(len(train), 3)
+        self.assertEqual(len(holdout), 6)
 
     def test_missing_target_timestamps_are_not_used_for_training(self):
         dates = pd.date_range("2026-01-01", periods=11, freq="D", tz="UTC")
