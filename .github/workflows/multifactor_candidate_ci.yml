@@ -55,6 +55,7 @@ jobs:
           build_all_nse_news_events_pit.py
           delivery_policy_update.py
           delivery_validation_diagnostics.py
+          delivery_all_nse_prediction_cycle.py
           refresh_canonical_cash_master_from_bulk_eod.py
           audit_live_prediction_health.py
           backfill_missing_delivery_pit_snapshots.py
