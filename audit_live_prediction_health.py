@@ -6,9 +6,11 @@ Indian_Market_Research Drive. It does not retrain, promote, or trade.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
-from datetime import datetime, timezone
+import tempfile
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -90,10 +92,10 @@ def _bulk_archive_audit(master_latest: str | None) -> dict[str, Any]:
     }
 
 
-def _latest_pit_readiness() -> dict[str, Any]:
+def _latest_pit_readiness(root: Path = PIT_ROOT) -> dict[str, Any]:
     reports = []
-    if PIT_ROOT.exists():
-        for path in PIT_ROOT.glob("DELIVERY_PIT_READINESS_*.json"):
+    if root.exists():
+        for path in root.glob("DELIVERY_PIT_READINESS_*.json"):
             match = PIT_DATE_RE.fullmatch(path.name)
             if not match:
                 continue
@@ -117,14 +119,14 @@ def _latest_pit_readiness() -> dict[str, Any]:
                 "production_data_quality_gate_pct": payload.get("production_data_quality_gate_pct"),
             })
     reports.sort(key=lambda item: (item.get("snapshot_date") or item.get("filename_date") or ""))
-    return reports[-1] if reports else {"status": "NO_PIT_READINESS_REPORT", "root": str(PIT_ROOT)}
+    return reports[-1] if reports else {"status": "NO_PIT_READINESS_REPORT", "root": str(root)}
 
 
-def _delivery_model_manifest() -> dict[str, Any]:
-    if not DELIVERY_MANIFEST.exists():
-        return {"status": "MANIFEST_NOT_FOUND", "path": str(DELIVERY_MANIFEST)}
+def _delivery_model_manifest(path: Path = DELIVERY_MANIFEST) -> dict[str, Any]:
+    if not path.exists():
+        return {"status": "MANIFEST_NOT_FOUND", "path": str(path)}
     try:
-        payload = json.loads(DELIVERY_MANIFEST.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"status": "MANIFEST_INVALID", "error": f"{type(exc).__name__}: {exc}"}
     artifacts = payload.get("artifacts", {}) or {}
@@ -219,7 +221,181 @@ def _intraday_model_audit() -> dict[str, Any]:
         return {"status": "AUDIT_FAILED", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def main() -> int:
+
+
+
+REMOTE_CASH_META = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.meta.json"
+REMOTE_CASH_MASTER = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
+REMOTE_DELIVERY_MANIFEST = "models/all_nse_delivery_multifactor_replacement_2026/ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+REMOTE_PIT_FOLDER = "features/daily"
+REMOTE_HEALTH_REPORT = "diagnostics/live_prediction_health/live_prediction_health_latest.json"
+
+
+def _drive_file_id(store, remote_path: str, *, folder: bool = False) -> str | None:
+    parts = [part for part in remote_path.replace("\\\\", "/").split("/") if part]
+    if not parts:
+        return None
+    parent = store.root_id
+    folder_type = "application/vnd.google-apps.folder"
+    for part in parts[:-1]:
+        hit = store._find_child(parent, part, folder_type)
+        if not hit:
+            return None
+        parent = hit["id"]
+    hit = store._find_child(parent, parts[-1], folder_type if folder else None)
+    return hit.get("id") if hit else None
+
+
+def _drive_download(store, remote_path: str, destination: Path) -> bool:
+    file_id = _drive_file_id(store, remote_path)
+    if not file_id:
+        return False
+    from googleapiclient.http import MediaIoBaseDownload
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_suffix(destination.suffix + ".download.tmp")
+    with temp.open("wb") as handle:
+        downloader = MediaIoBaseDownload(
+            handle, store.service.files().get_media(fileId=file_id)
+        )
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    temp.replace(destination)
+    return destination.exists() and destination.stat().st_size > 0
+
+
+def _drive_list(store, query: str) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    token = None
+    while True:
+        params = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,size,parents)",
+            "pageSize": 1000,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if token:
+            params["pageToken"] = token
+        response = store.service.files().list(**params).execute()
+        files.extend(response.get("files", []))
+        token = response.get("nextPageToken")
+        if not token:
+            break
+    return files
+
+
+def _drive_json_by_id(store, file_id: str, work_root: Path, name: str) -> tuple[dict[str, Any], Path | None]:
+    from googleapiclient.http import MediaIoBaseDownload
+    destination = work_root / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        downloader = MediaIoBaseDownload(
+            handle, store.service.files().get_media(fileId=file_id)
+        )
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    try:
+        return json.loads(destination.read_text(encoding="utf-8")), destination
+    except Exception:
+        return {}, destination
+
+
+def _drive_cash_master_audit(store, work_root: Path) -> dict[str, Any]:
+    file_id = _drive_file_id(store, REMOTE_CASH_MASTER)
+    if not file_id:
+        return {"status": "MISSING_MASTER", "remote_path": REMOTE_CASH_MASTER}
+    meta_id = _drive_file_id(store, REMOTE_CASH_META)
+    meta: dict[str, Any] = {}
+    if meta_id:
+        meta, _ = _drive_json_by_id(store, meta_id, work_root, "master-meta.json")
+    file_meta = store.service.files().get(
+        fileId=file_id, fields="id,name,modifiedTime,size"
+    ).execute()
+    duplicate_rows = meta.get(
+        "duplicate_identity_key_rows",
+        meta.get("duplicate_row_identity_keys"),
+    )
+    latest = meta.get("max_date")
+    trustworthy = latest is not None and duplicate_rows is not None
+    return {
+        "status": (
+            "PASS" if trustworthy and int(duplicate_rows or 0) == 0
+            else "MASTER_METADATA_STALE_OR_UNAVAILABLE"
+        ),
+        "remote_path": REMOTE_CASH_MASTER,
+        "metadata_path": REMOTE_CASH_META if meta_id else None,
+        "metadata_based_audit": True,
+        "full_master_downloaded_for_audit": False,
+        "rows": meta.get("rows"),
+        "symbols": meta.get("symbols"),
+        "trading_dates": meta.get("dates"),
+        "first_date": meta.get("min_date"),
+        "latest_date": latest,
+        "duplicate_identity_key_rows": duplicate_rows,
+        "last_incremental_refresh_utc": meta.get("last_incremental_refresh_utc"),
+        "master_modified_time": file_meta.get("modifiedTime"),
+        "master_size_bytes": int(file_meta.get("size") or 0),
+    }
+
+
+def _drive_bulk_archive_audit(store, master_latest: str | None) -> dict[str, Any]:
+    files = _drive_list(
+        store,
+        "name contains 'BhavCopy_NSE_CM_0_0_0_' and trashed = false",
+    )
+    dates: set[date] = set()
+    file_count = 0
+    for item in files:
+        name = str(item.get("name", ""))
+        if not (name.lower().endswith(".parquet") or name.lower().endswith(".csv.zip")):
+            continue
+        day = _date_from_file(Path(name))
+        if day is not None:
+            dates.add(day)
+            file_count += 1
+    ordered = sorted(dates)
+    later = [str(d) for d in ordered if master_latest and str(d) > master_latest]
+    return {
+        "source": "Google Drive file listing",
+        "files_with_parseable_dates": file_count,
+        "distinct_archive_dates": len(ordered),
+        "first_archive_date": str(ordered[0]) if ordered else None,
+        "latest_archive_date": str(ordered[-1]) if ordered else None,
+        "dates_later_than_cash_master": later,
+        "master_lags_archives": bool(later),
+        "status": "STALE_MASTER" if later else ("NO_ARCHIVES" if not ordered else "NO_LATER_ARCHIVES_FOUND"),
+    }
+
+
+def _prepare_drive_audit_inputs(store, work_root: Path) -> tuple[dict[str, Any], Path, Path]:
+    """Download only small readiness/model manifests; never fetch the full cash master."""
+    pit_folder_id = _drive_file_id(store, REMOTE_PIT_FOLDER, folder=True)
+    readiness: dict[str, Any] = {"status": "NO_PIT_READINESS_REPORT", "root": REMOTE_PIT_FOLDER}
+    readiness_root = work_root / "features" / "daily"
+    readiness_root.mkdir(parents=True, exist_ok=True)
+    if pit_folder_id:
+        candidates = store.service.files().list(
+            q=f"'{pit_folder_id}' in parents and name contains 'DELIVERY_PIT_READINESS_' and trashed = false",
+            spaces="drive",
+            fields="files(id,name,modifiedTime,size)",
+            pageSize=1000,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute().get("files", [])
+        candidates = sorted(
+            (x for x in candidates if PIT_DATE_RE.fullmatch(str(x.get("name", "")))),
+            key=lambda x: str(x["name"]),
+        )
+        if candidates:
+            chosen = candidates[-1]
+            _drive_json_by_id(store, chosen["id"], work_root, f"features/daily/{chosen['name']}")
+    manifest_path = work_root / REMOTE_DELIVERY_MANIFEST
+    _drive_download(store, REMOTE_DELIVERY_MANIFEST, manifest_path)
+    return readiness, readiness_root, manifest_path
+\n\ndef main() -> int:
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     master = _cash_master_audit()
     bulk = _bulk_archive_audit(master.get("latest_date"))
