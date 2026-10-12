@@ -70,6 +70,9 @@ EXPECTED_ENGINE_VERSIONS = {
     # Compatibility with the replacement artifact set already built before
     # the branch version string was normalized. No model data is changed.
     "2026-all-nse-delivery-multifactor-59-candidate-v2",
+    # Current candidate builder emits this version; all feature-contract and
+    # classifier/regressor SHA-256 checks below still apply unchanged.
+    "2026-all-nse-delivery-multifactor-59-replacement-v2",
 }
 
 BANK_SYMBOLS = {
