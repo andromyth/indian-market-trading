@@ -20,6 +20,7 @@ import pandas as pd
 from .sd_cycle import predict_stage
 from .sd_v2_panel import build_beta_delivery_panel, split_training_inference
 from .sd_intraday_v2 import _session_rows, _norm as norm_intraday, feature_columns
+from live_signal_guards import MIN_LIVE_FEATURE_COVERAGE, feature_coverage_fraction
 
 CACHE = (
     Path(__file__).resolve().parent.parent
@@ -396,7 +397,19 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
 
     pred = predict_stage(inference, registry_root)
     row = pred.iloc[0].to_dict()
-    row["prediction_status"] = "PASS"
+    coverage = pd.to_numeric(row.get("feature_coverage"), errors="coerce")
+    row["minimum_active_model_feature_coverage"] = MIN_LIVE_FEATURE_COVERAGE
+    if pd.isna(coverage) or not float(coverage) >= MIN_LIVE_FEATURE_COVERAGE:
+        row["prediction_status"] = "BLOCKED"
+        row["signal"] = "ABSTAIN"
+        row["signal_reason"] = "INSUFFICIENT_ACTIVE_MODEL_FEATURE_COVERAGE"
+        row["reason"] = (
+            "Active model feature coverage is "
+            + (f"{float(coverage):.1%}" if pd.notna(coverage) else "unavailable")
+            + f"; at least {MIN_LIVE_FEATURE_COVERAGE:.0%} is required."
+        )
+    else:
+        row["prediction_status"] = "PASS"
 
     # Expose the target, actual calculation time, and model input cutoff.
     # The existing champion was trained on prior-session point-in-time rows,
@@ -477,6 +490,39 @@ def beta_intraday_predict(
                     | (X[c].abs() > float32_max),
                     __import__("numpy").nan,
                 ).astype("float32")
+
+            # Use the registered bundle's actual fitted feature contract. Missing
+            # columns count as missing; they are never synthesized to pass the gate.
+            model_features = list(getattr(bundle_obj, "features", []) or features)
+            missing_model_features = [name for name in model_features if name not in X.columns]
+            if missing_model_features:
+                rows.append({
+                    "symbol": root,
+                    "horizon_min": horizon,
+                    "signal": "ABSTAIN",
+                    "reason": "MODEL_FEATURE_CONTRACT_MISSING",
+                    "missing_model_features": missing_model_features[:10],
+                    "active_model_feature_count": len(model_features),
+                })
+                continue
+
+            coverage = feature_coverage_fraction(X, model_features)
+            if coverage < MIN_LIVE_FEATURE_COVERAGE:
+                rows.append({
+                    "symbol": root,
+                    "horizon_min": horizon,
+                    "decision_timestamp": str(latest_ts),
+                    "signal": "ABSTAIN",
+                    "signal_reason": "INSUFFICIENT_ACTIVE_MODEL_FEATURE_COVERAGE",
+                    "reason": (
+                        f"Active model feature coverage is {coverage:.1%}; "
+                        f"at least {MIN_LIVE_FEATURE_COVERAGE:.0%} is required."
+                    ),
+                    "feature_coverage": coverage,
+                    "active_model_feature_count": len(model_features),
+                })
+                continue
+
             p = float(bundle_obj.predict_proba_up(X)[0])
             thr = state["champion"].get("thresholds", {"abstain_all": True})
             from .sd_walkforward import to_signal
@@ -488,6 +534,9 @@ def beta_intraday_predict(
                 "reference_close": float(h["reference_close"].iloc[0]),
                 "probability_up": p,
                 "signal": signal,
+                "feature_coverage": coverage,
+                "active_model_feature_count": len(model_features),
+                "minimum_active_model_feature_coverage": MIN_LIVE_FEATURE_COVERAGE,
                 "signal_reason": (
                     "VALIDATED_THRESHOLD"
                     if signal != "ABSTAIN" else "NO_VALIDATED_ACTION_BAND"
