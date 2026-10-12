@@ -544,7 +544,7 @@ def run_audit(panel_path: Path, out: Path):
             raise ValueError(f"OOF fold {k + 1} insufficient: train={len(tr)}, test={len(va)}.")
         if tr["target_date"].max() >= start:
             raise AssertionError(f"OOF fold {k + 1} has target leakage.")
-        print(f"OOF FOLD {k + 1}/{OOF_FOLDS} START: train_rows={len(tr):,}; validation_rows={len(va):,}; cutoff={fold_start.date()}", flush=True)
+        print(f"OOF FOLD {k + 1}/{OOF_FOLDS} START: train_rows={len(tr):,}; validation_rows={len(va):,}; cutoff={start.date()}", flush=True)
         pair, fit_stats = fit_production_family(tr, list(FEATURES_59))
         predictions = predict_rows(pair, va, list(FEATURES_59))
         print(f"OOF FOLD {k + 1}/{OOF_FOLDS} COMPLETE: predictions={len(predictions):,}; sampled_fit_rows={fit_stats['sampled_fit_rows']:,}", flush=True)
