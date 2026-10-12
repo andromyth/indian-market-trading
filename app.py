@@ -886,6 +886,7 @@ if interface_mode == "Live Test":
                     d_status = str(delivery.get("prediction_status", "UNKNOWN")).upper()
                     d_signal = str(delivery.get("signal") or d_status)
                     d_prob = pd.to_numeric(delivery.get("p"), errors="coerce")
+                    d_coverage = pd.to_numeric(delivery.get("feature_coverage"), errors="coerce")
                     if d_status != "PASS":
                         d_prob = np.nan
                     with delivery_col:
@@ -894,6 +895,8 @@ if interface_mode == "Live Test":
                         st.caption(
                             f"Model status: {d_status} · P(UP): "
                             + (f"{float(d_prob):.1%}" if pd.notna(d_prob) else "not available")
+                            + " · Active feature coverage: "
+                            + (f"{float(d_coverage):.1%}" if pd.notna(d_coverage) else "not available")
                         )
                         st.caption(
                             f"Reference: {delivery.get('date') or '—'} · Target: {delivery.get('target_session_date') or '—'}"
@@ -1062,12 +1065,15 @@ if interface_mode == "Live Test":
                 delivery_lookup.get("signal") or lookup_delivery_status
             )
             lookup_p_up = pd.to_numeric(delivery_lookup.get("p"), errors="coerce")
+            lookup_coverage = pd.to_numeric(delivery_lookup.get("feature_coverage"), errors="coerce")
             if lookup_delivery_status != "PASS":
                 lookup_p_up = np.nan
             st.metric("Delivery signal", lookup_delivery_signal)
             st.caption(
                 f"Model status: {lookup_delivery_status} · P(UP): "
                 + (f"{float(lookup_p_up):.1%}" if pd.notna(lookup_p_up) else "not available")
+                + " · Active feature coverage: "
+                + (f"{float(lookup_coverage):.1%}" if pd.notna(lookup_coverage) else "not available")
             )
             st.caption(
                 f"Reference: {delivery_lookup.get('date') or '—'} · "
