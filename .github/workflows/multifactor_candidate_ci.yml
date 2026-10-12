@@ -80,6 +80,7 @@ jobs:
         run: >
           pytest -q
           tests/test_purged_walk_forward.py
+          tests/test_cash_master_incremental_refresh.py
           tests/test_multifactor_data_layer_v2.py
           tests/test_59_feature_source_coverage.py
           tests/test_candidate_pipeline_stages.py
