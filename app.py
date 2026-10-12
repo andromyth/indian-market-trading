@@ -53,6 +53,7 @@ from selfdriving.sd_v2_runtime import (
     beta_intraday_predict,
     beta_status,
 )
+from live_signal_guards import assess_horizon_completeness, latest_completed_bar_status
 
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
@@ -713,24 +714,54 @@ def _auto_watch_intraday(symbol: str) -> dict:
 
     root = symbol.replace(".NS", "").replace(".BO", "").upper()
     state_key = f"auto_watch_intraday::{root}"
-    cached = st.session_state.get(state_key)
-    if isinstance(cached, dict) and cached.get("latest_candle_ist") == latest_ts.isoformat():
-        return cached
 
     try:
         benchmark = benchmark_for_symbol(symbol)
         market_frame = _cached_live_market_context(benchmark)
+        market_freshness = latest_completed_bar_status(
+            market_frame,
+            now,
+            max_age_seconds=5 * 60,
+            require_current_session=True,
+        )
+        if not market_freshness.get("ok"):
+            return {
+                "status": "STALE_MARKET_CONTEXT",
+                "reason": (
+                    f"{benchmark} benchmark context is not fresh enough: "
+                    f"{market_freshness.get('reason', market_freshness.get('status'))}"
+                ),
+                "latest_candle_ist": latest_ts.isoformat(),
+                "market_latest_candle_ist": market_freshness.get("latest_candle_ist"),
+                "source": source,
+            }
+
+        market_latest_ts = market_freshness.get("latest_candle_ist")
+        refresh_revision = int(st.session_state.get("watchlist_refresh_revision", 0))
+        cached = st.session_state.get(state_key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("latest_candle_ist") == latest_ts.isoformat()
+            and cached.get("market_latest_candle_ist") == market_latest_ts
+            and cached.get("refresh_revision") == refresh_revision
+        ):
+            return cached
+
         predictions = beta_intraday_predict(symbol, completed, market_frame)
         by_horizon = {
             int(item.get("horizon_min", 0)): item
             for item in predictions
             if int(item.get("horizon_min", 0)) in {5, 15, 30}
         }
+        completeness = assess_horizon_completeness(by_horizon, (5, 15, 30))
         out = {
-            "status": "PASS" if by_horizon else "NO_HORIZON_PREDICTIONS",
+            "status": completeness["status"],
+            "reason": completeness.get("reason"),
             "latest_candle_ist": latest_ts.isoformat(),
+            "market_latest_candle_ist": market_latest_ts,
             "source": source,
             "age_seconds": age_seconds,
+            "refresh_revision": refresh_revision,
             "horizons": by_horizon,
         }
         st.session_state[state_key] = out
@@ -762,7 +793,9 @@ if interface_mode == "Live Test":
     st.info(
         "Stocks are selected from recent market coverage across Moneycontrol, Economic Times, "
         "Financial Express, Mint and CNBC-TV18. Media mentions make a stock watch-worthy; "
-        "only the project's own model supplies its signal."
+        "only the project's own model supplies its signal. Delivery is a next-session forecast "
+        "from the last completed daily snapshot, not a live intraday prediction. An intraday "
+        "signal is displayed only when both stock candles and benchmark context pass freshness checks."
     )
 
     # This fragment updates the candidate panel automatically. Source results are
@@ -853,6 +886,8 @@ if interface_mode == "Live Test":
                     d_status = str(delivery.get("prediction_status", "UNKNOWN")).upper()
                     d_signal = str(delivery.get("signal") or d_status)
                     d_prob = pd.to_numeric(delivery.get("p"), errors="coerce")
+                    if d_status != "PASS":
+                        d_prob = np.nan
                     with delivery_col:
                         st.markdown("**Delivery · next session**")
                         st.metric("Signal", d_signal)
@@ -862,6 +897,9 @@ if interface_mode == "Live Test":
                         )
                         st.caption(
                             f"Reference: {delivery.get('date') or '—'} · Target: {delivery.get('target_session_date') or '—'}"
+                        )
+                        st.caption(
+                            f"Feature cutoff (UTC): {delivery.get('feature_cutoff_timestamp') or '—'}"
                         )
                         if delivery.get("signal_reason") or delivery.get("reason"):
                             st.caption(str(delivery.get("signal_reason") or delivery.get("reason")))
@@ -881,12 +919,23 @@ if interface_mode == "Live Test":
                                     signal = str(result.get("signal") or "ABSTAIN")
                                     prob = pd.to_numeric(result.get("probability_up"), errors="coerce")
                                     prob_text = f" · P↑ {float(prob):.0%}" if pd.notna(prob) else ""
-                                    items.append(f"+{horizon}m **{signal}**{prob_text}")
+                                    coverage = pd.to_numeric(result.get("feature_coverage"), errors="coerce")
+                                    coverage_text = f" · features {float(coverage):.0%}" if pd.notna(coverage) else ""
+                                    items.append(f"+{horizon}m **{signal}**{prob_text}{coverage_text}")
                                 st.write("  |  ".join(items))
                                 st.caption(
-                                    f"Candle: {intra.get('latest_candle_ist', '—')} · "
+                                    f"Stock candle: {intra.get('latest_candle_ist', '—')} · "
+                                    f"benchmark candle: {intra.get('market_latest_candle_ist', '—')} · "
                                     f"source: {intra.get('source', 'unknown')}"
                                 )
+                                abstentions = [
+                                    f"+{h}m: {v.get('signal_reason') or v.get('reason')}"
+                                    for h, v in (intra.get('horizons', {}) or {}).items()
+                                    if str(v.get('signal', '')).upper() == 'ABSTAIN'
+                                    and (v.get('signal_reason') or v.get('reason'))
+                                ]
+                                if abstentions:
+                                    st.caption("Abstentions: " + " · ".join(abstentions[:3]))
                             else:
                                 st.metric("Signal", status.replace("_", " "))
                                 st.caption(str(intra.get("reason") or "Fresh validated intraday predictions are not available."))
@@ -1013,6 +1062,8 @@ if interface_mode == "Live Test":
                 delivery_lookup.get("signal") or lookup_delivery_status
             )
             lookup_p_up = pd.to_numeric(delivery_lookup.get("p"), errors="coerce")
+            if lookup_delivery_status != "PASS":
+                lookup_p_up = np.nan
             st.metric("Delivery signal", lookup_delivery_signal)
             st.caption(
                 f"Model status: {lookup_delivery_status} · P(UP): "
@@ -1021,6 +1072,9 @@ if interface_mode == "Live Test":
             st.caption(
                 f"Reference: {delivery_lookup.get('date') or '—'} · "
                 f"Target: {delivery_lookup.get('target_session_date') or '—'}"
+            )
+            st.caption(
+                f"Feature cutoff (UTC): {delivery_lookup.get('feature_cutoff_timestamp') or '—'}"
             )
             if delivery_lookup.get("signal_reason") or delivery_lookup.get("reason"):
                 st.caption(str(
@@ -1072,9 +1126,18 @@ if interface_mode == "Live Test":
                         )
                     st.write("  |  ".join(horizon_summary))
                     st.caption(
-                        f"Latest completed candle: {intraday_lookup.get('latest_candle_ist', '—')} · "
+                        f"Stock candle: {intraday_lookup.get('latest_candle_ist', '—')} · "
+                        f"benchmark candle: {intraday_lookup.get('market_latest_candle_ist', '—')} · "
                         f"source: {intraday_lookup.get('source', 'unknown')}"
                     )
+                    abstentions = [
+                        f"+{h}m: {v.get('signal_reason') or v.get('reason')}"
+                        for h, v in (intraday_lookup.get('horizons', {}) or {}).items()
+                        if str(v.get('signal', '')).upper() == 'ABSTAIN'
+                        and (v.get('signal_reason') or v.get('reason'))
+                    ]
+                    if abstentions:
+                        st.caption("Abstentions: " + " · ".join(abstentions[:3]))
                 else:
                     st.metric("Intraday status", lookup_intraday_status.replace("_", " "))
                     st.caption(str(
