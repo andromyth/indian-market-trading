@@ -847,20 +847,28 @@ def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end:
             if _coverage_ok(cached, start_d, end_d):
                 if sync_drive:
                     folder = root.replace("^", "").replace("/", "_")
-                    result = _drive_upload(
-                        cache_path,
-                        f"production_data/nse_official/indices/{folder}/{cache_path.name}",
-                        "application/octet-stream",
-                    )
-                    if not isinstance(result, dict) or result.get("status") != "OK":
-                        detail = (
-                            result.get("error")
-                            if isinstance(result, dict)
-                            else repr(result)
+                    try:
+                        result = _drive_upload(
+                            cache_path,
+                            f"production_data/nse_official/indices/{folder}/{cache_path.name}",
+                            "application/octet-stream",
                         )
-                        raise RuntimeError(
-                            f"Google Drive index-cache persistence failed for "
-                            f"{root} {start_d}..{end_d}: {detail}"
+                        if not isinstance(result, dict) or result.get("status") != "OK":
+                            detail = (
+                                result.get("error")
+                                if isinstance(result, dict)
+                                else repr(result)
+                            )
+                            print(
+                                f"WARNING: Google Drive index-cache persistence failed for "
+                                f"{root} {start_d}..{end_d}: {detail}. "
+                                "Using the verified local cache for this run."
+                            )
+                    except Exception as exc:
+                        print(
+                            f"WARNING: Google Drive index-cache persistence failed for "
+                            f"{root} {start_d}..{end_d}: {type(exc).__name__}: {exc}. "
+                            "Using the verified local cache for this run."
                         )
                 return cached
         except RuntimeError:
@@ -948,11 +956,29 @@ def _fetch_index_history_nse_api(index_symbol: str, start: date | datetime, end:
     combined.to_parquet(cache_path, index=False)
 
     if sync_drive:
-        _drive_upload(
-            cache_path,
-            f"production_data/nse_official/indices/{root.replace('^','')}/{cache_path.name}",
-            "application/octet-stream",
-        )
+        try:
+            result = _drive_upload(
+                cache_path,
+                f"production_data/nse_official/indices/{root.replace('^','')}/{cache_path.name}",
+                "application/octet-stream",
+            )
+            if not isinstance(result, dict) or result.get("status") != "OK":
+                detail = (
+                    result.get("error")
+                    if isinstance(result, dict)
+                    else repr(result)
+                )
+                print(
+                    f"WARNING: Google Drive index-cache persistence failed for "
+                    f"{root} {start_d}..{end_d}: {detail}. "
+                    "Fetched history remains available locally for this run."
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: Google Drive index-cache persistence failed for "
+                f"{root} {start_d}..{end_d}: {type(exc).__name__}: {exc}. "
+                "Fetched history remains available locally for this run."
+            )
 
     return combined
 
