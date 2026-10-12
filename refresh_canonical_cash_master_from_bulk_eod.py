@@ -101,7 +101,7 @@ def _read_identity_rows(archive: Path, expected_date: date) -> pd.DataFrame:
     rows = normalize_udiff(raw, archive)
     if rows.empty:
         return pd.DataFrame(columns=final_columns(pd.DataFrame()).columns)
-    rows = rows.dropna(subset=["symbol", "series", "isin", "date", "close"]).copy()
+    rows = rows.dropna(subset=["symbol", "series", "date", "close"]).copy()
     rows["date"] = pd.to_datetime(rows["date"], errors="coerce").dt.normalize()
     rows = rows.dropna(subset=["date"])
     actual_dates = sorted(pd.to_datetime(rows["date"]).dt.date.unique().tolist())
@@ -119,7 +119,12 @@ def _read_identity_rows(archive: Path, expected_date: date) -> pd.DataFrame:
 
 def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
     con = duckdb.connect(database=":memory:")
+    spill_dir = Path(tempfile.gettempdir()) / "cash_master_refresh_duckdb_tmp"
+    spill_dir.mkdir(parents=True, exist_ok=True)
     try:
+        con.execute("PRAGMA threads=2")
+        con.execute("PRAGMA memory_limit='4GB'")
+        con.execute(f"SET temp_directory={_sql_path(spill_dir)}")
         m_sql, i_sql, o_sql = _sql_path(master), _sql_path(incoming), _sql_path(output)
         columns = [
             row[0] for row in con.execute(
