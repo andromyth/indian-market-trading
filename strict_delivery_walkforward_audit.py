@@ -43,6 +43,8 @@ MIN_ACTIONS = 30
 MIN_ACTION_DATES = 10
 TARGET_PRECISION = 0.80
 ROUND_TRIP_COST = 0.003  # 30 bps scenario; actual execution costs are not simulated.
+MAX_FIT_ROWS = 25000
+AUDIT_HGB_MAX_ITER = 45
 
 
 def parse_holidays() -> set[date]:
@@ -208,10 +210,36 @@ def clean_matrix(frame: pd.DataFrame, features: list[str]):
     return x.astype("float32")
 
 
+def deterministic_training_sample(train: pd.DataFrame, max_rows: int = MAX_FIT_ROWS) -> pd.DataFrame:
+    """Bound fit time while retaining training rows from across every reference session."""
+    if len(train) <= max_rows:
+        return train.copy()
+    if "reference_date" not in train.columns:
+        return train.sample(n=max_rows, random_state=42).copy()
+    dates = sorted(pd.to_datetime(train["reference_date"]).dt.normalize().unique())
+    per_date = max(1, max_rows // max(1, len(dates)))
+    parts = []
+    normalized_dates = pd.to_datetime(train["reference_date"]).dt.normalize()
+    for day in dates:
+        group = train.loc[normalized_dates.eq(pd.Timestamp(day))]
+        if len(group) > per_date:
+            seed = int(pd.Timestamp(day).strftime("%Y%m%d")) % (2**32 - 1)
+            group = group.sample(n=per_date, random_state=seed)
+        parts.append(group)
+    sampled = pd.concat(parts, ignore_index=False)
+    if len(sampled) > max_rows:
+        sampled = sampled.sample(n=max_rows, random_state=42)
+    return sampled.sort_values(["reference_date", "symbol"]).reset_index(drop=True)
+
+
 def fit_production_family(train: pd.DataFrame, features: list[str]):
-    """Same production classifier/regressor family, fitted in memory only."""
-    if len(train) < 1000:
-        raise ValueError(f"Too few fit rows: {len(train)}")
+    """Fit a time-bounded, in-memory sample of the production model family."""
+    input_rows = int(len(train))
+    if input_rows < 1000:
+        raise ValueError(f"Too few input fit rows: {input_rows}")
+    train = deterministic_training_sample(train)
+    fit_rows = int(len(train))
+    print(f"MODEL FIT: input_rows={input_rows:,}; sampled_fit_rows={fit_rows:,}; features={len(features)}", flush=True)
     y_return = pd.to_numeric(train["y_return"], errors="coerce")
     valid = y_return.notna()
     train = train.loc[valid].copy()
@@ -227,11 +255,17 @@ def fit_production_family(train: pd.DataFrame, features: list[str]):
     ])
     reg = Pipeline([
         ("imputer", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
-        ("model", HistGradientBoostingRegressor(max_iter=180, learning_rate=0.04, max_leaf_nodes=19, l2_regularization=2.0, random_state=42)),
+        ("model", HistGradientBoostingRegressor(max_iter=AUDIT_HGB_MAX_ITER, learning_rate=0.04, max_leaf_nodes=19, l2_regularization=2.0, random_state=42)),
     ])
     clf.fit(X, y_up)
     reg.fit(X, y_return.astype(float))
-    return clf, reg
+    fit_stats = {
+        "input_rows": input_rows,
+        "sampled_fit_rows": fit_rows,
+        "sampling_policy": "deterministic per-reference-session sampling, fixed seed, max 25000 rows per fit",
+        "regressor_max_iter": AUDIT_HGB_MAX_ITER,
+    }
+    return (clf, reg), fit_stats
 
 
 def predict_rows(pair, frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
@@ -477,7 +511,12 @@ def render_summary(report):
 
 
 def run_audit(panel_path: Path, out: Path):
-    labeled, stats = prepare_labeled_panel(pd.read_parquet(panel_path), parse_holidays())
+    print(f"READ PANEL: path={panel_path}; bytes={panel_path.stat().st_size:,}", flush=True)
+    panel = pd.read_parquet(panel_path)
+    print(f"READ PANEL COMPLETE: rows={len(panel):,}; columns={len(panel.columns):,}", flush=True)
+    labeled, stats = prepare_labeled_panel(panel, parse_holidays())
+    del panel
+    print(f"LABEL BUILD COMPLETE: labeled_rows={len(labeled):,}; symbols={labeled['symbol'].nunique():,}; sessions={labeled['reference_date'].nunique():,}", flush=True)
     sessions = sorted(pd.Timestamp(v).normalize() for v in labeled["reference_date"].unique())
     if len(sessions) < 100:
         raise ValueError(f"Need at least 100 labeled sessions; found {len(sessions)}.")
@@ -505,8 +544,10 @@ def run_audit(panel_path: Path, out: Path):
             raise ValueError(f"OOF fold {k + 1} insufficient: train={len(tr)}, test={len(va)}.")
         if tr["target_date"].max() >= start:
             raise AssertionError(f"OOF fold {k + 1} has target leakage.")
-        pair = fit_production_family(tr, list(FEATURES_59))
+        print(f"OOF FOLD {k + 1}/{OOF_FOLDS} START: train_rows={len(tr):,}; validation_rows={len(va):,}; cutoff={fold_start.date()}", flush=True)
+        pair, fit_stats = fit_production_family(tr, list(FEATURES_59))
         predictions = predict_rows(pair, va, list(FEATURES_59))
+        print(f"OOF FOLD {k + 1}/{OOF_FOLDS} COMPLETE: predictions={len(predictions):,}; sampled_fit_rows={fit_stats['sampled_fit_rows']:,}", flush=True)
         predictions["fold"] = k + 1
         oof_parts.append(predictions)
         folds.append({
@@ -517,14 +558,17 @@ def run_audit(panel_path: Path, out: Path):
             "validation_start": va["reference_date"].min().date().isoformat(),
             "validation_end": va["reference_date"].max().date().isoformat(),
             "purge_check": "PASS",
+            "fit_sampling": fit_stats,
         })
         del pair
     oof = pd.concat(oof_parts, ignore_index=True)
     policy, tuning = tune_policy_on_oof(oof)
 
-    final_pair = fit_production_family(dev, list(FEATURES_59))
+    print(f"FINAL DEVELOPMENT FIT START: train_rows={len(dev):,}; holdout_rows={len(hold):,}; cutoff={holdout_start.date()}", flush=True)
+    final_pair, final_fit_stats = fit_production_family(dev, list(FEATURES_59))
     hold_pred = predict_rows(final_pair, hold, list(FEATURES_59))
     del final_pair
+    print(f"FINAL HOLDOUT SCORING COMPLETE: rows={len(hold_pred):,}", flush=True)
 
     fixed = {"abstain_all": False, "buy_probability_threshold": 0.60, "sell_probability_threshold": 0.40,
              "min_expected_return": 0.0015, "policy_source": "fixed existing policy; not tuned on holdout"}
@@ -551,8 +595,16 @@ def run_audit(panel_path: Path, out: Path):
         "prediction_ledger_changed": False, "signal_policy_changed": False,
         "model_family": {
             "classifier": "median imputation + missing indicators + scaled LogisticRegression(C=0.5, class_weight=balanced)",
-            "regressor": "median imputation + missing indicators + HistGradientBoostingRegressor(180 iter, learning_rate=0.04, max_leaf_nodes=19, L2=2.0)",
+            "regressor": f"median imputation + missing indicators + HistGradientBoostingRegressor({AUDIT_HGB_MAX_ITER} iter, learning_rate=0.04, max_leaf_nodes=19, L2=2.0)",
             "features": list(FEATURES_59), "target": "positive raw return to next exact observed NSE session",
+            "audit_fit_is_sampled_proxy_not_exact_production_artifact": True,
+            "sample_cap_per_fit": MAX_FIT_ROWS,
+            "reason": "Runtime-bounded research refit; scores describe this sampled model-family walk-forward, not the exact locked production weights.",
+        },
+        "fit_policy": {
+            "max_rows_per_fit": MAX_FIT_ROWS,
+            "hgb_max_iter": AUDIT_HGB_MAX_ITER,
+            "sampling": "fixed-seed per-reference-session sampling",
         },
         "data": stats,
         "split": {
@@ -648,7 +700,8 @@ def render_summary(report):
         f"- Fully PIT-universe certified: {cert['certified_as_fully_unbiased_point_in_time_universe_oos']}",
         cert["reason"],
         f"- Panel last session: {report['source_freshness']['panel_last_session']}; latest expected: {report['source_freshness']['latest_completed_session_expected']}",
-        "", "All fitted models were kept in memory. No production model, registry, policy, ledger, or Drive source was changed.",
+        f"- Audit fit cap: {report['fit_policy']['max_rows_per_fit']} rows per fit; regressor iterations: {report['fit_policy']['hgb_max_iter']}",
+        "", "This is a sampled model-family research holdout, not the exact active production weights. No production model, registry, policy, ledger, or Drive source was changed.",
     ]) + "\n"
 
 
@@ -665,8 +718,11 @@ def main():
         if panel_path.exists() and panel_path.stat().st_size:
             provenance = {"remote_path": args.remote_panel, "local_cache_reused": True,
                           "size_bytes": int(panel_path.stat().st_size), "sha256": sha256_file(panel_path)}
+            print(f"REUSING LOCAL PIT PANEL: bytes={provenance['size_bytes']:,}", flush=True)
         else:
+            print(f"DOWNLOADING PIT PANEL FROM DRIVE: {args.remote_panel}", flush=True)
             provenance = download_drive_file(args.remote_panel, panel_path)
+            print(f"PANEL DOWNLOAD COMPLETE: bytes={provenance['size_bytes']:,}; sha256={provenance['sha256']}", flush=True)
     except Exception as exc:
         blocked = {
             "audit_schema_version": "1.0", "status": "BLOCKED_INPUT_UNAVAILABLE",
