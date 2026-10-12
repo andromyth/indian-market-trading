@@ -13,6 +13,7 @@ on:
       - "nse_bulk_eod_ingest.py"
       - "nse_delivery_daily_sync.py"
       - "production_data_freshness_gate.py"
+      - "delivery_all_nse_prediction_cycle.py"
 
   workflow_dispatch:
     inputs:
@@ -21,13 +22,13 @@ on:
         required: false
         default: ''
   # Post-market hourly retries. Each run fetches/repairs the completed NSE
-  # session, builds that session's PIT snapshot for the next trading day,
-  # validates the prior day's prediction against today's actual, and refreshes
-  # the CSV audit ledger.
+  # session, backfills recent missed PIT snapshots, builds the current session's
+  # PIT snapshot, generates the locked ALL-NSE 59-feature forecast for the next
+  # NSE session, validates prior forecasts, and refreshes the audit ledgers.
   #
   # 20:45-23:45 IST, 00:45-04:45 IST, 05:45-06:45 IST.
-  # The target session is the latest completed NSE session for the retry
-  # window; no prediction is generated here.
+  # Before close, the clock resolver pins the job to the latest completed
+  # session; after close, it advances to the session just completed.
   schedule:
     - cron: '15 15-18 * * 1-5'
     - cron: '15 19-23 * * 1-5'
@@ -150,6 +151,64 @@ jobs:
             --delivery-lookback-days 150 \
             --source-wait-minutes 0 \
             --expected-date "${{ steps.target.outputs.target_date }}"
+
+      - name: Generate active ALL-NSE 59-feature Delivery predictions for next NSE session
+        if: steps.target.outputs.target_date != ''
+        env:
+          TARGET_DATE: ${{ steps.target.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          python -u delivery_all_nse_prediction_cycle.py --snapshot-date "$TARGET_DATE"
+
+      - name: Verify next-session production prediction batch is persisted
+        if: steps.target.outputs.target_date != ''
+        env:
+          TARGET_DATE: ${{ steps.target.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from datetime import date
+          from collections import Counter
+          from delivery_all_nse_prediction_cycle import _next_trading_day
+          from prediction_ledger import load_records
+
+          reference_date = date.fromisoformat(os.environ["TARGET_DATE"])
+          prediction_date = _next_trading_day(reference_date).isoformat()
+          records = load_records()
+          batch = [
+              row for row in records
+              if str(row.get("mode", "")).lower() == "delivery"
+              and str(row.get("reference_session", ""))[:10] == reference_date.isoformat()
+              and str(row.get("prediction_for_date", ""))[:10] == prediction_date
+          ]
+          if not batch:
+              raise SystemExit(
+                  "NO_PERSISTED_ACTIVE_DELIVERY_BATCH: "
+                  f"reference={reference_date} prediction_for={prediction_date}"
+              )
+          symbols = [str(row.get("symbol", "")).strip().upper() for row in batch]
+          if not all(symbols) or len(symbols) != len(set(symbols)):
+              raise SystemExit("INVALID_PERSISTED_BATCH: empty or duplicate symbols")
+          if any(int(row.get("feature_count", 0) or 0) != 59 for row in batch):
+              raise SystemExit("INVALID_PERSISTED_BATCH: production feature_count is not 59")
+          versions = sorted({str(row.get("model_version", "")) for row in batch})
+          if len(versions) != 1 or not versions[0].startswith("2026-all-nse-delivery-multifactor-59-"):
+              raise SystemExit("INVALID_PERSISTED_BATCH: unexpected or mixed active model versions: " + str(versions))
+          signals = Counter(str(row.get("signal", "UNKNOWN")).upper() for row in batch)
+          print(json.dumps({
+              "status": "PASS",
+              "reference_session": reference_date.isoformat(),
+              "prediction_for_date": prediction_date,
+              "rows": len(batch),
+              "symbols": len(set(symbols)),
+              "model_version": versions[0],
+              "signals": dict(signals),
+              "persistence": "prediction_ledger.load_records() found the target batch after Drive sync",
+          }, indent=2))
+          PY
+
       - name: Validate prior trading-day Delivery predictions against today's actual
         if: steps.target.outputs.target_date != ''
         run: python -u validate_prediction_ledger.py
