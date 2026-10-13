@@ -179,7 +179,6 @@ def test_even_positive_validation_is_not_automatic_trade_approval():
         target_sessions=["2026-10-12", "2026-10-13"],
     )
 
-    # Current test case is a past-date target (outside pre-open on date 12, but
-    # is pre-open, so same-day first target is acceptable for this gate).
+    # Positive historical holdout results still do not authorize real-money use.
     assert guarded["status"] == "CALCULATED"
     assert guarded["trade_eligibility"] == "NOT_ELIGIBLE_PAPER_TRIAL_REQUIRED"
