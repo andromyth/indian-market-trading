@@ -1287,6 +1287,10 @@ if interface_mode == "Live Test":
             v3.metric("Mean MAE skill vs baseline", f"{float(overall_skill):+.1%}" if pd.notna(overall_skill) else "Unavailable")
             v4.metric("Validation status", validation_status.replace("_", " "))
             st.caption(
+                f"Validation prediction dates: {ohlc_forecast.get('validation_start', '—')} → {ohlc_forecast.get('validation_end', '—')} · "
+                f"actual outcomes through: {ohlc_forecast.get('validation_outcome_end', '—')}"
+            )
+            st.caption(
                 f"Calculation: {ohlc_forecast.get('calculation_status', 'UNKNOWN')} · "
                 f"Data: {ohlc_forecast.get('data_status', 'UNKNOWN')} · "
                 f"Trade eligibility: {trade_eligibility.replace('_', ' ')}"
