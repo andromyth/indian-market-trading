@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+import time as _perf_time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,11 @@ from .sd_cycle import predict_stage
 from .sd_v2_panel import build_beta_delivery_panel, split_training_inference
 from .sd_intraday_v2 import _session_rows, _norm as norm_intraday, feature_columns
 from live_signal_guards import MIN_LIVE_FEATURE_COVERAGE, feature_coverage_fraction
+from .runtime_timeframe_diagnostics import (
+    report_runtime_cadence,
+    runtime_diagnostics_enabled,
+    runtime_event,
+)
 
 CACHE = (
     Path(__file__).resolve().parent.parent
@@ -257,8 +263,7 @@ def beta_status() -> dict[str, Any]:
 def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
                           raw_news: pd.DataFrame | None = None,
                           fno_daily: pd.DataFrame | None = None) -> dict[str, Any]:
-    """Run the isolated Beta V2 Delivery champion for one current symbol."""
-    store = _drive()
+    """Run the isolated Beta V2 Delivery champion for one current symbol."""    store = _drive()
 
     # Check model readiness before touching optional feature archives. A fresh
     # deployment can legitimately have no Beta V2 training artefacts yet; that
@@ -440,8 +445,22 @@ def beta_intraday_predict(
     price_df: pd.DataFrame,
     market_df: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
-    """Run all trained Beta V2 intraday horizons for one live symbol."""
+    """Run trained intraday horizons and optionally log actual runtime cadence/latency."""
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
+    diagnostics = runtime_diagnostics_enabled()
+    call_started_perf = _perf_time.perf_counter()
+    price_input_report = {}
+    market_input_report = {}
+    if diagnostics:
+        price_input_report = report_runtime_cadence(
+            "intraday_price_df_received", getattr(price_df, "index", [])
+        )
+        if market_df is not None and not market_df.empty:
+            market_input_report = report_runtime_cadence(
+                "intraday_market_df_received", getattr(market_df, "index", [])
+            )
+
+    feature_build_started = _perf_time.perf_counter()
     rows = []
     latest_rows = _session_rows(
         price_df.assign(symbol=root),
@@ -449,7 +468,29 @@ def beta_intraday_predict(
         (5, 10, 15, 20, 25, 30),
         include_future=False,
     )
+    feature_build_seconds = _perf_time.perf_counter() - feature_build_started
+    if diagnostics:
+        report_runtime_cadence(
+            "intraday_derived_decision_timestamps",
+            [item.get("decision_timestamp") for item in latest_rows],
+        )
+        runtime_event(
+            "intraday_feature_construction_completed",
+            symbol=root,
+            input_price_rows=int(len(price_df)) if price_df is not None else 0,
+            input_market_rows=int(len(market_df)) if market_df is not None else 0,
+            derived_rows=int(len(latest_rows)),
+            feature_construction_seconds=round(feature_build_seconds, 6),
+            decision_schedule_minutes=5,
+        )
     if not latest_rows:
+        if diagnostics:
+            runtime_event(
+                "intraday_prediction_empty",
+                symbol=root,
+                reason="No completed decision rows available from current in-memory frames",
+                total_runtime_seconds=round(_perf_time.perf_counter() - call_started_perf, 6),
+            )
         return []
 
     frame = pd.DataFrame(latest_rows)
@@ -457,8 +498,37 @@ def beta_intraday_predict(
     frame = frame[frame["decision_timestamp"].eq(latest_ts)].copy()
     features = feature_columns()
 
+    input_to_decision_gap_minutes = None
+    if diagnostics:
+        latest_input_value = price_input_report.get("latest_timestamp_utc")
+        try:
+            latest_input_ts = pd.Timestamp(latest_input_value)
+            decision_anchor_ts = pd.Timestamp(latest_ts)
+            input_to_decision_gap_minutes = (
+                latest_input_ts - decision_anchor_ts
+            ).total_seconds() / 60.0
+        except Exception:
+            latest_input_value = None
+        runtime_event(
+            "intraday_decision_anchor",
+            symbol=root,
+            latest_price_candle_utc=latest_input_value,
+            latest_market_candle_utc=market_input_report.get("latest_timestamp_utc"),
+            selected_model_decision_utc=pd.Timestamp(latest_ts).isoformat(),
+            selected_model_decision_ist=pd.Timestamp(latest_ts).tz_convert("Asia/Kolkata").isoformat(),
+            latest_candle_to_decision_gap_minutes=(
+                round(float(input_to_decision_gap_minutes), 3)
+                if input_to_decision_gap_minutes is not None else None
+            ),
+            prediction_horizons_minutes=[5, 10, 15, 20, 25, 30],
+            decision_schedule_minutes=5,
+            note="Feature rows use minute bars but model decisions are selected on a five-minute schedule.",
+        )
+
     for horizon in (5, 10, 15, 20, 25, 30):
         h = frame[frame["horizon_min"].eq(horizon)].copy()
+        horizon_started_perf = _perf_time.perf_counter()
+        artifact_load_started = _perf_time.perf_counter()
         registry_root = CACHE / "intraday" / "models" / f"h{horizon}"
         try:
             _ensure(
@@ -481,6 +551,8 @@ def beta_intraday_predict(
                 registry_root / bundle,
             )
             bundle_obj = joblib.load(registry_root / bundle)
+            artifact_load_seconds = _perf_time.perf_counter() - artifact_load_started
+            matrix_started_perf = _perf_time.perf_counter()
             X = h[features].apply(pd.to_numeric, errors="coerce")
             float32_max = float(__import__("numpy").finfo(__import__("numpy").float32).max)
             X = X.replace([float("inf"), float("-inf")], __import__("numpy").nan)
@@ -523,11 +595,15 @@ def beta_intraday_predict(
                 })
                 continue
 
+            feature_matrix_seconds = _perf_time.perf_counter() - matrix_started_perf
+            model_predict_started = _perf_time.perf_counter()
             p = float(bundle_obj.predict_proba_up(X)[0])
+            model_prediction_seconds = _perf_time.perf_counter() - model_predict_started
             thr = state["champion"].get("thresholds", {"abstain_all": True})
             from .sd_walkforward import to_signal
             signal = to_signal(p, thr)
-            rows.append({
+            prediction_ready_at = pd.Timestamp.now(tz="UTC")
+            row_out = {
                 "symbol": root,
                 "horizon_min": horizon,
                 "decision_timestamp": str(latest_ts),
@@ -541,7 +617,43 @@ def beta_intraday_predict(
                     "VALIDATED_THRESHOLD"
                     if signal != "ABSTAIN" else "NO_VALIDATED_ACTION_BAND"
                 ),
-            })
+            }
+            if diagnostics:
+                input_value = price_input_report.get("latest_timestamp_utc")
+                try:
+                    input_age_seconds = (prediction_ready_at - pd.Timestamp(input_value)).total_seconds()
+                except Exception:
+                    input_age_seconds = None
+                metrics = {
+                    "latest_input_timestamp_utc": input_value,
+                    "decision_timestamp_utc": pd.Timestamp(latest_ts).isoformat(),
+                    "prediction_ready_at_utc": prediction_ready_at.isoformat(),
+                    "input_age_at_prediction_ready_seconds": (
+                        round(float(input_age_seconds), 3) if input_age_seconds is not None else None
+                    ),
+                    "latest_input_to_decision_gap_minutes": (
+                        round(float(input_to_decision_gap_minutes), 3)
+                        if input_to_decision_gap_minutes is not None else None
+                    ),
+                    "feature_construction_seconds": round(feature_build_seconds, 6),
+                    "model_artifact_load_seconds": round(artifact_load_seconds, 6),
+                    "feature_matrix_preparation_seconds": round(feature_matrix_seconds, 6),
+                    "model_prediction_seconds": round(model_prediction_seconds, 6),
+                    "horizon_total_seconds": round(_perf_time.perf_counter() - horizon_started_perf, 6),
+                    "input_cadence_median_minutes": price_input_report.get("median_interval_minutes"),
+                    "decision_schedule_minutes": 5,
+                }
+                row_out["runtime_diagnostics"] = metrics
+                runtime_event(
+                    "intraday_horizon_timing",
+                    symbol=root,
+                    horizon_min=horizon,
+                    signal=signal,
+                    probability_up=p,
+                    feature_count=len(model_features),
+                    **metrics,
+                )
+            rows.append(row_out)
         except Exception as exc:
             rows.append({
                 "symbol": root,
@@ -549,4 +661,13 @@ def beta_intraday_predict(
                 "signal": "ABSTAIN",
                 "reason": f"{type(exc).__name__}: {exc}",
             })
+    if diagnostics:
+        runtime_event(
+            "intraday_prediction_call_completed",
+            symbol=root,
+            horizons_attempted=[5, 10, 15, 20, 25, 30],
+            rows_returned=int(len(rows)),
+            prediction_ready_at_utc=pd.Timestamp.now(tz="UTC").isoformat(),
+            total_runtime_seconds=round(_perf_time.perf_counter() - call_started_perf, 6),
+        )
     return rows
