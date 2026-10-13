@@ -36,6 +36,7 @@ SEGMENT_STOP = {
     "morning": time(12, 15),
     "afternoon": time(15, 30),
     "once": time(15, 30),
+    "service": time(15, 30),
 }
 
 
@@ -307,6 +308,7 @@ class AutonomousIntradayWorker:
         self.started_at_utc = datetime.now(timezone.utc).isoformat()
         self.run_status = "STARTING"
         self.last_cycle_summary: dict = {}
+        self.last_tick_key: str | None = None
 
     def _ensure_paths(self, now: pd.Timestamp) -> None:
         d = now.tz_convert(IST)
@@ -526,6 +528,86 @@ class AutonomousIntradayWorker:
         _log("cycle_completed", **summary)
         return summary
 
+    def tick_once(self) -> dict[str, Any]:
+        """Execute one prediction cycle for the persistent Cloud Run service."""
+        now_dt = datetime.now(IST)
+        now = pd.Timestamp(now_dt)
+        current_day = now.strftime("%Y/%m/%d")
+
+        # Flush yesterday's data before replacing the active daily ledger path.
+        if self.daily_ledger is not None:
+            try:
+                current_ledger_day = "/".join(self.daily_ledger.relative_to(self.root).parts[:3])
+            except ValueError:
+                current_ledger_day = current_day
+            if current_ledger_day != current_day:
+                old_flush = self._flush(final=True)
+                if old_flush.get("status") != "OK":
+                    _log("day_rollover_waiting_for_persistence", old_ledger_day=current_ledger_day,
+                         current_day=current_day, flush=old_flush)
+                    return {
+                        "status": "PERSISTENCE_PENDING",
+                        "reason": "Could not finish syncing the previous session; retrying before rollover.",
+                        "flush": old_flush,
+                    }
+                self.session_frames.clear()
+                self.symbols = []
+                self.watchlist_meta = {}
+                self.last_watchlist_refresh = 0.0
+                self.cycle_count = 0
+                self.daily_ledger = None
+                self.run_status = "IDLE"
+                self.last_tick_key = None
+
+        self._ensure_paths(now)
+        market_open = (
+            is_nse_trading_day(now_dt.date())
+            and OPEN <= now_dt.time() < CLOSE
+        )
+        if not market_open:
+            if self.run_status == "RUNNING":
+                final_flush = self._flush(final=True)
+                self.run_status = "STOPPED" if final_flush.get("status") == "OK" else "PERSISTENCE_ERROR"
+                _log("market_session_worker_stopped", at_ist=now_dt.isoformat(), final_flush=final_flush)
+            return {
+                "status": "MARKET_CLOSED",
+                "at_ist": now_dt.isoformat(),
+                "nse_trading_day": is_nse_trading_day(now_dt.date()),
+                "run_status": self.run_status,
+            }
+
+        minute_key = now.floor("min").isoformat()
+        if self.last_tick_key == minute_key:
+            return {"status": "DUPLICATE_MINUTE_SKIPPED", "minute": minute_key}
+
+        self.last_tick_key = minute_key
+        self.run_status = "RUNNING"
+        self.cycle_count += 1
+        _log("minute_tick_started", minute=minute_key, cycle=self.cycle_count,
+             interval_seconds=self.interval_seconds)
+        try:
+            summary = self._cycle()
+            self.last_cycle_summary = summary
+            result: dict[str, Any] = {
+                "status": "PASS" if not summary.get("errors") else "PARTIAL",
+                "minute": minute_key,
+                "cycle": self.cycle_count,
+                "summary": summary,
+            }
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.last_cycle_summary = {"status": "ERROR", "error": error}
+            result = {"status": "ERROR", "minute": minute_key, "error": error}
+            _log("minute_tick_failed", minute=minute_key, error=error)
+
+        if self.cycle_count % self.flush_every == 0 or result["status"] == "ERROR":
+            flush = self._flush(final=False)
+            result["flush"] = flush
+            if flush.get("status") != "OK":
+                result["status"] = "PERSISTENCE_ERROR"
+        result["worker_status"] = self.run_status
+        return result
+
     def _status_payload(self, status: str) -> dict:
         now = pd.Timestamp.now(tz=IST)
         return {
@@ -551,11 +633,13 @@ class AutonomousIntradayWorker:
         try:
             from persistent_store import GoogleDriveStore
             store = GoogleDriveStore()
-            now = pd.Timestamp.now(tz=IST)
-            daily_dir = now.strftime("%Y/%m/%d")
             for symbol, (frame, source, local_path) in list(self.session_frames.items()):
                 if frame is None or frame.empty or not local_path.exists():
                     continue
+                relative_parts = local_path.relative_to(self.root).parts
+                if len(relative_parts) < 4:
+                    raise RuntimeError(f"Unexpected worker bar path: {local_path}")
+                daily_dir = "/".join(relative_parts[:3])
                 safe_symbol = "".join(
                     char if char.isalnum() or char in {"_", "-", "^"} else "_"
                     for char in str(symbol).upper()
@@ -582,15 +666,19 @@ class AutonomousIntradayWorker:
         try:
             from persistent_store import GoogleDriveStore
             store = GoogleDriveStore()
-            now = pd.Timestamp.now(tz=IST)
-            daily_dir = now.strftime("%Y/%m/%d")
             if self.daily_ledger is not None and self.daily_ledger.exists():
+                ledger_parts = self.daily_ledger.relative_to(self.root).parts
+                if len(ledger_parts) < 4:
+                    raise RuntimeError(f"Unexpected worker ledger path: {self.daily_ledger}")
+                ledger_day = "/".join(ledger_parts[:3])
                 store.upload_or_update(
                     self.daily_ledger,
-                    f"production_data/intraday_predictions/{daily_dir}/predictions_{self.segment}.jsonl",
+                    f"production_data/intraday_predictions/{ledger_day}/predictions_{self.segment}.jsonl",
                     mime_type="application/x-ndjson",
                 )
                 result["ledger_synced"] = True
+            else:
+                ledger_day = pd.Timestamp.now(tz=IST).strftime("%Y/%m/%d")
 
             local_status = self.root / "worker_status_latest.json"
             local_status.parent.mkdir(parents=True, exist_ok=True)
@@ -600,7 +688,7 @@ class AutonomousIntradayWorker:
             )
             store.upload_or_update(
                 local_status,
-                f"production_data/intraday_predictions/{daily_dir}/worker_status_{self.segment}.json",
+                f"production_data/intraday_predictions/{ledger_day}/worker_status_{self.segment}.json",
                 mime_type="application/json",
             )
             store.upload_or_update(
