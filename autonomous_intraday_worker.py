@@ -107,6 +107,10 @@ def normalize_bars(frame: pd.DataFrame | None) -> pd.DataFrame:
         if key in aliases:
             rename[col] = aliases[key]
     x = x.rename(columns=rename)
+    # Yahoo can return duplicate OHLC field labels after its MultiIndex columns
+    # are flattened (for example, multiple ticker levels). Keep the first field
+    # deterministically so pd.to_numeric never receives a 2-D DataFrame.
+    x = x.loc[:, ~x.columns.duplicated(keep="first")]
 
     if "_time" in x.columns:
         raw_ts = pd.to_datetime(x.pop("_time"), errors="coerce")
@@ -207,6 +211,28 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
     }
 
 
+def _fetch_yfinance_1m(ticker: str) -> pd.DataFrame:
+    """Fetch Yahoo's latest one-minute bars without the shared dashboard adapter.
+
+    The dashboard adapter can legitimately return an empty frame for symbols
+    whose other providers fail. For this worker, make one explicit Yahoo
+    attempt and normalize the raw yfinance shape at this boundary.
+    """
+    import yfinance as yf
+
+    raw = yf.download(
+        str(ticker).strip(),
+        period="1d",
+        interval="1m",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        timeout=10,
+        group_by="column",
+    )
+    return normalize_bars(raw)
+
+
 def _fetch_stock_bars(symbol: str) -> tuple[pd.DataFrame, str, dict]:
     root = symbol.replace(".NS", "").replace(".BO", "").upper()
     errors = []
@@ -245,7 +271,20 @@ def _fetch_stock_bars(symbol: str) -> tuple[pd.DataFrame, str, dict]:
     except Exception as exc:
         errors.append(f"HISTORICAL_ADAPTER:{type(exc).__name__}:{exc}")
 
-    raise RuntimeError("All stock-data sources failed: " + " | ".join(errors[-5:]))
+    # Direct Yahoo fallback is separate from get_historical so a blocked NSE
+    # chart or empty historical adapter does not prevent the final provider try.
+    try:
+        frame = _fetch_yfinance_1m(f"{root}.NS")
+        if not frame.empty:
+            return frame, "YFINANCE_DIRECT", {
+                "attempts": ["indstocks", "nse_chart", "get_historical", "yfinance_download"],
+                "prior_errors": errors,
+            }
+        errors.append("yfinance returned no rows")
+    except Exception as exc:
+        errors.append(f"YFINANCE_DIRECT:{type(exc).__name__}:{exc}")
+
+    raise RuntimeError("All stock-data sources failed: " + " | ".join(errors[-6:]))
 
 
 def _fetch_market_bars(benchmark: str) -> tuple[pd.DataFrame, str]:
@@ -267,8 +306,11 @@ def _fetch_market_bars(benchmark: str) -> tuple[pd.DataFrame, str]:
         raw = yf.download(
             benchmark, period="1d", interval="1m",
             auto_adjust=False, progress=False, threads=False, timeout=10,
+            group_by="column",
         )
-        frame = normalize_bars(_normalize_historical_frame(raw))
+        # Normalize raw provider columns directly; the generic dashboard
+        # adapter is unnecessary here and can fail on duplicate flattened fields.
+        frame = normalize_bars(raw)
         if not frame.empty:
             return frame, "YFINANCE_DIRECT"
         errors.append("yfinance returned no rows")
