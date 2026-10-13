@@ -67,7 +67,7 @@ from historical_replay import (
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
 from prediction_history_ui import render_delivery_forecast, render_prediction_history
-from daily_ohlc_forecast import forecast_next_sessions
+from daily_ohlc_forecast import forecast_next_sessions, guard_daily_forecast_for_display
 from nse_data_layer import (
     fetch_equity_history as nse_fetch_equity_history,
     fetch_intraday_1m_current as nse_fetch_intraday_1m_current,
@@ -1217,14 +1217,22 @@ if interface_mode == "Live Test":
         forecast_status = str(ohlc_forecast.get("status", "UNKNOWN")).upper()
         as_of = ohlc_forecast.get("as_of_date")
         expected_reference = latest_completed_nse_session(now_ist.to_pydatetime())
-        if forecast_status == "PASS" and expected_reference is not None:
-            if str(as_of) != str(expected_reference):
-                st.warning(
-                    f"Daily history is stale: last close {as_of or 'missing'}, "
-                    f"latest completed NSE session expected {expected_reference}. "
-                    "The seven-session OHLC projections are withheld until history refreshes."
-                )
-                forecast_status = "STALE_HISTORY"
+        candidate_target_dates = (
+            _next_nse_session_dates(as_of, len(ohlc_forecast.get("forecasts", []) or []) or 7)
+            if as_of else []
+        )
+        ohlc_forecast = guard_daily_forecast_for_display(
+            ohlc_forecast,
+            expected_latest_session=expected_reference,
+            now_ist=now_ist,
+            target_sessions=candidate_target_dates,
+        )
+        forecast_status = str(ohlc_forecast.get("status", "UNKNOWN")).upper()
+        as_of = ohlc_forecast.get("as_of_date")
+        session_dates = [
+            pd.Timestamp(value).date()
+            for value in (ohlc_forecast.get("target_sessions", []) or [])
+        ]
 
         direction_signal = str(
             delivery.get("prior_close_forecast_signal")
@@ -1242,7 +1250,7 @@ if interface_mode == "Live Test":
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Beta V2 direction", direction_signal)
-        m2.metric("Probability up", f"{float(p_up):.1%}" if pd.notna(p_up) else "—")
+        m2.metric("P(outperform median)", f"{float(p_up):.1%}" if pd.notna(p_up) else "—")
         m3.metric("Active-model coverage", f"{float(active_coverage):.1%}" if pd.notna(active_coverage) else "—")
         m4.metric(
             "Beta V2 next close",
@@ -1253,13 +1261,17 @@ if interface_mode == "Live Test":
             f"reference session: {delivery.get('date') or '—'} · "
             f"return-head status: {delivery_return_status}"
         )
+        st.caption(
+            "Beta V2's probability is for outperforming the cross-sectional median next-session return, "
+            "not simply for the stock's absolute price to rise. Numerical closing-price prediction uses a separate return head."
+        )
         if delivery.get("signal_reason") or delivery.get("reason"):
             st.caption(str(delivery.get("signal_reason") or delivery.get("reason")))
 
-        if forecast_status != "PASS":
+        if forecast_status != "CALCULATED":
             st.error(
-                "Seven-session OHLC forecast is unavailable. "
-                + str(ohlc_forecast.get("reason") or f"Forecast status: {forecast_status}")
+                "Seven-session OHLC forecast is withheld or unavailable. "
+                + str(ohlc_forecast.get("reason") or f"Calculation/data status: {forecast_status}")
             )
         else:
             validation = ohlc_forecast.get("validation", []) or []
@@ -1267,22 +1279,33 @@ if interface_mode == "Live Test":
                 ohlc_forecast.get("overall_mean_mae_skill_vs_median"),
                 errors="coerce",
             )
-            v1, v2, v3 = st.columns(3)
+            validation_status = str(ohlc_forecast.get("validation_status") or "NOT_EVALUATED")
+            trade_eligibility = str(ohlc_forecast.get("trade_eligibility") or "NOT_ELIGIBLE")
+            v1, v2, v3, v4 = st.columns(4)
             v1.metric("History through", str(as_of or "—"))
             v2.metric("Chronological holdout", f"{ohlc_forecast.get('validation_start', '—')} → {ohlc_forecast.get('validation_end', '—')}")
             v3.metric("Mean MAE skill vs baseline", f"{float(overall_skill):+.1%}" if pd.notna(overall_skill) else "Unavailable")
-            if pd.isna(overall_skill) or float(overall_skill) <= 0:
+            v4.metric("Validation status", validation_status.replace("_", " "))
+            st.caption(
+                f"Calculation: {ohlc_forecast.get('calculation_status', 'UNKNOWN')} · "
+                f"Data: {ohlc_forecast.get('data_status', 'UNKNOWN')} · "
+                f"Trade eligibility: {trade_eligibility.replace('_', ' ')}"
+            )
+            if validation_status != "BASELINE_EDGE_ON_CHRONOLOGICAL_HOLDOUT" or pd.isna(overall_skill) or float(overall_skill) <= 0:
                 st.warning(
-                    "LOW VALIDATION SKILL: the OHLC path did not beat the median-return baseline overall. "
-                    "Values are shown for transparency, but they are not qualified as trading-grade forecasts."
+                    "LOW VALIDATION SKILL: the coherent OHLC forecasts did not beat the median-return baseline at every horizon. "
+                    "Values are research estimates only and are not qualified for trading."
                 )
             else:
                 st.info(
-                    "Positive average holdout skill means the model beat the median baseline on average in this historical split; "
-                    "it does not establish future profitability."
+                    "The coherent OHLC estimates beat the median-return baseline in this single chronological holdout. "
+                    "That is limited historical evidence, not proof of future profitability."
                 )
+            st.warning(
+                "Trading eligibility is blocked pending forward paper-trading validation. "
+                "A successful calculation or one positive holdout is not sufficient for real-money use."
+            )
 
-            session_dates = _next_nse_session_dates(as_of, 7)
             rows = []
             chart_rows = []
             for index, prediction in enumerate(ohlc_forecast.get("forecasts", []) or []):
@@ -1331,6 +1354,10 @@ if interface_mode == "Live Test":
         st.caption(
             "Only the selected symbol is recalculated. In-session updates target each new completed one-minute candle; "
             "stale stock or benchmark input is withheld rather than guessed."
+        )
+        st.caption(
+            "Beta V2 horizon probabilities refer to beating the cross-sectional median forward return at that horizon; "
+            "they are not the probability of an absolute price increase."
         )
         auto_refresh = st.checkbox(
             "Auto-refresh this stock every 60 seconds",
@@ -1478,7 +1505,7 @@ if interface_mode == "Live Test":
                     rows.append({
                         "Horizon": f"+{int(item.get('horizon_min', 0))} min",
                         "Signal": item.get("signal", "ABSTAIN"),
-                        "P(UP)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
+                        "P(outperform median)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
                         "Reference price": f"₹{float(ref_price):,.2f}" if pd.notna(ref_price) else "—",
                         "Predicted price": f"₹{float(price):,.2f}" if pd.notna(price) else "—",
                         "Expected move": f"₹{move:+,.2f}" if pd.notna(move) else "—",
