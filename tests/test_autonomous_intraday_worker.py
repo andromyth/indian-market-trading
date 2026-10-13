@@ -54,6 +54,32 @@ def test_normalize_and_freshness_use_current_completed_candles():
     assert completed.index.max() == pd.Timestamp("2026-10-13 10:59:00", tz=IST)
 
 
+def test_normalize_bars_handles_duplicate_yahoo_multilevel_fields():
+    columns = pd.MultiIndex.from_tuples(
+        [
+            ("Open", "HCLTECH.NS"),
+            ("High", "HCLTECH.NS"),
+            ("Low", "HCLTECH.NS"),
+            ("Close", "HCLTECH.NS"),
+            ("Volume", "HCLTECH.NS"),
+            ("Open", "duplicate-provider-column"),
+        ]
+    )
+    raw = pd.DataFrame(
+        [[100.0, 101.0, 99.0, 100.5, 1200.0, 999.0]],
+        columns=columns,
+        index=pd.DatetimeIndex(["2026-10-13 10:00:00"], tz=IST),
+    )
+
+    normalized = normalize_bars(raw)
+
+    assert not normalized.empty
+    assert normalized.iloc[0]["Open"] == 100.0
+    assert normalized.iloc[0]["High"] == 101.0
+    assert normalized.iloc[0]["Close"] == 100.5
+    assert normalized.columns.is_unique
+
+
 def test_worker_rejects_stale_candles():
     now = pd.Timestamp("2026-10-13 11:10:00", tz=IST)
     old = _bars("2026-10-13 10:00", 5)
