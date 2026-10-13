@@ -603,12 +603,52 @@ def beta_intraday_predict(
             thr = state["champion"].get("thresholds", {"abstain_all": True})
             from .sd_walkforward import to_signal
             signal = to_signal(p, thr)
+
+            reference_close = pd.to_numeric(
+                h["reference_close"].iloc[0], errors="coerce"
+            )
+            expected_return = np.nan
+            predicted_price = np.nan
+            price_forecast_status = "RETRAIN_REQUIRED"
+            price_forecast_validation = {}
+            predict_return = getattr(bundle_obj, "predict_expected_return", None)
+            if callable(predict_return):
+                try:
+                    return_prediction = predict_return(X)
+                    if return_prediction is not None and len(return_prediction):
+                        expected_return = float(return_prediction[0])
+                        if np.isfinite(expected_return) and pd.notna(reference_close) and float(reference_close) > 0:
+                            candidate_price = float(reference_close) * (1.0 + expected_return)
+                            if np.isfinite(candidate_price) and candidate_price > 0:
+                                predicted_price = candidate_price
+                                model_meta = getattr(bundle_obj, "meta", {}) or {}
+                                price_forecast_validation = (
+                                    model_meta.get("return_forecast", {}) or {}
+                                )
+                                price_forecast_status = str(
+                                    price_forecast_validation.get(
+                                        "status", "REGRESSION_HEAD_PRESENT_UNVALIDATED"
+                                    )
+                                )
+                            else:
+                                price_forecast_status = "INVALID_PRICE_FROM_RETURN_HEAD"
+                        else:
+                            price_forecast_status = "INVALID_RETURN_FORECAST"
+                except Exception as return_exc:
+                    price_forecast_status = (
+                        f"RETURN_HEAD_ERROR:{type(return_exc).__name__}"
+                    )
+
             prediction_ready_at = pd.Timestamp.now(tz="UTC")
             row_out = {
                 "symbol": root,
                 "horizon_min": horizon,
                 "decision_timestamp": str(latest_ts),
-                "reference_close": float(h["reference_close"].iloc[0]),
+                "reference_close": float(reference_close) if pd.notna(reference_close) else np.nan,
+                "expected_return": expected_return,
+                "predicted_price": predicted_price,
+                "price_forecast_status": price_forecast_status,
+                "price_forecast_validation": price_forecast_validation,
                 "probability_up": p,
                 "signal": signal,
                 "feature_coverage": coverage,
