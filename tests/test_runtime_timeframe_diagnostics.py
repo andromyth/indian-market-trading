@@ -52,3 +52,34 @@ def test_time_tolerant_fitness_rejects_missing_event_timestamps():
     assert result["eligible_for_comparison"] is False
     assert result["fitness_loss"] is None
     assert "insufficient_event_timestamp_coverage" in result["missing_components"]
+
+
+def test_runtime_diagnostics_reads_streamlit_secrets_when_env_is_unset(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("QUANT_TIMEFRAME_DIAGNOSTICS", raising=False)
+    fake_streamlit = SimpleNamespace(
+        secrets={"QUANT_TIMEFRAME_DIAGNOSTICS": "true"}
+    )
+    monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
+
+    from selfdriving.runtime_timeframe_diagnostics import runtime_diagnostics_enabled
+
+    assert runtime_diagnostics_enabled() is True
+
+
+def test_runtime_environment_setting_overrides_streamlit_secret(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules,
+        "streamlit",
+        SimpleNamespace(secrets={"QUANT_TIMEFRAME_DIAGNOSTICS": "true"}),
+    )
+    monkeypatch.setenv("QUANT_TIMEFRAME_DIAGNOSTICS", "false")
+
+    from selfdriving.runtime_timeframe_diagnostics import runtime_diagnostics_enabled
+
+    assert runtime_diagnostics_enabled() is False
