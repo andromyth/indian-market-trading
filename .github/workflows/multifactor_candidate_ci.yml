@@ -83,6 +83,7 @@ jobs:
           COLAB_SD_V2_RETRAIN.py
           COLAB_SD_INTRADAY_V2_RETRAIN.py
           COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py
+          daily_ohlc_forecast.py
           autonomous_intraday_worker.py
           autonomous_intraday_worker_service.py
 
@@ -114,6 +115,7 @@ jobs:
           tests/test_sd_v2_runtime_optional_archives.py
           tests/test_runtime_timeframe_diagnostics.py
           tests/test_return_forecast_head.py
+          tests/test_daily_ohlc_forecast.py
           tests/test_autonomous_intraday_worker.py
           tests/test_intraday_bundle_cache.py
           tests/test_nse_eod_archive_presence.py
