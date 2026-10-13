@@ -84,9 +84,23 @@ def _worker_loop() -> None:
                 with STATE_LOCK:
                     STATE["last_tick_at_utc"] = datetime.now(timezone.utc).isoformat()
                     STATE["last_tick_result"] = _clean_json(result)
-                    STATE["last_error"] = None if result.get("status") not in {
-                        "ERROR", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"
-                    } else str(result.get("error") or result.get("reason") or result.get("status"))
+                    result_status = str(result.get("status", "")).upper()
+                    if result_status in {
+                        "ERROR", "PARTIAL", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"
+                    }:
+                        STATE["last_error"] = str(
+                            result.get("error") or result.get("reason") or result_status
+                        )
+                    elif (
+                        (result.get("flush") or {}).get("status") == "OK"
+                        or (
+                            result_status == "MARKET_CLOSED"
+                            and result.get("run_status") in {"STOPPED", "IDLE", "STARTING"}
+                        )
+                    ):
+                        # Only a confirmed successful persistence flush clears a
+                        # previous persistence alert; non-flush ticks don't hide it.
+                        STATE["last_error"] = None
                 _log("cloud_run_tick_result", **result)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
