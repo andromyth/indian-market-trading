@@ -29,6 +29,7 @@ from selfdriving.sd_walkforward import (
     FoldSpec,
     ModelConfig,
     fit_bundle,
+    fit_return_regressor,
     evaluate,
     paired_logloss_gain,
     run_walkforward,
@@ -302,6 +303,7 @@ def train_horizon(frame: pd.DataFrame, horizon: int, registry_root: Path) -> dic
     ))
 
     bundle = None
+    return_head_result = {"status": "NOT_UPDATED"}
     if decision["promote"]:
         bundle = fit_bundle(
             h.dropna(subset=["y_up_excess"]),
@@ -310,11 +312,61 @@ def train_horizon(frame: pd.DataFrame, horizon: int, registry_root: Path) -> dic
             cfg,
         )
         entry = reg.register(f"beta_v2_intraday_h{horizon}", bundle, metrics, decision, thresholds)
+        return_head_result = (
+            (getattr(bundle, "meta", {}) or {}).get("return_forecast", {})
+            or {"status": "UNAVAILABLE"}
+        )
     else:
         entry = None
+        # Adding a return head does not alter the existing classifier, blend,
+        # calibration or thresholds. If the incumbent predates price forecasts,
+        # retrofit only that continuous-return head using the same horizon data.
+        # This lets a rejected directional challenger leave the live classifier
+        # untouched while the UI gains an explicitly qualified price estimate.
+        if champ is not None and getattr(champ, "return_model", None) is None:
+            try:
+                return_model, return_head_result = fit_return_regressor(
+                    h, features, "fwd_ret", date_col="date"
+                )
+                if return_model is not None:
+                    champ.return_model = return_model
+                    if not isinstance(getattr(champ, "meta", None), dict):
+                        champ.meta = {}
+                    champ.meta["return_forecast"] = return_head_result
+                    champ.meta["return_head_retrofit_only"] = True
+                    old_champion = reg.state.get("champion") or {}
+                    old_thresholds = old_champion.get("thresholds") or thresholds
+                    old_metrics = old_champion.get("metrics") or {}
+                    retrofit_decision = {
+                        "promote": True,
+                        "type": "RETURN_HEAD_ONLY",
+                        "reasons": [
+                            "Only continuous-return head added; existing classifier, "
+                            "feature contract, calibration and thresholds are unchanged."
+                        ],
+                    }
+                    entry = reg.register(
+                        f"beta_v2_intraday_h{horizon}_return_head",
+                        champ,
+                        old_metrics,
+                        retrofit_decision,
+                        old_thresholds,
+                    )
+                else:
+                    return_head_result = {
+                        **return_head_result,
+                        "registry_updated": False,
+                    }
+            except Exception as exc:
+                return_head_result = {
+                    "status": "ERROR",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "registry_updated": False,
+                }
 
     return {
         "status": "PROMOTED" if decision["promote"] else "REJECTED",
+        "return_head": return_head_result,
         "horizon_min": horizon,
         "rows": int(len(h)),
         "dates": int(h["date"].nunique()),
