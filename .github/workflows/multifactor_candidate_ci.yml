@@ -73,6 +73,8 @@ jobs:
           selfdriving/sd_intraday_v2.py
           selfdriving/sd_v2_runtime.py
           selfdriving/runtime_timeframe_diagnostics.py
+          selfdriving/sd_walkforward.py
+          selfdriving/sd_cycle.py
           selfdriving/sd_cycle.py
           selfdriving/sd_registry.py
           selfdriving/sd_github_job_v2.py
