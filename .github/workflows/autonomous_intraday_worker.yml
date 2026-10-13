@@ -1,0 +1,65 @@
+name: Autonomous intraday worker smoke test
+
+# The live unattended service runs on Cloud Run. GitHub Actions is intentionally
+# manual-only here so a long-running job cannot consume private-repository minutes.
+on:
+  workflow_dispatch:
+    inputs:
+      max_stocks:
+        description: "Maximum dynamic watchlist symbols for the one-cycle test"
+        type: choice
+        required: true
+        default: "1"
+        options:
+          - "1"
+          - "3"
+          - "5"
+
+permissions:
+  contents: read
+
+jobs:
+  worker-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      INDSTOCKS_CLIENT_ID: ${{ secrets.INDSTOCKS_CLIENT_ID }}
+      INDSTOCKS_MPIN: ${{ secrets.INDSTOCKS_MPIN }}
+      INDSTOCKS_TOTP_SECRET: ${{ secrets.INDSTOCKS_TOTP_SECRET }}
+      INDSTOCKS_ACCESS_TOKEN: ${{ secrets.INDSTOCKS_ACCESS_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify durable Drive persistence
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status(require_write=True)
+          print({
+              key: status.get(key)
+              for key in ("configured", "reachable", "write_ready", "auth_method", "write_auth_method", "reason")
+          })
+          if (
+              not status.get("configured")
+              or status.get("reachable") is False
+              or status.get("write_ready") is False
+          ):
+              raise SystemExit("Drive read/write preflight failed.")
+          PY
+      - name: Run one cycle during the NSE session
+        run: |
+          python -u autonomous_intraday_worker.py \
+            --segment once \
+            --max-cycles 1 \
+            --max-stocks "${{ inputs.max_stocks || '1' }}"

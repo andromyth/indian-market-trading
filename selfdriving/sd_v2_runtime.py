@@ -35,6 +35,53 @@ CACHE = (
 )
 REMOTE_ROOT = "selfdriving/beta_version2"
 
+# The unattended service evaluates several symbols every minute. Re-downloading
+# the same six Drive registries/bundles for every symbol wastes the latency
+# budget. Revalidate model artifacts on a short TTL so updated return heads
+# arrive automatically without forcing a service restart.
+_INTRADAY_BUNDLE_CACHE: dict[int, tuple[float, dict[str, Any], Any]] = {}
+
+
+def _load_intraday_champion(horizon: int) -> tuple[dict[str, Any], Any, float, bool]:
+    ttl_seconds = max(
+        0.0,
+        float(os.getenv("BETA_V2_MODEL_CACHE_TTL_SECONDS", "180")),
+    )
+    now_mono = _perf_time.monotonic()
+    cached = _INTRADAY_BUNDLE_CACHE.get(int(horizon))
+    if cached is not None and now_mono - cached[0] < ttl_seconds:
+        return cached[1], cached[2], 0.0, True
+
+    started = _perf_time.perf_counter()
+    registry_root = CACHE / "intraday" / "models" / f"h{int(horizon)}"
+    _ensure(
+        f"{REMOTE_ROOT}/intraday/models/h{int(horizon)}/registry.json",
+        registry_root / "registry.json",
+    )
+    state = json.loads(
+        (registry_root / "registry.json").read_text(encoding="utf-8")
+    )
+    champion = state.get("champion")
+    bundle_obj = None
+    if champion:
+        bundle_name = str(champion.get("file") or "").strip()
+        if not bundle_name:
+            raise RuntimeError(
+                f"Intraday h{horizon} registry champion is missing its bundle filename"
+            )
+        _ensure(
+            f"{REMOTE_ROOT}/intraday/models/h{int(horizon)}/{bundle_name}",
+            registry_root / bundle_name,
+        )
+        bundle_obj = joblib.load(registry_root / bundle_name)
+
+    _INTRADAY_BUNDLE_CACHE[int(horizon)] = (
+        _perf_time.monotonic(),
+        state,
+        bundle_obj,
+    )
+    return state, bundle_obj, _perf_time.perf_counter() - started, False
+
 
 def _drive():
     from persistent_store import GoogleDriveStore
@@ -445,8 +492,13 @@ def beta_intraday_predict(
     symbol: str,
     price_df: pd.DataFrame,
     market_df: pd.DataFrame | None = None,
+    *,
+    decision_interval_minutes: int = 1,
 ) -> list[dict[str, Any]]:
-    """Run trained intraday horizons and optionally log actual runtime cadence/latency."""
+    """Run trained intraday horizons on fresh bars, defaulting to 1-minute inference anchors.
+
+    Historical training remains 5-minute anchored unless explicitly changed.
+    """
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
     diagnostics = runtime_diagnostics_enabled()
     call_started_perf = _perf_time.perf_counter()
@@ -468,6 +520,7 @@ def beta_intraday_predict(
         market_df,
         (5, 10, 15, 20, 25, 30),
         include_future=False,
+        decision_interval_minutes=decision_interval_minutes,
     )
     feature_build_seconds = _perf_time.perf_counter() - feature_build_started
     if diagnostics:
@@ -482,7 +535,7 @@ def beta_intraday_predict(
             input_market_rows=int(len(market_df)) if market_df is not None else 0,
             derived_rows=int(len(latest_rows)),
             feature_construction_seconds=round(feature_build_seconds, 6),
-            decision_schedule_minutes=5,
+            decision_schedule_minutes=decision_interval_minutes,
         )
     if not latest_rows:
         if diagnostics:
@@ -522,37 +575,28 @@ def beta_intraday_predict(
                 if input_to_decision_gap_minutes is not None else None
             ),
             prediction_horizons_minutes=[5, 10, 15, 20, 25, 30],
-            decision_schedule_minutes=5,
-            note="Feature rows use minute bars but model decisions are selected on a five-minute schedule.",
+            decision_schedule_minutes=decision_interval_minutes,
+            note="Inference selects fresh minute-aligned decisions; training rows retain their default five-minute anchor cadence.",
         )
 
     for horizon in (5, 10, 15, 20, 25, 30):
         h = frame[frame["horizon_min"].eq(horizon)].copy()
         horizon_started_perf = _perf_time.perf_counter()
-        artifact_load_started = _perf_time.perf_counter()
-        registry_root = CACHE / "intraday" / "models" / f"h{horizon}"
+        model_cache_hit = False
         try:
-            _ensure(
-                f"{REMOTE_ROOT}/intraday/models/h{horizon}/registry.json",
-                registry_root / "registry.json",
+            state, bundle_obj, artifact_load_seconds, model_cache_hit = (
+                _load_intraday_champion(horizon)
             )
-            state = json.loads((registry_root / "registry.json").read_text(encoding="utf-8"))
             champion = state.get("champion")
-            if not champion:
+            if not champion or bundle_obj is None:
                 rows.append({
                     "symbol": root,
                     "horizon_min": horizon,
+                    "decision_timestamp": str(latest_ts),
                     "signal": "ABSTAIN",
                     "reason": "NO_CHAMPION",
                 })
                 continue
-            bundle = str(champion["file"])
-            _ensure(
-                f"{REMOTE_ROOT}/intraday/models/h{horizon}/{bundle}",
-                registry_root / bundle,
-            )
-            bundle_obj = joblib.load(registry_root / bundle)
-            artifact_load_seconds = _perf_time.perf_counter() - artifact_load_started
             matrix_started_perf = _perf_time.perf_counter()
             X = h[features].apply(pd.to_numeric, errors="coerce")
             float32_max = float(__import__("numpy").finfo(__import__("numpy").float32).max)
@@ -678,6 +722,7 @@ def beta_intraday_predict(
                     ),
                     "feature_construction_seconds": round(feature_build_seconds, 6),
                     "model_artifact_load_seconds": round(artifact_load_seconds, 6),
+                    "model_artifact_cache_hit": bool(model_cache_hit),
                     "feature_matrix_preparation_seconds": round(feature_matrix_seconds, 6),
                     "model_prediction_seconds": round(model_prediction_seconds, 6),
                     "horizon_total_seconds": round(_perf_time.perf_counter() - horizon_started_perf, 6),
