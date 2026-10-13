@@ -84,6 +84,7 @@ jobs:
           COLAB_SD_INTRADAY_V2_RETRAIN.py
           COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py
           autonomous_intraday_worker.py
+          autonomous_intraday_worker_service.py
 
       - name: Run multi-factor tests
         run: >
