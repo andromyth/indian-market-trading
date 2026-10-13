@@ -73,6 +73,8 @@ jobs:
           selfdriving/sd_intraday_v2.py
           selfdriving/sd_v2_runtime.py
           selfdriving/runtime_timeframe_diagnostics.py
+          selfdriving/sd_walkforward.py
+          selfdriving/sd_cycle.py
           selfdriving/sd_cycle.py
           selfdriving/sd_registry.py
           selfdriving/sd_github_job_v2.py
@@ -80,6 +82,7 @@ jobs:
           live_signal_guards.py
           COLAB_SD_V2_RETRAIN.py
           COLAB_SD_INTRADAY_V2_RETRAIN.py
+          COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py
 
       - name: Run multi-factor tests
         run: >
@@ -102,6 +105,7 @@ jobs:
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
           tests/test_runtime_timeframe_diagnostics.py
+          tests/test_return_forecast_head.py
           tests/test_nse_eod_archive_presence.py
           tests/test_nse_index_daily_snapshot_fallback.py
           tests/test_market_session_guard.py

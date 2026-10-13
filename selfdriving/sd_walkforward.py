@@ -19,7 +19,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from scipy.stats import binomtest, spearmanr
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -105,6 +105,7 @@ class Bundle:
     w_hgb: float
     iso: Optional[IsotonicRegression]
     meta: Dict
+    return_model: Optional[HistGradientBoostingRegressor] = None
 
     def raw(self, X: pd.DataFrame) -> np.ndarray:
         X = X[self.features].apply(pd.to_numeric, errors="coerce")
@@ -113,6 +114,20 @@ class Bundle:
     def predict_proba_up(self, X: pd.DataFrame) -> np.ndarray:
         p = self.raw(X)
         return np.clip(self.iso.predict(p), 0.001, 0.999) if self.iso is not None else p
+
+    def predict_expected_return(self, X: pd.DataFrame) -> Optional[np.ndarray]:
+        """Predict continuous raw forward return when this bundle has a return head.
+
+        Old joblib bundles lack this head; returning None lets the UI explicitly
+        report that a price forecast requires a retrained/retrofitted bundle.
+        """
+        model = getattr(self, "return_model", None)
+        if model is None:
+            return None
+        matrix = _clean_model_matrix(X, self.features)
+        values = np.asarray(model.predict(matrix), dtype=float)
+        values[~np.isfinite(values)] = np.nan
+        return values
 
 
 def _clean_model_matrix(df: pd.DataFrame, features: Sequence[str]) -> pd.DataFrame:
@@ -123,6 +138,126 @@ def _clean_model_matrix(df: pd.DataFrame, features: Sequence[str]) -> pd.DataFra
         v = x[c]
         x[c] = v.mask(~np.isfinite(v) | (v.abs() > float32_max), np.nan)
     return x.astype("float32")
+
+
+def fit_return_regressor(
+    df: pd.DataFrame,
+    features: Sequence[str],
+    target_col: str,
+    date_col: str = "date",
+    X: Optional[pd.DataFrame] = None,
+) -> Tuple[Optional[HistGradientBoostingRegressor], Dict]:
+    """Fit a continuous forward-return head and report chronological-tail diagnostics.
+
+    The classifier/action thresholds are not involved in this head. Validation
+    compares model MAE against a training-period median-return baseline on later
+    dates. This is a diagnostic, not a substitute for purged walk-forward tests.
+    """
+    empty_meta = {
+        "target": target_col,
+        "status": "UNAVAILABLE",
+        "validation_method": "chronological_tail_vs_training_median_baseline",
+        "validation_rows": 0,
+        "validation_mae": None,
+        "baseline_mae": None,
+        "mae_skill_vs_baseline": None,
+        "validation_directional_accuracy": None,
+    }
+    if target_col not in df.columns or date_col not in df.columns or df.empty:
+        return None, {**empty_meta, "reason": "missing target/date or empty training frame"}
+
+    y_series = pd.to_numeric(df[target_col], errors="coerce")
+    y = y_series.to_numpy(dtype=float, na_value=np.nan)
+    dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    date_values = dates.to_numpy()
+    valid = np.isfinite(y) & dates.notna().to_numpy()
+    valid_positions = np.flatnonzero(valid)
+    if len(valid_positions) < 50:
+        return None, {**empty_meta, "reason": f"only {len(valid_positions)} valid return labels"}
+    if X is None:
+        X = _clean_model_matrix(df, features)
+    elif list(X.columns) != list(features):
+        X = _clean_model_matrix(X, features)
+
+    unique_dates = np.array(sorted(pd.Series(dates[valid]).dropna().unique()))
+    if len(unique_dates) >= 2:
+        split_pos = max(1, min(len(unique_dates) - 1, int(len(unique_dates) * 0.85)))
+        cutoff = unique_dates[split_pos]
+        train_mask = valid & (date_values < cutoff)
+        valid_mask = valid & (date_values >= cutoff)
+    else:
+        # Same-day-only data is not enough for a credible chronological check.
+        return None, {
+            **empty_meta,
+            "reason": "at least two distinct sessions required for chronological validation",
+        }
+
+    train_positions = np.flatnonzero(train_mask)
+    validation_positions = np.flatnonzero(valid_mask)
+    if len(train_positions) < 30 or len(validation_positions) < 30:
+        return None, {
+            **empty_meta,
+            "reason": (
+                f"insufficient chronological split: train={len(train_positions)}, "
+                f"validation={len(validation_positions)}"
+            ),
+        }
+
+    def _params(n_rows: int) -> Dict:
+        return {
+            "max_depth": 3,
+            "learning_rate": 0.04,
+            "max_iter": 180,
+            "min_samples_leaf": max(5, min(120, n_rows // 30)),
+            "l2_regularization": 8.0,
+            "max_bins": 63,
+            "early_stopping": False,
+            "random_state": 37,
+        }
+
+    validation_model = HistGradientBoostingRegressor(**_params(len(train_positions)))
+    validation_model.fit(X.iloc[train_positions], y[train_positions])
+    validation_prediction = np.asarray(
+        validation_model.predict(X.iloc[validation_positions]), dtype=float
+    )
+    actual = y[validation_positions]
+    baseline = float(np.median(y[train_positions]))
+    model_mae = float(np.mean(np.abs(actual - validation_prediction)))
+    baseline_mae = float(np.mean(np.abs(actual - baseline)))
+    skill = (
+        float(1.0 - model_mae / baseline_mae)
+        if np.isfinite(baseline_mae) and baseline_mae > 0 else None
+    )
+    direction_acc = float(
+        np.mean(np.sign(validation_prediction) == np.sign(actual))
+    )
+    status = (
+        "MAE_BEATS_MEDIAN_BASELINE"
+        if skill is not None and skill > 0
+        else "MAE_NOT_BETTER_THAN_MEDIAN_BASELINE"
+    )
+
+    final_model = HistGradientBoostingRegressor(**_params(len(valid_positions)))
+    final_model.fit(X.iloc[valid_positions], y[valid_positions])
+    diagnostics = {
+        "target": target_col,
+        "status": status,
+        "validation_method": "chronological_tail_vs_training_median_baseline",
+        "train_rows": int(len(train_positions)),
+        "validation_rows": int(len(validation_positions)),
+        "validation_sessions": int(pd.Series(dates.iloc[validation_positions]).nunique()),
+        "validation_mae": model_mae,
+        "baseline_mae": baseline_mae,
+        "mae_skill_vs_baseline": skill,
+        "validation_directional_accuracy": direction_acc,
+        "validation_start": pd.Timestamp(unique_dates[split_pos]).date().isoformat(),
+        "validation_end": pd.Timestamp(unique_dates[-1]).date().isoformat(),
+        "note": (
+            "Chronological-tail diagnostic. It is not an untouched holdout or "
+            "a guarantee of live forecast accuracy."
+        ),
+    }
+    return final_model, diagnostics
 
 
 def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: ModelConfig,
@@ -151,10 +286,27 @@ def fit_bundle(df: pd.DataFrame, features: Sequence[str], target: str, cfg: Mode
     yall = df[target].astype(int)
     hgb = HistGradientBoostingClassifier(**cfg.hgb_params).fit(Xall, yall)
     lg = _logit_pipe(cfg.logit_C).fit(Xall, yall)
+    # Attach an independent continuous-return head only when a raw forward-return
+    # target is part of the training frame. Intraday uses fwd_ret; Delivery uses y_return.
+    return_target = next(
+        (name for name in ("fwd_ret", "y_return") if name in df.columns),
+        None,
+    )
+    return_model = None
+    return_metrics = {
+        "status": "UNAVAILABLE",
+        "reason": "training frame contains neither fwd_ret nor y_return",
+    }
+    if return_target is not None:
+        return_model, return_metrics = fit_return_regressor(
+            df, features, return_target, date_col=date_col, X=Xall
+        )
+
     meta = {"config": cfg.name, "target": target, "n_rows": int(len(df)), "val_logloss": float(best_ll),
             "w_hgb": float(best_w), "cfg": {"hgb_params": cfg.hgb_params, "logit_C": cfg.logit_C, "name": cfg.name, "val_frac": cfg.val_frac}, "train_start": pd.Timestamp(d[0]).date().isoformat(),
-            "train_end": pd.Timestamp(d[-1]).date().isoformat()}
-    return Bundle(features, hgb, lg, float(best_w), iso, meta)
+            "train_end": pd.Timestamp(d[-1]).date().isoformat(),
+            "return_forecast": return_metrics}
+    return Bundle(features, hgb, lg, float(best_w), iso, meta, return_model)
 
 
 # ----------------------------------------------------------------------------- run
