@@ -82,6 +82,7 @@ jobs:
           live_signal_guards.py
           COLAB_SD_V2_RETRAIN.py
           COLAB_SD_INTRADAY_V2_RETRAIN.py
+          COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py
 
       - name: Run multi-factor tests
         run: >
