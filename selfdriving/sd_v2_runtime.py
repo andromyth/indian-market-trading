@@ -445,8 +445,13 @@ def beta_intraday_predict(
     symbol: str,
     price_df: pd.DataFrame,
     market_df: pd.DataFrame | None = None,
+    *,
+    decision_interval_minutes: int = 1,
 ) -> list[dict[str, Any]]:
-    """Run trained intraday horizons and optionally log actual runtime cadence/latency."""
+    """Run trained intraday horizons on fresh bars, defaulting to 1-minute inference anchors.
+
+    Historical training remains 5-minute anchored unless explicitly changed.
+    """
     root = str(symbol).upper().replace(".NS", "").replace(".BO", "")
     diagnostics = runtime_diagnostics_enabled()
     call_started_perf = _perf_time.perf_counter()
@@ -468,6 +473,7 @@ def beta_intraday_predict(
         market_df,
         (5, 10, 15, 20, 25, 30),
         include_future=False,
+        decision_interval_minutes=decision_interval_minutes,
     )
     feature_build_seconds = _perf_time.perf_counter() - feature_build_started
     if diagnostics:
@@ -482,7 +488,7 @@ def beta_intraday_predict(
             input_market_rows=int(len(market_df)) if market_df is not None else 0,
             derived_rows=int(len(latest_rows)),
             feature_construction_seconds=round(feature_build_seconds, 6),
-            decision_schedule_minutes=5,
+            decision_schedule_minutes=decision_interval_minutes,
         )
     if not latest_rows:
         if diagnostics:
@@ -522,8 +528,8 @@ def beta_intraday_predict(
                 if input_to_decision_gap_minutes is not None else None
             ),
             prediction_horizons_minutes=[5, 10, 15, 20, 25, 30],
-            decision_schedule_minutes=5,
-            note="Feature rows use minute bars but model decisions are selected on a five-minute schedule.",
+            decision_schedule_minutes=decision_interval_minutes,
+            note="Inference selects fresh minute-aligned decisions; training rows retain their default five-minute anchor cadence.",
         )
 
     for horizon in (5, 10, 15, 20, 25, 30):
