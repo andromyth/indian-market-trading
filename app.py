@@ -509,11 +509,122 @@ def _cached_live_benchmark_summary(benchmark_symbol: str) -> dict:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
+    """Fetch fresh intraday benchmark candles, with explicit source diagnostics.
+
+    The old implementation swallowed every exception and returned an empty
+    frame. For index tickers such as ^NSEI, the generic historical adapter may
+    have no local archive and its first Yahoo chart path can return no candles.
+    Try the primary path first, then yfinance directly; keep the freshness guard
+    fail-closed if neither source yields completed current-session candles.
+    """
+    import json
+    import time
+
+    started = time.perf_counter()
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    attempts: list[dict[str, object]] = []
+    primary_frame = pd.DataFrame()
+
+    def _freshness(frame: pd.DataFrame) -> dict:
+        return latest_completed_bar_status(
+            frame,
+            now,
+            max_age_seconds=5 * 60,
+            require_current_session=True,
+        )
+
     try:
-        frame = get_historical(benchmark_symbol, period="5d", interval="1m")
-        return frame if frame is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+        candidate = get_historical(
+            benchmark_symbol,
+            period="5d",
+            interval="1m",
+            force_refresh=True,
+        )
+        if candidate is not None:
+            primary_frame = candidate
+        state = _freshness(primary_frame)
+        attempts.append({
+            "source": "get_historical",
+            "rows": int(len(primary_frame)),
+            "status": state.get("status"),
+            "reason": state.get("reason"),
+            "latest_candle_ist": state.get("latest_candle_ist"),
+        })
+        if not primary_frame.empty and state.get("ok"):
+            primary_frame.attrs["market_context_source"] = "get_historical"
+            print("[MARKET_CONTEXT_FETCH] " + json.dumps({
+                "benchmark": benchmark_symbol,
+                "selected_source": "get_historical",
+                "rows": int(len(primary_frame)),
+                "freshness": state,
+                "elapsed_seconds": round(time.perf_counter() - started, 4),
+            }, default=str, sort_keys=True))
+            return primary_frame
+    except Exception as exc:
+        attempts.append({
+            "source": "get_historical",
+            "status": "EXCEPTION",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    fallback_frame = pd.DataFrame()
+    try:
+        import yfinance as yf
+        from data_fetcher import _normalize_historical_frame
+
+        raw = yf.download(
+            str(benchmark_symbol).strip(),
+            period="1d",
+            interval="1m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=10,
+        )
+        fallback_frame = _normalize_historical_frame(raw)
+        state = _freshness(fallback_frame)
+        attempts.append({
+            "source": "yfinance_direct",
+            "rows": int(len(fallback_frame)),
+            "status": state.get("status"),
+            "reason": state.get("reason"),
+            "latest_candle_ist": state.get("latest_candle_ist"),
+        })
+        if not fallback_frame.empty and state.get("ok"):
+            fallback_frame.attrs["market_context_source"] = "yfinance_direct"
+            print("[MARKET_CONTEXT_FETCH] " + json.dumps({
+                "benchmark": benchmark_symbol,
+                "selected_source": "yfinance_direct",
+                "rows": int(len(fallback_frame)),
+                "freshness": state,
+                "attempts": attempts,
+                "elapsed_seconds": round(time.perf_counter() - started, 4),
+            }, default=str, sort_keys=True))
+            return fallback_frame
+    except Exception as exc:
+        attempts.append({
+            "source": "yfinance_direct",
+            "status": "EXCEPTION",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    # Preserve a stale primary frame when available so the UI can explain that
+    # its timestamps are stale, rather than disguising it as a successful fetch.
+    selected = primary_frame if not primary_frame.empty else fallback_frame
+    selected_state = _freshness(selected)
+    print("[MARKET_CONTEXT_FETCH] " + json.dumps({
+        "benchmark": benchmark_symbol,
+        "selected_source": (
+            selected.attrs.get("market_context_source", "stale_or_unverified")
+            if not selected.empty else "none"
+        ),
+        "rows": int(len(selected)),
+        "freshness": selected_state,
+        "attempts": attempts,
+        "elapsed_seconds": round(time.perf_counter() - started, 4),
+        "action": "fail_closed_no_fresh_benchmark_context",
+    }, default=str, sort_keys=True))
+    return selected
 
 
 
