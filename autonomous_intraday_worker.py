@@ -346,11 +346,13 @@ class AutonomousIntradayWorker:
 
     def _refresh_watchlist_if_due(self, force: bool = False) -> None:
         monotonic_now = time_module.monotonic()
-        due = (
-            force
-            or not self.symbols
-            or monotonic_now - self.last_watchlist_refresh >= self.refresh_watchlist_seconds
-        )
+        elapsed = monotonic_now - self.last_watchlist_refresh
+        if self.symbols:
+            due = force or elapsed >= self.refresh_watchlist_seconds
+        else:
+            # Avoid re-querying all five news publishers every single minute
+            # while still retrying fairly quickly when no symbols have matched.
+            due = force or self.last_watchlist_refresh == 0.0 or elapsed >= 300
         if not due:
             return
         try:
@@ -361,11 +363,9 @@ class AutonomousIntradayWorker:
                 self.symbols = symbols
             _log("watchlist_refreshed", symbols=self.symbols, metadata=meta)
         except Exception as exc:
-            # Keep the last successful symbols; retry quickly if none have ever
-            # been resolved instead of silently inventing a fallback universe.
+            # Retain the latest successful watchlist and apply a backoff after errors.
+            self.last_watchlist_refresh = monotonic_now
             _log("watchlist_refresh_failed", error=f"{type(exc).__name__}: {exc}", retained_symbols=self.symbols)
-            if not self.symbols:
-                self.last_watchlist_refresh = 0.0
 
     def _append_rows(self, rows: list[dict]) -> None:
         if not rows or self.daily_ledger is None:
