@@ -14,3 +14,12 @@ data/nse_official
 .market_data
 .env
 .env.*
+credentials.json
+token.json
+google_drive_oauth_token.json
+client_secret*.json
+oauth_client_secret*.json
+*service-account*.json
+*service_account*.json
+*.pem
+*.key
