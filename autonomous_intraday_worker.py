@@ -302,7 +302,6 @@ def _fetch_market_bars(benchmark: str) -> tuple[pd.DataFrame, str]:
 
     try:
         import yfinance as yf
-        from data_fetcher import _normalize_historical_frame
         raw = yf.download(
             benchmark, period="1d", interval="1m",
             auto_adjust=False, progress=False, threads=False, timeout=10,
@@ -422,7 +421,7 @@ class AutonomousIntradayWorker:
         now = pd.Timestamp.now(tz=IST)
         self._refresh_watchlist_if_due()
         summary = {
-            "cycle": self.cycle_count + 1,
+            "cycle": self.cycle_count,
             "observed_at_utc": now.tz_convert("UTC").isoformat(),
             "observed_at_ist": now.isoformat(),
             "watchlist_symbols": list(self.symbols),
