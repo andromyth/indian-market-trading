@@ -1422,9 +1422,7 @@ if interface_mode == "Live Test":
                     str(result.get("prediction_status", "")).upper() == "PASS"
                     and observed_reference_date != expected_reference_date
                 ):
-                    # A successful inference on a stale PIT snapshot must not
-                    # appear as a current BUY/SELL recommendation. Preserve
-                    # ERROR/ABSTAIN/BLOCKED states so the guard never hides them.
+                    # Do not present a stale point-in-time forecast as current.
                     result["prediction_status"] = "STALE"
                     result["signal"] = "STALE"
                     result["signal_reason"] = (
@@ -1432,6 +1430,26 @@ if interface_mode == "Live Test":
                         f"{observed_reference_date or 'missing'}; expected "
                         f"{expected_reference_date} from the latest completed NSE session"
                     )
+                elif str(result.get("prediction_status", "")).upper() == "PASS":
+                    try:
+                        from production_data_freshness_gate import HOLIDAYS as _delivery_holidays
+                        known_delivery_holidays = set(_delivery_holidays)
+                    except Exception:
+                        known_delivery_holidays = set()
+                    if target_session_is_underway(
+                        result.get("target_session_date"),
+                        now_ist,
+                        known_delivery_holidays,
+                    ):
+                        result["prior_close_forecast_signal"] = result.get("signal")
+                        result["prior_close_probability_up"] = result.get("p")
+                        result["target_session_underway"] = True
+                        result["prediction_status"] = "IN_PROGRESS"
+                        result["signal"] = "IN_PROGRESS"
+                        result["signal_reason"] = (
+                            "TARGET_SESSION_UNDERWAY: retained the prior-close Delivery forecast "
+                            "but do not treat it as an intraday-refreshed signal."
+                        )
                 beta_delivery_results[sym] = result
             except Exception as exc:
                 beta_delivery_errors[sym] = {
@@ -1447,10 +1465,19 @@ if interface_mode == "Live Test":
             coverage = pd.to_numeric(
                 result.get("feature_coverage"), errors="coerce"
             )
+            prior_close_signal = result.get("prior_close_forecast_signal")
+            display_signal = prior_close_signal or result.get("signal", "—")
+            predicted_delivery_price = pd.to_numeric(result.get("predicted_price"), errors="coerce")
+            return_forecast_status = str(result.get("price_forecast_status") or "RETRAIN_REQUIRED")
             table_rows.append({
                 "Symbol": sym,
                 "Status": result.get("prediction_status", "ERROR"),
-                "Signal": result.get("signal", "—"),
+                "Signal / prior-close forecast": display_signal,
+                "Expected next-session close": (
+                    f"₹{float(predicted_delivery_price):,.2f}"
+                    if pd.notna(predicted_delivery_price) else "Unavailable"
+                ),
+                "Price-head status": return_forecast_status,
                 "P(UP)": f"{float(p_up):.1%}" if pd.notna(p_up) else "—",
                 "Feature coverage": (
                     f"{float(coverage):.1%}"
@@ -1663,25 +1690,32 @@ if interface_mode == "Live Test":
                         p_up = pd.to_numeric(
                             item.get("probability_up"), errors="coerce"
                         )
+                        reference_price = pd.to_numeric(item.get("reference_close"), errors="coerce")
+                        predicted_price = pd.to_numeric(item.get("predicted_price"), errors="coerce")
+                        expected_return = pd.to_numeric(item.get("expected_return"), errors="coerce")
+                        return_status = str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
+                        expected_move = (
+                            float(predicted_price) - float(reference_price)
+                            if pd.notna(predicted_price) and pd.notna(reference_price)
+                            else np.nan
+                        )
                         table_rows.append({
                             "Horizon": f"+{int(item.get('horizon_min', 0))}m",
                             "Signal": item.get("signal", "ABSTAIN"),
-                            "P(UP)": (
-                                f"{float(p_up):.1%}"
-                                if pd.notna(p_up) else "—"
-                            ),
                             "Reference price": (
-                                f"₹{float(item.get('reference_close')):,.2f}"
-                                if pd.notna(item.get("reference_close"))
-                                else "—"
+                                f"₹{float(reference_price):,.2f}"
+                                if pd.notna(reference_price) else "—"
                             ),
-                            "Decision": str(
-                                item.get("decision_timestamp") or latest_ts
+                            "Predicted price": (
+                                f"₹{float(predicted_price):,.2f}"
+                                if pd.notna(predicted_price) else "Unavailable"
                             ),
-                            "Reason": item.get(
-                                "signal_reason",
-                                item.get("reason", "—"),
+                            "Expected move": (
+                                f"₹{expected_move:+,.2f}" if pd.notna(expected_move) else "—"
                             ),
+                            "Price-model validation": return_status,
+                            "Decision": str(item.get("decision_timestamp") or latest_ts),
+                            "Reason": item.get("signal_reason", item.get("reason", "—")),
                         })
 
                     if recalculated:
@@ -1696,35 +1730,62 @@ if interface_mode == "Live Test":
                         )
 
                     h0 = predictions[0]
-                    p0 = pd.to_numeric(h0.get("probability_up"), errors="coerce")
+                    reference0 = pd.to_numeric(h0.get("reference_close"), errors="coerce")
+                    predicted0 = pd.to_numeric(h0.get("predicted_price"), errors="coerce")
+                    move0 = (
+                        float(predicted0) - float(reference0)
+                        if pd.notna(predicted0) and pd.notna(reference0) else np.nan
+                    )
                     a, b, c = st.columns(3)
                     a.metric(
                         "Reference price ₹",
-                        (
-                            f"₹{float(h0.get('reference_close')):,.2f}"
-                            if pd.notna(h0.get("reference_close"))
-                            else "—"
-                        ),
+                        f"₹{float(reference0):,.2f}" if pd.notna(reference0) else "—",
                     )
-                    b.metric(
-                        "Next +5m signal",
-                        str(h0.get("signal", "ABSTAIN")),
-                    )
+                    b.metric("Next +5m signal", str(h0.get("signal", "ABSTAIN")))
                     c.metric(
-                        "Next +5m P(UP)",
-                        f"{float(p0):.1%}" if pd.notna(p0) else "—",
+                        "Predicted +5m price ₹",
+                        f"₹{float(predicted0):,.2f}" if pd.notna(predicted0) else "Unavailable",
+                        delta=f"₹{move0:+,.2f}" if pd.notna(move0) else None,
                     )
 
-                    st.subheader("Beta V2 multi-horizon directional predictions")
-                    st.dataframe(
-                        pd.DataFrame(table_rows),
-                        width="stretch",
-                        hide_index=True,
-                    )
-                    st.caption(
-                        "These are direct Beta V2 probabilities from the volume-free price/time "
-                        "feature contract. No legacy precomputed volume features are passed."
-                    )
+                    st.subheader("Beta V2 multi-horizon price forecasts")
+                    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
+                    price_head_status = str(h0.get("price_forecast_status") or "RETRAIN_REQUIRED")
+                    if price_head_status == "RETRAIN_REQUIRED":
+                        st.warning(
+                            "The deployed horizon bundle is classifier-only and does not contain "
+                            "a continuous-return head. Run the updated intraday trainer once to add "
+                            "per-horizon price forecasts; probability is not being converted into a price."
+                        )
+                    elif price_head_status == "MAE_NOT_BETTER_THAN_MEDIAN_BASELINE":
+                        st.warning(
+                            "The price-regression head did not beat the chronological-tail median-return "
+                            "baseline. Its numerical estimates are shown for diagnosis, not as validated targets."
+                        )
+                    else:
+                        st.caption(
+                            "Predicted price = latest reference price × (1 + model-predicted forward return). "
+                            "The return head is separately fitted; the classifier probability is not used "
+                            "to manufacture a price. Tail metrics are diagnostics, not a guarantee of live accuracy."
+                        )
+
+                    with st.expander("Directional classifier diagnostics", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Horizon": f"+{int(item.get('horizon_min', 0))}m",
+                                    "P(UP)": (
+                                        f"{float(pd.to_numeric(item.get('probability_up'), errors='coerce')):.1%}"
+                                        if pd.notna(pd.to_numeric(item.get('probability_up'), errors='coerce'))
+                                        else "—"
+                                    ),
+                                    "Signal": item.get("signal", "ABSTAIN"),
+                                }
+                                for item in predictions
+                            ]),
+                            width="stretch",
+                            hide_index=True,
+                        )
                 except Exception as exc:
                     st.error(
                         f"Beta V2 Intraday forecast failed: {type(exc).__name__}: {exc}"
