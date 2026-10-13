@@ -225,6 +225,38 @@ def predict_stage(inference_rows: pd.DataFrame, registry_dir: str | Path, market
     out["model_file"] = reg.state["champion"]["file"]
     out["feature_coverage"] = x[b.features].notna().mean(axis=1).to_numpy()
     out["signal_reason"] = "VALIDATED_THRESHOLD"
+
+    # Optional continuous-return head added to newer Bundle versions. Legacy
+    # classifier-only bundles remain loadable but explicitly lack price forecasts
+    # until their return head has been trained/retrofitted.
+    predict_return = getattr(b, "predict_expected_return", None)
+    expected_return = predict_return(x) if callable(predict_return) else None
+    if expected_return is not None and "close" in x.columns:
+        expected_return = np.asarray(expected_return, dtype=float)
+        reference_close = pd.to_numeric(x["close"], errors="coerce").to_numpy(dtype=float)
+        predicted_close = reference_close * (1.0 + expected_return)
+        valid_price = (
+            np.isfinite(reference_close)
+            & (reference_close > 0)
+            & np.isfinite(expected_return)
+            & np.isfinite(predicted_close)
+            & (predicted_close > 0)
+        )
+        out["reference_close"] = reference_close
+        out["expected_return"] = expected_return
+        out["predicted_price"] = np.where(valid_price, predicted_close, np.nan)
+        forecast_meta = (getattr(b, "meta", {}) or {}).get("return_forecast", {}) or {}
+        out["price_forecast_status"] = str(
+            forecast_meta.get("status", "REGRESSION_HEAD_PRESENT_UNVALIDATED")
+        )
+    else:
+        out["reference_close"] = (
+            pd.to_numeric(x["close"], errors="coerce").to_numpy(dtype=float)
+            if "close" in x.columns else np.nan
+        )
+        out["expected_return"] = np.nan
+        out["predicted_price"] = np.nan
+        out["price_forecast_status"] = "RETRAIN_REQUIRED"
     low_cov = out["feature_coverage"] < 0.6
     out.loc[low_cov, "signal"] = "ABSTAIN"
     out.loc[low_cov, "signal_reason"] = "INSUFFICIENT_FEATURE_COVERAGE"
