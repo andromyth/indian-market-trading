@@ -102,6 +102,7 @@ jobs:
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
           tests/test_runtime_timeframe_diagnostics.py
+          tests/test_return_forecast_head.py
           tests/test_nse_eod_archive_presence.py
           tests/test_nse_index_daily_snapshot_fallback.py
           tests/test_market_session_guard.py
