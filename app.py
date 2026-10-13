@@ -67,6 +67,7 @@ from historical_replay import (
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
 )
 from prediction_history_ui import render_delivery_forecast, render_prediction_history
+from daily_ohlc_forecast import forecast_next_sessions
 from nse_data_layer import (
     fetch_equity_history as nse_fetch_equity_history,
     fetch_intraday_1m_current as nse_fetch_intraday_1m_current,
@@ -806,6 +807,77 @@ def _cached_watch_delivery_prediction(symbol: str, refresh_revision: int) -> dic
         }
 
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_daily_ohlc_history(symbol: str, refresh_revision: int = 0) -> pd.DataFrame:
+    """Load daily OHLCV history for one selected stock, never for the whole watchlist."""
+    root = str(symbol).replace(".NS", "").replace(".BO", "").strip().upper()
+    period = "450d"
+    try:
+        frame = get_historical(
+            f"{root}.NS",
+            period=period,
+            interval="1d",
+            force_refresh=bool(refresh_revision),
+        )
+        if frame is not None and not frame.empty and len(frame) >= 160:
+            return frame
+    except Exception:
+        pass
+
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    start = (now - pd.Timedelta(days=450)).date()
+    end = now.date()
+    try:
+        frame = nse_fetch_equity_history(root, start, end, sync_drive=False)
+        if frame is not None and not frame.empty:
+            return frame
+    except Exception:
+        pass
+
+    try:
+        frame = fetch_nse_drive_bulk_symbol_history(
+            root,
+            start,
+            end,
+            max_calendar_days=240,
+        )
+        if frame is not None and not frame.empty:
+            return frame
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_7day_ohlc_forecast(symbol: str, refresh_revision: int = 0) -> dict:
+    """Fit/evaluate the selected symbol's direct daily OHLC horizon models once per cache key."""
+    frame = _cached_daily_ohlc_history(symbol, refresh_revision)
+    return forecast_next_sessions(frame, n_sessions=7)
+
+
+def _next_nse_session_dates(as_of_date, count: int = 7) -> list:
+    """Return future weekdays excluding the project's known NSE holiday dates."""
+    try:
+        from production_data_freshness_gate import HOLIDAYS
+        holidays = set()
+        for item in HOLIDAYS:
+            try:
+                holidays.add(pd.Timestamp(item).date())
+            except Exception:
+                continue
+    except Exception:
+        holidays = set()
+
+    cursor = pd.Timestamp(as_of_date).date()
+    out = []
+    while len(out) < count:
+        cursor += pd.Timedelta(days=1)
+        if cursor.weekday() < 5 and cursor not in holidays:
+            out.append(cursor)
+    return out
+
+
 def _auto_watch_intraday(symbol: str) -> dict:
     """Use only fresh, completed one-minute candles for intraday watchlist forecasts."""
     now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -915,892 +987,538 @@ def _auto_watch_intraday(symbol: str) -> dict:
 
 
 if interface_mode == "Live Test":
-    st.title("Stocks to Watch")
-    st.caption("Automatic daily shortlist from recent market coverage, with separate model forecasts for Delivery and Intraday. No orders are placed.")
-
-    refresh_col, note_col = st.columns([1, 3])
-    with refresh_col:
-        refresh_watch = st.button("Refresh watchlist & forecasts", type="primary", width="stretch")
-    if refresh_watch:
-        st.cache_data.clear()
-        st.session_state["watchlist_refresh_revision"] = int(
-            st.session_state.get("watchlist_refresh_revision", 0)
-        ) + 1
-
-    refresh_revision = int(st.session_state.get("watchlist_refresh_revision", 0))
-
-    st.info(
-        "Stocks are selected from recent market coverage across Moneycontrol, Economic Times, "
-        "Financial Express, Mint and CNBC-TV18. Media mentions make a stock watch-worthy; "
-        "only the project's own model supplies its signal. Delivery is a next-session forecast "
-        "from the last completed daily snapshot, not a live intraday prediction. An intraday "
-        "signal is displayed only when both stock candles and benchmark context pass freshness checks."
+    # A single-stock workflow modelled on modern broker terminals: compact market
+    # status, searchable watchlist, and explicit Delivery/Intraday workspaces.
+    st.markdown(
+        """
+        <style>
+        .block-container {max-width: 1500px; padding-top: 1.25rem; padding-bottom: 2.5rem;}
+        .trading-hero {border-radius: 18px; padding: 1.35rem 1.5rem; margin: 0.15rem 0 1rem;
+            background: linear-gradient(115deg,#101d35 0%,#162b4d 56%,#1a4661 100%); color: #f8fafc;}
+        .trading-eyebrow {font-size: .72rem; letter-spacing: .16em; text-transform: uppercase;
+            color: #9dd7d7; font-weight: 750; margin-bottom: .35rem;}
+        .trading-title {font-size: 2rem; line-height: 1.15; font-weight: 760; margin: 0;}
+        .trading-subtitle {font-size: .92rem; color: #d2dfed; margin-top: .55rem;}
+        div[data-testid="stMetric"] {background: #ffffff; border: 1px solid #e2e8f0;
+            border-radius: 13px; padding: .8rem 1rem; box-shadow: 0 2px 8px rgba(15,23,42,.035);}
+        div[data-testid="stMetricLabel"] {color: #64748b; font-weight: 600;}
+        div[data-testid="stMetricValue"] {color: #10213d; font-weight: 750;}
+        div.stButton > button {border-radius: 10px; min-height: 2.55rem; font-weight: 650;}
+        div[data-testid="stRadio"] > div {gap: .45rem;}
+        div[data-testid="stRadio"] label {border: 1px solid #dbe4ee; padding: .35rem .8rem;
+            border-radius: 10px; background: #fff;}
+        </style>
+        <div class="trading-hero">
+          <div class="trading-eyebrow">NSE · Market intelligence</div>
+          <div class="trading-title">Indian Market <span style="color:#8be0d3">Trading Desk</span></div>
+          <div class="trading-subtitle">One selected stock at a time · seven-session Delivery outlook · minute-level Intraday signals</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # This fragment updates the candidate panel automatically. Source results are
-    # cached for 15 minutes, Delivery scoring for 3 minutes, and live candles for
-    # 20 seconds; explicit Refresh clears caches immediately.
-    @st.fragment(run_every="60s")
-    def _render_daily_market_watch():
-        watch_now = pd.Timestamp.now(tz="Asia/Kolkata")
-        try:
-            from production_data_freshness_gate import HOLIDAYS
-            known_holidays = set(HOLIDAYS)
-        except Exception:
-            known_holidays = set()
-        watch_target = resolve_watch_target_session(watch_now.to_pydatetime(), known_holidays)
-        session_open = (
-            watch_now.weekday() < 5
-            and watch_now.date() not in known_holidays
-            and pd.Timestamp("09:15").time() <= watch_now.time() <= pd.Timestamp("15:30").time()
-        )
-        top = st.columns(4)
-        top[0].metric("Market", "OPEN" if session_open else "CLOSED")
-        top[1].metric("Watchlist session", watch_target.strftime("%a, %d %b %Y"))
-        top[2].metric("IST", watch_now.strftime("%H:%M:%S"))
-        top[3].metric("Auto-refresh", "Every 60 sec")
-        data = _today_stock_watchlist()
-        stock_rows = data.get("stocks", []) or []
-        sources = data.get("sources", []) or []
-        pass_sources = sum(1 for item in sources if item.get("status") == "PASS")
-        st.caption(
-            f"News source status: {pass_sources}/{len(sources)} publishers returned recent articles · "
-            f"{int(data.get('article_count', 0))} recent articles scanned · "
-            f"watchlist checked {str(data.get('checked_at_utc') or 'time unavailable').replace('T', ' ').replace('+00:00', ' UTC')}"
-        )
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    try:
+        from production_data_freshness_gate import HOLIDAYS as _ui_holidays
+        known_holidays = {pd.Timestamp(x).date() for x in _ui_holidays}
+    except Exception:
+        known_holidays = set()
+    market_open = (
+        now_ist.weekday() < 5
+        and now_ist.date() not in known_holidays
+        and pd.Timestamp("09:15").time() <= now_ist.time() < pd.Timestamp("15:30").time()
+    )
+    target_session = resolve_watch_target_session(now_ist.to_pydatetime(), known_holidays)
 
-        if not stock_rows:
-            st.warning(
-                data.get("message")
-                or "No source-backed stock candidates are available right now. No default stocks will be substituted."
-            )
-            with st.expander("Publisher feed status"):
-                st.dataframe(pd.DataFrame(sources), width="stretch", hide_index=True)
-            return
-
-        for stock in stock_rows:
-            symbol = str(stock.get("symbol", "")).strip().upper()
-            if not symbol:
-                continue
-            label_map = {}
+    refresh_col, market_col, session_col, time_col = st.columns([1.35, 1, 1.15, 1])
+    with refresh_col:
+        refresh_pressed = st.button(
+            "↻ Refresh market data",
+            type="primary",
+            width="stretch",
+            help="Refresh the shortlist and selected-stock inputs only. It does not clear unrelated application caches.",
+        )
+    if refresh_pressed:
+        st.session_state["trading_refresh_revision"] = (
+            int(st.session_state.get("trading_refresh_revision", 0)) + 1
+        )
+        for cache_owner in (
+            _today_stock_watchlist,
+            _cached_watch_delivery_prediction,
+            _cached_daily_ohlc_history,
+            _cached_7day_ohlc_forecast,
+            _live_5m_price_frame,
+            _cached_live_market_context,
+        ):
             try:
-                universe = _searchable_nse_universe()
-                if not universe.empty:
-                    match = universe.loc[universe["symbol"].astype(str).str.upper().eq(symbol)]
-                    if not match.empty:
-                        label_map["company"] = str(match.iloc[0]["company"])
+                cache_owner.clear()
             except Exception:
                 pass
-            company = label_map.get("company") or symbol
-            full_symbol = symbol if symbol.endswith((".NS", ".BO")) else f"{symbol}.NS"
+        st.rerun()
 
-            with st.container(border=True):
-                head_left, head_right = st.columns([2, 3])
-                with head_left:
-                    st.subheader(f"{symbol}")
-                    st.caption(company)
-                    st.caption(
-                        f"Media support: {int(stock.get('source_count', 0))} publishers · "
-                        f"{int(stock.get('mention_count', 0))} mentions"
-                    )
-                    headlines = stock.get("headlines", []) or []
-                    if headlines:
-                        with st.expander("Why this stock is in focus", expanded=False):
-                            for article in headlines[:3]:
-                                title = str(article.get("title", "Market article")).replace("[", "(").replace("]", ")")
-                                url = str(article.get("url", ""))
-                                publisher = str(article.get("publisher", article.get("domain", "Publisher")))
-                                published = str(article.get("published_utc", ""))[:16].replace("T", " ")
-                                if url.startswith(("https://", "http://")):
-                                    st.markdown(f"[{title}]({url})")
-                                else:
-                                    st.write(title)
-                                st.caption(f"{publisher} · {published} UTC")
-                with head_right:
-                    delivery_col, intraday_col = st.columns(2)
-                    try:
-                        delivery = _cached_watch_delivery_prediction(full_symbol, refresh_revision)
-                    except Exception as exc:
-                        delivery = {"prediction_status": "ERROR", "signal": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
-                    d_status = str(delivery.get("prediction_status", "UNKNOWN")).upper()
-                    prior_close_signal = delivery.get("prior_close_forecast_signal")
-                    d_signal = str(prior_close_signal or delivery.get("signal") or d_status)
-                    d_prob = pd.to_numeric(
-                        delivery.get("prior_close_probability_up", delivery.get("p")),
-                        errors="coerce",
-                    )
-                    d_coverage = pd.to_numeric(delivery.get("feature_coverage"), errors="coerce")
-                    if d_status != "PASS" and not prior_close_signal:
-                        d_prob = np.nan
-                    with delivery_col:
-                        st.markdown("**Delivery · next session**")
-                        st.metric(
-                            "Prior-close forecast" if prior_close_signal else "Signal",
-                            d_signal,
-                        )
-                        if prior_close_signal:
-                            st.caption(
-                                "TARGET SESSION UNDERWAY — this is the signal calculated from "
-                                "the previous close, not a new intraday forecast."
-                            )
-                        st.caption(
-                            f"Model status: {d_status} · P(UP): "
-                            + (f"{float(d_prob):.1%}" if pd.notna(d_prob) else "not available")
-                            + (
-                                f" · Active feature coverage: {float(d_coverage):.1%}"
-                                if pd.notna(d_coverage) else ""
-                            )
-                        )
-                        delivery_price = pd.to_numeric(delivery.get("predicted_price"), errors="coerce")
-                        delivery_price_status = str(delivery.get("price_forecast_status") or "RETRAIN_REQUIRED")
-                        if pd.notna(delivery_price):
-                            st.caption(
-                                f"Expected next-session close: ₹{float(delivery_price):,.2f} "
-                                f"· return model: {delivery_price_status}"
-                            )
-                        elif delivery_price_status == "RETRAIN_REQUIRED":
-                            st.caption("Expected close: unavailable until the Delivery return-forecast head is trained.")
-                    with intraday_col:
-                        st.markdown("**Intraday · +5 / +15 / +30 min**")
-                        if not session_open:
-                            st.metric("Signal", "WAITING")
-                            st.caption("Intraday signals require fresh candles during the regular NSE session.")
-                        else:
-                            intra = _auto_watch_intraday(full_symbol)
-                            status = str(intra.get("status", "UNKNOWN")).upper()
-                            if status == "PASS":
-                                horizons = intra.get("horizons", {}) or {}
-                                items = []
-                                for horizon in (5, 15, 30):
-                                    result = horizons.get(horizon, {}) or {}
-                                    signal = str(result.get("signal") or "ABSTAIN")
-                                    predicted_price = pd.to_numeric(result.get("predicted_price"), errors="coerce")
-                                    reference_price = pd.to_numeric(result.get("reference_close"), errors="coerce")
-                                    price_status = str(result.get("price_forecast_status") or "RETRAIN_REQUIRED")
-                                    if pd.notna(predicted_price):
-                                        price_text = f" · forecast ₹{float(predicted_price):,.2f}"
-                                        if pd.notna(reference_price):
-                                            delta_rupees = float(predicted_price) - float(reference_price)
-                                            price_text += f" (Δ₹{delta_rupees:+,.2f})"
-                                        if price_status == "MAE_NOT_BETTER_THAN_MEDIAN_BASELINE":
-                                            price_text += " · low-validation-skill"
-                                    else:
-                                        price_text = " · price forecast needs return-head retraining"
-                                    items.append(f"+{horizon}m **{signal}**{price_text}")
-                                st.write("  |  ".join(items))
-                                st.caption(
-                                    f"Stock candle: {intra.get('latest_candle_ist', '—')} · "
-                                    f"benchmark candle: {intra.get('market_latest_candle_ist', '—')} · "
-                                    f"source: {intra.get('source', 'unknown')}"
-                                )
-                                abstentions = [
-                                    f"+{h}m: {v.get('signal_reason') or v.get('reason')}"
-                                    for h, v in (intra.get('horizons', {}) or {}).items()
-                                    if str(v.get('signal', '')).upper() == 'ABSTAIN'
-                                    and (v.get('signal_reason') or v.get('reason'))
-                                ]
-                                if abstentions:
-                                    st.caption("Abstentions: " + " · ".join(abstentions[:3]))
-                            else:
-                                st.metric("Signal", status.replace("_", " "))
-                                st.caption(str(intra.get("reason") or "Fresh validated intraday predictions are not available."))
+    refresh_revision = int(st.session_state.get("trading_refresh_revision", 0))
+    watch_data = _today_stock_watchlist()
+    stocks = watch_data.get("stocks", []) or []
+    sources = watch_data.get("sources", []) or []
+    with market_col:
+        st.metric("NSE market", "OPEN" if market_open else "CLOSED")
+    with session_col:
+        st.metric("Next watch session", target_session.strftime("%d %b %Y"))
+    with time_col:
+        st.metric("IST time", now_ist.strftime("%H:%M"))
 
-        with st.expander("Publishers checked and methodology", expanded=False):
-            st.dataframe(pd.DataFrame(sources), width="stretch", hide_index=True)
-            st.caption(
-                "The shortlist ranks recent stock mentions across publisher feeds. It is not a recommendation by itself. "
-                "Delivery forecasts must pass the point-in-time freshness gate; intraday uses completed one-minute bars and "
-                "suppresses signals when candles are older than five minutes. Missing model champions or data remain explicitly unavailable."
+    # The universe and watchlist are cached, but no model is run while the user
+    # is only viewing the shortlist. Forecasts are computed for the chosen symbol.
+    try:
+        universe = _searchable_nse_universe()
+    except Exception:
+        universe = pd.DataFrame()
+
+    company_by_symbol: dict[str, str] = {}
+    if universe is not None and not universe.empty:
+        company_by_symbol = {
+            str(row.symbol).strip().upper(): str(row.company).strip()
+            for row in universe.itertuples(index=False)
+            if str(getattr(row, "symbol", "")).strip()
+        }
+    watch_symbols: list[str] = []
+    for stock in stocks:
+        root = str(stock.get("symbol") or "").strip().upper().replace(".NS", "")
+        if root and root not in watch_symbols:
+            watch_symbols.append(root)
+    all_symbols = list(dict.fromkeys(watch_symbols + list(company_by_symbol)))
+    if not all_symbols:
+        all_symbols = watch_symbols
+
+    def _stock_label(root: str) -> str:
+        company = company_by_symbol.get(root, "")
+        return f"{root} — {company}" if company and company.lower() != "nan" else root
+
+    labels = [_stock_label(root) for root in all_symbols]
+    default_root = (
+        str(st.session_state.get("trading_selected_root", "")).strip().upper()
+        or (watch_symbols[0] if watch_symbols else (all_symbols[0] if all_symbols else ""))
+    )
+    default_label = _stock_label(default_root) if default_root in all_symbols else (labels[0] if labels else None)
+
+    left, right = st.columns([2.5, 1])
+    with left:
+        if labels:
+            selected_label = st.selectbox(
+                "Selected stock",
+                labels,
+                index=labels.index(default_label) if default_label in labels else 0,
+                key="trading_stock_selector",
+                help="Type a symbol or company name to search. Only this stock is forecast in Delivery or Intraday.",
             )
+            selected_root = selected_label.split(" — ", 1)[0].strip().upper()
+            st.session_state["trading_selected_root"] = selected_root
+            selected_symbol = f"{selected_root}.NS"
+        else:
+            selected_root = ""
+            selected_symbol = ""
+            st.warning("The NSE symbol list and source-backed watchlist are unavailable. Retry Refresh market data.")
+    with right:
+        st.caption(
+            f"News scan: {int(watch_data.get('article_count', 0))} articles · "
+            f"{sum(1 for item in sources if item.get('status') == 'PASS')}/{len(sources)} publishers healthy"
+        )
 
-    st.divider()
-    st.subheader("Check a specific NSE stock")
-    st.caption(
-        "Search the official NSE equity list to run forecasts for a stock of your choice. "
-        "This lookup is independent of the automatic news-based shortlist above."
+    workspace = st.radio(
+        "Workspace",
+        ["Market overview", "Delivery · 7 sessions", "Intraday · 1 minute"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="trading_workspace",
     )
 
-    try:
-        lookup_universe = _searchable_nse_universe()
-    except Exception:
-        lookup_universe = pd.DataFrame()
-
-    lookup_options = []
-    if lookup_universe is not None and not lookup_universe.empty:
-        for row in lookup_universe.itertuples(index=False):
-            root = str(getattr(row, "symbol", "")).strip().upper()
-            company = str(getattr(row, "company", "")).strip()
-            if not root or root in {"NAN", "NONE"}:
-                continue
-            if not company or company.lower() == "nan":
-                lookup_options.append(root)
-            else:
-                lookup_options.append(f"{root} — {company}")
-
-    lookup_prompt = "— Select a stock —"
-    if lookup_options:
-        selected_lookup_label = st.selectbox(
-            "Find by NSE symbol or company name",
-            [lookup_prompt] + lookup_options,
-            key="live_specific_stock_select",
-            help="Click the field and type a symbol or company name to search the official NSE list.",
-        )
-        if st.button("Check selected stock", key="live_specific_stock_check", type="primary"):
-            if selected_lookup_label == lookup_prompt:
-                st.warning("Select a stock first.")
-            else:
-                selected_root = selected_lookup_label.split(" — ", 1)[0].strip().upper()
-                st.session_state["live_specific_stock_requested"] = selected_root
-                st.session_state["live_specific_stock_lookup_revision"] = int(
-                    st.session_state.get("live_specific_stock_lookup_revision", 0)
-                ) + 1
-    else:
-        st.info("The official NSE list is currently unavailable. You can still enter an NSE symbol below.")
-
-    with st.expander("Or enter an NSE symbol directly", expanded=not bool(lookup_options)):
-        with st.form("live_specific_stock_manual_form", clear_on_submit=False):
-            manual_lookup_text = st.text_input(
-                "NSE symbol",
-                placeholder="e.g. RELIANCE, TCS, TRENT",
-                key="live_specific_stock_manual_symbol",
-            )
-            manual_lookup_submit = st.form_submit_button("Check NSE symbol", width="stretch")
-        if manual_lookup_submit:
-            manual_value = str(manual_lookup_text or "").strip().upper()
-            if not manual_value:
-                st.warning("Enter an NSE symbol first.")
-            elif manual_value.endswith(".BO"):
-                st.warning("This lookup currently expects NSE symbols, not BSE-only tickers.")
-            else:
-                manual_full_symbol = normalize_symbol(manual_value)
-                if not manual_full_symbol.endswith(".NS"):
-                    st.warning("Enter an NSE equity symbol, such as TCS or RELIANCE.")
-                else:
-                    st.session_state["live_specific_stock_requested"] = manual_full_symbol[:-3]
-                    st.session_state["live_specific_stock_lookup_revision"] = int(
-                        st.session_state.get("live_specific_stock_lookup_revision", 0)
-                    ) + 1
-
-    requested_root = str(
-        st.session_state.get("live_specific_stock_requested", "")
-    ).strip().upper()
-    if requested_root:
-        requested_full_symbol = normalize_symbol(requested_root)
-        requested_company = requested_root
-        if lookup_universe is not None and not lookup_universe.empty:
-            company_match = lookup_universe.loc[
-                lookup_universe["symbol"].astype(str).str.upper().eq(requested_root)
-            ]
-            if not company_match.empty:
-                company_value = str(company_match.iloc[0].get("company", "")).strip()
-                if company_value and company_value.lower() != "nan":
-                    requested_company = company_value
-
-        st.markdown(f"### Individual forecast: {requested_root}")
+    if workspace == "Market overview":
+        st.subheader("Today's watchlist")
         st.caption(
-            f"{requested_company} · Requested independently of Stocks to Watch · "
-            "decision-support only; no orders are placed."
+            "News is used to discover stocks, not to create a buy/sell signal. "
+            "Select a row above, then open Delivery or Intraday when you need that stock's forecast."
         )
-        delivery_col, intraday_col = st.columns(2)
+        if stocks:
+            watch_rows = []
+            for item in stocks:
+                root = str(item.get("symbol") or "").strip().upper()
+                if not root:
+                    continue
+                watch_rows.append({
+                    "Stock": root,
+                    "Company": company_by_symbol.get(root, root),
+                    "Publishers": int(item.get("source_count", 0)),
+                    "Mentions": int(item.get("mention_count", 0)),
+                    "Coverage": "News watchlist",
+                })
+            st.dataframe(
+                pd.DataFrame(watch_rows),
+                width="stretch",
+                hide_index=True,
+                height=min(340, 46 + 38 * max(1, len(watch_rows))),
+            )
+            selected_watch = next(
+                (item for item in stocks if str(item.get("symbol") or "").strip().upper() == selected_root),
+                None,
+            )
+            headlines = (selected_watch or {}).get("headlines", []) or []
+            if headlines:
+                with st.expander(f"Recent headlines for {selected_root}", expanded=False):
+                    for article in headlines[:5]:
+                        title = str(article.get("title", "Market article")).replace("[", "(").replace("]", ")")
+                        url = str(article.get("url", ""))
+                        publisher = str(article.get("publisher", article.get("domain", "Publisher")))
+                        published = str(article.get("published_utc", ""))[:16].replace("T", " ")
+                        if url.startswith(("https://", "http://")):
+                            st.markdown(f"[{title}]({url})")
+                        else:
+                            st.write(title)
+                        st.caption(f"{publisher} · {published} UTC")
+        else:
+            st.info(
+                watch_data.get("message")
+                or "No recent source-backed stocks are available. No default picks will be substituted."
+            )
+        with st.expander("Data source health and methodology", expanded=False):
+            st.dataframe(pd.DataFrame(sources), width="stretch", hide_index=True)
+            st.caption(
+                "Watchlist refreshes when requested and is cached for 15 minutes. "
+                "Model inference runs only in the selected Delivery or Intraday workspace."
+            )
 
-        with delivery_col:
-            st.markdown("**Delivery · next NSE session**")
+    elif workspace == "Delivery · 7 sessions":
+        st.subheader(f"{selected_root} · Seven-session OHLC outlook" if selected_root else "Seven-session OHLC outlook")
+        st.caption(
+            "Daily opening, high, low and closing estimates for the next seven expected NSE sessions. "
+            "The OHLC path is a horizon-conditioned model trained on historical daily bars and checked "
+            "against a chronological holdout. Validation metrics are shown; a forecast is not a guarantee."
+        )
+        if not selected_symbol:
+            st.stop()
+
+        with st.spinner(f"Loading daily history and evaluating the seven-session OHLC model for {selected_root}…"):
             try:
-                lookup_revision = int(
-                    st.session_state.get("live_specific_stock_lookup_revision", 0)
-                )
-                delivery_lookup = _cached_watch_delivery_prediction(
-                    requested_full_symbol,
-                    lookup_revision,
-                )
+                ohlc_forecast = _cached_7day_ohlc_forecast(selected_symbol, refresh_revision)
             except Exception as exc:
-                delivery_lookup = {
+                ohlc_forecast = {
+                    "status": "ERROR",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "forecasts": [],
+                }
+            try:
+                delivery = _cached_watch_delivery_prediction(selected_symbol, refresh_revision)
+            except Exception as exc:
+                delivery = {
                     "prediction_status": "ERROR",
                     "signal": "UNAVAILABLE",
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
 
-            lookup_delivery_status = str(
-                delivery_lookup.get("prediction_status", "UNKNOWN")
-            ).upper()
-            lookup_prior_close_signal = delivery_lookup.get("prior_close_forecast_signal")
-            lookup_delivery_signal = str(
-                lookup_prior_close_signal or delivery_lookup.get("signal") or lookup_delivery_status
+        forecast_status = str(ohlc_forecast.get("status", "UNKNOWN")).upper()
+        as_of = ohlc_forecast.get("as_of_date")
+        expected_reference = latest_completed_nse_session(now_ist.to_pydatetime())
+        if forecast_status == "PASS" and expected_reference is not None:
+            if str(as_of) != str(expected_reference):
+                st.warning(
+                    f"Daily history is stale: last close {as_of or 'missing'}, "
+                    f"latest completed NSE session expected {expected_reference}. "
+                    "The seven-session OHLC projections are withheld until history refreshes."
+                )
+                forecast_status = "STALE_HISTORY"
+
+        direction_signal = str(
+            delivery.get("prior_close_forecast_signal")
+            or delivery.get("signal")
+            or delivery.get("prediction_status")
+            or "UNAVAILABLE"
+        )
+        p_up = pd.to_numeric(
+            delivery.get("prior_close_probability_up", delivery.get("p")),
+            errors="coerce",
+        )
+        active_coverage = pd.to_numeric(delivery.get("feature_coverage"), errors="coerce")
+        predicted_delivery_close = pd.to_numeric(delivery.get("predicted_price"), errors="coerce")
+        delivery_return_status = str(delivery.get("price_forecast_status") or "RETRAIN_REQUIRED")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Beta V2 direction", direction_signal)
+        m2.metric("Probability up", f"{float(p_up):.1%}" if pd.notna(p_up) else "—")
+        m3.metric("Active-model coverage", f"{float(active_coverage):.1%}" if pd.notna(active_coverage) else "—")
+        m4.metric(
+            "Beta V2 next close",
+            f"₹{float(predicted_delivery_close):,.2f}" if pd.notna(predicted_delivery_close) else "Not available",
+        )
+        st.caption(
+            f"Beta V2 status: {delivery.get('prediction_status', 'UNKNOWN')} · "
+            f"reference session: {delivery.get('date') or '—'} · "
+            f"return-head status: {delivery_return_status}"
+        )
+        if delivery.get("signal_reason") or delivery.get("reason"):
+            st.caption(str(delivery.get("signal_reason") or delivery.get("reason")))
+
+        if forecast_status != "PASS":
+            st.error(
+                "Seven-session OHLC forecast is unavailable. "
+                + str(ohlc_forecast.get("reason") or f"Forecast status: {forecast_status}")
             )
-            lookup_p_up = pd.to_numeric(
-                delivery_lookup.get("prior_close_probability_up", delivery_lookup.get("p")),
+        else:
+            validation = ohlc_forecast.get("validation", []) or []
+            overall_skill = pd.to_numeric(
+                ohlc_forecast.get("overall_mean_mae_skill_vs_median"),
                 errors="coerce",
             )
-            lookup_coverage = pd.to_numeric(delivery_lookup.get("feature_coverage"), errors="coerce")
-            if lookup_delivery_status != "PASS" and not lookup_prior_close_signal:
-                lookup_p_up = np.nan
-            st.metric(
-                "Prior-close Delivery forecast" if lookup_prior_close_signal else "Delivery signal",
-                lookup_delivery_signal,
-            )
-            if lookup_prior_close_signal:
-                st.caption(
-                    "TARGET SESSION UNDERWAY — this direction was forecast from the previous close; "
-                    "it is not a refreshed intraday signal."
+            v1, v2, v3 = st.columns(3)
+            v1.metric("History through", str(as_of or "—"))
+            v2.metric("Chronological holdout", f"{ohlc_forecast.get('validation_start', '—')} → {ohlc_forecast.get('validation_end', '—')}")
+            v3.metric("Mean MAE skill vs baseline", f"{float(overall_skill):+.1%}" if pd.notna(overall_skill) else "Unavailable")
+            if pd.isna(overall_skill) or float(overall_skill) <= 0:
+                st.warning(
+                    "LOW VALIDATION SKILL: the OHLC path did not beat the median-return baseline overall. "
+                    "Values are shown for transparency, but they are not qualified as trading-grade forecasts."
                 )
-            st.caption(
-                f"Model status: {lookup_delivery_status} · P(UP): "
-                + (f"{float(lookup_p_up):.1%}" if pd.notna(lookup_p_up) else "not available")
-                + " · Active feature coverage: "
-                + (f"{float(lookup_coverage):.1%}" if pd.notna(lookup_coverage) else "not available")
-            )
-            st.caption(
-                f"Reference: {delivery_lookup.get('date') or '—'} · "
-                f"Target: {delivery_lookup.get('target_session_date') or '—'}"
-            )
-            st.caption(
-                f"Feature cutoff (UTC): {delivery_lookup.get('feature_cutoff_timestamp') or '—'}"
-            )
-            if delivery_lookup.get("signal_reason") or delivery_lookup.get("reason"):
-                st.caption(str(
-                    delivery_lookup.get("signal_reason") or delivery_lookup.get("reason")
-                ))
-
-        with intraday_col:
-            st.markdown("**Intraday · +5 / +15 / +30 minutes**")
-            lookup_now = pd.Timestamp.now(tz="Asia/Kolkata")
-            try:
-                from production_data_freshness_gate import HOLIDAYS as _lookup_holidays
-                lookup_known_holidays = set(_lookup_holidays)
-            except Exception:
-                lookup_known_holidays = set()
-            lookup_session_open = (
-                lookup_now.weekday() < 5
-                and lookup_now.date() not in lookup_known_holidays
-                and pd.Timestamp("09:15").time() <= lookup_now.time() <= pd.Timestamp("15:30").time()
-            )
-            if not lookup_session_open:
-                st.metric("Intraday status", "WAITING")
-                st.caption("Fresh intraday signals are shown only during the regular NSE session.")
             else:
-                try:
-                    intraday_lookup = _auto_watch_intraday(requested_full_symbol)
-                except Exception as exc:
-                    intraday_lookup = {
-                        "status": "ERROR",
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    }
-                lookup_intraday_status = str(
-                    intraday_lookup.get("status", "UNKNOWN")
-                ).upper()
-                if lookup_intraday_status == "PASS":
-                    lookup_horizons = intraday_lookup.get("horizons", {}) or {}
-                    horizon_summary = []
-                    for horizon in (5, 15, 30):
-                        horizon_result = lookup_horizons.get(horizon, {}) or {}
-                        horizon_signal = str(horizon_result.get("signal") or "ABSTAIN")
-                        predicted_price = pd.to_numeric(horizon_result.get("predicted_price"), errors="coerce")
-                        reference_price = pd.to_numeric(horizon_result.get("reference_close"), errors="coerce")
-                        if pd.notna(predicted_price):
-                            price_label = f" · forecast ₹{float(predicted_price):,.2f}"
-                            if pd.notna(reference_price):
-                                price_label += f" (Δ₹{float(predicted_price) - float(reference_price):+,.2f})"
-                        else:
-                            price_label = " · price forecast needs return-head retraining"
-                        horizon_summary.append(
-                            f"+{horizon}m **{horizon_signal}**{price_label}"
-                        )
-                    st.write("  |  ".join(horizon_summary))
-                    st.caption(
-                        f"Stock candle: {intraday_lookup.get('latest_candle_ist', '—')} · "
-                        f"benchmark candle: {intraday_lookup.get('market_latest_candle_ist', '—')} · "
-                        f"source: {intraday_lookup.get('source', 'unknown')}"
-                    )
-                    abstentions = [
-                        f"+{h}m: {v.get('signal_reason') or v.get('reason')}"
-                        for h, v in (intraday_lookup.get('horizons', {}) or {}).items()
-                        if str(v.get('signal', '')).upper() == 'ABSTAIN'
-                        and (v.get('signal_reason') or v.get('reason'))
-                    ]
-                    if abstentions:
-                        st.caption("Abstentions: " + " · ".join(abstentions[:3]))
-                else:
-                    st.metric("Intraday status", lookup_intraday_status.replace("_", " "))
-                    st.caption(str(
-                        intraday_lookup.get("reason")
-                        or "Fresh validated intraday predictions are not available."
-                    ))
-
-    _render_daily_market_watch()
-    st.stop()
-
-
-if interface_mode == "Live Test":
-    st.sidebar.subheader("Live mode")
-    live_mode = st.sidebar.radio(
-        "Prediction type",
-        ["Delivery", "Intraday 5-minute"],
-        index=0,
-        key="live_test_mode",
-    )
-    refresh_live = st.sidebar.button(
-        "Refresh live data",
-        type="primary",
-        width="stretch",
-        help="Fetch fresh production inputs and run the selected model. No orders are placed.",
-    )
-    if refresh_live:
-        st.cache_data.clear()
-        st.session_state["live_test_revision"] = int(
-            st.session_state.get("live_test_revision", 0)
-        ) + 1
-
-    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
-    session_label = nse_session_label(now_ist.to_pydatetime())
-
-    st.title("Indian Market — Live Test")
-    st.caption(
-        "Production decision-support only · no order placement · "
-        "NSE is the primary exchange-data source."
-    )
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric("NSE session", session_label)
-    s2.metric("IST time", now_ist.strftime("%d %b %Y %H:%M:%S"))
-    s3.metric("Symbols selected", str(len(symbols)))
-
-    if live_mode == "Delivery":
-        beta_state = _cached_beta_status()
-        delivery_state = beta_state.get("delivery", {}) or {}
-        delivery_status = str(delivery_state.get("status") or "NOT_TRAINED").upper()
-
-        if delivery_status == "PROMOTED":
-            st.success("Beta V2 Delivery model is active with a validated champion.")
-        elif delivery_status == "REJECTED":
-            st.warning(
-                "The latest Beta V2 Delivery challenger was rejected by the validation gate. "
-                "An existing validated champion remains eligible when present."
-            )
-        else:
-            st.warning(
-                f"Beta V2 Delivery status: {delivery_status}. "
-                "Prediction is emitted only when a validated champion is available."
-            )
-
-        gate_info = delivery_state.get("gate") or {}
-        if isinstance(gate_info, dict) and gate_info.get("reasons"):
-            st.caption(
-                "Latest training gate: "
-                + " · ".join(map(str, gate_info["reasons"]))
-            )
-
-        st.caption(
-            "The Live Delivery route calls the Beta V2 runtime adapter directly. "
-            "Its canonical point-in-time global/news/F&O inputs are resolved from the persisted "
-            "Beta V2 data layer; the UI's live advisory feeds are not substituted into the model."
-        )
-
-        beta_delivery_results = {}
-        beta_delivery_errors = {}
-
-        for sym in symbols:
-            if not sym.endswith(".NS"):
-                beta_delivery_results[sym] = {
-                    "prediction_status": "BLOCKED",
-                    "symbol": sym,
-                    "reason": "BETA_V2_DELIVERY_REQUIRES_NSE_SYMBOL",
-                }
-                continue
-
-            try:
-                result = dict(beta_delivery_predict(
-                    sym,
-                    None,
-                    None,
-                    None,
-                ))
-                expected_reference_date = latest_completed_nse_session(
-                    now_ist.to_pydatetime()
+                st.info(
+                    "Positive average holdout skill means the model beat the median baseline on average in this historical split; "
+                    "it does not establish future profitability."
                 )
-                observed_reference_date = parse_reference_date(result.get("date"))
-                if (
-                    str(result.get("prediction_status", "")).upper() == "PASS"
-                    and observed_reference_date != expected_reference_date
-                ):
-                    # Do not present a stale point-in-time forecast as current.
-                    result["prediction_status"] = "STALE"
-                    result["signal"] = "STALE"
-                    result["signal_reason"] = (
-                        "STALE_REFERENCE_DATE: reference "
-                        f"{observed_reference_date or 'missing'}; expected "
-                        f"{expected_reference_date} from the latest completed NSE session"
-                    )
-                elif str(result.get("prediction_status", "")).upper() == "PASS":
-                    try:
-                        from production_data_freshness_gate import HOLIDAYS as _delivery_holidays
-                        known_delivery_holidays = set(_delivery_holidays)
-                    except Exception:
-                        known_delivery_holidays = set()
-                    if target_session_is_underway(
-                        result.get("target_session_date"),
-                        now_ist,
-                        known_delivery_holidays,
-                    ):
-                        result["prior_close_forecast_signal"] = result.get("signal")
-                        result["prior_close_probability_up"] = result.get("p")
-                        result["target_session_underway"] = True
-                        result["prediction_status"] = "IN_PROGRESS"
-                        result["signal"] = "IN_PROGRESS"
-                        result["signal_reason"] = (
-                            "TARGET_SESSION_UNDERWAY: retained the prior-close Delivery forecast "
-                            "but do not treat it as an intraday-refreshed signal."
-                        )
-                beta_delivery_results[sym] = result
-            except Exception as exc:
-                beta_delivery_errors[sym] = {
-                    "symbol": sym,
-                    "prediction_status": "ERROR",
-                    "error": f"{type(exc).__name__}: {exc}",
+
+            session_dates = _next_nse_session_dates(as_of, 7)
+            rows = []
+            chart_rows = []
+            for index, prediction in enumerate(ohlc_forecast.get("forecasts", []) or []):
+                if index >= len(session_dates):
+                    break
+                session_date = session_dates[index]
+                skill = pd.to_numeric(prediction.get("mean_mae_skill_vs_median"), errors="coerce")
+                row = {
+                    "Session": f"Day +{prediction.get('horizon', index + 1)}",
+                    "Date": session_date.strftime("%a, %d %b"),
+                    "Open forecast": f"₹{float(prediction['open']):,.2f}",
+                    "High forecast": f"₹{float(prediction['high']):,.2f}",
+                    "Low forecast": f"₹{float(prediction['low']):,.2f}",
+                    "Close forecast": f"₹{float(prediction['close']):,.2f}",
+                    "MAE skill vs baseline": f"{float(skill):+.1%}" if pd.notna(skill) else "—",
+                    "Validation": str(prediction.get("validation_status", "UNKNOWN")).replace("_", " "),
                 }
+                rows.append(row)
+                chart_rows.append({"Session": pd.Timestamp(session_date), "Predicted close": float(prediction["close"])})
 
-        table_rows = []
-        for sym in symbols:
-            result = beta_delivery_results.get(sym, {})
-            p_up = pd.to_numeric(result.get("p"), errors="coerce")
-            coverage = pd.to_numeric(
-                result.get("feature_coverage"), errors="coerce"
-            )
-            prior_close_signal = result.get("prior_close_forecast_signal")
-            display_signal = prior_close_signal or result.get("signal", "—")
-            predicted_delivery_price = pd.to_numeric(result.get("predicted_price"), errors="coerce")
-            return_forecast_status = str(result.get("price_forecast_status") or "RETRAIN_REQUIRED")
-            table_rows.append({
-                "Symbol": sym,
-                "Status": result.get("prediction_status", "ERROR"),
-                "Signal / prior-close forecast": display_signal,
-                "Expected next-session close": (
-                    f"₹{float(predicted_delivery_price):,.2f}"
-                    if pd.notna(predicted_delivery_price) else "Unavailable"
-                ),
-                "Price-head status": return_forecast_status,
-                "P(UP)": f"{float(p_up):.1%}" if pd.notna(p_up) else "—",
-                "Feature coverage": (
-                    f"{float(coverage):.1%}"
-                    if pd.notna(coverage) else "—"
-                ),
-                "Reference date": str(result.get("date") or "—"),
-                "Target session": str(result.get("target_session_date") or "—"),
-                "Forecast as-of (UTC)": str(result.get("forecast_as_of_utc") or "—"),
-                "Model": str(result.get("model_file") or "—"),
-                "Reason": str(
-                    result.get("signal_reason")
-                    or result.get("reason")
-                    or result.get("error")
-                    or "—"
-                ),
-            })
-
-        st.subheader("Beta V2 Delivery — next-session directional signal")
-        stale_symbols = [
-            str(sym) for sym, result in beta_delivery_results.items()
-            if str(result.get("prediction_status", "")).upper() == "STALE"
-        ]
-        if stale_symbols:
-            expected_ref = latest_completed_nse_session(now_ist.to_pydatetime())
-            st.warning(
-                "STALE DATA — current BUY/SELL signals are blocked for "
-                + ", ".join(stale_symbols)
-                + f". Latest completed NSE session expected: {expected_ref}. "
-                "Repair/update the Delivery point-in-time snapshot before using these predictions."
-            )
-        if table_rows:
             st.dataframe(
-                pd.DataFrame(table_rows),
+                pd.DataFrame(rows),
                 width="stretch",
                 hide_index=True,
+                height=330,
             )
-            dated_results = [
-                result for result in beta_delivery_results.values()
-                if str(result.get("prediction_status", "")).upper() == "PASS"
-            ]
-            if dated_results:
-                current = dated_results[0]
-                cutoff = current.get("feature_cutoff_timestamp")
-                st.caption(
-                    "Forecast target: "
-                    + str(current.get("target_session_date") or "not resolved")
-                    + " · recalculated at "
-                    + str(current.get("forecast_as_of_utc") or "unknown UTC time")
-                    + " · model information cutoff: "
-                    + str(cutoff or "not available")
-                    + ". The current model remains point-in-time: newer post-cutoff news/global inputs "
-                    "require a separately trained and validated pre-open feature contract before they can affect its signal."
-                )
-
-        if beta_delivery_errors:
-            with st.expander("Beta V2 Delivery runtime errors", expanded=True):
-                st.dataframe(
-                    pd.DataFrame(beta_delivery_errors.values()),
-                    width="stretch",
-                    hide_index=True,
-                )
-
-        with st.expander("Beta V2 Delivery runtime status", expanded=False):
-            st.json(beta_state)
-
-        st.caption(
-            "P(UP) is the calibrated probability that the stock beats the same-session "
-            "cross-sectional median over the next session. BUY/SELL are emitted only inside "
-            "the validated Wilson-bound action band; otherwise the model explicitly abstains."
-        )
-
-    elif live_mode == "Intraday 5-minute":
-        beta_state = _cached_beta_status()
-        intraday_state = beta_state.get("intraday", {}) or {}
-        manifest_status = str(intraday_state.get("status") or "NOT_TRAINED").upper()
-
-        if manifest_status == "CANDIDATE_ONLY":
-            st.info(
-                "Beta V2 Intraday manifest is present. Each horizon requires its own validated "
-                "champion before BUY/SELL can be emitted."
-            )
-        else:
-            st.warning(
-                f"Beta V2 Intraday status: {manifest_status}. "
-                "Run the Beta V2 Intraday trainer before expecting trained horizon models."
-            )
-
-        universe_df = _searchable_nse_universe()
-        if universe_df is None or universe_df.empty:
-            candidates = [s for s in symbols if s.endswith(".NS")]
-            candidate_labels = {s: s for s in candidates}
-        else:
-            candidates = [
-                f"{s}.NS"
-                for s in universe_df["symbol"].astype(str).str.upper()
-            ]
-            candidate_labels = {
-                f"{row.symbol}.NS": (
-                    f"{row.symbol} — {row.company}"
-                    if str(row.company).strip()
-                    and str(row.company).lower() != "nan"
-                    else str(row.symbol)
-                )
-                for row in universe_df.itertuples()
-            }
-
-        if not candidates:
-            st.info("Official NSE equity universe is unavailable for Beta V2 Intraday selection.")
-        else:
-            live_default = st.session_state.get("live_intraday_selected_symbol")
-            if live_default not in candidates:
-                live_default = candidates[0]
-
-            selected_symbol = st.selectbox(
-                "Stock for continuous Beta V2 Intraday forecast",
-                candidates,
-                index=candidates.index(live_default),
-                format_func=lambda s: candidate_labels.get(s, s),
-                key="live_intraday_selected_symbol",
-                help="Select any current NSE equity; the forecast refreshes when a new completed 1-minute bar arrives.",
-            )
-            auto_update = st.checkbox(
-                "Continuous recalculation every new 1-minute bar",
-                value=True,
-                key="live_intraday_auto_update",
-            )
+            if chart_rows:
+                chart = pd.DataFrame(chart_rows).set_index("Session")
+                st.line_chart(chart, height=220, y_label="Projected close (₹)")
             st.caption(
-                "Only completed 1-minute bars are passed to Beta V2. "
-                "The six independent horizons are +5/+10/+15/+20/+25/+30 minutes."
+                f"Model: {ohlc_forecast.get('model', '—')} · "
+                f"training samples: {ohlc_forecast.get('training_samples', '—')} · "
+                f"holdout samples: {ohlc_forecast.get('validation_samples', '—')} · "
+                f"purge: {ohlc_forecast.get('purge_sessions', 7)} sessions."
             )
-            run_every = "60s" if auto_update else None
-
-            @st.fragment(run_every=run_every, key="live_intraday_beta_v2_stream")
-            def _render_live_beta_v2_intraday_stream():
-                now = pd.Timestamp.now(tz="Asia/Kolkata")
-                root = selected_symbol.replace(".NS", "").upper()
-                in_session = (
-                    pd.Timestamp("09:15").time()
-                    <= now.time()
-                    <= pd.Timestamp("15:30").time()
+            with st.expander("How to read this forecast", expanded=False):
+                st.write(str(ohlc_forecast.get("note", "")))
+                st.write(
+                    "Opening, high, low and closing values are direct model estimates anchored on the latest observed close. "
+                    "Each session has a separate holdout skill check against a training-median baseline. "
+                    "The table is an OHLC forecast, not a broker signal and not a promise of a particular price."
                 )
-                if not in_session:
-                    st.info(
-                        f"Beta V2 Intraday stream idle outside regular NSE hours · "
-                        f"IST {now.strftime('%H:%M:%S')}"
+
+    else:
+        st.subheader(f"{selected_root} · Intraday signal desk" if selected_root else "Intraday signal desk")
+        st.caption(
+            "Only the selected symbol is recalculated. In-session updates target each new completed one-minute candle; "
+            "stale stock or benchmark input is withheld rather than guessed."
+        )
+        auto_refresh = st.checkbox(
+            "Auto-refresh this stock every 60 seconds",
+            value=True,
+            key=f"intraday_auto_refresh::{selected_root or 'none'}",
+            help="Auto-refresh runs only in this Intraday workspace and only during regular NSE market hours.",
+        )
+        if not selected_symbol:
+            st.stop()
+        if not market_open:
+            st.info("Market is closed. Intraday inference will resume during the regular NSE session; no all-stock scans are running.")
+        else:
+            @st.fragment(
+                run_every="60s" if auto_refresh and market_open else None,
+                key="selected_intraday_prediction_panel",
+            )
+            def _render_selected_intraday_panel():
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                try:
+                    raw, source = _live_5m_price_frame(selected_symbol)
+                except Exception as exc:
+                    st.error(f"Market-data request failed: {type(exc).__name__}: {exc}")
+                    return
+                if raw is None or raw.empty:
+                    st.error("No live one-minute candles are available from the configured providers.")
+                    return
+
+                frame = raw.copy()
+                frame.columns = [str(col).strip().lower() for col in frame.columns]
+                aliases = {"ltp": "close", "adj close": "close", "adj_close": "close", "vol": "volume"}
+                frame = frame.rename(columns=aliases)
+                try:
+                    idx = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
+                    valid = ~idx.isna()
+                    frame = frame.loc[valid].copy()
+                    idx = idx[valid]
+                    idx = idx.tz_localize("Asia/Kolkata") if idx.tz is None else idx.tz_convert("Asia/Kolkata")
+                    frame.index = idx
+                    frame = frame.sort_index()
+                    frame = frame[~frame.index.duplicated(keep="last")]
+                except Exception as exc:
+                    st.error(f"Invalid candle timestamps: {type(exc).__name__}: {exc}")
+                    return
+
+                completed = frame.loc[frame.index < now.floor("min")].copy()
+                if completed.empty:
+                    st.info("Waiting for the first completed one-minute candle.")
+                    return
+                latest_candle = pd.Timestamp(completed.index[-1])
+                age_seconds = max(0.0, (now - latest_candle).total_seconds())
+                if latest_candle.date() != now.date() or age_seconds > 300:
+                    st.warning(
+                        f"Intraday inference withheld: newest completed candle is {latest_candle.strftime('%H:%M:%S')} IST "
+                        f"({age_seconds / 60:.1f} minutes old). A current-session candle under five minutes old is required."
+                    )
+                    return
+                if len(completed) < 80:
+                    st.info(f"Model warm-up: {len(completed)}/80 completed one-minute candles available.")
+                    return
+
+                benchmark = benchmark_for_symbol(selected_symbol)
+                try:
+                    market_frame = _cached_live_market_context(benchmark)
+                    market_freshness = latest_completed_bar_status(
+                        market_frame,
+                        now,
+                        max_age_seconds=300,
+                        require_current_session=True,
+                    )
+                except Exception as exc:
+                    st.error(f"Benchmark validation failed: {type(exc).__name__}: {exc}")
+                    return
+                if not market_freshness.get("ok"):
+                    st.warning(
+                        f"Intraday inference withheld because {benchmark} context is not fresh: "
+                        f"{market_freshness.get('reason') or market_freshness.get('status')}."
                     )
                     return
 
-                try:
-                    raw, live_source = _live_5m_price_frame(selected_symbol)
-                    if raw is None or raw.empty:
-                        st.error(
-                            "Live 1-minute market data is unavailable from NSE and the configured fallbacks."
-                        )
-                        return
-
-                    cutoff = now.floor("min")
-                    completed = raw.loc[raw.index < cutoff].copy()
-                    if completed.empty:
-                        st.info("Waiting for the first completed NSE 1-minute bar.")
-                        return
-
-                    latest_ts = completed.index[-1]
-                    if len(completed) < 80:
-                        st.info(
-                            f"Beta V2 warm-up: {len(completed)}/80 completed 1-minute rows available."
-                        )
-                        return
-
-                    benchmark_symbol = benchmark_for_symbol(selected_symbol)
-                    market_df = _cached_live_market_context(benchmark_symbol)
-
-                    state_key = f"beta_v2_intraday_last_ts::{root}"
-                    result_key = f"beta_v2_intraday_result::{root}"
-
-                    if (
-                        st.session_state.get(state_key) == str(latest_ts)
-                        and result_key in st.session_state
-                    ):
-                        predictions = st.session_state[result_key]
-                        recalculated = False
-                    else:
+                market_latest = str(market_freshness.get("latest_candle_ist"))
+                prediction_key = f"intraday_predictions::{selected_root}::{refresh_revision}"
+                cached_result = st.session_state.get(prediction_key, {})
+                if (
+                    cached_result.get("latest_candle") == latest_candle.isoformat()
+                    and cached_result.get("market_latest") == market_latest
+                ):
+                    predictions = cached_result.get("predictions", [])
+                    recalculated = False
+                else:
+                    try:
                         predictions = beta_intraday_predict(
                             selected_symbol,
                             completed,
-                            market_df,
+                            market_frame,
+                            decision_interval_minutes=1,
                         )
-                        st.session_state[state_key] = str(latest_ts)
-                        st.session_state[result_key] = predictions
-                        recalculated = True
-
-                    source_label = {
-                        "NSE_OFFICIAL_CHART": "NSE official",
-                        "PERSISTENT_LOCAL_CACHE": "persistent local cache",
-                        "INDSTOCKS_API": "INDstocks API",
-                        "DHAN": "Dhan",
-                        "YAHOO_FINANCE": "Yahoo Finance",
-                        "YFINANCE": "yfinance",
-                    }.get(live_source, "fallback provider")
-
-                    if not predictions:
-                        st.warning(
-                            "Beta V2 returned no horizon rows. A validated horizon champion "
-                            "may not be available yet."
-                        )
+                    except Exception as exc:
+                        st.error(f"Intraday model failed: {type(exc).__name__}: {exc}")
                         return
+                    st.session_state[prediction_key] = {
+                        "latest_candle": latest_candle.isoformat(),
+                        "market_latest": market_latest,
+                        "predictions": predictions,
+                    }
+                    recalculated = True
 
-                    table_rows = []
-                    for item in predictions:
-                        p_up = pd.to_numeric(
-                            item.get("probability_up"), errors="coerce"
-                        )
-                        reference_price = pd.to_numeric(item.get("reference_close"), errors="coerce")
-                        predicted_price = pd.to_numeric(item.get("predicted_price"), errors="coerce")
-                        expected_return = pd.to_numeric(item.get("expected_return"), errors="coerce")
-                        return_status = str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
-                        expected_move = (
-                            float(predicted_price) - float(reference_price)
-                            if pd.notna(predicted_price) and pd.notna(reference_price)
-                            else np.nan
-                        )
-                        table_rows.append({
-                            "Horizon": f"+{int(item.get('horizon_min', 0))}m",
-                            "Signal": item.get("signal", "ABSTAIN"),
-                            "Reference price": (
-                                f"₹{float(reference_price):,.2f}"
-                                if pd.notna(reference_price) else "—"
-                            ),
-                            "Predicted price": (
-                                f"₹{float(predicted_price):,.2f}"
-                                if pd.notna(predicted_price) else "Unavailable"
-                            ),
-                            "Expected move": (
-                                f"₹{expected_move:+,.2f}" if pd.notna(expected_move) else "—"
-                            ),
-                            "Price-model validation": return_status,
-                            "Decision": str(item.get("decision_timestamp") or latest_ts),
-                            "Reason": item.get("signal_reason", item.get("reason", "—")),
-                        })
+                if not predictions:
+                    st.warning("The model returned no eligible horizon predictions.")
+                    return
 
-                    if recalculated:
-                        st.success(
-                            f"Beta V2 recalculated from completed 1-minute bar "
-                            f"{latest_ts.strftime('%H:%M:%S')} IST · source: {source_label}"
-                        )
-                    else:
-                        st.info(
-                            f"Showing Beta V2 forecast from {latest_ts.strftime('%H:%M:%S')} IST · "
-                            f"source: {source_label}"
-                        )
+                source_label = {
+                    "NSE_OFFICIAL_CHART": "NSE official",
+                    "PERSISTENT_LOCAL_CACHE": "Persistent cache",
+                    "INDSTOCKS_API": "INDstocks API",
+                    "DHAN": "Dhan",
+                    "YAHOO_FINANCE": "Yahoo Finance",
+                    "YFINANCE": "Yahoo Finance",
+                }.get(source, source)
+                p1, p2, p3, p4 = st.columns(4)
+                first = predictions[0]
+                reference0 = pd.to_numeric(first.get("reference_close"), errors="coerce")
+                predicted0 = pd.to_numeric(first.get("predicted_price"), errors="coerce")
+                move0 = float(predicted0) - float(reference0) if pd.notna(predicted0) and pd.notna(reference0) else np.nan
+                p1.metric("Reference price", f"₹{float(reference0):,.2f}" if pd.notna(reference0) else "—")
+                p2.metric("Next +5m signal", str(first.get("signal") or "ABSTAIN"))
+                p3.metric("Predicted +5m price", f"₹{float(predicted0):,.2f}" if pd.notna(predicted0) else "Unavailable",
+                          delta=f"₹{move0:+,.2f}" if pd.notna(move0) else None)
+                p4.metric("Latest 1m candle", latest_candle.strftime("%H:%M:%S"))
 
-                    h0 = predictions[0]
-                    reference0 = pd.to_numeric(h0.get("reference_close"), errors="coerce")
-                    predicted0 = pd.to_numeric(h0.get("predicted_price"), errors="coerce")
-                    move0 = (
-                        float(predicted0) - float(reference0)
-                        if pd.notna(predicted0) and pd.notna(reference0) else np.nan
+                st.caption(
+                    f"{'Recalculated' if recalculated else 'Unchanged for latest candle'} · "
+                    f"source: {source_label} · benchmark: {benchmark} · "
+                    f"benchmark candle: {market_latest} · input age: {age_seconds:.0f}s"
+                )
+
+                rows = []
+                for item in predictions:
+                    prob = pd.to_numeric(item.get("probability_up"), errors="coerce")
+                    ref_price = pd.to_numeric(item.get("reference_close"), errors="coerce")
+                    price = pd.to_numeric(item.get("predicted_price"), errors="coerce")
+                    expected_return = pd.to_numeric(item.get("expected_return"), errors="coerce")
+                    price_status = str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
+                    move = float(price) - float(ref_price) if pd.notna(price) and pd.notna(ref_price) else np.nan
+                    coverage = pd.to_numeric(item.get("feature_coverage"), errors="coerce")
+                    rows.append({
+                        "Horizon": f"+{int(item.get('horizon_min', 0))} min",
+                        "Signal": item.get("signal", "ABSTAIN"),
+                        "P(UP)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
+                        "Reference price": f"₹{float(ref_price):,.2f}" if pd.notna(ref_price) else "—",
+                        "Predicted price": f"₹{float(price):,.2f}" if pd.notna(price) else "—",
+                        "Expected move": f"₹{move:+,.2f}" if pd.notna(move) else "—",
+                        "Feature coverage": f"{float(coverage):.1%}" if pd.notna(coverage) else "—",
+                        "Price-head status": price_status,
+                        "Reason": str(item.get("signal_reason") or item.get("reason") or "—"),
+                    })
+                st.subheader("Multi-horizon forecast")
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                weak_heads = [
+                    str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
+                    for item in predictions
+                    if pd.isna(pd.to_numeric(item.get("predicted_price"), errors="coerce"))
+                    or str(item.get("price_forecast_status") or "") == "MAE_NOT_BETTER_THAN_MEDIAN_BASELINE"
+                ]
+                if weak_heads:
+                    st.warning(
+                        "Some price horizons are unavailable or below the median-baseline validation gate. "
+                        "Read the per-horizon Reason and Price-head status columns; do not substitute probability for price."
                     )
-                    a, b, c = st.columns(3)
-                    a.metric(
-                        "Reference price ₹",
-                        f"₹{float(reference0):,.2f}" if pd.notna(reference0) else "—",
-                    )
-                    b.metric("Next +5m signal", str(h0.get("signal", "ABSTAIN")))
-                    c.metric(
-                        "Predicted +5m price ₹",
-                        f"₹{float(predicted0):,.2f}" if pd.notna(predicted0) else "Unavailable",
-                        delta=f"₹{move0:+,.2f}" if pd.notna(move0) else None,
-                    )
+                with st.expander("Model diagnostics", expanded=False):
+                    st.json({
+                        "stock_source": source_label,
+                        "latest_completed_candle_ist": latest_candle.isoformat(),
+                        "benchmark": benchmark,
+                        "benchmark_freshness": market_freshness,
+                        "horizons": predictions,
+                    })
 
-                    st.subheader("Beta V2 multi-horizon price forecasts")
-                    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
-                    price_head_status = str(h0.get("price_forecast_status") or "RETRAIN_REQUIRED")
-                    if price_head_status == "RETRAIN_REQUIRED":
-                        st.warning(
-                            "The deployed horizon bundle is classifier-only and does not contain "
-                            "a continuous-return head. Run the updated intraday trainer once to add "
-                            "per-horizon price forecasts; probability is not being converted into a price."
-                        )
-                    elif price_head_status == "MAE_NOT_BETTER_THAN_MEDIAN_BASELINE":
-                        st.warning(
-                            "The price-regression head did not beat the chronological-tail median-return "
-                            "baseline. Its numerical estimates are shown for diagnosis, not as validated targets."
-                        )
-                    else:
-                        st.caption(
-                            "Predicted price = latest reference price × (1 + model-predicted forward return). "
-                            "The return head is separately fitted; the classifier probability is not used "
-                            "to manufacture a price. Tail metrics are diagnostics, not a guarantee of live accuracy."
-                        )
+            _render_selected_intraday_panel()
 
-                    with st.expander("Directional classifier diagnostics", expanded=False):
-                        st.dataframe(
-                            pd.DataFrame([
-                                {
-                                    "Horizon": f"+{int(item.get('horizon_min', 0))}m",
-                                    "P(UP)": (
-                                        f"{float(pd.to_numeric(item.get('probability_up'), errors='coerce')):.1%}"
-                                        if pd.notna(pd.to_numeric(item.get('probability_up'), errors='coerce'))
-                                        else "—"
-                                    ),
-                                    "Signal": item.get("signal", "ABSTAIN"),
-                                }
-                                for item in predictions
-                            ]),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                except Exception as exc:
-                    st.error(
-                        f"Beta V2 Intraday forecast failed: {type(exc).__name__}: {exc}"
-                    )
-
-            _render_live_beta_v2_intraday_stream()
-
-    st.divider()
-    st.subheader("What to watch tomorrow")
-    st.write(
-        "For the first live test, verify only: NSE data arrives → model is READY → "
-        "signal is produced → readiness is explicit → prediction is persisted. "
-        "Do not use the research/replay screens to judge live performance."
+    st.caption(
+        "Decision-support only · no orders are placed · the model may abstain when data or validation is inadequate."
     )
     st.stop()
+
+
+
+
+
 
 # These are populated later by the NSE official-universe section. Initialize
 # them before the early input validation so first app render cannot raise
