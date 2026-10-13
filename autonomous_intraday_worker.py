@@ -519,9 +519,10 @@ class AutonomousIntradayWorker:
 
     def _flush(self, final: bool = False) -> dict:
         result = {"status": "OK", "data_partitions_synced": 0, "ledger_synced": False, "status_synced": False, "errors": []}
+        synced_symbols = []
         try:
             from persistent_store import persist_1m_frame
-            for symbol, (frame, source) in self.session_frames.items():
+            for symbol, (frame, source) in list(self.session_frames.items()):
                 if frame is None or frame.empty:
                     continue
                 sync_result = persist_1m_frame(
@@ -530,11 +531,16 @@ class AutonomousIntradayWorker:
                 partitions = sync_result.get("partitions", []) or []
                 if partitions and all(p.get("drive_sync") == "OK" for p in partitions):
                     result["data_partitions_synced"] += len(partitions)
+                    synced_symbols.append(symbol)
                 else:
                     result["errors"].append({
                         "symbol": symbol,
                         "sync": sync_result,
                     })
+            # Keep only failed/pending symbols; already-synced partitions should
+            # not be uploaded again every five minutes for the rest of the day.
+            for symbol in synced_symbols:
+                self.session_frames.pop(symbol, None)
         except Exception as exc:
             result["errors"].append({"data_sync_error": f"{type(exc).__name__}: {exc}"})
 
@@ -554,7 +560,7 @@ class AutonomousIntradayWorker:
             local_status = self.root / "worker_status_latest.json"
             local_status.parent.mkdir(parents=True, exist_ok=True)
             local_status.write_text(
-                json.dumps(_clean_json(self._status_payload("STOPPING" if final else "RUNNING")), indent=2, sort_keys=True),
+                json.dumps(_clean_json(self._status_payload("STOPPED" if final else "RUNNING")), indent=2, sort_keys=True),
                 encoding="utf-8",
             )
             store.upload_or_update(
@@ -648,7 +654,7 @@ class AutonomousIntradayWorker:
                 stopped_at_ist=datetime.now(IST).isoformat(),
             )
 
-        return 1 if final_flush.get("status") == "FAILED" else 0
+        return 1 if final_flush.get("status") != "OK" else 0
 
 
 def main(argv: list[str] | None = None) -> int:
