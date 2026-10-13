@@ -263,7 +263,8 @@ def beta_status() -> dict[str, Any]:
 def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
                           raw_news: pd.DataFrame | None = None,
                           fno_daily: pd.DataFrame | None = None) -> dict[str, Any]:
-    """Run the isolated Beta V2 Delivery champion for one current symbol."""    store = _drive()
+    """Run the isolated Beta V2 Delivery champion for one current symbol."""
+    store = _drive()
 
     # Check model readiness before touching optional feature archives. A fresh
     # deployment can legitimately have no Beta V2 training artefacts yet; that
