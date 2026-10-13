@@ -93,3 +93,43 @@ def test_live_inference_can_emit_minute_anchors_while_training_default_stays_fiv
     assert len(minute_anchors) > len(default_anchors) * 4
     assert len(default_anchors) >= 10
     assert all(ts.second == 0 for ts in minute_anchors)
+
+
+def test_cloud_run_worker_tick_skips_weekend_without_fetching_or_persisting(tmp_path):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    result = worker.tick_once(datetime(2026, 10, 17, 10, 15, tzinfo=IST))
+
+    assert result["status"] == "MARKET_CLOSED"
+    assert worker.cycle_count == 0
+    assert worker.run_status == "STARTING"
+
+
+def test_cloud_run_worker_runs_at_most_one_cycle_per_minute(tmp_path, monkeypatch):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_cycle",
+        lambda: calls.append("cycle") or {"errors": [], "predictions_written": 2},
+    )
+    tick_time = datetime(2026, 10, 13, 11, 15, 30, tzinfo=IST)
+
+    first = worker.tick_once(tick_time)
+    duplicate = worker.tick_once(tick_time.replace(second=50))
+
+    assert first["status"] == "PASS"
+    assert duplicate["status"] == "DUPLICATE_MINUTE_SKIPPED"
+    assert len(calls) == 1
+    assert worker.cycle_count == 1
