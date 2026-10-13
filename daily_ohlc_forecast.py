@@ -129,6 +129,137 @@ def _new_model(n_rows: int) -> HistGradientBoostingRegressor:
     )
 
 
+
+def _cohere_log_return_predictions(
+    predicted_log_returns: np.ndarray,
+    anchor_close: np.ndarray,
+) -> np.ndarray:
+    """Apply the same OHLC price-coherence rule to every scored and shown forecast."""
+    values = np.asarray(predicted_log_returns, dtype=float)
+    anchors = np.asarray(anchor_close, dtype=float).reshape(-1)
+    if values.ndim != 2 or values.shape[1] != len(TARGETS):
+        raise ValueError(f"Expected an (n, {len(TARGETS)}) log-return matrix.")
+    if len(values) != len(anchors):
+        raise ValueError("Forecast rows and anchor closes must have the same length.")
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        prices = anchors[:, None] * np.exp(values)
+    if (
+        not np.isfinite(prices).all()
+        or not np.isfinite(anchors).all()
+        or (anchors <= 0).any()
+        or (prices <= 0).any()
+    ):
+        return np.full_like(values, np.nan)
+
+    # TARGETS order: open, high, low, close.
+    prices[:, 1] = np.maximum.reduce([prices[:, 1], prices[:, 0], prices[:, 3]])
+    prices[:, 2] = np.minimum.reduce([prices[:, 2], prices[:, 0], prices[:, 3]])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.log(prices / anchors[:, None])
+
+
+def guard_daily_forecast_for_display(
+    result: dict[str, Any],
+    *,
+    expected_latest_session: object,
+    now_ist: object,
+    target_sessions: list[object],
+) -> dict[str, Any]:
+    """Fail closed on stale source sessions or an already-started first target session.
+
+    A forecast calculated successfully is not necessarily current or eligible for
+    trading. This gate checks the exact issue-time contract before the UI renders it.
+    The first target may be today's session only before the 09:15 IST open.
+    """
+    out = dict(result or {})
+    if str(out.get("status", "")).upper() != "CALCULATED":
+        out.setdefault("trade_eligibility", "NOT_ELIGIBLE")
+        return out
+
+    out["trade_eligibility"] = "NOT_ELIGIBLE_PAPER_TRIAL_REQUIRED"
+    out.setdefault("forecast_status", "CALCULATED")
+    out.setdefault("data_status", "PASS")
+    out.setdefault("validation_status", "LOW_VALIDATION_SKILL")
+
+    try:
+        observed_date = pd.Timestamp(out.get("as_of_date")).date()
+        expected_date = pd.Timestamp(expected_latest_session).date()
+    except (TypeError, ValueError):
+        observed_date = expected_date = None
+
+    if expected_date is None or observed_date != expected_date:
+        out.update({
+            "status": "STALE_HISTORY",
+            "data_status": "STALE",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_CURRENT_DATA",
+            "reason": (
+                f"Daily history through {observed_date or 'an unknown date'} does not match "
+                f"the latest completed NSE session expected ({expected_date or 'unknown'})."
+            ),
+            "forecasts": [],
+        })
+        return out
+
+    forecasts = out.get("forecasts", []) or []
+    target_dates = []
+    try:
+        target_dates = [pd.Timestamp(value).date() for value in target_sessions]
+    except (TypeError, ValueError):
+        target_dates = []
+
+    if forecasts and (
+        len(target_dates) < len(forecasts)
+        or any(target_dates[i] >= target_dates[i + 1] for i in range(len(target_dates) - 1))
+    ):
+        out.update({
+            "status": "TARGET_DATES_UNAVAILABLE",
+            "forecast_status": "WITHHELD",
+            "reason": "The forecast target-session dates are missing, incomplete, or not strictly increasing.",
+            "forecasts": [],
+        })
+        return out
+
+    try:
+        current = pd.Timestamp(now_ist)
+        if current.tzinfo is None:
+            current = current.tz_localize("Asia/Kolkata")
+        else:
+            current = current.tz_convert("Asia/Kolkata")
+    except (TypeError, ValueError):
+        out.update({
+            "status": "ISSUE_TIME_INVALID",
+            "forecast_status": "WITHHELD",
+            "reason": "Unable to validate the forecast issue time in Asia/Kolkata.",
+            "forecasts": [],
+        })
+        return out
+
+    if forecasts and target_dates:
+        first_target = target_dates[0]
+        same_day_preopen = (
+            first_target == current.date()
+            and current.time() < pd.Timestamp("09:15").time()
+        )
+        if first_target <= current.date() and not same_day_preopen:
+            out.update({
+                "status": "STALE_TARGET_DATE",
+                "forecast_status": "WITHHELD",
+                "reason": (
+                    f"The first forecast target ({first_target}) has already started or passed "
+                    f"at issue time {current.strftime('%Y-%m-%d %H:%M %Z')}. "
+                    "Wait for the current session's completed daily data before issuing a new seven-session outlook."
+                ),
+                "forecasts": [],
+            })
+            return out
+
+    out["target_sessions"] = [value.isoformat() for value in target_dates[:len(forecasts)]]
+    out["status"] = "CALCULATED"
+    out.setdefault("reason", None)
+    return out
+
+
 def forecast_next_sessions(
     frame: pd.DataFrame | None,
     n_sessions: int = 7,
@@ -139,6 +270,11 @@ def forecast_next_sessions(
     if len(daily) < 160:
         return {
             "status": "INSUFFICIENT_HISTORY",
+            "calculation_status": "NOT_CALCULATED",
+            "data_status": "INSUFFICIENT_HISTORY",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_EVALUATED",
+            "trade_eligibility": "NOT_ELIGIBLE",
             "reason": f"Need at least 160 valid daily OHLC rows; received {len(daily)}.",
             "history_rows": int(len(daily)),
             "forecasts": [],
@@ -150,6 +286,11 @@ def forecast_next_sessions(
     if len(features) < 100:
         return {
             "status": "INSUFFICIENT_HISTORY",
+            "calculation_status": "NOT_CALCULATED",
+            "data_status": "INSUFFICIENT_HISTORY",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_EVALUATED",
+            "trade_eligibility": "NOT_ELIGIBLE",
             "reason": f"Only {len(features)} rows remain after feature warm-up.",
             "history_rows": int(len(daily)),
             "forecasts": [],
@@ -162,6 +303,7 @@ def forecast_next_sessions(
         block["forecast_horizon"] = float(horizon)
         block["asof_position"] = source_positions
         anchor = daily["close"].reindex(features.index).astype(float)
+        block["anchor_close"] = anchor.to_numpy(dtype=float)
         for target in TARGETS:
             future = daily[target].shift(-horizon).reindex(features.index).astype(float)
             block[f"target_{target}"] = np.log(future / anchor)
@@ -173,6 +315,11 @@ def forecast_next_sessions(
     if len(stacked) < 300:
         return {
             "status": "INSUFFICIENT_HISTORY",
+            "calculation_status": "NOT_CALCULATED",
+            "data_status": "INSUFFICIENT_HISTORY",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_EVALUATED",
+            "trade_eligibility": "NOT_ELIGIBLE",
             "reason": f"Only {len(stacked)} labelled horizon samples are available.",
             "history_rows": int(len(daily)),
             "forecasts": [],
@@ -188,6 +335,11 @@ def forecast_next_sessions(
     if len(train) < 200 or len(valid) < 60:
         return {
             "status": "VALIDATION_UNAVAILABLE",
+            "calculation_status": "NOT_CALCULATED",
+            "data_status": "PASS",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_EVALUATED",
+            "trade_eligibility": "NOT_ELIGIBLE",
             "reason": f"Chronological split too small after purge: train={len(train)}, validation={len(valid)}.",
             "history_rows": int(len(daily)),
             "forecasts": [],
@@ -197,26 +349,60 @@ def forecast_next_sessions(
     target_skill_by_horizon: dict[int, dict[str, float | None]] = {
         horizon: {} for horizon in range(1, n_sessions + 1)
     }
-    for target in TARGETS:
-        target_col = f"target_{target}"
-        model = _new_model(len(train))
-        model.fit(train[feature_names], train[target_col])
-        predicted = np.asarray(model.predict(valid[feature_names]), dtype=float)
-        actual = valid[target_col].to_numpy(dtype=float)
 
-        for horizon in range(1, n_sessions + 1):
-            mask = valid["forecast_horizon"].to_numpy(dtype=int) == horizon
-            if not mask.any():
+    # Fit on the chronological training slice, then score the exact coherent OHLC
+    # values that will be displayed. The median baseline receives the identical
+    # OHLC coherence transformation, so the comparison is like-for-like.
+    raw_model_matrix = np.column_stack([
+        _new_model(len(train)).fit(
+            train[feature_names], train[f"target_{target}"]
+        ).predict(valid[feature_names])
+        for target in TARGETS
+    ])
+    horizon_values = valid["forecast_horizon"].to_numpy(dtype=int)
+    baseline_matrix = np.full_like(raw_model_matrix, np.nan, dtype=float)
+    for row_idx, horizon in enumerate(horizon_values):
+        horizon_train = train.loc[train["forecast_horizon"].eq(float(horizon))]
+        for target_idx, target in enumerate(TARGETS):
+            values = horizon_train[f"target_{target}"].to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if len(values):
+                baseline_matrix[row_idx, target_idx] = float(np.median(values))
+
+    anchors = valid["anchor_close"].to_numpy(dtype=float)
+    model_scored = _cohere_log_return_predictions(raw_model_matrix, anchors)
+    baseline_scored = _cohere_log_return_predictions(baseline_matrix, anchors)
+    actual_matrix = valid[[f"target_{target}" for target in TARGETS]].to_numpy(dtype=float)
+
+    if (
+        not np.isfinite(model_scored).all()
+        or not np.isfinite(baseline_scored).all()
+        or not np.isfinite(actual_matrix).all()
+    ):
+        return {
+            "status": "INVALID_VALIDATION_VALUES",
+            "calculation_status": "NOT_CALCULATED",
+            "data_status": "INVALID",
+            "forecast_status": "WITHHELD",
+            "validation_status": "NOT_EVALUATED",
+            "trade_eligibility": "NOT_ELIGIBLE",
+            "reason": "Non-finite OHLC values appeared in the coherent validation comparison.",
+            "history_rows": int(len(daily)),
+            "forecasts": [],
+        }
+
+    for horizon in range(1, n_sessions + 1):
+        mask = horizon_values == horizon
+        if not mask.any():
+            for target in TARGETS:
                 target_skill_by_horizon[horizon][target] = None
-                continue
-            actual_h = actual[mask]
-            pred_h = predicted[mask]
-            training_h = train.loc[
-                train["forecast_horizon"].eq(float(horizon)), target_col
-            ].to_numpy(dtype=float)
-            baseline = float(np.nanmedian(training_h)) if len(training_h) else 0.0
+            continue
+        for target_idx, target in enumerate(TARGETS):
+            actual_h = actual_matrix[mask, target_idx]
+            pred_h = model_scored[mask, target_idx]
+            base_h = baseline_scored[mask, target_idx]
             model_mae = float(np.mean(np.abs(actual_h - pred_h)))
-            baseline_mae = float(np.mean(np.abs(actual_h - baseline)))
+            baseline_mae = float(np.mean(np.abs(actual_h - base_h)))
             skill = (
                 float(1.0 - model_mae / baseline_mae)
                 if np.isfinite(baseline_mae) and baseline_mae > 0
@@ -224,8 +410,8 @@ def forecast_next_sessions(
             )
             target_skill_by_horizon[horizon][target] = skill
             validation_by_horizon.setdefault(horizon, {})[target] = {
-                "model_mae_log_return": model_mae,
-                "median_baseline_mae_log_return": baseline_mae,
+                "model_mae_log_return_after_ohlc_coherence": model_mae,
+                "median_baseline_mae_log_return_after_ohlc_coherence": baseline_mae,
                 "mae_skill_vs_median": skill,
                 "validation_rows": int(mask.sum()),
             }
@@ -238,7 +424,7 @@ def forecast_next_sessions(
         beats = sum(value is not None and value > 0 for value in metrics.values())
         status = (
             "BEATS_MEDIAN_BASELINE"
-            if mean_skill is not None and mean_skill > 0 and beats >= 3
+            if mean_skill is not None and mean_skill > 0 and beats >= 3 and len(numeric) == len(TARGETS)
             else "LOW_VALIDATION_SKILL"
         )
         validation.append({
@@ -264,24 +450,30 @@ def forecast_next_sessions(
     for horizon in range(1, n_sessions + 1):
         query = latest_features.copy()
         query["forecast_horizon"] = float(horizon)
-        prices: dict[str, float] = {}
-        for target in TARGETS:
-            predicted_log_return = float(models[target].predict(query[feature_names])[0])
-            projected = latest_close * float(np.exp(predicted_log_return))
-            if not np.isfinite(projected) or projected <= 0:
-                return {
-                    "status": "INVALID_FORECAST",
-                    "reason": f"Invalid {target} estimate for horizon +{horizon}.",
-                    "history_rows": int(len(daily)),
-                    "forecasts": [],
-                }
-            prices[target] = projected
-
-        # Keep the OHLC bar internally coherent without fabricating a direction:
-        # the predicted high cannot be below the predicted open/close, and the
-        # predicted low cannot be above either.
-        prices["high"] = max(prices["high"], prices["open"], prices["close"])
-        prices["low"] = min(prices["low"], prices["open"], prices["close"])
+        raw_returns = np.asarray([
+            float(models[target].predict(query[feature_names])[0])
+            for target in TARGETS
+        ], dtype=float).reshape(1, -1)
+        coherent_returns = _cohere_log_return_predictions(
+            raw_returns,
+            np.asarray([latest_close], dtype=float),
+        )
+        if not np.isfinite(coherent_returns).all():
+            return {
+                "status": "INVALID_FORECAST",
+                "calculation_status": "NOT_CALCULATED",
+                "data_status": "INVALID",
+                "forecast_status": "WITHHELD",
+                "validation_status": "NOT_EVALUATED",
+                "trade_eligibility": "NOT_ELIGIBLE",
+                "reason": f"Invalid or non-finite coherent OHLC estimate for horizon +{horizon}.",
+                "history_rows": int(len(daily)),
+                "forecasts": [],
+            }
+        prices = {
+            target: float(latest_close * np.exp(coherent_returns[0, idx]))
+            for idx, target in enumerate(TARGETS)
+        }
         metric = validation[horizon - 1]
         forecasts.append({
             "horizon": horizon,
@@ -299,8 +491,26 @@ def forecast_next_sessions(
     ]
     overall_skill = float(np.mean(all_skill)) if all_skill else None
     validation_start_date = features.index[validation_start_feature_pos].date().isoformat()
+    all_horizons_beat_baseline = bool(validation) and all(
+        row["status"] == "BEATS_MEDIAN_BASELINE" for row in validation
+    )
+    global_validation_status = (
+        "BASELINE_EDGE_ON_CHRONOLOGICAL_HOLDOUT"
+        if all_horizons_beat_baseline and overall_skill is not None and overall_skill > 0
+        else "LOW_VALIDATION_SKILL"
+    )
     return {
-        "status": "PASS",
+        "status": "CALCULATED",
+        "calculation_status": "CALCULATED",
+        "data_status": "PASS",
+        "forecast_status": "CALCULATED",
+        "validation_status": global_validation_status,
+        "trade_eligibility": "NOT_ELIGIBLE_PAPER_TRIAL_REQUIRED",
+        "validation_gate": (
+            "PASS_ON_SINGLE_CHRONOLOGICAL_HOLDOUT_ONLY"
+            if global_validation_status == "BASELINE_EDGE_ON_CHRONOLOGICAL_HOLDOUT"
+            else "FAIL_BASELINE_COMPARISON"
+        ),
         "model": "horizon-conditioned HistGradientBoostingRegressor",
         "history_rows": int(len(daily)),
         "training_samples": int(len(train)),
@@ -313,9 +523,14 @@ def forecast_next_sessions(
         "validation_end": features.index[-1].date().isoformat(),
         "validation": validation,
         "forecasts": forecasts,
+        "reason": None if global_validation_status == "BASELINE_EDGE_ON_CHRONOLOGICAL_HOLDOUT" else (
+            "Validation did not beat the baseline at every forecast horizon. "
+            "Forecasts may be reviewed for research but are not qualified for trading."
+        ),
         "note": (
-            "Direct multi-horizon OHLC estimates from historical OHLCV. Holdout skill is "
-            "reported against a horizon-specific training-median baseline; positive skill "
-            "is not a guarantee of profit and low-skill forecasts must not be treated as trade signals."
+            "Direct multi-horizon OHLC estimates from historical OHLCV. The chronological "
+            "holdout is scored after the same OHLC-coherence transformation applied to the "
+            "shown forecasts. A single holdout is not trading approval; low-skill forecasts "
+            "must not be treated as trading-grade targets."
         ),
     }
