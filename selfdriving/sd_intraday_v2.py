@@ -103,7 +103,12 @@ def _session_rows(
     *,
     include_future: bool = True,
     max_decisions: int | None = None,
+    decision_interval_minutes: int = 5,
 ) -> list[dict]:
+    """Build horizon rows; training defaults to 5-minute anchors, inference may use 1-minute."""
+    if int(decision_interval_minutes) < 1:
+        raise ValueError("decision_interval_minutes must be >= 1")
+    decision_interval_minutes = int(decision_interval_minutes)
     z = _norm(g)
     if z.empty:
         return []
@@ -160,7 +165,7 @@ def _session_rows(
 
             decision_positions = np.flatnonzero(
                 (minutes0 >= OPEN_MIN + 15)
-                & (((minutes0 - OPEN_MIN) % 5) == 0)
+                & (((minutes0 - OPEN_MIN) % decision_interval_minutes) == 0)
             )
             if len(decision_positions) == 0:
                 continue
@@ -213,7 +218,7 @@ def _session_rows(
 
         decision_mask = (
             (minutes >= OPEN_MIN + 15)
-            & (((minutes - OPEN_MIN) % 5) == 0)
+            & (((minutes - OPEN_MIN) % decision_interval_minutes) == 0)
         )
         if not bool(decision_mask.any()):
             continue
