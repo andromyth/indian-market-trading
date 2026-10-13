@@ -181,11 +181,19 @@ def guard_daily_forecast_for_display(
     out.setdefault("data_status", "PASS")
     out.setdefault("validation_status", "LOW_VALIDATION_SKILL")
 
-    try:
-        observed_date = pd.Timestamp(out.get("as_of_date")).date()
-        expected_date = pd.Timestamp(expected_latest_session).date()
-    except (TypeError, ValueError):
-        observed_date = expected_date = None
+    def _as_date(value: object) -> object | None:
+        if value is None:
+            return None
+        try:
+            stamp = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(stamp):
+            return None
+        return stamp.date()
+
+    observed_date = _as_date(out.get("as_of_date"))
+    expected_date = _as_date(expected_latest_session)
 
     if expected_date is None or observed_date != expected_date:
         out.update({
@@ -202,6 +210,15 @@ def guard_daily_forecast_for_display(
         return out
 
     forecasts = out.get("forecasts", []) or []
+    if not forecasts:
+        out.update({
+            "status": "NO_FORECAST_ROWS",
+            "forecast_status": "WITHHELD",
+            "reason": "The model returned no forecast rows; nothing can be displayed as a valid outlook.",
+            "forecasts": [],
+        })
+        return out
+
     target_dates = []
     try:
         target_dates = [pd.Timestamp(value).date() for value in target_sessions]
