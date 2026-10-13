@@ -508,6 +508,9 @@ def forecast_next_sessions(
     ]
     overall_skill = float(np.mean(all_skill)) if all_skill else None
     validation_start_date = features.index[validation_start_feature_pos].date().isoformat()
+    validation_end_position = int(valid["asof_position"].max())
+    validation_end_date = daily.index[validation_end_position].date().isoformat()
+    validation_outcome_end_date = daily.index[-1].date().isoformat()
     all_horizons_beat_baseline = bool(validation) and all(
         row["status"] == "BEATS_MEDIAN_BASELINE" for row in validation
     )
@@ -537,7 +540,8 @@ def forecast_next_sessions(
         "anchor_close": latest_close,
         "overall_mean_mae_skill_vs_median": overall_skill,
         "validation_start": validation_start_date,
-        "validation_end": features.index[-1].date().isoformat(),
+        "validation_end": validation_end_date,
+        "validation_outcome_end": validation_outcome_end_date,
         "validation": validation,
         "forecasts": forecasts,
         "reason": None if global_validation_status == "BASELINE_EDGE_ON_CHRONOLOGICAL_HOLDOUT" else (
