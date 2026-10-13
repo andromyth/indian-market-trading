@@ -21,15 +21,17 @@ References:
 
 ## 1. Transfer existing credentials into Secret Manager
 
-Open Google Cloud Console → **Security → Secret Manager**. Create each secret below and add its latest version. Copy the values from the existing GitHub repository's **Settings → Secrets and variables → Actions** or the existing Streamlit Cloud Secrets; do not commit credentials into files, notebooks, or logs.
+Open Google Cloud Console → **Security → Secret Manager**. Create the required secrets below and add their latest versions. Copy the values from the existing GitHub repository's **Settings → Secrets and variables → Actions** or the existing Streamlit Cloud Secrets; do not commit credentials into files, notebooks, or logs.
 
-| Secret Manager name | Value |
-|---|---|
-| google-drive-root-id | The existing GOOGLE_DRIVE_ROOT_ID folder ID |
-| google-service-account-json | Full GOOGLE_SERVICE_ACCOUNT_JSON JSON |
-| google-oauth-token-json | Full GOOGLE_OAUTH_TOKEN_JSON JSON, including its refresh token |
+| Secret Manager name | Required? | Value |
+|---|---|---|
+| google-drive-root-id | Yes | The existing GOOGLE_DRIVE_ROOT_ID folder ID |
+| google-oauth-token-json | Yes | Full GOOGLE_OAUTH_TOKEN_JSON JSON, including its refresh token |
+| google-service-account-json | Optional | Full GOOGLE_SERVICE_ACCOUNT_JSON service-account key JSON |
 
-The OAuth token is required when writes to the owner's My Drive need user OAuth; the deployment preflight checks read/write access and refuses to run if it fails.
+The worker can use the OAuth user token for both Google Drive reads and writes. A valid service-account JSON is optional; when present and valid, it can be used for Drive read/list operations while OAuth handles writes to the owner's My Drive. The deployment script validates this optional secret silently and falls back to OAuth-only access if it is missing or malformed.
+
+The deployment preflight checks actual Google Drive read/write access and refuses to run if it fails. JSON formatting alone is not proof that the account can access the configured Drive folder.
 
 Optional broker credentials can be added to Secret Manager using these names to enable the authenticated INDstocks source:
 - indstocks-client-id
