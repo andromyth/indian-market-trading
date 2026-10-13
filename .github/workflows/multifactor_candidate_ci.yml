@@ -89,6 +89,9 @@ jobs:
       - name: Validate Cloud Run deployment script syntax
         run: bash -n deploy_autonomous_intraday_cloud_run.sh
 
+      - name: Build Cloud Run worker container
+        run: docker build --tag indian-market-intraday-worker:ci .
+
       - name: Run multi-factor tests
         run: >
           pytest -q
