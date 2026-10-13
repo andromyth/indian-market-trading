@@ -528,9 +528,13 @@ class AutonomousIntradayWorker:
         _log("cycle_completed", **summary)
         return summary
 
-    def tick_once(self) -> dict[str, Any]:
-        """Execute one prediction cycle for the persistent Cloud Run service."""
-        now_dt = datetime.now(IST)
+    def tick_once(self, now_value: datetime | None = None) -> dict[str, Any]:
+        """Execute one prediction cycle for the persistent Cloud Run service.
+
+        now_value is injectable for deterministic tests; production calls omit it.
+        """
+        now_dt = now_value or datetime.now(IST)
+        now_dt = now_dt.replace(tzinfo=IST) if now_dt.tzinfo is None else now_dt.astimezone(IST)
         now = pd.Timestamp(now_dt)
         current_day = now.strftime("%Y/%m/%d")
 
