@@ -86,6 +86,9 @@ jobs:
           autonomous_intraday_worker.py
           autonomous_intraday_worker_service.py
 
+      - name: Validate Cloud Run deployment script syntax
+        run: bash -n deploy_autonomous_intraday_cloud_run.sh
+
       - name: Run multi-factor tests
         run: >
           pytest -q
