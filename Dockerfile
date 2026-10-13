@@ -13,7 +13,9 @@ RUN apt-get update \
 
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -r /app/requirements.txt
+    && python -m pip install --no-cache-dir -r /app/requirements.txt \
+    && python -m pip install --no-cache-dir "pyarrow<25" \
+    && python -m pip check
 
 COPY . /app
 
