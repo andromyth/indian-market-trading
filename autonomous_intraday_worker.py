@@ -2,12 +2,12 @@
 """Unattended NSE intraday watchlist collector and prediction worker.
 
 The worker runs independently of Streamlit, polls during the NSE cash session,
-persists 1-minute bars locally and to Google Drive, runs the saved Beta V2
-horizon models, and appends prediction/health records to a Drive-backed ledger.
+persists 1-minute watchlist bars to a dedicated Drive namespace, runs the saved
+Beta V2 horizon models, and appends prediction/health records to a Drive ledger.
 
-It intentionally scores the same dynamic news-derived watchlist as the dashboard
-(top 5 by default), not thousands of securities every minute. The existing
-nse_intraday_sync.yml job remains responsible for hourly full-universe capture.
+It scores the dynamic news-derived watchlist (top 5 by default), not thousands
+of securities every minute. The existing nse_intraday_sync.yml job retains
+ownership of the separate hourly full-universe archive.
 """
 from __future__ import annotations
 
@@ -302,7 +302,7 @@ class AutonomousIntradayWorker:
         self.symbols: list[str] = []
         self.watchlist_meta: dict = {}
         self.last_watchlist_refresh = 0.0
-        self.session_frames: dict[str, tuple[pd.DataFrame, str]] = {}
+        self.session_frames: dict[str, tuple[pd.DataFrame, str, Path]] = {}
         self.daily_ledger: Path | None = None
         self.started_at_utc = datetime.now(timezone.utc).isoformat()
         self.run_status = "STARTING"
@@ -314,6 +314,35 @@ class AutonomousIntradayWorker:
         daily = self.root / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
         daily.mkdir(parents=True, exist_ok=True)
         self.daily_ledger = daily / f"predictions_{self.segment}.jsonl"
+
+    def _persist_bars_locally(
+        self, symbol: str, frame: pd.DataFrame, source: str
+    ) -> tuple[Path, int]:
+        """Append/upsert bars into the worker-owned local partition."""
+        normalized = normalize_bars(frame)
+        if normalized.empty:
+            raise RuntimeError(f"No normalized bars to persist for {symbol}")
+        now = pd.Timestamp.now(tz=IST)
+        day_dir = self.root / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}" / "bars"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        safe_symbol = "".join(
+            char if char.isalnum() or char in {"_", "-", "^"} else "_"
+            for char in str(symbol).upper()
+        )
+        path = day_dir / f"{safe_symbol}.parquet"
+        if path.exists():
+            try:
+                old = normalize_bars(pd.read_parquet(path))
+                normalized = pd.concat([old, normalized]).sort_index()
+                normalized = normalized[~normalized.index.duplicated(keep="last")]
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Existing worker partition is unreadable for {symbol}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+        normalized.to_parquet(path, index=True)
+        self.session_frames[str(symbol)] = (normalized, source, path)
+        return path, int(len(normalized))
 
     def _refresh_watchlist_if_due(self, force: bool = False) -> None:
         monotonic_now = time_module.monotonic()
@@ -380,7 +409,7 @@ class AutonomousIntradayWorker:
                     raise RuntimeError("benchmark is stale: " + str(freshness))
                 market_frames[benchmark] = (completed, source, freshness)
                 summary["fresh_benchmark_count"] += 1
-                self.session_frames[benchmark] = (completed, source)
+                self._persist_bars_locally(benchmark, completed, source)
             except Exception as exc:
                 summary["errors"].append({
                     "benchmark": benchmark,
@@ -401,11 +430,9 @@ class AutonomousIntradayWorker:
                 # Persist locally every cycle. Google Drive sync is batched every
                 # five cycles so it does not turn each ticker's minute fetch into
                 # a large number of uploads.
-                from persistent_store import persist_1m_frame
-                local_persist = persist_1m_frame(
-                    root, completed, source=source, sync_drive=False
+                local_path, local_rows = self._persist_bars_locally(
+                    root, completed, source
                 )
-                self.session_frames[root] = (completed, source)
                 summary["stock_fetch_ok"] += 1
                 _log(
                     "stock_data_collected",
@@ -413,7 +440,8 @@ class AutonomousIntradayWorker:
                     source=source,
                     rows_current_session=int(len(completed)),
                     freshness=stock_freshness,
-                    local_rows_added=local_persist.get("rows_added"),
+                    local_partition=str(local_path),
+                    local_rows=int(local_rows),
                 )
 
                 if not fresh:
@@ -521,24 +549,31 @@ class AutonomousIntradayWorker:
         result = {"status": "OK", "data_partitions_synced": 0, "ledger_synced": False, "status_synced": False, "errors": []}
         synced_symbols = []
         try:
-            from persistent_store import persist_1m_frame
-            for symbol, (frame, source) in list(self.session_frames.items()):
-                if frame is None or frame.empty:
+            from persistent_store import GoogleDriveStore
+            store = GoogleDriveStore()
+            now = pd.Timestamp.now(tz=IST)
+            daily_dir = now.strftime("%Y/%m/%d")
+            for symbol, (frame, source, local_path) in list(self.session_frames.items()):
+                if frame is None or frame.empty or not local_path.exists():
                     continue
-                sync_result = persist_1m_frame(
-                    symbol, frame, source=source, sync_drive=True
+                safe_symbol = "".join(
+                    char if char.isalnum() or char in {"_", "-", "^"} else "_"
+                    for char in str(symbol).upper()
                 )
-                partitions = sync_result.get("partitions", []) or []
-                if partitions and all(p.get("drive_sync") == "OK" for p in partitions):
-                    result["data_partitions_synced"] += len(partitions)
-                    synced_symbols.append(symbol)
-                else:
-                    result["errors"].append({
-                        "symbol": symbol,
-                        "sync": sync_result,
-                    })
-            # Keep only failed/pending symbols; already-synced partitions should
-            # not be uploaded again every five minutes for the rest of the day.
+                remote = (
+                    f"production_data/intraday_live_worker/{daily_dir}/"
+                    f"{safe_symbol}.parquet"
+                )
+                store.upload_or_update(
+                    local_path,
+                    remote,
+                    mime_type="application/vnd.apache.parquet",
+                )
+                result["data_partitions_synced"] += 1
+                synced_symbols.append(symbol)
+            # Avoid repeatedly uploading already-synced partitions until their
+            # contents change again. This namespace never races the full-universe
+            # producer under production_data/intraday_1m.
             for symbol in synced_symbols:
                 self.session_frames.pop(symbol, None)
         except Exception as exc:
