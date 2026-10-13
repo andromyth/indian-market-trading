@@ -549,9 +549,17 @@ class AutonomousIntradayWorker:
                         {
                             "horizon_min": row.get("horizon_min"),
                             "signal": row.get("signal"),
+                            "signal_reason": row.get("signal_reason"),
+                            "reason": row.get("reason"),
+                            "decision_timestamp": row.get("decision_timestamp"),
+                            "reference_close": row.get("reference_close"),
+                            "expected_return": row.get("expected_return"),
                             "predicted_price": row.get("predicted_price"),
                             "price_forecast_status": row.get("price_forecast_status"),
-                            "decision_timestamp": row.get("decision_timestamp"),
+                            "probability_up": row.get("probability_up"),
+                            "feature_coverage": row.get("feature_coverage"),
+                            "active_model_feature_count": row.get("active_model_feature_count"),
+                            "missing_model_features": row.get("missing_model_features"),
                         }
                         for row in predictions
                     ],
