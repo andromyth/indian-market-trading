@@ -10,10 +10,24 @@ import pandas as pd
 
 
 def runtime_diagnostics_enabled() -> bool:
-    """Diagnostics are opt-in; normal production behavior is unchanged by default."""
-    return os.getenv("QUANT_TIMEFRAME_DIAGNOSTICS", "0").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
+    """Read opt-in from environment first, then Streamlit Cloud secrets.
+
+    Colab environment variables do not propagate to a separately hosted
+    Streamlit deployment. Defining QUANT_TIMEFRAME_DIAGNOSTICS="true" in the
+    deployed app's Secrets enables telemetry there without enabling it by
+    default for ordinary installations.
+    """
+    env_value = os.getenv("QUANT_TIMEFRAME_DIAGNOSTICS")
+    if env_value is not None:
+        return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        import streamlit as st
+        setting = st.secrets.get("QUANT_TIMEFRAME_DIAGNOSTICS", "0")
+    except Exception:
+        setting = "0"
+
+    return str(setting).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def report_runtime_cadence(
