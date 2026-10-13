@@ -48,7 +48,7 @@ def _dedupe_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(index=x.index)
     for name in list(dict.fromkeys(x.columns)):
-        part = x.loc[:, x.columns.eq(name)]
+        part = x.loc[:, (x.columns == name)]
         out[name] = part.iloc[:, 0] if part.shape[1] == 1 else part.bfill(axis=1).iloc[:, 0]
     return out
 

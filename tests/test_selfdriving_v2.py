@@ -6,6 +6,7 @@ from selfdriving.sd_intraday_v2 import (
     add_cross_sectional_targets,
     feature_columns,
     _session_rows,
+    _dedupe_columns,
 )
 from selfdriving.sd_registry import GateRules, gate
 from selfdriving.sd_v2_panel import add_delivery_targets
@@ -148,3 +149,22 @@ def test_delivery_forecast_revision_replaces_current_and_archives_prior(tmp_path
     assert len(prior) == 1
     assert prior.iloc[0]["signal"] == "BUY"
     assert prior.iloc[0]["revision_status"] == "SUPERSEDED"
+
+
+def test_intraday_duplicate_column_normalization_works_with_pandas_index():
+    # Some provider frames (notably Yahoo-style OHLC/MultiIndex frames after
+    # normalization) can expose duplicate labels such as Close/Adj Close -> Close.
+    # pandas Index has no .eq() method; boolean equality is cross-version safe.
+    frame = pd.DataFrame(
+        [
+            [np.nan, 100.0, 10.0],
+            [101.0, np.nan, 11.0],
+        ],
+        columns=["close", "close", "open"],
+    )
+
+    normalized = _dedupe_columns(frame)
+
+    assert list(normalized.columns) == ["close", "open"]
+    assert normalized.columns.is_unique
+    assert np.allclose(normalized["close"].to_numpy(), [100.0, 101.0])
