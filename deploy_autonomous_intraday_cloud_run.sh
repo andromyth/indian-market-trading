@@ -14,7 +14,6 @@ SCHEDULER_SA="${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 required_secrets=(
   "google-drive-root-id"
-  "google-service-account-json"
   "google-oauth-token-json"
 )
 
@@ -63,12 +62,25 @@ for secret_name in "${required_secrets[@]}"; do
   fi
 done
 
+# OAuth user credentials are sufficient for My Drive read/write. An optional
+# valid service-account key may be used for Drive read/list while OAuth handles writes.
 secret_mappings=(
   "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest"
   "GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest"
-  "GOOGLE_SERVICE_ACCOUNT_JSON=google-service-account-json:latest"
   "GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 )
+
+# Do not fail deployment because an optional legacy service-account secret is
+# malformed. Validate it silently before injecting it into the container.
+if gcloud secrets describe "google-service-account-json" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  if gcloud secrets versions access latest \
+      --secret "google-service-account-json" --project "$PROJECT_ID" 2>/dev/null \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d,dict) and d.get("type")=="service_account" and d.get("client_email") and d.get("private_key") else 1)' >/dev/null 2>&1; then
+    secret_mappings+=("GOOGLE_SERVICE_ACCOUNT_JSON=google-service-account-json:latest")
+  else
+    echo "WARNING: Optional google-service-account-json is invalid or unreadable; using OAuth-only Google Drive access." >&2
+  fi
+fi
 optional_secrets=(
   "INDSTOCKS_CLIENT_ID=indstocks-client-id"
   "INDSTOCKS_MPIN=indstocks-mpin"
