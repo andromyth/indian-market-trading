@@ -72,6 +72,7 @@ jobs:
           selfdriving/sd_v2_panel.py
           selfdriving/sd_intraday_v2.py
           selfdriving/sd_v2_runtime.py
+          selfdriving/runtime_timeframe_diagnostics.py
           selfdriving/sd_cycle.py
           selfdriving/sd_registry.py
           selfdriving/sd_github_job_v2.py
@@ -100,6 +101,7 @@ jobs:
           tests/test_global_cues_datetime_precision.py
           tests/test_beta_v2_join_timestamp_precision.py
           tests/test_sd_v2_runtime_optional_archives.py
+          tests/test_runtime_timeframe_diagnostics.py
           tests/test_nse_eod_archive_presence.py
           tests/test_nse_index_daily_snapshot_fallback.py
           tests/test_market_session_guard.py
