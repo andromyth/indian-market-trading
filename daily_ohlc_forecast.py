@@ -258,14 +258,56 @@ def guard_daily_forecast_for_display(
             first_target == current.date()
             and current.time() < pd.Timestamp("09:15").time()
         )
-        if first_target <= current.date() and not same_day_preopen:
+        current_session_underway = (
+            first_target == current.date()
+            and pd.Timestamp("09:15").time() <= current.time() < pd.Timestamp("15:30").time()
+        )
+
+        if current_session_underway:
+            # The first direct forecast targets today's session, which is no
+            # longer a future target once the cash market has opened. Keep the
+            # remaining trained horizons (+2 through +7), aligned to their
+            # original future NSE sessions, instead of discarding all useful
+            # future rows or showing today's partial session as an OHLC forecast.
+            first_horizon = forecasts[0].get("horizon", 1)
+            try:
+                first_horizon = int(first_horizon)
+            except (TypeError, ValueError):
+                first_horizon = -1
+            if first_horizon != 1:
+                out.update({
+                    "status": "TARGET_HORIZON_MISMATCH",
+                    "forecast_status": "WITHHELD",
+                    "reason": "The active-session target cannot be safely removed because the first forecast row is not horizon +1.",
+                    "forecasts": [],
+                })
+                return out
+
+            out["active_session_target_omitted"] = first_target.isoformat()
+            out["active_session_target_omission_reason"] = (
+                "The +1-session target is the current, already-started NSE session; "
+                "only later future-session horizons are displayed."
+            )
+            forecasts = forecasts[1:]
+            target_dates = target_dates[1:]
+            out["forecasts"] = forecasts
+            if not forecasts or not target_dates:
+                out.update({
+                    "status": "NO_FUTURE_TARGETS_REMAINING",
+                    "forecast_status": "WITHHELD",
+                    "reason": "The active-session target was omitted and no later forecast horizons remain.",
+                    "forecasts": [],
+                })
+                return out
+
+        if target_dates[0] <= current.date() and not same_day_preopen:
             out.update({
                 "status": "STALE_TARGET_DATE",
                 "forecast_status": "WITHHELD",
                 "reason": (
-                    f"The first forecast target ({first_target}) has already started or passed "
+                    f"The first forecast target ({target_dates[0]}) has already started or passed "
                     f"at issue time {current.strftime('%Y-%m-%d %H:%M %Z')}. "
-                    "Wait for the current session's completed daily data before issuing a new seven-session outlook."
+                    "Wait for the current session's completed daily data before issuing a new forward outlook."
                 ),
                 "forecasts": [],
             })
