@@ -240,3 +240,79 @@ def test_cloud_run_partial_prediction_tick_flushes_immediately(tmp_path, monkeyp
     assert result["status"] == "PARTIAL"
     assert result["flush"]["status"] == "OK"
     assert flush_calls == [False]
+
+
+
+def test_worker_health_records_empty_prediction_output_as_failure(tmp_path, monkeypatch):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_cycle",
+        lambda: {
+            "errors": [
+                {
+                    "symbol": "RBLBANK",
+                    "error": "Intraday runtime produced no prediction rows after warmup",
+                }
+            ],
+            "predictions_written": 0,
+            "prediction_rows_valid": 0,
+            "prediction_errors": 1,
+            "prediction_abstains": 0,
+            "warmup_symbols": [
+                {"symbol": "RBLBANK", "rows": 85, "required": 80,
+                 "reason": "runtime produced no eligible rows"}
+            ],
+        },
+    )
+    flush_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_flush",
+        lambda final=False: (
+            flush_calls.append(final)
+            or {
+                "status": "OK",
+                "data_partitions_synced": 5,
+                "ledger_synced": True,
+                "status_synced": True,
+                "errors": [],
+            }
+        ),
+    )
+
+    result = worker.tick_once(datetime(2026, 10, 14, 10, 16, 30, tzinfo=IST))
+
+    assert result["status"] == "PARTIAL"
+    assert result["summary"]["prediction_errors"] == 1
+    assert result["flush"]["status"] == "OK"
+    assert flush_calls == [False]
+
+
+def test_worker_health_endpoint_retains_specific_prediction_error(monkeypatch):
+    from autonomous_intraday_worker_service import STATE, _record_tick_result
+
+    original = dict(STATE)
+    try:
+        _record_tick_result({
+            "status": "PARTIAL",
+            "summary": {
+                "errors": [
+                    {
+                        "symbol": "RBLBANK",
+                        "horizon_min": 5,
+                        "error": "Prediction unavailable: NameError: name 'np' is not defined",
+                    }
+                ]
+            },
+        })
+        assert "NameError: name 'np' is not defined" in STATE["last_error"]
+    finally:
+        STATE.clear()
+        STATE.update(original)
