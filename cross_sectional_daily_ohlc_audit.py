@@ -504,7 +504,16 @@ def run_audit(
     fetch_meta: dict[str, Any] = {}
     raw_history: dict[str, pd.DataFrame] = {}
     for symbol in ["^NSEI", *all_symbols]:
-        daily, meta = history_loader(symbol, period)
+        try:
+            daily, meta = history_loader(symbol, period)
+        except Exception as exc:
+            daily = pd.DataFrame()
+            meta = {
+                "requested_symbol": symbol,
+                "provider_path": "history_loader_exception",
+                "history_rows": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         if daily is None or daily.empty:
             fetch_meta[symbol] = {**meta, "status": "NO_HISTORY"}
             raw_history[symbol] = pd.DataFrame()
@@ -606,7 +615,8 @@ def run_audit(
         training_meta[symbol] = {
             "purged_training_rows": train_rows,
             "purge_cutoff_position_exclusive": training_cutoff_position,
-            "train_labels_end_before_position": training_cutoff_position,
+            "max_training_label_target_position": training_cutoff_position - 1 + max(HORIZONS),
+            "first_validation_origin_position": first_evaluation_position,
             "validation_origin_count": len(evaluation_positions),
             "validation_rows_per_horizon": len(evaluation_positions),
             "model_refit_policy": "one fit before the shared holdout; weights frozen during holdout",
