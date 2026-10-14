@@ -213,6 +213,14 @@ def test_new_official_snapshot_is_mirrored_to_mounted_drive(
     assert len(result) == 1
     assert local_file.read_bytes() == AvailableSnapshot.content
     assert drive_file.read_bytes() == AvailableSnapshot.content
+    durable_parquet = (
+        drive_root / "production_data" / "nse_official"
+        / "indices" / "NSEI" / "20260515_20260515.parquet"
+    )
+    assert durable_parquet.is_file()
+    cached = pd.read_parquet(durable_parquet)
+    assert len(cached) == 1
+    assert pd.to_datetime(cached["date"]).max().date() == date(2026, 5, 15)
 
 
 def test_fetch_index_history_audit_tail_opt_in_does_not_weaken_default(
