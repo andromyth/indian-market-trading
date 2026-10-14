@@ -5,9 +5,10 @@ This is a read-only evaluation utility. It fetches daily histories via the
 repository's NSE-first provider chain, evaluates the existing daily OHLC model
 against the same training-median baseline on a common NSE-session holdout, and
 writes local JSON/CSV reports. The official NSE snapshot layer may cache
-immutable source CSVs on mounted Drive to resume an interrupted download; the
-audit does not modify research datasets, production models, prediction ledgers,
-or place orders.
+immutable source CSVs and a normalized range cache on mounted Drive so an
+interrupted or repeated audit can resume without rescanning the full history.
+The audit does not modify research datasets, production models, prediction
+ledgers, or place orders.
 
 Run:
   ./py.sh cross_sectional_daily_ohlc_audit.py --period 900d
