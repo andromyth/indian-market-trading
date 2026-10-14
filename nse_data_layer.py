@@ -1302,7 +1302,12 @@ def _fetch_index_history_from_daily_snapshots(
     cache_path = cache_dir / f"{start_d:%Y%m%d}_{end_d:%Y%m%d}.parquet"
     combined.to_parquet(cache_path, index=False)
 
-    if sync_drive:
+    # Keep one consolidated cache on mounted Drive as well as the per-date
+    # CSVs. An interrupted or repeated audit can then load the complete official
+    # range directly instead of re-reading hundreds of individual snapshots.
+    # When Drive is not mounted, sync_drive=False remains strictly local.
+    mounted_drive_available = _mounted_drive_root() is not None
+    if sync_drive or mounted_drive_available:
         remote_path = (
             f"production_data/nse_official/indices/{folder}/{cache_path.name}"
         )
@@ -1317,9 +1322,15 @@ def _fetch_index_history_from_daily_snapshots(
                 if isinstance(result, dict)
                 else repr(result)
             )
-            raise RuntimeError(
-                f"Official NSE index history was recovered but Google Drive "
-                f"persistence failed for {root} {start_d}..{end_d}: {detail}"
+            if sync_drive:
+                raise RuntimeError(
+                    f"Official NSE index history was recovered but Google Drive "
+                    f"persistence failed for {root} {start_d}..{end_d}: {detail}"
+                )
+            print(
+                f"WARNING: could not persist resumable official NSE index cache "
+                f"for {root} {start_d}..{end_d}: {detail}",
+                flush=True,
             )
 
     print(
