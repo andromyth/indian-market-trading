@@ -4,8 +4,10 @@
 This is a read-only evaluation utility. It fetches daily histories via the
 repository's NSE-first provider chain, evaluates the existing daily OHLC model
 against the same training-median baseline on a common NSE-session holdout, and
-writes local JSON/CSV reports. It does not retrain or promote production
-artifacts, update Drive, modify prediction ledgers, or place orders.
+writes local JSON/CSV reports. The official NSE snapshot layer may cache
+immutable source CSVs on mounted Drive to resume an interrupted download; the
+audit does not modify research datasets, production models, prediction ledgers,
+or place orders.
 
 Run:
   ./py.sh cross_sectional_daily_ohlc_audit.py --period 900d
@@ -103,7 +105,11 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
         start_date = end_date - timedelta(days=_period_days(period))
         try:
             index_frame = fetch_index_history(
-                ticker, start_date, end_date, sync_drive=False
+                ticker,
+                start_date,
+                end_date,
+                sync_drive=False,
+                allow_latest_missing_end=True,
             )
             if index_frame is None or index_frame.empty:
                 daily = pd.DataFrame()
