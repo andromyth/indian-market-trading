@@ -159,3 +159,84 @@ def test_cloud_run_worker_runs_at_most_one_cycle_per_minute(tmp_path, monkeypatc
     assert duplicate["status"] == "DUPLICATE_MINUTE_SKIPPED"
     assert len(calls) == 1
     assert worker.cycle_count == 1
+
+
+
+def test_beta_v2_runtime_imports_numpy_alias():
+    from selfdriving import sd_v2_runtime
+
+    assert sd_v2_runtime.np is np
+
+
+def test_prediction_health_distinguishes_runtime_failure_from_valid_abstain():
+    from autonomous_intraday_worker import _prediction_row_failure
+
+    failure = _prediction_row_failure(
+        "RBLBANK",
+        {
+            "horizon_min": 5,
+            "signal": "ABSTAIN",
+            "reason": "NameError: name 'np' is not defined",
+        },
+    )
+    assert failure == {
+        "symbol": "RBLBANK",
+        "horizon_min": 5,
+        "error": "Prediction unavailable: NameError: name 'np' is not defined",
+    }
+
+    valid_abstain = _prediction_row_failure(
+        "RBLBANK",
+        {
+            "horizon_min": 5,
+            "signal": "ABSTAIN",
+            "signal_reason": "NO_VALIDATED_ACTION_BAND",
+            "probability_up": 0.51,
+            "decision_timestamp": "2026-10-14T05:09:00Z",
+        },
+    )
+    assert valid_abstain is None
+
+
+def test_cloud_run_partial_prediction_tick_flushes_immediately(tmp_path, monkeypatch):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_cycle",
+        lambda: {
+            "errors": [
+                {"symbol": "RBLBANK", "horizon_min": 5, "error": "Prediction unavailable"}
+            ],
+            "predictions_written": 6,
+            "prediction_rows_valid": 0,
+            "prediction_errors": 6,
+            "prediction_abstains": 0,
+        },
+    )
+    flush_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_flush",
+        lambda final=False: (
+            flush_calls.append(final)
+            or {
+                "status": "OK",
+                "data_partitions_synced": 5,
+                "ledger_synced": True,
+                "status_synced": True,
+                "errors": [],
+            }
+        ),
+    )
+
+    result = worker.tick_once(datetime(2026, 10, 14, 10, 15, 30, tzinfo=IST))
+
+    assert result["status"] == "PARTIAL"
+    assert result["flush"]["status"] == "OK"
+    assert flush_calls == [False]
