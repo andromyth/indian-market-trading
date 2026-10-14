@@ -20,14 +20,6 @@ def _finite_positive(value: Any) -> float | None:
     return result if math.isfinite(result) and result > 0 else None
 
 
-def _finite_number(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
 def stepwise_horizon_path(
     predictions: Iterable[dict[str, Any]],
     *,
