@@ -128,6 +128,26 @@ def test_stale_daily_source_is_withheld_when_first_target_session_has_started():
     assert "already started or passed" in result["reason"]
 
 
+def test_current_session_target_is_omitted_but_later_horizons_are_kept():
+    result = guard_daily_forecast_for_display(
+        _forecast_result(as_of="2026-10-13"),
+        expected_latest_session="2026-10-13",
+        now_ist="2026-10-14T12:17:00+05:30",
+        target_sessions=[
+            "2026-10-14",
+            "2026-10-15",
+        ],
+    )
+
+    assert result["status"] == "CALCULATED"
+    assert result["forecast_status"] == "CALCULATED"
+    assert result["active_session_target_omitted"] == "2026-10-14"
+    assert len(result["forecasts"]) == 1
+    assert result["forecasts"][0]["horizon"] == 2
+    assert result["target_sessions"] == ["2026-10-15"]
+    assert result["trade_eligibility"] == "NOT_ELIGIBLE_PAPER_TRIAL_REQUIRED"
+
+
 def test_stale_source_reference_is_withheld_even_before_target_date_check():
     result = guard_daily_forecast_for_display(
         _forecast_result(as_of="2026-10-12"),
