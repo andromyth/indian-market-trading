@@ -1188,11 +1188,12 @@ if interface_mode == "Live Test":
             )
 
     elif workspace == "Delivery · 7 sessions":
-        st.subheader(f"{selected_root} · Seven-session OHLC outlook" if selected_root else "Seven-session OHLC outlook")
+        st.subheader(f"{selected_root} · Daily OHLC outlook" if selected_root else "Daily OHLC outlook")
         st.caption(
-            "Daily opening, high, low and closing estimates for the next seven expected NSE sessions. "
-            "The OHLC path is a horizon-conditioned model trained on historical daily bars and checked "
-            "against a chronological holdout. Validation metrics are shown; a forecast is not a guarantee."
+            "Direct daily opening, high, low and closing estimates for eligible future NSE sessions. "
+            "The horizon-conditioned model is trained on completed historical daily bars and checked "
+            "against a chronological holdout. During market hours, the already-started +1-session target "
+            "is omitted rather than displayed as a forward forecast. Validation metrics are shown; a forecast is not a guarantee."
         )
         if not selected_symbol:
             st.stop()
@@ -1268,6 +1269,16 @@ if interface_mode == "Live Test":
         )
         if delivery.get("signal_reason") or delivery.get("reason"):
             st.caption(str(delivery.get("signal_reason") or delivery.get("reason")))
+
+        if ohlc_forecast.get("active_session_target_omitted"):
+            omitted_date = str(ohlc_forecast.get("active_session_target_omitted"))
+            future_count = len(ohlc_forecast.get("forecasts", []) or [])
+            st.info(
+                f"The {omitted_date} session is already underway, so its +1-session OHLC target "
+                f"has been omitted. Showing {future_count} remaining forward session forecast(s), "
+                "using the last completed daily history. After today's completed EOD data is available, "
+                "refresh for a new seven-session outlook."
+            )
 
         if forecast_status != "CALCULATED":
             st.error(
