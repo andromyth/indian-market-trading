@@ -558,6 +558,13 @@ class AutonomousIntradayWorker:
                     decision_interval_minutes=1,
                 )
                 if not predictions:
+                    empty_error = {
+                        "symbol": root,
+                        "error": "Intraday runtime produced no prediction rows after warmup",
+                    }
+                    summary["prediction_errors"] += 1
+                    summary["errors"].append(empty_error)
+                    _log("intraday_prediction_empty", **empty_error)
                     summary["warmup_symbols"].append({
                         "symbol": root,
                         "rows": int(len(completed)),
