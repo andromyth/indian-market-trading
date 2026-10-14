@@ -85,18 +85,21 @@ def completed_session_cutoff(now_ist: datetime | pd.Timestamp | None = None):
 
 
 def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load history without asking the historical provider to persist index data to Drive."""
+    """Load history with diagnostic errors; never request Drive persistence for the index."""
     from data_fetcher import _period_days, get_historical
 
     ticker = "^NSEI" if symbol == "^NSEI" else f"{normalize_symbol(symbol)}.NS"
     provider = "repository_NSE_first_provider_chain"
+    provider_errors: list[str] = []
+    source_diag_data: dict[str, Any] = {}
 
     if ticker == "^NSEI":
         # get_historical("^NSEI") requests sync_drive=True in the official index
-        # adapter. This audit must not write recovered benchmark data to Drive.
+        # adapter. This audit uses the last completed-session cutoff and explicitly
+        # disables Drive sync so its benchmark fetch remains read-only.
         from nse_data_layer import fetch_index_history
 
-        end_date = datetime.now(IST).date()
+        end_date = completed_session_cutoff()
         start_date = end_date - timedelta(days=_period_days(period))
         try:
             index_frame = fetch_index_history(
@@ -104,6 +107,9 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
             )
             if index_frame is None or index_frame.empty:
                 daily = pd.DataFrame()
+                provider_errors.append(
+                    f"official NSE index adapter returned no rows for {start_date}..{end_date}"
+                )
             else:
                 index_frame = index_frame.rename(
                     columns={
@@ -115,17 +121,44 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
                     index_frame = index_frame.set_index("date")
                 daily = _normalise_daily(index_frame)
             provider = "NSE_official_index_adapter_sync_drive_false"
-        except Exception:
+        except Exception as exc:
             daily = pd.DataFrame()
             provider = "NSE_official_index_adapter_failed"
+            provider_errors.append(
+                f"official NSE index adapter: {type(exc).__name__}: {exc}"
+            )
     else:
-        frame = get_historical(
-            ticker, period=period, interval="1d", force_refresh=False
-        )
-        daily = _normalise_daily(frame)
+        try:
+            frame = get_historical(
+                ticker, period=period, interval="1d", force_refresh=False
+            )
+            daily = _normalise_daily(frame)
+            if daily.empty:
+                provider_errors.append(
+                    "repository historical provider chain returned no usable daily rows"
+                )
+        except Exception as exc:
+            daily = pd.DataFrame()
+            provider_errors.append(
+                f"repository historical provider chain: {type(exc).__name__}: {exc}"
+            )
+        try:
+            from data_fetcher import source_diagnostics as get_source_diagnostics
 
-    # If an official/local provider has only a short slice, retain Yahoo history
-    # only when it supplies more rows, and record that provider change.
+            diagnostics = get_source_diagnostics()
+            if diagnostics:
+                # Keep the source-level diagnostic for investigation; do not include
+                # credentials or request headers.
+                source_diag_data = diagnostics if isinstance(diagnostics, dict) else {
+                    "detail": str(diagnostics)
+                }
+        except Exception as exc:
+            source_diag_data = {
+                "diagnostic_read_error": f"{type(exc).__name__}: {exc}"
+            }
+
+    # Some provider paths return an empty or recent-only slice. Prefer whichever
+    # history source gives more rows, and record failures instead of silently hiding them.
     if len(daily) < MIN_HISTORY_ROWS:
         try:
             from data_fetcher import _yahoo_history
@@ -134,8 +167,17 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
             if len(fallback) > len(daily):
                 daily = fallback
                 provider = "Yahoo_reference_fallback_after_short_provider_history"
-        except Exception:
-            pass
+            elif fallback.empty:
+                provider_errors.append("Yahoo reference history returned no usable daily rows")
+            else:
+                provider_errors.append(
+                    f"Yahoo reference history had only {len(fallback)} usable rows; "
+                    f"kept provider history with {len(daily)} rows"
+                )
+        except Exception as exc:
+            provider_errors.append(
+                f"Yahoo reference history: {type(exc).__name__}: {exc}"
+            )
 
     meta = {
         "requested_symbol": ticker,
@@ -144,6 +186,10 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
         "first_date": daily.index.min().date().isoformat() if not daily.empty else None,
         "last_date": daily.index.max().date().isoformat() if not daily.empty else None,
     }
+    if provider_errors:
+        meta["provider_errors"] = provider_errors
+    if source_diag_data:
+        meta["source_diagnostics"] = source_diag_data
     return daily, meta
 
 def prepare_symbol_data(

@@ -130,6 +130,7 @@ def test_nifty_history_loader_does_not_request_drive_sync(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][0] == "^NSEI"
+    assert calls[0][2] == completed_session_cutoff()
     assert calls[0][3] is False
     assert len(daily) >= 200
     assert meta["provider_path"] == "NSE_official_index_adapter_sync_drive_false"
