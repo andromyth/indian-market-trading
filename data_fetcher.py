@@ -186,11 +186,16 @@ def _normalize_historical_frame(df):
         # provider column-shape problem crash the dashboard.
         frame.columns = [str(c).strip() for c in frame.columns]
 
+    column_keys = {str(column).strip().lower() for column in frame.columns}
     aliases = {
         "open": "Open",
+        "open price": "Open",
         "high": "High",
+        "high price": "High",
         "low": "Low",
+        "low price": "Low",
         "close": "Close",
+        "close price": "Close",
         "adj close": "Close",
         "adj_close": "Close",
         "ltp": "Close",
@@ -198,7 +203,15 @@ def _normalize_historical_frame(df):
         "lastprice": "Close",
         "volume": "Volume",
         "vol": "Volume",
+        "total traded quantity": "Volume",
+        "traded quantity": "Volume",
     }
+    # The official NSE security-wise report contains both "Last Price" and
+    # "Close Price". Prefer the authoritative "Close Price" field where both
+    # are present; otherwise retain the existing Last Price fallback.
+    if "close price" in column_keys:
+        aliases.pop("last price", None)
+        aliases.pop("lastprice", None)
 
     rename = {}
     for column in frame.columns:
