@@ -102,3 +102,35 @@ def test_purge_gap_is_more_than_longest_target_horizon():
     from cross_sectional_daily_ohlc_audit import PURGE_SESSIONS
 
     assert PURGE_SESSIONS > max(1, 7)
+
+
+
+def test_nifty_history_loader_does_not_request_drive_sync(monkeypatch):
+    from cross_sectional_daily_ohlc_audit import load_daily_history
+    import nse_data_layer as layer
+
+    dates = pd.bdate_range("2025-01-01", periods=220)
+    source = pd.DataFrame({
+        "date": dates,
+        "open": np.full(len(dates), 100.0),
+        "high": np.full(len(dates), 102.0),
+        "low": np.full(len(dates), 99.0),
+        "close": np.full(len(dates), 101.0),
+        "volume": np.zeros(len(dates)),
+    })
+    calls = []
+
+    def fake_fetch_index_history(symbol, start, end, *, sync_drive):
+        calls.append((symbol, start, end, sync_drive))
+        return source.copy()
+
+    monkeypatch.setattr(layer, "fetch_index_history", fake_fetch_index_history)
+
+    daily, meta = load_daily_history("^NSEI", "900d")
+
+    assert len(calls) == 1
+    assert calls[0][0] == "^NSEI"
+    assert calls[0][3] is False
+    assert len(daily) >= 200
+    assert meta["provider_path"] == "NSE_official_index_adapter_sync_drive_false"
+    assert not daily.empty

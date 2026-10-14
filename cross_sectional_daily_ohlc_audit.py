@@ -85,17 +85,47 @@ def completed_session_cutoff(now_ist: datetime | pd.Timestamp | None = None):
 
 
 def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load a symbol without silently claiming provider provenance the adapter doesn't expose."""
-    from data_fetcher import get_historical
+    """Load history without asking the historical provider to persist index data to Drive."""
+    from data_fetcher import _period_days, get_historical
 
     ticker = "^NSEI" if symbol == "^NSEI" else f"{normalize_symbol(symbol)}.NS"
-    frame = get_historical(ticker, period=period, interval="1d", force_refresh=False)
-    daily = _normalise_daily(frame)
     provider = "repository_NSE_first_provider_chain"
 
-    # Some cached official-history routes may return only a short recent slice.
-    # If so, try the repository's explicit Yahoo reference fallback and retain it
-    # only when it provides more usable history. Record this source change.
+    if ticker == "^NSEI":
+        # get_historical("^NSEI") requests sync_drive=True in the official index
+        # adapter. This audit must not write recovered benchmark data to Drive.
+        from nse_data_layer import fetch_index_history
+
+        end_date = datetime.now(IST).date()
+        start_date = end_date - timedelta(days=_period_days(period))
+        try:
+            index_frame = fetch_index_history(
+                ticker, start_date, end_date, sync_drive=False
+            )
+            if index_frame is None or index_frame.empty:
+                daily = pd.DataFrame()
+            else:
+                index_frame = index_frame.rename(
+                    columns={
+                        "open": "Open", "high": "High", "low": "Low",
+                        "close": "Close", "volume": "Volume",
+                    }
+                )
+                if "date" in index_frame.columns:
+                    index_frame = index_frame.set_index("date")
+                daily = _normalise_daily(index_frame)
+            provider = "NSE_official_index_adapter_sync_drive_false"
+        except Exception:
+            daily = pd.DataFrame()
+            provider = "NSE_official_index_adapter_failed"
+    else:
+        frame = get_historical(
+            ticker, period=period, interval="1d", force_refresh=False
+        )
+        daily = _normalise_daily(frame)
+
+    # If an official/local provider has only a short slice, retain Yahoo history
+    # only when it supplies more rows, and record that provider change.
     if len(daily) < MIN_HISTORY_ROWS:
         try:
             from data_fetcher import _yahoo_history
@@ -115,7 +145,6 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
         "last_date": daily.index.max().date().isoformat() if not daily.empty else None,
     }
     return daily, meta
-
 
 def prepare_symbol_data(
     daily: pd.DataFrame,
