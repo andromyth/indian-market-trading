@@ -162,6 +162,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "predictions_written": (
                     (result.get("summary") or {}).get("predictions_written")
                 ),
+                "prediction_rows_valid": (
+                    (result.get("summary") or {}).get("prediction_rows_valid")
+                ),
+                "prediction_errors": (
+                    (result.get("summary") or {}).get("prediction_errors")
+                ),
+                "prediction_abstains": (
+                    (result.get("summary") or {}).get("prediction_abstains")
+                ),
                 "watchlist_symbols": (
                     (result.get("summary") or {}).get("watchlist_symbols")
                 ),
