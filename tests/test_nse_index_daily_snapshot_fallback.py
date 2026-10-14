@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 import nse_data_layer as layer
 
@@ -116,3 +117,154 @@ def test_parse_actual_nse_daily_snapshot_closing_header():
     assert len(frame) == 1
     assert float(frame.loc[0, "close"]) == 22050.0
     assert frame.loc[0, "source"] == "NSE_OFFICIAL_DAILY_SNAPSHOT"
+
+
+
+def test_snapshot_tail_gap_is_audit_only_and_bounded(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "daily_snapshots"
+    root.mkdir()
+    for day, label in (
+        (date(2026, 5, 13), "13-May-2026"),
+        (date(2026, 5, 14), "14-May-2026"),
+    ):
+        (root / f"ind_close_all_{day:%d%m%Y}.csv").write_bytes(_csv(label))
+
+    class MissingEndSnapshot:
+        status_code = 404
+        content = b""
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        def get(self, *args, **kwargs):
+            return MissingEndSnapshot()
+
+    monkeypatch.setattr(layer, "INDEX_DAILY_SNAPSHOT_ROOT", root)
+    monkeypatch.setattr(layer, "INDEX_NORMALIZED_ROOT", tmp_path / "normalized")
+    monkeypatch.setattr(layer, "_mounted_drive_root", lambda: None)
+    monkeypatch.setattr(layer, "_sleep_rate_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(layer, "_session", lambda: FakeSession())
+
+    # The exchange has supplied data through 14 May, but the 15 May archive
+    # is unavailable. An explicit audit opt-in may use the latest complete day.
+    audit_frame = layer._fetch_index_history_from_daily_snapshots(
+        "^NSEI",
+        date(2026, 5, 13),
+        date(2026, 5, 15),
+        sync_drive=False,
+        allow_latest_missing_end=True,
+    )
+    assert len(audit_frame) == 2
+    assert pd.to_datetime(audit_frame["date"]).max().date() == date(2026, 5, 14)
+
+    # Default behavior remains strict for production callers.
+    with pytest.raises(RuntimeError, match="coverage incomplete"):
+        layer._fetch_index_history_from_daily_snapshots(
+            "^NSEI",
+            date(2026, 5, 13),
+            date(2026, 5, 15),
+            sync_drive=False,
+        )
+
+
+def test_new_official_snapshot_is_mirrored_to_mounted_drive(
+    monkeypatch,
+    tmp_path,
+):
+    local_root = tmp_path / "local_snapshots"
+    drive_root = tmp_path / "mounted_drive"
+    normalized_root = tmp_path / "normalized"
+    local_root.mkdir()
+
+    class AvailableSnapshot:
+        status_code = 200
+        content = _csv("15-May-2026")
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        def get(self, *args, **kwargs):
+            return AvailableSnapshot()
+
+    monkeypatch.setattr(layer, "INDEX_DAILY_SNAPSHOT_ROOT", local_root)
+    monkeypatch.setattr(layer, "INDEX_NORMALIZED_ROOT", normalized_root)
+    monkeypatch.setattr(layer, "_mounted_drive_root", lambda: drive_root)
+    monkeypatch.setattr(layer, "_sleep_rate_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(layer, "_session", lambda: FakeSession())
+
+    result = layer._fetch_index_history_from_daily_snapshots(
+        "^NSEI",
+        date(2026, 5, 15),
+        date(2026, 5, 15),
+        sync_drive=False,
+    )
+    filename = "ind_close_all_15052026.csv"
+    local_file = local_root / filename
+    drive_file = (
+        drive_root / "production_data" / "nse_official"
+        / "indices" / "daily_snapshots" / filename
+    )
+
+    assert len(result) == 1
+    assert local_file.read_bytes() == AvailableSnapshot.content
+    assert drive_file.read_bytes() == AvailableSnapshot.content
+    durable_parquet = (
+        drive_root / "production_data" / "nse_official"
+        / "indices" / "NSEI" / "20260515_20260515.parquet"
+    )
+    assert durable_parquet.is_file()
+    cached = pd.read_parquet(durable_parquet)
+    assert len(cached) == 1
+    assert pd.to_datetime(cached["date"]).max().date() == date(2026, 5, 15)
+
+
+def test_fetch_index_history_audit_tail_opt_in_does_not_weaken_default(
+    monkeypatch,
+):
+    dates = pd.to_datetime(["2026-05-13", "2026-05-14"])
+    snapshot = pd.DataFrame({
+        "symbol": ["^NSEI"] * 2,
+        "date": dates,
+        "open": [100.0, 101.0],
+        "high": [101.0, 102.0],
+        "low": [99.0, 100.0],
+        "close": [100.5, 101.5],
+        "volume": [0.0, 0.0],
+        "source": ["NSE_OFFICIAL_DAILY_SNAPSHOT"] * 2,
+        "provenance": ["official archive"] * 2,
+    })
+    monkeypatch.setattr(layer, "_drive_index_history", lambda *args: pd.DataFrame())
+    monkeypatch.setattr(
+        layer,
+        "_fetch_index_history_nse_api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("NSE API unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        layer,
+        "_fetch_index_history_from_daily_snapshots",
+        lambda *args, **kwargs: snapshot,
+    )
+
+    accepted = layer.fetch_index_history(
+        "^NSEI",
+        date(2026, 5, 13),
+        date(2026, 5, 15),
+        sync_drive=False,
+        allow_latest_missing_end=True,
+    )
+    assert len(accepted) == 2
+
+    with pytest.raises(RuntimeError, match="Daily Snapshot frame did not cover"):
+        layer.fetch_index_history(
+            "^NSEI",
+            date(2026, 5, 13),
+            date(2026, 5, 15),
+            sync_drive=False,
+        )

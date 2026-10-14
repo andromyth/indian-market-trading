@@ -449,6 +449,26 @@ INDEX_DAILY_SNAPSHOT_URL_TEMPLATE = (
 )
 
 
+def _index_daily_snapshot_paths(filename: str) -> list[Path]:
+    """Return mounted-Drive and local paths for a resumable raw NSE snapshot.
+
+    Successful immutable source CSVs are mirrored to mounted Drive when it is
+    available. The local repository cache remains the fallback on ordinary
+    machines and hosted workers without a mounted Drive.
+    """
+    local_path = INDEX_DAILY_SNAPSHOT_ROOT / filename
+    paths = [local_path]
+    mounted_root = _mounted_drive_root()
+    if mounted_root is not None:
+        drive_path = (
+            mounted_root / "production_data" / "nse_official"
+            / "indices" / "daily_snapshots" / filename
+        )
+        if drive_path not in paths:
+            paths.insert(0, drive_path)
+    return paths
+
+
 def _normalize_index_history(frame: pd.DataFrame, requested_index: str) -> pd.DataFrame:
     """Normalize official NSE historical-index JSON into stable daily OHLC."""
     if frame is None or frame.empty:
@@ -1092,14 +1112,18 @@ def _fetch_index_history_from_daily_snapshots(
     start: date | datetime,
     end: date | datetime,
     sync_drive: bool = False,
+    *,
+    allow_latest_missing_end: bool = False,
 ) -> pd.DataFrame:
     """Recover official NSE index history from Daily Snapshot CSV archives.
 
     This path is used only when the historical-index JSON endpoint is unusable.
     It uses NSE's own end-of-day snapshot files, validates actual dates/coverage,
-    caches each downloaded CSV locally, and persists the normalized benchmark
-    parquet to Drive when requested. It never substitutes third-party prices
-    or estimated index values.
+    and caches each downloaded CSV locally plus on mounted Drive when available.
+    When explicitly requested by a read-only audit, it may accept an unpublished
+    endpoint snapshot if the newest available date is no more than four calendar
+    days before the requested end date. Production callers stay strict by default.
+    It never substitutes third-party prices or estimated index values.
     """
     root = str(index_symbol).strip().upper()
     if root not in INDEX_HISTORY_NAMES:
@@ -1136,18 +1160,26 @@ def _fetch_index_history_from_daily_snapshots(
                 f"errors={len(diagnostics)}",
                 flush=True,
             )
-        csv_path = INDEX_DAILY_SNAPSHOT_ROOT / f"ind_close_all_{day:%d%m%Y}.csv"
+        filename = f"ind_close_all_{day:%d%m%Y}.csv"
+        cache_paths = _index_daily_snapshot_paths(filename)
         frame = pd.DataFrame()
 
-        if csv_path.exists() and csv_path.stat().st_size > 0:
+        # Prefer the persistent Drive cache after a Colab runtime reset, then
+        # fall back to the repository-local cache. A malformed copy does not
+        # prevent trying the other copy.
+        for csv_path in cache_paths:
+            if not csv_path.exists() or csv_path.stat().st_size == 0:
+                continue
             try:
                 frame = _parse_index_daily_snapshot(
                     csv_path.read_bytes(),
                     root,
                     day,
                 )
+                if not frame.empty:
+                    break
             except Exception as exc:
-                diagnostics.append(f"{day}: bad local cache ({type(exc).__name__})")
+                diagnostics.append(f"{day}: bad snapshot cache ({type(exc).__name__})")
                 frame = pd.DataFrame()
 
         if frame.empty:
@@ -1175,7 +1207,20 @@ def _fetch_index_history_from_daily_snapshots(
                     raise RuntimeError(
                         f"no {INDEX_HISTORY_NAMES[root]} row for {day} in official snapshot"
                     )
-                csv_path.write_bytes(response.content)
+                # Save to the local cache and, when mounted, durable Drive
+                # storage. Cache-write failure does not invalidate an already
+                # parsed official response for the current run.
+                for cache_path in cache_paths:
+                    try:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cache_path.write_bytes(response.content)
+                    except Exception as cache_exc:
+                        print(
+                            f"WARNING: could not cache official NSE snapshot "
+                            f"{day} at {cache_path}: "
+                            f"{type(cache_exc).__name__}: {cache_exc}",
+                            flush=True,
+                        )
                 consecutive_errors = 0
             except Exception as exc:
                 diagnostics.append(f"{day}: {type(exc).__name__}: {exc}")
@@ -1209,10 +1254,24 @@ def _fetch_index_history_from_daily_snapshots(
         if span_days >= 90
         else 1
     )
+    latest_date = dates.max().date() if not dates.empty else None
+    latest_lag_days = (
+        (end_d - latest_date).days if latest_date is not None else None
+    )
+    latest_end_ok = (
+        latest_date is not None
+        and (
+            latest_date >= end_d
+            or (
+                allow_latest_missing_end
+                and 0 < latest_lag_days <= 4
+            )
+        )
+    )
     if (
         dates.empty
         or dates.min().date() > start_d + timedelta(days=10)
-        or dates.max().date() < end_d
+        or not latest_end_ok
         or len(dates) < minimum_rows
     ):
         detail = "; ".join(diagnostics[-5:]) or "archive did not cover the requested range"
@@ -1228,13 +1287,27 @@ def _fetch_index_history_from_daily_snapshots(
             f"{detail}"
         )
 
+    if latest_date is not None and latest_date < end_d:
+        print(
+            f"OFFICIAL INDEX FALLBACK LATEST-DATE GAP: symbol={root} "
+            f"requested_end={end_d} latest_available={latest_date} "
+            f"lag_calendar_days={latest_lag_days} "
+            f"audit_tolerance_enabled={allow_latest_missing_end}",
+            flush=True,
+        )
+
     folder = root.replace("^", "").replace("/", "_")
     cache_dir = INDEX_NORMALIZED_ROOT / folder
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{start_d:%Y%m%d}_{end_d:%Y%m%d}.parquet"
     combined.to_parquet(cache_path, index=False)
 
-    if sync_drive:
+    # Keep one consolidated cache on mounted Drive as well as the per-date
+    # CSVs. An interrupted or repeated audit can then load the complete official
+    # range directly instead of re-reading hundreds of individual snapshots.
+    # When Drive is not mounted, sync_drive=False remains strictly local.
+    mounted_drive_available = _mounted_drive_root() is not None
+    if sync_drive or mounted_drive_available:
         remote_path = (
             f"production_data/nse_official/indices/{folder}/{cache_path.name}"
         )
@@ -1249,9 +1322,15 @@ def _fetch_index_history_from_daily_snapshots(
                 if isinstance(result, dict)
                 else repr(result)
             )
-            raise RuntimeError(
-                f"Official NSE index history was recovered but Google Drive "
-                f"persistence failed for {root} {start_d}..{end_d}: {detail}"
+            if sync_drive:
+                raise RuntimeError(
+                    f"Official NSE index history was recovered but Google Drive "
+                    f"persistence failed for {root} {start_d}..{end_d}: {detail}"
+                )
+            print(
+                f"WARNING: could not persist resumable official NSE index cache "
+                f"for {root} {start_d}..{end_d}: {detail}",
+                flush=True,
             )
 
     print(
@@ -1268,6 +1347,8 @@ def fetch_index_history(
     start: date | datetime,
     end: date | datetime,
     sync_drive: bool = False,
+    *,
+    allow_latest_missing_end: bool = False,
 ) -> pd.DataFrame:
     """Fetch official NSE benchmark history with persistent Drive-first fallback.
 
@@ -1275,6 +1356,11 @@ def fetch_index_history(
     returns an HTML/non-JSON response from a hosted IP. The project already
     persists official NIFTY 50 / NIFTY BANK history in Google Drive when those
     files were previously retrieved successfully.
+
+    The allow_latest_missing_end option is intended for read-only audits that
+    evaluate only complete observations: it permits an official history ending
+    up to four calendar days before the requested endpoint when NSE has not
+    published the most recent daily snapshot yet. It is strict by default.
     """
     root = str(index_symbol).strip().upper()
 
@@ -1297,12 +1383,19 @@ def fetch_index_history(
         last = dates.max().date()
         start_slack = 10
         # The final benchmark date is a hard requirement for a PIT production
-        # snapshot. Accepting a stale index through a calendar-day slack window
-        # silently creates missing market-context features for the target
-        # session and can leave thousands of rows incorrectly gated.
+        # snapshot. The explicit audit-only opt-in below is narrow and must not
+        # weaken production freshness checks.
         if first > start_d + timedelta(days=start_slack):
             return False
-        if last < end_d:
+        latest_lag_days = (end_d - last).days
+        latest_ok = (
+            last >= end_d
+            or (
+                allow_latest_missing_end
+                and 0 < latest_lag_days <= 4
+            )
+        )
+        if not latest_ok:
             return False
         span_days = max(1, (end_d - start_d).days)
         if span_days >= 90:
@@ -1364,6 +1457,7 @@ def fetch_index_history(
                 start_d,
                 end_d,
                 sync_drive=sync_drive,
+                allow_latest_missing_end=allow_latest_missing_end,
             )
             if _drive_coverage_ok(snapshot_frame):
                 return snapshot_frame

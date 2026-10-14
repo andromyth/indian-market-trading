@@ -4,8 +4,11 @@
 This is a read-only evaluation utility. It fetches daily histories via the
 repository's NSE-first provider chain, evaluates the existing daily OHLC model
 against the same training-median baseline on a common NSE-session holdout, and
-writes local JSON/CSV reports. It does not retrain or promote production
-artifacts, update Drive, modify prediction ledgers, or place orders.
+writes local JSON/CSV reports. The official NSE snapshot layer may cache
+immutable source CSVs and a normalized range cache on mounted Drive so an
+interrupted or repeated audit can resume without rescanning the full history.
+The audit does not modify research datasets, production models, prediction
+ledgers, or place orders.
 
 Run:
   ./py.sh cross_sectional_daily_ohlc_audit.py --period 900d
@@ -94,16 +97,21 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
     source_diag_data: dict[str, Any] = {}
 
     if ticker == "^NSEI":
-        # get_historical("^NSEI") requests sync_drive=True in the official index
-        # adapter. This audit uses the last completed-session cutoff and explicitly
-        # disables Drive sync so its benchmark fetch remains read-only.
+        # get_historical("^NSEI") requests sync_drive=True in the legacy adapter.
+        # This audit disables that broad persistence. The index layer may still
+        # cache immutable official snapshot inputs/range parquet on a mounted
+        # Drive for resumability; it never changes research/model/trading outputs.
         from nse_data_layer import fetch_index_history
 
         end_date = completed_session_cutoff()
         start_date = end_date - timedelta(days=_period_days(period))
         try:
             index_frame = fetch_index_history(
-                ticker, start_date, end_date, sync_drive=False
+                ticker,
+                start_date,
+                end_date,
+                sync_drive=False,
+                allow_latest_missing_end=True,
             )
             if index_frame is None or index_frame.empty:
                 daily = pd.DataFrame()
