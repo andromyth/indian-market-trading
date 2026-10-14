@@ -97,9 +97,10 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
     source_diag_data: dict[str, Any] = {}
 
     if ticker == "^NSEI":
-        # get_historical("^NSEI") requests sync_drive=True in the official index
-        # adapter. This audit uses the last completed-session cutoff and explicitly
-        # disables Drive sync so its benchmark fetch remains read-only.
+        # get_historical("^NSEI") requests sync_drive=True in the legacy adapter.
+        # This audit disables that broad persistence. The index layer may still
+        # cache immutable official snapshot inputs/range parquet on a mounted
+        # Drive for resumability; it never changes research/model/trading outputs.
         from nse_data_layer import fetch_index_history
 
         end_date = completed_session_cutoff()
