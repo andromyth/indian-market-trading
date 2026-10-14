@@ -39,7 +39,11 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+        # Advertise only encodings the Requests/urllib3 stack can always decode
+    # in the deployed environment. Explicitly advertising Brotli without a
+    # decoder can make a successful HTTP 200 CSV response appear as opaque
+    # binary bytes and break historical NSE requests.
+    "Accept-Encoding": "gzip, deflate",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Referer": "https://www.nseindia.com/report-detail/eq_security",
@@ -127,6 +131,7 @@ def _request(path: str, *, params: dict[str, Any] | None = None,
             _last_nse_diagnostic = {
                 "path": path, "status_code": r.status_code,
                 "content_type": r.headers.get("content-type", ""),
+                "content_encoding": r.headers.get("content-encoding", "identity"),
                 "bytes": len(r.content), "attempt": attempt + 1,
             }
             if r.status_code == 200:
