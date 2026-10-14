@@ -319,6 +319,42 @@ def _fetch_market_bars(benchmark: str) -> tuple[pd.DataFrame, str]:
     raise RuntimeError("All benchmark sources failed: " + " | ".join(errors[-4:]))
 
 
+def _prediction_row_failure(symbol: str, prediction: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a health error when a row is not a usable live model inference.
+
+    ABSTAIN is a valid policy output when the model has a valid probability and
+    decision timestamp. An exception, absent probability, or absent timestamp is
+    instead an inference failure and must degrade the worker health.
+    """
+    horizon = prediction.get("horizon_min")
+
+    def failure(reason: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "horizon_min": horizon,
+            "error": f"Prediction unavailable: {reason}",
+        }
+
+    reason = str(prediction.get("reason") or "").strip()
+    if reason:
+        return failure(reason)
+
+    try:
+        probability = float(prediction.get("probability_up"))
+    except (TypeError, ValueError):
+        return failure("missing_or_invalid_probability_up")
+    if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        return failure("missing_or_invalid_probability_up")
+
+    decision_timestamp = pd.to_datetime(
+        prediction.get("decision_timestamp"), errors="coerce", utc=True
+    )
+    if pd.isna(decision_timestamp):
+        return failure("missing_or_invalid_decision_timestamp")
+
+    return None
+
+
 class AutonomousIntradayWorker:
     def __init__(
         self,
@@ -430,6 +466,9 @@ class AutonomousIntradayWorker:
             "stock_fetch_errors": 0,
             "fresh_benchmark_count": 0,
             "predictions_written": 0,
+            "prediction_rows_valid": 0,
+            "prediction_errors": 0,
+            "prediction_abstains": 0,
             "warmup_symbols": [],
             "stale_symbols": [],
             "errors": [],
@@ -519,6 +558,13 @@ class AutonomousIntradayWorker:
                     decision_interval_minutes=1,
                 )
                 if not predictions:
+                    empty_error = {
+                        "symbol": root,
+                        "error": "Intraday runtime produced no prediction rows after warmup",
+                    }
+                    summary["prediction_errors"] += 1
+                    summary["errors"].append(empty_error)
+                    _log("intraday_prediction_empty", **empty_error)
                     summary["warmup_symbols"].append({
                         "symbol": root,
                         "rows": int(len(completed)),
@@ -526,6 +572,16 @@ class AutonomousIntradayWorker:
                         "reason": "runtime produced no eligible rows",
                     })
                 for result in predictions:
+                    prediction_failure = _prediction_row_failure(root, result)
+                    if prediction_failure:
+                        summary["prediction_errors"] += 1
+                        summary["errors"].append(prediction_failure)
+                        _log("intraday_prediction_invalid", **prediction_failure)
+                    else:
+                        summary["prediction_rows_valid"] += 1
+                        if str(result.get("signal") or "").upper() == "ABSTAIN":
+                            summary["prediction_abstains"] += 1
+
                     record = {
                         **result,
                         "worker_observed_at_utc": now.tz_convert("UTC").isoformat(),
@@ -653,7 +709,9 @@ class AutonomousIntradayWorker:
             result = {"status": "ERROR", "minute": minute_key, "error": error}
             _log("minute_tick_failed", minute=minute_key, error=error)
 
-        if self.cycle_count % self.flush_every == 0 or result["status"] == "ERROR":
+        # Persist immediately on any degraded tick so failed inference rows and
+        # their health status survive even when the scheduler runs a one-off tick.
+        if self.cycle_count % self.flush_every == 0 or result["status"] in {"ERROR", "PARTIAL"}:
             flush = self._flush(final=False)
             result["flush"] = flush
             if flush.get("status") != "OK":

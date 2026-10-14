@@ -54,9 +54,19 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         if status in {
             "ERROR", "PARTIAL", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"
         }:
-            STATE["last_error"] = str(
-                result.get("error") or result.get("reason") or status
-            )
+            detail = result.get("error") or result.get("reason")
+            if not detail:
+                summary = result.get("summary") or {}
+                errors = summary.get("errors") or []
+                if errors:
+                    first = errors[0]
+                    if isinstance(first, dict):
+                        detail = first.get("error") or first.get("reason")
+                        if not detail:
+                            detail = json.dumps(_clean_json(first), sort_keys=True)
+                    else:
+                        detail = str(first)
+            STATE["last_error"] = str(detail or status)
         elif (
             (result.get("flush") or {}).get("status") == "OK"
             or (
@@ -161,6 +171,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "cycle": result.get("cycle"),
                 "predictions_written": (
                     (result.get("summary") or {}).get("predictions_written")
+                ),
+                "prediction_rows_valid": (
+                    (result.get("summary") or {}).get("prediction_rows_valid")
+                ),
+                "prediction_errors": (
+                    (result.get("summary") or {}).get("prediction_errors")
+                ),
+                "prediction_abstains": (
+                    (result.get("summary") or {}).get("prediction_abstains")
                 ),
                 "watchlist_symbols": (
                     (result.get("summary") or {}).get("watchlist_symbols")
