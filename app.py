@@ -53,6 +53,7 @@ from selfdriving.sd_v2_runtime import (
     beta_intraday_predict,
     beta_status,
 )
+from selfdriving.stepwise_forecast import stepwise_horizon_path
 from live_signal_guards import (
     assess_horizon_completeness,
     latest_completed_bar_status,
@@ -1472,6 +1473,17 @@ if interface_mode == "Live Test":
                     st.warning("The model returned no eligible horizon predictions.")
                     return
 
+                # Option B: render direct horizon endpoints as a stepwise price path.
+                # Each step after +5m references the immediately prior forecast endpoint.
+                current_observed_price = (
+                    pd.to_numeric(completed["close"].iloc[-1], errors="coerce")
+                    if "close" in completed.columns else np.nan
+                )
+                display_predictions = stepwise_horizon_path(
+                    predictions,
+                    current_reference_price=current_observed_price,
+                )
+
                 source_label = {
                     "NSE_OFFICIAL_CHART": "NSE official",
                     "PERSISTENT_LOCAL_CACHE": "Persistent cache",
@@ -1481,7 +1493,7 @@ if interface_mode == "Live Test":
                     "YFINANCE": "Yahoo Finance",
                 }.get(source, source)
                 p1, p2, p3, p4 = st.columns(4)
-                first = predictions[0]
+                first = display_predictions[0]
                 reference0 = pd.to_numeric(first.get("reference_close"), errors="coerce")
                 predicted0 = pd.to_numeric(first.get("predicted_price"), errors="coerce")
                 move0 = float(predicted0) - float(reference0) if pd.notna(predicted0) and pd.notna(reference0) else np.nan
@@ -1498,27 +1510,35 @@ if interface_mode == "Live Test":
                 )
 
                 rows = []
-                for item in predictions:
+                for item in display_predictions:
                     prob = pd.to_numeric(item.get("probability_up"), errors="coerce")
                     ref_price = pd.to_numeric(item.get("reference_close"), errors="coerce")
                     price = pd.to_numeric(item.get("predicted_price"), errors="coerce")
-                    expected_return = pd.to_numeric(item.get("expected_return"), errors="coerce")
+                    move = pd.to_numeric(item.get("expected_move"), errors="coerce")
                     price_status = str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
-                    move = float(price) - float(ref_price) if pd.notna(price) and pd.notna(ref_price) else np.nan
                     coverage = pd.to_numeric(item.get("feature_coverage"), errors="coerce")
                     rows.append({
                         "Horizon": f"+{int(item.get('horizon_min', 0))} min",
-                        "Signal": item.get("signal", "ABSTAIN"),
-                        "P(outperform median)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
-                        "Reference price": f"₹{float(ref_price):,.2f}" if pd.notna(ref_price) else "—",
-                        "Predicted price": f"₹{float(price):,.2f}" if pd.notna(price) else "—",
-                        "Expected move": f"₹{move:+,.2f}" if pd.notna(move) else "—",
+                        "Step interval": str(item.get("step_interval") or "—"),
+                        "Model signal (from now)": item.get("signal", "ABSTAIN"),
+                        "P(outperform median, from now)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
+                        "Step reference price": f"₹{float(ref_price):,.2f}" if pd.notna(ref_price) else "Unavailable",
+                        "Forecast endpoint": f"₹{float(price):,.2f}" if pd.notna(price) else "Unavailable",
+                        "Expected step move": f"₹{float(move):+,.2f}" if pd.notna(move) else "Unavailable",
+                        "Step direction": str(item.get("step_direction") or "UNAVAILABLE"),
                         "Feature coverage": f"{float(coverage):.1%}" if pd.notna(coverage) else "—",
                         "Price-head status": price_status,
                         "Reason": str(item.get("signal_reason") or item.get("reason") or "—"),
                     })
-                st.subheader("Multi-horizon forecast")
+                st.subheader("Multi-horizon forecast · stepwise path")
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                st.caption(
+                    "Stepwise path: +5 min starts from the latest observed close; each subsequent "
+                    "reference uses the previous horizon's predicted endpoint. Step move/direction "
+                    "are changes between adjacent forecast endpoints. Model signal and probability "
+                    "remain direct from-now horizon outputs, not re-scored interval predictions. "
+                    "This is a presentation transform, not recursive model inference."
+                )
                 weak_heads = [
                     str(item.get("price_forecast_status") or "RETRAIN_REQUIRED")
                     for item in predictions
@@ -1536,7 +1556,7 @@ if interface_mode == "Live Test":
                         "latest_completed_candle_ist": latest_candle.isoformat(),
                         "benchmark": benchmark,
                         "benchmark_freshness": market_freshness,
-                        "horizons": predictions,
+                        "horizons": display_predictions,
                     })
 
             _render_selected_intraday_panel()
