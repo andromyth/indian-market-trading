@@ -8,7 +8,7 @@ set -euo pipefail
 REGION="${REGION:-asia-south1}"
 SERVICE_NAME="${SERVICE_NAME:-indian-market-intraday-worker}"
 RUN_SA_NAME="${RUN_SA_NAME:-indian-market-intraday-runtime}"
-SCHEDULER_SA_NAME="${SCHEDULER_SA_NAME:-indian-market-intraday-scheduler}"
+SCHEDULER_SA_NAME="${SCHEDULER_SA_NAME:-indian-market-scheduler}"
 RUN_SA="${RUN_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 SCHEDULER_SA="${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
