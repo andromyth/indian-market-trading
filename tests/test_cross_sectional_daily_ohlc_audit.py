@@ -50,7 +50,7 @@ def test_missing_expected_stock_session_is_not_shifted_to_next_available_bar():
     # The +7 target for an origin exactly seven sessions before the missing
     # bar is unavailable; it must not be assigned the next available stock bar.
     missing_origin = 210 - 7
-    assert prepared["complete_origin"][missing_origin] is False
+    assert not bool(prepared["complete_origin"][missing_origin])
     stack = prepared["stacked"]
     assert not (
         stack["origin_position"].eq(missing_origin)
