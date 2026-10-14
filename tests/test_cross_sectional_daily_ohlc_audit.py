@@ -120,8 +120,10 @@ def test_nifty_history_loader_does_not_request_drive_sync(monkeypatch):
     })
     calls = []
 
-    def fake_fetch_index_history(symbol, start, end, *, sync_drive):
-        calls.append((symbol, start, end, sync_drive))
+    def fake_fetch_index_history(
+        symbol, start, end, *, sync_drive, allow_latest_missing_end
+    ):
+        calls.append((symbol, start, end, sync_drive, allow_latest_missing_end))
         return source.copy()
 
     monkeypatch.setattr(layer, "fetch_index_history", fake_fetch_index_history)
@@ -132,6 +134,7 @@ def test_nifty_history_loader_does_not_request_drive_sync(monkeypatch):
     assert calls[0][0] == "^NSEI"
     assert calls[0][2] == completed_session_cutoff()
     assert calls[0][3] is False
+    assert calls[0][4] is True
     assert len(daily) >= 200
     assert meta["provider_path"] == "NSE_official_index_adapter_sync_drive_false"
     assert not daily.empty
