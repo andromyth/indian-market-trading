@@ -91,7 +91,7 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
     ticker = "^NSEI" if symbol == "^NSEI" else f"{normalize_symbol(symbol)}.NS"
     provider = "repository_NSE_first_provider_chain"
     provider_errors: list[str] = []
-    source_diagnostics: dict[str, Any] = {}
+    source_diag_data: dict[str, Any] = {}
 
     if ticker == "^NSEI":
         # get_historical("^NSEI") requests sync_drive=True in the official index
@@ -143,17 +143,17 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
                 f"repository historical provider chain: {type(exc).__name__}: {exc}"
             )
         try:
-            from data_fetcher import source_diagnostics
+            from data_fetcher import source_diagnostics as get_source_diagnostics
 
-            diagnostics = source_diagnostics()
+            diagnostics = get_source_diagnostics()
             if diagnostics:
                 # Keep the source-level diagnostic for investigation; do not include
                 # credentials or request headers.
-                source_diagnostics = diagnostics if isinstance(diagnostics, dict) else {
+                source_diag_data = diagnostics if isinstance(diagnostics, dict) else {
                     "detail": str(diagnostics)
                 }
         except Exception as exc:
-            source_diagnostics = {
+            source_diag_data = {
                 "diagnostic_read_error": f"{type(exc).__name__}: {exc}"
             }
 
@@ -188,8 +188,8 @@ def load_daily_history(symbol: str, period: str) -> tuple[pd.DataFrame, dict[str
     }
     if provider_errors:
         meta["provider_errors"] = provider_errors
-    if source_diagnostics:
-        meta["source_diagnostics"] = source_diagnostics
+    if source_diag_data:
+        meta["source_diagnostics"] = source_diag_data
     return daily, meta
 
 def prepare_symbol_data(
