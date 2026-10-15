@@ -300,9 +300,11 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
         con.execute(f"""
             COPY (
               WITH combined AS (
-                SELECT *, 0 AS _refresh_priority FROM read_parquet({m_sql})
+                SELECT * REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry),
+                       0 AS _refresh_priority FROM read_parquet({m_sql})
                 UNION ALL BY NAME
-                SELECT *, 1 AS _refresh_priority FROM read_parquet({i_sql})
+                SELECT * REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry),
+                       1 AS _refresh_priority FROM read_parquet({i_sql})
               ),
               ranked AS (
                 SELECT *,
@@ -478,7 +480,12 @@ def main() -> int:
                     if name in incoming_columns and name not in {"row_identity_key", "raw_archive"}
                 ]
                 differences = " OR ".join(
-                    f"i.{_quote_ident(name)} IS DISTINCT FROM m.{_quote_ident(name)}"
+                    (
+                        f"NULLIF(TRIM(CAST(i.{_quote_ident(name)} AS VARCHAR)), '') "
+                        f"IS DISTINCT FROM NULLIF(TRIM(CAST(m.{_quote_ident(name)} AS VARCHAR)), '')"
+                    )
+                    if name == "actual_expiry"
+                    else f"i.{_quote_ident(name)} IS DISTINCT FROM m.{_quote_ident(name)}"
                     for name in compared_columns
                 ) or "FALSE"
                 changed_keys = int(con.execute(f"""

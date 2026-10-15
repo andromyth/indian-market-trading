@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -91,19 +92,48 @@ def _parsed_dates(items: Iterable[dict[str, Any]], pattern: re.Pattern[str], fmt
     return found
 
 
-def load_drive_inventory(store: GoogleDriveStore) -> dict[str, set[date]]:
-    eod_folder = _resolve_folder(store, "production_data/nse_official/bulk_eod")
-    delivery_folder = _resolve_folder(store, "production_data/nse_official/delivery_full")
-    pit_folder = _resolve_folder(store, "features/daily")
+def load_drive_inventory(store: GoogleDriveStore, *, max_attempts: int = 4) -> dict[str, set[date]]:
+    """Read the three Drive inventories, retrying transient rate/server errors."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
 
-    eod_files = _list_files_recursive(store, eod_folder, recursive=True)
-    delivery_files = _list_files_recursive(store, delivery_folder, recursive=False)
-    pit_files = _list_files_recursive(store, pit_folder, recursive=False)
-    return {
-        "eod": _parsed_dates(eod_files, EOD_RE, "%Y%m%d"),
-        "delivery": _parsed_dates(delivery_files, DELIVERY_RE, "%Y%m%d"),
-        "pit": _parsed_dates(pit_files, PIT_RE, "%Y-%m-%d"),
-    }
+    retryable_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(1, max_attempts + 1):
+        try:
+            eod_folder = _resolve_folder(store, "production_data/nse_official/bulk_eod")
+            delivery_folder = _resolve_folder(store, "production_data/nse_official/delivery_full")
+            pit_folder = _resolve_folder(store, "features/daily")
+
+            eod_files = _list_files_recursive(store, eod_folder, recursive=True)
+            delivery_files = _list_files_recursive(store, delivery_folder, recursive=False)
+            pit_files = _list_files_recursive(store, pit_folder, recursive=False)
+            inventory = {
+                "eod": _parsed_dates(eod_files, EOD_RE, "%Y%m%d"),
+                "delivery": _parsed_dates(delivery_files, DELIVERY_RE, "%Y%m%d"),
+                "pit": _parsed_dates(pit_files, PIT_RE, "%Y-%m-%d"),
+            }
+            print(
+                "DRIVE_INVENTORY_READ_OK: "
+                f"eod_dates={len(inventory['eod'])} "
+                f"delivery_dates={len(inventory['delivery'])} "
+                f"pit_dates={len(inventory['pit'])}",
+                flush=True,
+            )
+            return inventory
+        except Exception as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status not in retryable_statuses or attempt >= max_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 8)
+            print(
+                "DRIVE_TRANSIENT_READ_RETRY: "
+                f"http_status={status} attempt={attempt}/{max_attempts} "
+                f"retry_in_seconds={delay} error={type(exc).__name__}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Drive inventory retry loop ended unexpectedly")
 
 
 def expected_nse_sessions(start: date, end: date) -> list[date]:
