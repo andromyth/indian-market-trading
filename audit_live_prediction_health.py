@@ -73,7 +73,15 @@ def _expected_missing_sessions(master_latest: str | None, available_dates: set[d
     if not master_latest or not available_dates:
         return [], 0
     latest_archive = max(available_dates)
-    start = date.fromisoformat(master_latest) + timedelta(days=1)
+    # Drive metadata may serialize a Parquet DATE as a midnight timestamp, e.g.
+    # "2026-10-01 00:00:00". The date portion is the canonical session date.
+    try:
+        master_date = date.fromisoformat(str(master_latest).strip()[:10])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid canonical cash-master latest date: {master_latest!r}"
+        ) from exc
+    start = master_date + timedelta(days=1)
     if start > latest_archive:
         return [], 0
     try:

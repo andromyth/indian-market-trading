@@ -154,10 +154,17 @@ def evaluate_record(
     }
 
     try:
-        decision = pd.Timestamp(pd.to_datetime(record.get("decision_timestamp"), errors="raise", utc=True))
+        parsed_decision = pd.to_datetime(
+            record.get("decision_timestamp"), errors="coerce", utc=True
+        )
+        if pd.isna(parsed_decision):
+            out["validation_reason"] = "missing_or_invalid_decision_timestamp"
+            return out
+        decision = pd.Timestamp(parsed_decision)
         horizon = int(record.get("horizon_min"))
         if horizon <= 0 or horizon > 240:
-            raise ValueError("horizon_min outside supported range")
+            out["validation_reason"] = "horizon_min_outside_supported_range"
+            return out
     except Exception as exc:
         out["validation_reason"] = f"invalid_decision_timestamp_or_horizon:{type(exc).__name__}"
         return out
