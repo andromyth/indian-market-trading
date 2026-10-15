@@ -316,3 +316,82 @@ def test_worker_health_endpoint_retains_specific_prediction_error(monkeypatch):
     finally:
         STATE.clear()
         STATE.update(original)
+
+
+def test_cloud_run_worker_final_minute_flushes_successful_prediction_batch(tmp_path, monkeypatch):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_cycle",
+        lambda: {
+            "errors": [],
+            "predictions_written": 30,
+            "prediction_rows_valid": 30,
+            "prediction_errors": 0,
+            "prediction_abstains": 0,
+        },
+    )
+    flush_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_flush",
+        lambda final=False: (
+            flush_calls.append(final)
+            or {
+                "status": "OK",
+                "data_partitions_synced": 5,
+                "ledger_synced": True,
+                "status_synced": True,
+                "errors": [],
+            }
+        ),
+    )
+
+    result = worker.tick_once(datetime(2026, 10, 13, 15, 29, 30, tzinfo=IST))
+
+    assert result["status"] == "PASS"
+    assert result["flush"]["status"] == "OK"
+    assert flush_calls == [True]
+    assert result["worker_status"] == "STOPPED"
+
+
+def test_cloud_run_closed_tick_retries_final_flush_when_local_ledger_exists(tmp_path, monkeypatch):
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    closed_time = datetime(2026, 10, 17, 10, 15, tzinfo=IST)
+    worker._ensure_paths(pd.Timestamp(closed_time))
+    assert worker.daily_ledger is not None
+    worker.daily_ledger.write_text('{"prediction_id":"unsynced-test-row"}\\n', encoding="utf-8")
+
+    flush_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_flush",
+        lambda final=False: (
+            flush_calls.append(final)
+            or {
+                "status": "OK",
+                "data_partitions_synced": 0,
+                "ledger_synced": True,
+                "status_synced": True,
+                "errors": [],
+            }
+        ),
+    )
+
+    result = worker.tick_once(closed_time)
+
+    assert result["status"] == "MARKET_CLOSED"
+    assert result["run_status"] == "STOPPED"
+    assert flush_calls == [True]
