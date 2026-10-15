@@ -35,15 +35,15 @@ on:
         description: 'Optional NSE production session date YYYY-MM-DD'
         required: false
         default: ''
-  # Post-market hourly retries. Each run fetches/repairs the completed NSE
-  # session, backfills recent missed PIT snapshots, builds the current session's
-  # PIT snapshot, generates the locked ALL-NSE 59-feature forecast for the next
-  # NSE session, validates prior forecasts, and refreshes the audit ledgers.
-  #
-  # 20:45-23:45 IST, 00:45-04:45 IST, 05:45-06:45 IST.
-  # Before close, the clock resolver pins the job to the latest completed
-  # session; after close, it advances to the session just completed.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  # Post-market retries, followed by early-morning retries. GitHub cron is UTC:
+  # 20:45-23:45 IST = 15:15-18:15 UTC (weekdays).
+  # 00:45-04:45 IST = 19:15-23:15 UTC (Sunday-Thursday UTC).
+  # 05:45-06:45 IST = 00:15-01:15 UTC (weekdays).
+  # The script's NSE-session/holiday guard decides whether a session is valid.
+  schedule:
+    - cron: "15 15-18 * * 1-5"
+    - cron: "15 19-23 * * 0-4"
+    - cron: "15 0-1 * * 1-5"
 # Prevent overlapping production refreshes while never cancelling a scheduled
 # retry. A normal run is ~5-6 minutes, well below the hourly cadence.
 concurrency:
