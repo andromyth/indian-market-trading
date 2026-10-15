@@ -1,9 +1,18 @@
 name: Live prediction accuracy audit
 
 # Manual/commit-triggered only. No cron is enabled; this respects the request
-# to keep scheduled jobs paused while allowing an explicit live-data audit.
+# to keep scheduled jobs paused while allowing an explicit month-to-date audit.
 on:
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'First date to audit (YYYY-MM-DD; blank = first of current month in IST)'
+        required: false
+        default: ''
+      end_date:
+        description: 'Last date to audit (YYYY-MM-DD; blank = today in IST)'
+        required: false
+        default: ''
   push:
     branches:
       - main
@@ -60,6 +69,29 @@ jobs:
               raise SystemExit("Google Drive preflight failed.")
           PY
 
+      - name: Resolve audit period (IST)
+        id: period
+        shell: bash
+        run: |
+          START_DATE='${{ inputs.start_date }}'
+          END_DATE='${{ inputs.end_date }}'
+          if [ -z "$START_DATE" ]; then
+            START_DATE="$(TZ=Asia/Kolkata date +%Y-%m-01)"
+          fi
+          if [ -z "$END_DATE" ]; then
+            END_DATE="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
+          fi
+          python - "$START_DATE" "$END_DATE" <<'PY'
+          import sys
+          from datetime import date
+          start, end = map(date.fromisoformat, sys.argv[1:3])
+          if end < start:
+              raise SystemExit("end_date must be on or after start_date")
+          PY
+          echo "start_date=$START_DATE" >> "$GITHUB_OUTPUT"
+          echo "end_date=$END_DATE" >> "$GITHUB_OUTPUT"
+          echo "Auditing $START_DATE through $END_DATE (Asia/Kolkata)"
+
       - name: Score current Delivery outcomes from the live ledger
         id: delivery
         continue-on-error: true
@@ -85,6 +117,8 @@ jobs:
           mkdir -p accuracy-audit/intraday
           set +e
           python -u audit_autonomous_intraday_outcomes.py \
+            --start-date "${{ steps.period.outputs.start_date }}" \
+            --end-date "${{ steps.period.outputs.end_date }}" \
             --segment service \
             --out-dir accuracy-audit/intraday \
             > accuracy-audit/intraday_audit_stdout.json \
