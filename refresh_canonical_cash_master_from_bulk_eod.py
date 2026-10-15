@@ -271,8 +271,11 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
     spill_dir = Path(tempfile.gettempdir()) / "cash_master_refresh_duckdb_tmp"
     spill_dir.mkdir(parents=True, exist_ok=True)
     try:
-        con.execute("PRAGMA threads=2")
-        con.execute("PRAGMA memory_limit='4GB'")
+        # Keep a margin for pandas/Arrow and prefer external spilling over an
+        # OOM when refreshing the multi-million-row canonical master.
+        con.execute("PRAGMA threads=1")
+        con.execute("PRAGMA memory_limit='3GB'")
+        con.execute("SET preserve_insertion_order=false")
         con.execute(f"SET temp_directory={_sql_path(spill_dir)}")
         m_sql, i_sql, o_sql = _sql_path(master), _sql_path(incoming), _sql_path(output)
         columns = [
@@ -316,25 +319,34 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
         projection = ", ".join(_quote_ident(c) for c in columns)
         con.execute(f"""
             COPY (
-              WITH combined AS (
-                SELECT *{master_expiry_replacement},
-                       0 AS _refresh_priority FROM read_parquet({m_sql})
-                UNION ALL BY NAME
+              WITH incoming_ranked AS (
                 SELECT *{incoming_expiry_replacement},
-                       1 AS _refresh_priority FROM read_parquet({i_sql})
-              ),
-              ranked AS (
-                SELECT *,
                   ROW_NUMBER() OVER (
                     PARTITION BY row_identity_key
-                    ORDER BY _refresh_priority DESC
-                  ) AS _identity_rank
-                FROM combined
+                    ORDER BY row_identity_key
+                  ) AS _incoming_rank
+                FROM read_parquet({i_sql})
+              ),
+              incoming_unique AS (
+                SELECT * EXCLUDE (_incoming_rank)
+                FROM incoming_ranked
+                WHERE _incoming_rank = 1
+              ),
+              untouched_master AS (
+                SELECT *{master_expiry_replacement}
+                FROM (
+                  SELECT m.*
+                  FROM read_parquet({m_sql}) AS m
+                  ANTI JOIN incoming_unique AS i USING (row_identity_key)
+                )
+              ),
+              combined AS (
+                SELECT * FROM untouched_master
+                UNION ALL BY NAME
+                SELECT * FROM incoming_unique
               )
               SELECT {projection}
-              FROM ranked
-              WHERE _identity_rank = 1
-              ORDER BY TRY_CAST(date AS DATE), listing_id
+              FROM combined
             )
             TO {o_sql} (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
