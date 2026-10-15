@@ -40,6 +40,41 @@ class IncrementalCashMasterMergeTests(unittest.TestCase):
             self.assertEqual(stats["null_identity_key_rows"], 0)
             self.assertEqual(stats["max_date"], "2026-10-09")
 
+    def test_actual_expiry_blank_string_does_not_force_numeric_cast(self):
+        with tempfile.TemporaryDirectory(prefix="cash-master-expiry-test-") as directory:
+            root = Path(directory)
+            master = root / "master.parquet"
+            incoming = root / "incoming.parquet"
+            output = root / "output.parquet"
+
+            # Model a legacy master whose all-null expiry column was inferred
+            # as DOUBLE, while a fresh UDiFF archive parses it as text.
+            pd.DataFrame([
+                {"row_identity_key": "AAA|EQ|2026-10-08", "symbol": "AAA",
+                 "date": "2026-10-08", "listing_id": "AAA|EQ",
+                 "close": 100.0, "actual_expiry": float("nan")},
+            ]).to_parquet(master, index=False)
+            pd.DataFrame([
+                {"row_identity_key": "AAA|EQ|2026-10-08", "symbol": "AAA",
+                 "date": "2026-10-08", "listing_id": "AAA|EQ",
+                 "close": 101.0, "actual_expiry": ""},
+                {"row_identity_key": "BBB|EQ|2026-10-09", "symbol": "BBB",
+                 "date": "2026-10-09", "listing_id": "BBB|EQ",
+                 "close": 200.0, "actual_expiry": ""},
+            ]).to_parquet(incoming, index=False)
+
+            result = _merge_master(master, incoming, output)
+            merged = pd.read_parquet(output).set_index("row_identity_key")
+            self.assertEqual(result["incoming_rows"], 2)
+            self.assertEqual(result["new_identity_keys"], 1)
+            self.assertEqual(len(merged), 2)
+            self.assertEqual(
+                merged.loc["AAA|EQ|2026-10-08", "close"], 101.0
+            )
+            self.assertEqual(
+                _master_stats(output)["duplicate_identity_key_rows"], 0
+            )
+
     def test_refresh_rejects_master_without_identity_key(self):
         with tempfile.TemporaryDirectory(prefix="cash-master-test-") as directory:
             root = Path(directory)

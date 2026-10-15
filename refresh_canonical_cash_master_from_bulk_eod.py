@@ -280,6 +280,23 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
                 f"DESCRIBE SELECT * FROM read_parquet({m_sql})"
             ).fetchall()
         ]
+        incoming_columns = [
+            row[0] for row in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({i_sql})"
+            ).fetchall()
+        ]
+        # UDiFF expiry values are text. A legacy Parquet master may infer the
+        # all-null column as numeric while the incoming archive contains blanks.
+        # Cast the column before DuckDB aligns UNION types, but keep compatibility
+        # with minimal/legacy schemas where the column is absent entirely.
+        master_expiry_replacement = (
+            " REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry)"
+            if "actual_expiry" in columns else ""
+        )
+        incoming_expiry_replacement = (
+            " REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry)"
+            if "actual_expiry" in incoming_columns else ""
+        )
         if "row_identity_key" not in columns:
             raise RuntimeError("Existing master lacks row_identity_key; refusing to merge.")
         incoming_rows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet({i_sql})").fetchone()[0])
@@ -300,10 +317,10 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
         con.execute(f"""
             COPY (
               WITH combined AS (
-                SELECT * REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry),
+                SELECT *{master_expiry_replacement},
                        0 AS _refresh_priority FROM read_parquet({m_sql})
                 UNION ALL BY NAME
-                SELECT * REPLACE (CAST(actual_expiry AS VARCHAR) AS actual_expiry),
+                SELECT *{incoming_expiry_replacement},
                        1 AS _refresh_priority FROM read_parquet({i_sql})
               ),
               ranked AS (
