@@ -75,6 +75,50 @@ class IncrementalCashMasterMergeTests(unittest.TestCase):
                 _master_stats(output)["duplicate_identity_key_rows"], 0
             )
 
+    def test_reconstructs_null_identity_key_only_from_listing_and_valid_date(self):
+        with tempfile.TemporaryDirectory(prefix="cash-master-repair-test-") as directory:
+            root = Path(directory)
+            master = root / "master.parquet"
+            incoming = root / "incoming.parquet"
+            output = root / "output.parquet"
+
+            pd.DataFrame([
+                {"row_identity_key": None, "symbol": "AAA", "date": "2026-10-08",
+                 "listing_id": "AAA|EQ", "close": 100.0},
+            ]).to_parquet(master, index=False)
+            pd.DataFrame([
+                {"row_identity_key": "BBB|EQ|DATE:2026-10-09", "symbol": "BBB",
+                 "date": "2026-10-09", "listing_id": "BBB|EQ", "close": 200.0},
+            ]).to_parquet(incoming, index=False)
+
+            result = _merge_master(master, incoming, output)
+            merged = pd.read_parquet(output).set_index("row_identity_key")
+
+            self.assertEqual(result["repaired_null_master_identity_keys"], 1)
+            self.assertIn("AAA|EQ|DATE:2026-10-08", merged.index)
+            self.assertIn("BBB|EQ|DATE:2026-10-09", merged.index)
+            self.assertEqual(_master_stats(output)["null_identity_key_rows"], 0)
+            self.assertEqual(_master_stats(output)["duplicate_identity_key_rows"], 0)
+
+    def test_rejects_null_identity_when_listing_or_date_is_unusable(self):
+        with tempfile.TemporaryDirectory(prefix="cash-master-unrepairable-test-") as directory:
+            root = Path(directory)
+            master = root / "master.parquet"
+            incoming = root / "incoming.parquet"
+            output = root / "output.parquet"
+
+            pd.DataFrame([
+                {"row_identity_key": None, "symbol": "AAA", "date": "2026-10-08",
+                 "listing_id": None, "close": 100.0},
+            ]).to_parquet(master, index=False)
+            pd.DataFrame([
+                {"row_identity_key": "BBB|EQ|DATE:2026-10-09", "symbol": "BBB",
+                 "date": "2026-10-09", "listing_id": "BBB|EQ", "close": 200.0},
+            ]).to_parquet(incoming, index=False)
+
+            with self.assertRaisesRegex(RuntimeError, "lack listing_id or a valid date"):
+                _merge_master(master, incoming, output)
+
     def test_refresh_rejects_master_without_identity_key(self):
         with tempfile.TemporaryDirectory(prefix="cash-master-test-") as directory:
             root = Path(directory)
