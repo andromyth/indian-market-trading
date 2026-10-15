@@ -7,11 +7,11 @@ on:
         description: "Optional NSE prediction session date YYYY-MM-DD"
         required: false
         default: ""
-  # 08:00 IST on NSE trading weekdays = 02:30 UTC.
-  # The run uses the immediately preceding NSE trading session as the
-  # point-in-time reference and produces the next-session prediction before
-  # the cash market opens.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  # 08:00 IST on NSE trading weekdays = 02:30 UTC. The run uses the
+  # immediately preceding NSE session and retains the quality gate; a blocked
+  # batch must not be reported as usable directional signals.
+  schedule:
+    - cron: "30 2 * * 1-5"
 concurrency:
   group: nse-delivery-morning-prediction
   cancel-in-progress: false
