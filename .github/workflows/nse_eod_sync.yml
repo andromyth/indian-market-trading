@@ -29,9 +29,7 @@ on:
   # NSE EOD archives are sometimes published later than the first post-close
   # run. Retry during the evening instead of allowing a transient 404 to leave
   # the production Delivery snapshot on the previous trading day.
-  schedule:
-    - cron: '15 13,14,15 * * 1-5'
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 jobs:
   sync-nse-eod:
     runs-on: ubuntu-latest
