@@ -1,0 +1,110 @@
+name: Activate Cloud Run intraday schedules
+
+# This is an explicit, one-time activation task. It does not add or enable a cron
+# trigger in this workflow. It only resumes existing Cloud Scheduler jobs whose
+# HTTP target is the known indian-market-intraday-worker Cloud Run service.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/activate_intraday_cloud_scheduler.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  resume-worker-schedules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Inspect and resume only the intraday worker scheduler jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud scheduler jobs list \
+            --project="$PROJECT_ID" \
+            --location="$REGION" \
+            --format=json > /tmp/scheduler-jobs.json
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import PurePosixPath
+
+          project = os.environ["PROJECT_ID"]
+          region = os.environ["REGION"]
+          jobs = json.load(open("/tmp/scheduler-jobs.json", encoding="utf-8"))
+          token = "indian-market-intraday-worker"
+          target_jobs = []
+          for job in jobs:
+              name = str(job.get("name", ""))
+              uri = str((job.get("httpTarget") or {}).get("uri", ""))
+              if token in name or token in uri:
+                  target_jobs.append(job)
+
+          if not target_jobs:
+              raise SystemExit(
+                  "No existing Cloud Scheduler jobs targeting indian-market-intraday-worker "
+                  f"were found in project={project}, region={region}; nothing was changed."
+              )
+
+          print("Matched existing intraday worker schedules:")
+          for job in sorted(target_jobs, key=lambda x: str(x.get("name", ""))):
+              name = str(job.get("name", ""))
+              short_name = PurePosixPath(name).name
+              state = str(job.get("state", "UNKNOWN")).upper()
+              print(
+                  f"- {short_name}: state={state}, "
+                  f"schedule={job.get('schedule')}, timezone={job.get('timeZone')}"
+              )
+              if state == "PAUSED":
+                  subprocess.run(
+                      [
+                          "gcloud", "scheduler", "jobs", "resume", short_name,
+                          "--project", project, "--location", region, "--quiet"
+                      ],
+                      check=True,
+                  )
+              elif state not in {"ENABLED"}:
+                  raise SystemExit(
+                      f"Job {short_name} has unexpected state={state}; "
+                      "refusing to alter it automatically."
+                  )
+
+          refreshed = subprocess.run(
+              [
+                  "gcloud", "scheduler", "jobs", "list",
+                  "--project", project, "--location", region, "--format=json"
+              ],
+              check=True, capture_output=True, text=True,
+          )
+          verified = json.loads(refreshed.stdout)
+          by_name = {str(j.get("name", "")): j for j in verified}
+          failures = []
+          for prior in target_jobs:
+              name = str(prior.get("name", ""))
+              current = by_name.get(name, {})
+              state = str(current.get("state", "UNKNOWN")).upper()
+              print(f"VERIFY {PurePosixPath(name).name}: state={state}")
+              if state != "ENABLED":
+                  failures.append(f"{name}: {state}")
+          if failures:
+              raise SystemExit("Cloud Scheduler activation not verified: " + "; ".join(failures))
+          print(f"SUCCESS: verified {len(target_jobs)} intraday worker schedule(s) ENABLED.")
+          PY
