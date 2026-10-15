@@ -302,19 +302,68 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
         )
         if "row_identity_key" not in columns:
             raise RuntimeError("Existing master lacks row_identity_key; refusing to merge.")
+
+        master_relation = f"read_parquet({m_sql})"
+        null_key_row = con.execute(f"""
+            SELECT COUNT(*) FILTER (WHERE row_identity_key IS NULL)
+            FROM read_parquet({m_sql})
+        """).fetchone()
+        null_master_identity_keys = int((null_key_row[0] if null_key_row else 0) or 0)
+        if null_master_identity_keys:
+            # Repair a null key only when the canonical listing_id and trade date
+            # are present. This is the exact composition used by add_identity:
+            # row_identity_key = listing_id + '|DATE:' + YYYY-MM-DD.
+            # If either source component is missing, fail closed; never guess or
+            # silently drop a row from the historical master.
+            missing_components = {"listing_id", "date"} - set(columns)
+            if missing_components:
+                raise RuntimeError(
+                    "Cannot safely repair null master identity keys; missing columns: "
+                    + ", ".join(sorted(missing_components))
+                )
+            unrepairable = int(con.execute(f"""
+                SELECT COUNT(*)
+                FROM read_parquet({m_sql})
+                WHERE row_identity_key IS NULL
+                  AND (
+                    listing_id IS NULL
+                    OR TRIM(CAST(listing_id AS VARCHAR)) = ''
+                    OR TRY_CAST(date AS DATE) IS NULL
+                  )
+            """).fetchone()[0])
+            if unrepairable:
+                raise RuntimeError(
+                    "Cannot safely repair null master identity keys because "
+                    f"{unrepairable} row(s) lack listing_id or a valid date; refusing to merge."
+                )
+            con.execute(f"""
+                CREATE TEMP VIEW master_identity_repaired AS
+                SELECT * REPLACE (
+                    CASE
+                      WHEN row_identity_key IS NULL THEN
+                        CAST(listing_id AS VARCHAR)
+                        || '|DATE:'
+                        || strftime(TRY_CAST(date AS DATE), '%Y-%m-%d')
+                      ELSE row_identity_key
+                    END AS row_identity_key
+                )
+                FROM read_parquet({m_sql})
+            """)
+            master_relation = "master_identity_repaired"
+
         incoming_rows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet({i_sql})").fetchone()[0])
         new_keys = int(con.execute(f"""
             SELECT COUNT(*) FROM (
               SELECT DISTINCT i.row_identity_key
               FROM read_parquet({i_sql}) i
-              LEFT JOIN read_parquet({m_sql}) m USING (row_identity_key)
+              LEFT JOIN {master_relation} m USING (row_identity_key)
               WHERE m.row_identity_key IS NULL
             )
         """).fetchone()[0])
         overlapping_keys = int(con.execute(f"""
             SELECT COUNT(DISTINCT i.row_identity_key)
             FROM read_parquet({i_sql}) i
-            INNER JOIN read_parquet({m_sql}) m USING (row_identity_key)
+            INNER JOIN {master_relation} m USING (row_identity_key)
         """).fetchone()[0])
         projection = ", ".join(_quote_ident(c) for c in columns)
         con.execute(f"""
@@ -336,7 +385,7 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
                 SELECT *{master_expiry_replacement}
                 FROM (
                   SELECT m.*
-                  FROM read_parquet({m_sql}) AS m
+                  FROM {master_relation} AS m
                   ANTI JOIN incoming_unique AS i USING (row_identity_key)
                 )
               ),
@@ -357,6 +406,7 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
             "incoming_rows": incoming_rows,
             "new_identity_keys": new_keys,
             "overlapping_identity_keys_refreshed_from_official_archive": overlapping_keys,
+            "repaired_null_master_identity_keys": null_master_identity_keys,
             "output_stats": stats,
         }
     finally:
