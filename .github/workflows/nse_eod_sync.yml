@@ -26,10 +26,17 @@ on:
         required: false
         default: '14'
 
-  # NSE EOD archives are sometimes published later than the first post-close
-  # run. Retry during the evening instead of allowing a transient 404 to leave
-  # the production Delivery snapshot on the previous trading day.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  # Retry official EOD ingestion after close and before the pre-open prediction.
+  # Times are IST converted to UTC; the script's session/holiday guards still apply.
+  schedule:
+    - cron: "45 15,17 * * 1-5"
+    - cron: "45 19,21,23 * * 0-4"
+    - cron: "45 0 * * 1-5"
+
+concurrency:
+  group: nse-eod-sync
+  cancel-in-progress: false
+
 jobs:
   sync-nse-eod:
     runs-on: ubuntu-latest
