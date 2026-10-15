@@ -674,7 +674,20 @@ class AutonomousIntradayWorker:
             and OPEN <= now_dt.time() < CLOSE
         )
         if not market_open:
-            if self.run_status == "RUNNING":
+            local_ledger_has_rows = (
+                self.daily_ledger is not None
+                and self.daily_ledger.is_file()
+                and self.daily_ledger.stat().st_size > 0
+            )
+            has_local_bar_frames = bool(self.session_frames)
+            should_final_flush = (
+                self.run_status in {"RUNNING", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"}
+                or (
+                    self.run_status in {"STARTING", "IDLE"}
+                    and (local_ledger_has_rows or has_local_bar_frames)
+                )
+            )
+            if should_final_flush:
                 final_flush = self._flush(final=True)
                 self.run_status = "STOPPED" if final_flush.get("status") == "OK" else "PERSISTENCE_ERROR"
                 _log("market_session_worker_stopped", at_ist=now_dt.isoformat(), final_flush=final_flush)
@@ -711,11 +724,26 @@ class AutonomousIntradayWorker:
 
         # Persist immediately on any degraded tick so failed inference rows and
         # their health status survive even when the scheduler runs a one-off tick.
-        if self.cycle_count % self.flush_every == 0 or result["status"] in {"ERROR", "PARTIAL"}:
-            flush = self._flush(final=False)
+        # Cloud Run instances are ephemeral: force the final 15:29 IST prediction
+        # batch to Drive in this same request instead of relying on a later request
+        # that may be routed to a cold instance with no local ledger.
+        final_minute_start = time(CLOSE.hour, max(0, CLOSE.minute - 1))
+        final_session_tick = final_minute_start <= now_dt.time() < CLOSE
+        should_flush = (
+            self.cycle_count % self.flush_every == 0
+            or result["status"] in {"ERROR", "PARTIAL"}
+            or final_session_tick
+        )
+        if should_flush:
+            flush = self._flush(final=final_session_tick)
             result["flush"] = flush
             if flush.get("status") != "OK":
                 result["status"] = "PERSISTENCE_ERROR"
+                if final_session_tick:
+                    self.run_status = "PERSISTENCE_ERROR"
+            elif final_session_tick:
+                self.run_status = "STOPPED"
+                _log("market_session_final_flush_completed", final_flush=flush, at_ist=now_dt.isoformat())
         result["worker_status"] = self.run_status
         return result
 
