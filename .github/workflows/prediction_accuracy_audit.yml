@@ -1,0 +1,108 @@
+name: Live prediction accuracy audit
+
+# Manual/commit-triggered only. No cron is enabled; this respects the request
+# to keep scheduled jobs paused while allowing an explicit live-data audit.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/prediction_accuracy_audit.yml"
+      - "audit_live_prediction_health.py"
+      - "audit_autonomous_intraday_outcomes.py"
+      - "prediction_ledger.py"
+      - "prediction_validation.py"
+      - "delivery_validation_diagnostics.py"
+
+permissions:
+  contents: read
+
+jobs:
+  audit-live-accuracy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Google Drive access
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status(require_write=True)
+          print({
+              key: status.get(key)
+              for key in (
+                  "configured", "reachable", "write_ready",
+                  "auth_method", "write_auth_method", "reason"
+              )
+          })
+          if (
+              not status.get("configured")
+              or status.get("reachable") is False
+              or status.get("write_ready") is False
+          ):
+              raise SystemExit("Google Drive preflight failed.")
+          PY
+
+      - name: Score current Delivery outcomes from the live ledger
+        id: delivery
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit
+          set +e
+          python -u audit_live_prediction_health.py --drive-api \
+            > accuracy-audit/live_prediction_health.json \
+            2> accuracy-audit/delivery_audit_stderr.txt
+          rc=$?
+          printf '{"audit":"delivery_live_health","exit_code":%s}\n' "$rc" \
+            > accuracy-audit/delivery_audit_exit.json
+          cat accuracy-audit/live_prediction_health.json
+          if [ "$rc" -ne 0 ]; then
+            echo "Delivery audit returned exit code $rc; inspect the JSON and stderr artifact."
+            exit "$rc"
+          fi
+
+      - name: Score matured autonomous Intraday outcomes against persisted 1-minute bars
+        id: intraday
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit/intraday
+          set +e
+          python -u audit_autonomous_intraday_outcomes.py \
+            --segment service \
+            --out-dir accuracy-audit/intraday \
+            > accuracy-audit/intraday_audit_stdout.json \
+            2> accuracy-audit/intraday_audit_stderr.txt
+          rc=$?
+          printf '{"audit":"intraday_service_outcomes","exit_code":%s}\n' "$rc" \
+            > accuracy-audit/intraday_audit_exit.json
+          cat accuracy-audit/intraday_audit_stdout.json
+          if [ "$rc" -ne 0 ]; then
+            echo "Intraday audit returned exit code $rc; inspect the JSON and stderr artifact."
+            exit "$rc"
+          fi
+
+      - name: Upload accuracy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-prediction-accuracy-${{ github.run_id }}
+          path: accuracy-audit/**
+          if-no-files-found: warn
+          retention-days: 30
