@@ -332,9 +332,28 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
                   )
             """).fetchone()[0])
             if unrepairable:
+                diagnostic_columns = [
+                    "symbol", "series", "isin", "date", "business_date", "listing_id",
+                    "instrument_id", "instrument_name", "source_format", "raw_archive",
+                ]
+                diagnostic_projection = ", ".join(
+                    (
+                        f"CAST({_quote_ident(column)} AS VARCHAR) AS {_quote_ident(column)}"
+                        if column in columns
+                        else f"NULL::VARCHAR AS {_quote_ident(column)}"
+                    )
+                    for column in diagnostic_columns
+                )
+                sample = con.execute(f"""
+                    SELECT {diagnostic_projection}
+                    FROM read_parquet({m_sql})
+                    WHERE row_identity_key IS NULL
+                    LIMIT 3
+                """).fetchall()
                 raise RuntimeError(
                     "Cannot safely repair null master identity keys because "
-                    f"{unrepairable} row(s) lack listing_id or a valid date; refusing to merge."
+                    f"{unrepairable} row(s) lack listing_id or a valid date; "
+                    f"identity diagnostic sample={sample!r}; refusing to merge."
                 )
             con.execute(f"""
                 CREATE TEMP VIEW master_identity_repaired AS
