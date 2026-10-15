@@ -2,10 +2,7 @@ name: Self-driving daily cycle (global cues, news archive, predict, validate)
 
 on:
   workflow_dispatch:
-  schedule:
-    # after the existing NSE EOD (13:15 UTC), F&O and news/events (13:45 UTC) syncs
-    - cron: '30 14 * * 1-5'
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 jobs:
   cycle:
     runs-on: ubuntu-latest

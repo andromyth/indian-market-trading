@@ -43,11 +43,7 @@ on:
   # 20:45-23:45 IST, 00:45-04:45 IST, 05:45-06:45 IST.
   # Before close, the clock resolver pins the job to the latest completed
   # session; after close, it advances to the session just completed.
-  schedule:
-    - cron: '15 15-18 * * 1-5'
-    - cron: '15 19-23 * * 1-5'
-    - cron: '15 0-1 * * 2-6'
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 # Prevent overlapping production refreshes while never cancelling a scheduled
 # retry. A normal run is ~5-6 minutes, well below the hourly cadence.
 concurrency:

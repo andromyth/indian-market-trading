@@ -11,9 +11,7 @@ on:
   # The run uses the immediately preceding NSE trading session as the
   # point-in-time reference and produces the next-session prediction before
   # the cash market opens.
-  schedule:
-    - cron: "30 2 * * 1-5"
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 concurrency:
   group: nse-delivery-morning-prediction
   cancel-in-progress: false

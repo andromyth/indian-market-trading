@@ -11,9 +11,7 @@ on:
         description: 'Optional last NSE date (YYYY-MM-DD)'
         required: false
         default: ''
-  schedule:
-    - cron: '45 13 * * 1-5'
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 jobs:
   sync-nse-news-events:
     runs-on: ubuntu-latest

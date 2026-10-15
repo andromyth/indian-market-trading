@@ -16,9 +16,7 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: '45 13 * * 1-5'
-
+  # Cron schedule paused at user request; manual workflow_dispatch remains available.
 concurrency:
   group: nse-fno-udiff
   cancel-in-progress: false
