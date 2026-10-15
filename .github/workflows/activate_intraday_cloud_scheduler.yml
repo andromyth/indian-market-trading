@@ -1,15 +1,11 @@
 name: Activate Cloud Run intraday schedules
 
-# This is an explicit, one-time activation task. It does not add or enable a cron
-# trigger in this workflow. It only resumes existing Cloud Scheduler jobs whose
-# HTTP target is the known indian-market-intraday-worker Cloud Run service.
+# This is an explicit, manually dispatched activation task. It does not create
+# schedules; it resumes only existing Cloud Scheduler jobs targeting the known
+# intraday worker. The Google service account must have Cloud Scheduler list,
+# get, and pause/resume permissions in the project before this can succeed.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/activate_intraday_cloud_scheduler.yml"
 
 permissions:
   contents: read
