@@ -246,7 +246,7 @@ def _latest_revision_per_symbol_date(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_delivery_csv_ledger() -> pd.DataFrame:
+def build_delivery_csv_ledger(eod_history: pd.DataFrame | None = None) -> pd.DataFrame:
     predictions = pd.DataFrame(load_records())
     validations = pd.DataFrame(load_validation_records())
 
@@ -292,7 +292,7 @@ def build_delivery_csv_ledger() -> pd.DataFrame:
     else:
         validations = pd.DataFrame(columns=["prediction_id"])
 
-    eod = _load_eod()
+    eod = _load_eod() if eod_history is None else eod_history
     rows: list[dict[str, Any]] = []
 
     for _, p in predictions.iterrows():
@@ -382,8 +382,8 @@ def build_delivery_csv_ledger() -> pd.DataFrame:
     return _latest_revision_per_symbol_date(df)
 
 
-def sync_delivery_csv_ledger() -> dict[str, Any]:
-    df = build_delivery_csv_ledger()
+def sync_delivery_csv_ledger(eod_history: pd.DataFrame | None = None) -> dict[str, Any]:
+    df = build_delivery_csv_ledger(eod_history=eod_history)
     LOCAL_CSV.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(LOCAL_CSV, index=False)
 
