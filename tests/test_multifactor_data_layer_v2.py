@@ -121,3 +121,23 @@ def test_pit_merge_expires_old_observations_instead_of_forward_filling_forever()
     assert merged["news_available"].iloc[0] == 1
     assert merged["news_available"].iloc[1] == 1
     assert pd.isna(merged["news_available"].iloc[2])
+
+def test_pit_merge_normalizes_microsecond_and_nanosecond_utc_keys():
+    # Parquet can round-trip different timestamp resolutions from different
+    # source files; the merge must normalize them before merge_asof.
+    base_ts = pd.to_datetime(["2026-01-02T10:00:00Z"], utc=True).astype(
+        "datetime64[ns, UTC]"
+    )
+    layer_ts = pd.to_datetime(["2026-01-01T10:00:00Z"], utc=True).astype(
+        "datetime64[us, UTC]"
+    )
+    base = pd.DataFrame({"symbol": ["ABC"], "decision_timestamp": base_ts})
+    layer = pd.DataFrame({
+        "symbol": ["ABC"],
+        "decision_timestamp": layer_ts,
+        "news_available": [1],
+    })
+    merged = merge_pit_layer(base, layer, ["news_available"], "news")
+    assert int(merged.loc[0, "news_available"]) == 1
+    assert str(merged.loc[0, "decision_timestamp"].dtype) == "datetime64[ns, UTC]"
+
