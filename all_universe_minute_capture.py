@@ -271,6 +271,15 @@ def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dic
     if minute_result.get("status") != "OK":
         raise RuntimeError(f"Drive per-minute manifest write was not confirmed: {minute_result}")
 
+    minute_path.with_suffix(".uploaded.json").write_text(
+        json.dumps({
+            "status": "OK",
+            "remote_path": minute_remote,
+            "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+
     latest_result = store.upload_or_update(
         path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json"
     )
@@ -301,6 +310,44 @@ def _upload_pending_snapshots(store: Any, local_dir: Path, current_name: str) ->
             )
             if upload.get("status") != "OK":
                 raise RuntimeError(f"Drive retry was not confirmed: {upload}")
+            marker_path.write_text(
+                json.dumps({
+                    "status": "OK",
+                    "remote_path": remote,
+                    "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
+            result["recovered"] += 1
+        except Exception as exc:
+            result["errors"].append({
+                "local_path": str(local_path),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return result
+
+
+
+def _upload_pending_manifests(
+    store: Any, local_dir: Path, current_name: str
+) -> dict[str, Any]:
+    """Retry local per-minute manifests whose Drive writes were not confirmed."""
+    result: dict[str, Any] = {"attempted": 0, "recovered": 0, "errors": []}
+    for local_path in sorted(local_dir.glob("manifest_*.json")):
+        if local_path.name == current_name:
+            continue
+        marker_path = local_path.with_suffix(".uploaded.json")
+        if marker_path.is_file():
+            continue
+        try:
+            stamp = datetime.strptime(local_path.stem, "manifest_%Y%m%d_%H%M")
+            remote = f"{REMOTE_ROOT}/{stamp:%Y/%m/%d}/{local_path.name}"
+            result["attempted"] += 1
+            upload = store.upload_or_update(
+                local_path, remote, mime_type="application/json"
+            )
+            if upload.get("status") != "OK":
+                raise RuntimeError(f"Drive manifest retry was not confirmed: {upload}")
             marker_path.write_text(
                 json.dumps({
                     "status": "OK",
@@ -361,7 +408,11 @@ def capture_all_universe_minute_snapshot(
     pending_recovery = _upload_pending_snapshots(
         store, local_dir, f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
     )
+    pending_manifest_recovery = _upload_pending_manifests(
+        store, local_dir, f"manifest_{cycle_minute:%Y%m%d_%H%M}.json"
+    )
     manifest["pending_snapshot_recovery"] = pending_recovery
+    manifest["pending_manifest_recovery"] = pending_manifest_recovery
     if not configured():
         manifest.update({
             "status": "BLOCKED_PROVIDER_CREDENTIALS",
@@ -487,13 +538,15 @@ def capture_all_universe_minute_snapshot(
                 "row_count": int(len(frame)),
             })
 
-    if pending_recovery.get("errors") and manifest.get("status") not in {
+    if (
+        pending_recovery.get("errors") or pending_manifest_recovery.get("errors")
+    ) and manifest.get("status") not in {
         "BLOCKED_PROVIDER_CREDENTIALS", "NO_ROWS", "PERSISTENCE_ERROR"
     }:
         manifest["status"] = "PERSISTENCE_ERROR"
         manifest["error"] = (
-            "One or more previous minute snapshots still failed Drive recovery; "
-            "see pending_snapshot_recovery.errors."
+            "One or more previous minute snapshots or manifests still failed Drive "
+            "recovery; inspect pending_snapshot_recovery and pending_manifest_recovery."
         )
 
     try:
