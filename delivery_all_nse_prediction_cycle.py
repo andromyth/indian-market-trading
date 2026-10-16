@@ -22,6 +22,7 @@ import pandas as pd
 from all_nse_delivery_model import _load_models, _signal_policy, _safe_float
 from delivery_prediction_csv_ledger import load_eod_history, project_next_session_ohlc
 from prediction_ledger import append_predictions
+from delivery_quality_gate import apply_quality_gate, quality_gate_reasons
 
 
 DEFAULT_BASE = "/content/drive/MyDrive/Indian_Market_Research"
@@ -152,7 +153,16 @@ def main() -> int:
             "HOLD",
         ),
     )
-    signals = np.where(~gate & np.isin(raw_signals, ["BUY", "SELL"]), "HOLD", raw_signals)
+    gate_reasons_by_row = []
+    for _, row in x.iterrows():
+        reasons = quality_gate_reasons(row)
+        if not gate[len(gate_reasons_by_row)] and not reasons:
+            reasons = ["QUALITY_GATE_BLOCKED_UNSPECIFIED"]
+        gate_reasons_by_row.append(reasons)
+    # A blocked BUY/SELL is not a HOLD: HOLD means the model was allowed to
+    # score the row and found no action. Keep the raw model output for audit,
+    # but publish DATA INSUFFICIENT when the strict quality gate fails.
+    signals = np.asarray(apply_quality_gate(raw_signals, gate), dtype=object)
 
     decision_ts = f"{snapshot_date}T15:30:00+05:30"
     model_version = str(manifest.get("engine_version", "2026-all-nse-delivery-multifactor-59-replacement-v1"))
@@ -270,6 +280,10 @@ def main() -> int:
                 ),
 
                 "signal": str(signals[i]),
+                "raw_model_signal": str(raw_signals[i]),
+                "signal_status": "DATA_INSUFFICIENT" if not gate[i] else "SCORED",
+                "signal_reason": ";".join(gate_reasons_by_row[i]),
+                "quality_gate_block_reasons": gate_reasons_by_row[i],
                 "confidence": (
                     "HIGH" if abs(p_up[i] - 0.5) >= 0.25
                     else "MEDIUM" if abs(p_up[i] - 0.5) >= 0.12
