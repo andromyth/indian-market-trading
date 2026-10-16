@@ -92,4 +92,5 @@ jobs:
             --start-date "${{ steps.target.outputs.start_date }}" \
             --end-date "${{ steps.target.outputs.end_date }}" \
             --segment service \
-            --train-fraction 0.70
+            --train-fraction 0.70 \
+            --strict
