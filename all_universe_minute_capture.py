@@ -8,7 +8,6 @@ existing prediction engine actually emitted them.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -298,7 +297,6 @@ def capture_all_universe_minute_snapshot(
         if str(s).strip()
     })
     instruments = _instrument_map()
-    reverse = {code: symbol for symbol, code in instruments.items() if symbol in set(universe)}
     prediction_map = _prediction_map(prediction_snapshots)
     forecast_rows = _load_forecast_rows(daily_ledger)
     manifest["expected_symbol_count"] = len(universe)
@@ -364,6 +362,13 @@ def capture_all_universe_minute_snapshot(
         manifest["status"] = "NO_ROWS"
         manifest["error"] = "The all-universe quote collector returned no rows."
     else:
+        # Count coverage before attempting Drive upload, so failure reports retain
+        # the real collector result rather than dropping coverage statistics.
+        manifest["quoted_symbol_count"] = int(frame["quote_status"].eq("PASS").sum())
+        manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
+        manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
+        manifest["row_count"] = int(len(frame))
+        manifest["forecast_record_count"] = int(frame["forecast_count"].sum())
         local_path = local_dir / f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
         temp_path = local_path.with_suffix(".tmp.parquet")
         frame.to_parquet(temp_path, index=False, compression="zstd")
@@ -376,10 +381,6 @@ def capture_all_universe_minute_snapshot(
             if drive_result.get("status") != "OK":
                 raise RuntimeError(f"Drive snapshot upload was not confirmed: {drive_result}")
             manifest["status"] = "OK" if request_errors == 0 and frame["quote_status"].eq("PASS").all() else "PARTIAL"
-            manifest["quoted_symbol_count"] = int(frame["quote_status"].eq("PASS").sum())
-            manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
-            manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
-            manifest["row_count"] = int(len(frame))
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
             manifest["snapshot_drive_path"] = remote_path
@@ -395,7 +396,6 @@ def capture_all_universe_minute_snapshot(
         _write_manifest(store, local_dir, manifest)
     except Exception as exc:
         manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
-        if manifest.get("status") == "OK":
-            manifest["status"] = "PERSISTENCE_ERROR"
+        manifest["status"] = "PERSISTENCE_ERROR"
 
     return _clean(manifest)
