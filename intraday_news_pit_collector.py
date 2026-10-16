@@ -197,6 +197,15 @@ def collect_and_publish_live_news(
         old = old.copy()
         if "decision_timestamp" in old:
             old["decision_timestamp"] = pd.to_datetime(old["decision_timestamp"], errors="coerce", utc=True)
+        # Legacy archives may lack a separate collection timestamp. Preserve their
+        # existing decision timestamp as the best available first-seen time.
+        if "collected_at_utc" not in old:
+            old["collected_at_utc"] = old["decision_timestamp"].astype(str)
+        else:
+            old["collected_at_utc"] = old["collected_at_utc"].where(
+                old["collected_at_utc"].notna(),
+                old["decision_timestamp"].astype(str),
+            )
         if "article_id" not in old:
             old["article_id"] = old.apply(
                 lambda row: hashlib.sha256(
@@ -220,10 +229,10 @@ def collect_and_publish_live_news(
             & combined["decision_timestamp"].ge(cutoff)
         ].copy()
         # One record per symbol/article. Repeated 15-minute RSS observations do not
-        # inflate article counts; latest collected timestamp wins on conflict.
+        # inflate article counts or move the first-seen decision timestamp forward.
         if "collected_at_utc" in combined:
-            combined = combined.sort_values("collected_at_utc")
-        combined = combined.drop_duplicates(["symbol", "article_id"], keep="last")
+            combined = combined.sort_values("collected_at_utc", ascending=True, na_position="last")
+        combined = combined.drop_duplicates(["symbol", "article_id"], keep="first")
         combined = combined.sort_values(["symbol", "decision_timestamp"]).reset_index(drop=True)
 
     status = "PASS" if successful_feeds >= 3 else ("PARTIAL" if successful_feeds else "ERROR")
