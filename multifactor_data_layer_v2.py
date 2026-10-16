@@ -63,7 +63,12 @@ def normalize_timestamp(frame: pd.DataFrame, preferred: Iterable[str] = ()) -> p
         if len(present)!=1:
             raise ValueError(f"Unable to resolve PIT timestamp; present={present}")
         x=x.rename(columns={present[0]:"decision_timestamp"})
-    x["decision_timestamp"]=pd.to_datetime(x["decision_timestamp"],errors="coerce",utc=True)
+    # Parquet/Arrow may restore UTC timestamps at microsecond resolution
+    # while another source uses nanoseconds. pandas.merge_asof requires join
+    # keys to have identical dtypes, including datetime resolution.
+    x["decision_timestamp"] = pd.to_datetime(
+        x["decision_timestamp"], errors="coerce", utc=True
+    ).astype("datetime64[ns, UTC]")
     if "symbol" not in x.columns:
         raise ValueError("PIT frame requires symbol")
     x["symbol"]=x["symbol"].map(normalize_symbol)
