@@ -1210,7 +1210,8 @@ def merge_optional(panel, source_cache=None):
     web_context_cols = [
         c for c in (
             "news_available", "news_sentiment", "news_article_count",
-            "news_source_count", "news_source_weight",
+            "news_source_count", "news_source_weight", "news_direction_score",
+            "event_impact_score",
         ) if c in web_news.columns
     ] if not web_news.empty else []
     if web_context_cols:
@@ -1224,7 +1225,7 @@ def merge_optional(panel, source_cache=None):
             aggregations["web_news_available"] = "max"
         for col in value_cols:
             aggregations[col] = (
-                "max" if col in {"news_article_count", "news_source_count"} else "mean"
+                "max" if col in {"news_article_count", "news_source_count", "event_impact_score"} else "mean"
             )
         context = context.groupby(
             ["symbol", "decision_timestamp"], as_index=False
