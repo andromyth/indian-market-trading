@@ -1419,6 +1419,10 @@ if interface_mode == "Live Test":
                     a2.metric("Close MAE · model", f"{float(summary.get('coherent_mae_bps', float('nan'))):.1f} bps")
                     a3.metric("Close MAE · median baseline", f"{float(summary.get('median_baseline_mae_bps', float('nan'))):.1f} bps")
                     a4.metric("Close directional accuracy", f"{float(summary.get('coherent_directional_accuracy_pct', float('nan'))):.1f}%")
+                    st.caption(
+                        f"Latest forecast origin evaluated: {rolling_report.get('latest_forecast_origin_date', '—')} · "
+                        f"Latest actual target scored: {rolling_report.get('latest_evaluated_target_date', '—')}"
+                    )
                 elif rolling_report.get("status"):
                     st.warning(
                         f"Audit status: {str(rolling_report.get('status')).replace('_', ' ')}. "

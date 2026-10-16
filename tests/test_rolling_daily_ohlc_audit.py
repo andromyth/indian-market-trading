@@ -33,6 +33,10 @@ def test_rolling_origin_audit_purges_each_fold_and_reports_baselines():
     assert report["safety"]["production_model_changed"] is False
     assert report["safety"]["orders_placed"] is False
     assert report["rolling_origin_count"] >= 3
+    # The most recent fully mature target date must be evaluated even if it does
+    # not lie on the regular step_sessions grid.
+    assert predictions["target_date"].max() == frame.index.max().date().isoformat()
+    assert report["latest_evaluated_target_date"] == frame.index.max().date().isoformat()
     assert len(predictions) == report["rolling_origin_count"] * 7
     assert set(predictions["horizon"].unique()) == set(range(1, 8))
     assert all(fold["leakage_check_pass"] for fold in report["folds"])

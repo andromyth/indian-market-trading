@@ -96,6 +96,19 @@ def run_rolling_origin_audit(
         indices = np.linspace(0, len(positions) - 1, num=max_origins).round().astype(int)
         positions = list(dict.fromkeys(positions[i] for i in indices))
 
+    # Always score the most recent fully matured origin. A regular five-session
+    # grid can otherwise stop one to four sessions early (e.g. target 14 Oct while
+    # completed 15 Oct outcomes are available), which misleads users into thinking
+    # the latest source date is missing. Preserve the cap by replacing the last
+    # selected origin when necessary.
+    latest_viable_origin = viable[-1]
+    if latest_viable_origin not in positions:
+        if len(positions) >= max_origins:
+            positions[-1] = latest_viable_origin
+        else:
+            positions.append(latest_viable_origin)
+        positions = sorted(set(positions))
+
     target_cols = [f"target_{t}" for t in TARGETS]
     rows: list[dict[str, Any]] = []
     folds: list[dict[str, Any]] = []
@@ -255,6 +268,8 @@ def run_rolling_origin_audit(
         "missing_stock_sessions_on_calendar": int((~calendar.isin(daily.index)).sum()),
         "min_train_origins": int(min_train_origins), "step_sessions": int(step_sessions),
         "max_origins": int(max_origins), "rolling_origin_count": int(predictions["origin_date"].nunique()),
+        "latest_forecast_origin_date": str(predictions["origin_date"].max()),
+        "latest_evaluated_target_date": str(predictions["target_date"].max()),
         "forecast_rows": int(total_rows), "horizons": list(HORIZONS), "targets": list(TARGETS),
         "aggregate_close_metric": close_summary,
         "coherence_corrections": {
