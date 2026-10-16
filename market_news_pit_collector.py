@@ -256,6 +256,118 @@ def _sentiment_analyzer():
         return None
 
 
+
+# Explainable finance-news classifier; the strength score is not a calibrated probability.
+NEWS_CATEGORY_RULES = (
+    ("FRAUD_REGULATORY", ("fraud", "accounting irregularit", "forensic audit", "default", "insolvency", "bankruptcy", "penalty", "regulatory action", "chargesheet", "charge sheet", "money laundering", "bribery", "investigation", "probe", "raid"), 0.95),
+    ("EARNINGS_RESULTS", ("quarterly result", "quarterly earnings", "financial results", "net profit", "profit after tax", "revenue", "earnings", "ebitda", "margin", "misses estimates", "beats estimates", "profit warning"), 0.80),
+    ("ORDER_CONTRACT", ("order win", "wins order", "wins contract", "bags order", "secures order", "work order", "letter of award", "contract awarded", "order cancellation", "contract cancelled", "cancels order"), 0.78),
+    ("RATING_BROKERAGE", ("rating upgrade", "rating downgrade", "upgrades", "downgrades", "price target", "target price", "buy rating", "sell rating", "outperform", "underperform"), 0.72),
+    ("CORPORATE_ACTION", ("dividend", "bonus issue", "stock split", "share buyback", "buyback", "rights issue", "record date", "merger", "demerger", "acquisition", "open offer", "delisting"), 0.70),
+    ("FINANCING_CREDIT", ("debt reduction", "debt repayment", "fund raising", "fundraise", "fundraising", "pledge", "credit rating", "refinancing", "loan default", "debt restructuring"), 0.72),
+    ("OPERATIONS_MANAGEMENT", ("plant shutdown", "production halt", "production resumes", "capacity expansion", "commercial production", "commissioning", "strike", "layoffs", "ceo resigns", "managing director resigns", "management change"), 0.62),
+    ("MACRO_MARKET", ("rbi policy", "repo rate", "inflation", "gdp growth", "crude oil", "rupee falls", "rupee rises", "nifty", "sensex", "market rally", "market selloff", "market sell-off"), 0.48),
+)
+POSITIVE_FINANCIAL_CUES = (
+    "beats estimates", "beat estimates", "beats analyst estimates", "profit rises",
+    "profit jumps", "profit surges", "profit grows", "revenue rises", "revenue growth",
+    "earnings beat", "strong results", "record profit", "order win", "wins order",
+    "wins contract", "bags order", "secures order", "rating upgrade", "upgraded to",
+    "price target raised", "target price raised", "dividend increase", "dividend raised",
+    "bonus issue", "share buyback", "regulatory approval", "receives approval",
+    "wins approval", "debt reduction", "debt repaid", "deleveraging", "margin expands",
+    "capacity expansion", "production resumes", "guidance raised", "outlook improved",
+    "cash flow improves", "cleared of wrongdoing", "charges dismissed", "probe dropped",
+    "acquitted",
+)
+NEGATIVE_FINANCIAL_CUES = (
+    "misses estimates", "missed estimates", "earnings miss", "profit falls",
+    "profit declines", "profit plunges", "profit drops", "loss widens", "revenue falls",
+    "revenue declines", "weak results", "guidance cut", "dividend cut",
+    "order cancellation", "contract cancelled", "order cancelled", "rating downgrade",
+    "downgraded to", "price target cut", "target price cut", "penalty", "fine imposed",
+    "fraud", "default", "insolvency", "bankruptcy", "probe", "investigation", "raided",
+    "chargesheet", "charge sheet", "plant shutdown", "production halt", "debt default",
+    "pledge rises", "auditor resigns", "data breach", "layoffs", "strike",
+)
+SEVERE_NEGATIVE_CUES = (
+    "fraud", "default", "insolvency", "bankruptcy", "money laundering", "bribery",
+    "accounting irregularity", "accounting irregularities", "forensic audit",
+    "chargesheet", "charge sheet",
+)
+NEGATION_OR_EXONERATION_PATTERNS = (
+    r"\bno\s+(?:evidence\s+of\s+)?(?:fraud|default|wrongdoing|irregularit\w*)\b",
+    r"\bnot\s+(?:guilty|responsible|in\s+default)\b",
+    r"\b(?:cleared|acquitted|exonerated)\s+(?:of|from)\b",
+    r"\b(?:charges?|allegations?|probe|investigation)\s+(?:dismissed|dropped|withdrawn)\b",
+    r"\bprobe\s+finds\s+no\b",
+)
+
+
+def classify_financial_news(
+    text: object, sentiment_score: object = None, source_weight: float = 0.8
+) -> dict[str, Any]:
+    """Produce an explainable news-direction bias from VADER and finance cues."""
+    lowered = re.sub(r"\s+", " ", _clean_text(text, 1600).casefold())
+    category, impact = "GENERAL_MARKET", 0.25
+    for label, cues, category_impact in NEWS_CATEGORY_RULES:
+        if any(cue in lowered for cue in cues):
+            category, impact = label, category_impact
+            break
+    positive_hits = [cue for cue in POSITIVE_FINANCIAL_CUES if cue in lowered]
+    negative_hits = [cue for cue in NEGATIVE_FINANCIAL_CUES if cue in lowered]
+    exonerating = any(re.search(pattern, lowered, flags=re.I) for pattern in NEGATION_OR_EXONERATION_PATTERNS)
+    if exonerating:
+        negative_hits = [
+            cue for cue in negative_hits
+            if not any(term in cue for term in ("fraud", "default", "insolvency", "bankruptcy", "probe", "investigation", "charge", "bribery", "irregularit"))
+        ]
+        positive_hits = list(positive_hits) + ["negation_or_exoneration"]
+    try:
+        vader = float(sentiment_score)
+        if not np.isfinite(vader):
+            vader = 0.0
+    except (TypeError, ValueError):
+        vader = 0.0
+    vader = float(np.clip(vader, -1.0, 1.0))
+    cue_total = len(positive_hits) + len(negative_hits)
+    lexicon = (len(positive_hits) - len(negative_hits)) / cue_total if cue_total else 0.0
+    score = 0.62 * vader + 0.38 * lexicon
+    severe_negative = any(cue in lowered for cue in SEVERE_NEGATIVE_CUES)
+    if severe_negative and not exonerating:
+        score = min(score, -0.62)
+        impact = max(impact, 0.95)
+    elif any(cue in lowered for cue in ("wins order", "wins contract", "beats estimates", "record profit", "regulatory approval", "guidance raised")):
+        score = max(score, 0.38)
+        impact = max(impact, 0.72)
+    score = float(np.clip(score, -1.0, 1.0))
+    signal = "NEWS_BUY_BIAS" if score >= 0.18 else ("NEWS_SELL_BIAS" if score <= -0.18 else "NEWS_NEUTRAL")
+    try:
+        weight = float(source_weight)
+        if not np.isfinite(weight):
+            weight = 0.5
+    except (TypeError, ValueError):
+        weight = 0.5
+    weight = float(np.clip(weight, 0.0, 1.0))
+    strength = float(np.clip(0.70 * abs(score) + 0.20 * impact + 0.10 * weight, 0.0, 1.0))
+    reasons = [f"category={category}", f"finance_lexicon={lexicon:.2f}", f"vader={vader:.2f}"]
+    if positive_hits:
+        reasons.append("positive_cues=" + ",".join(positive_hits[:4]))
+    if negative_hits:
+        reasons.append("negative_cues=" + ",".join(negative_hits[:4]))
+    if severe_negative and not exonerating:
+        reasons.append("high_impact_negative_event")
+    if exonerating:
+        reasons.append("negation_or_exoneration_detected")
+    return {
+        "news_event_category": category,
+        "event_impact_score": float(impact),
+        "news_direction_score": score,
+        "news_signal": signal,
+        "news_signal_strength": strength,
+        "news_signal_reason": "; ".join(reasons),
+    }
+
 def merge_article_archive(
     previous: pd.DataFrame | None,
     fresh_articles: list[dict[str, Any]],
@@ -335,6 +447,8 @@ def build_pit_layer(
             "symbol", "decision_timestamp", "news_available", "news_source",
             "news_sentiment", "news_article_count", "news_source_count",
             "news_source_weight", "news_title", "news_url", "news_article_id",
+            "news_event_category", "event_impact_score", "news_direction_score",
+            "news_signal", "news_signal_strength", "news_signal_reason",
             "published_at_utc", "first_seen_at_utc",
         ])
     now = (now_utc or datetime.now(UTC)).astimezone(UTC)
@@ -366,6 +480,14 @@ def build_pit_layer(
                 score = np.nan
         except (TypeError, ValueError):
             score = np.nan
+        source_weight = article.get("source_weight", 0.0)
+        try:
+            source_weight = float(source_weight)
+            if not np.isfinite(source_weight):
+                source_weight = 0.0
+        except (TypeError, ValueError):
+            source_weight = 0.0
+        news_analysis = classify_financial_news(text, score, source_weight)
         available = pd.Timestamp(available).tz_convert("UTC")
         for symbol in symbols:
             rows.append({
@@ -376,7 +498,8 @@ def build_pit_layer(
                 "news_sentiment": score,
                 "news_article_count": 1,
                 "news_source_count": 1,
-                "news_source_weight": float(article.get("source_weight", 0.0) or 0.0),
+                "news_source_weight": source_weight,
+                **news_analysis,
                 "news_title": title[:500],
                 "news_url": str(article.get("url") or ""),
                 "news_article_id": str(article.get("article_id") or ""),
@@ -388,6 +511,8 @@ def build_pit_layer(
             "symbol", "decision_timestamp", "news_available", "news_source",
             "news_sentiment", "news_article_count", "news_source_count",
             "news_source_weight", "news_title", "news_url", "news_article_id",
+            "news_event_category", "event_impact_score", "news_direction_score",
+            "news_signal", "news_signal_strength", "news_signal_reason",
             "published_at_utc", "first_seen_at_utc",
         ])
     out = pd.DataFrame(rows)
@@ -401,12 +526,30 @@ def build_pit_layer(
         news_article_count=("news_article_id", "nunique"),
         news_source_count=("news_source", "nunique"),
         news_source_weight=("news_source_weight", "mean"),
+        news_event_category=("news_event_category", lambda s: ";".join(sorted(set(str(v) for v in s if v))[:6])),
+        event_impact_score=("event_impact_score", "max"),
+        news_direction_score=("news_direction_score", "mean"),
+        news_signal_strength=("news_signal_strength", "max"),
+        news_signal_reason=("news_signal_reason", lambda s: " | ".join(list(dict.fromkeys(str(v) for v in s if v))[:3])),
         news_title=("news_title", "last"),
         news_url=("news_url", "last"),
         news_article_id=("news_article_id", lambda s: ";".join(sorted(set(str(v) for v in s if v))[:8])),
         published_at_utc=("published_at_utc", "max"),
         first_seen_at_utc=("first_seen_at_utc", "max"),
     )
+    out["news_signal"] = np.select(
+        [
+            pd.to_numeric(out["news_direction_score"], errors="coerce").ge(0.18),
+            pd.to_numeric(out["news_direction_score"], errors="coerce").le(-0.18),
+        ],
+        ["NEWS_BUY_BIAS", "NEWS_SELL_BIAS"],
+        default="NEWS_NEUTRAL",
+    )
+    out["news_signal_strength"] = (
+        0.70 * pd.to_numeric(out["news_direction_score"], errors="coerce").abs().fillna(0.0)
+        + 0.20 * pd.to_numeric(out["event_impact_score"], errors="coerce").fillna(0.25)
+        + 0.10 * pd.to_numeric(out["news_source_weight"], errors="coerce").fillna(0.5)
+    ).clip(0.0, 1.0)
     return out.sort_values(["symbol", "decision_timestamp"]).reset_index(drop=True)
 
 
@@ -453,10 +596,15 @@ def _download_remote(store: Any, remote: str, local: Path) -> bool:
 
 
 def _within_collection_window(now_ist: datetime) -> tuple[bool, str]:
-    # News can affect the next NSE session even on exchange holidays/weekends.
-    # This is a news-collection window, deliberately independent of the cash session.
-    if now_ist.time() < time(7, 30) or now_ist.time() > time(22, 0):
-        return False, "OUTSIDE_0730_TO_2200_IST_COLLECTION_WINDOW"
+    """Fail closed outside the requested 08:50-15:00 IST NSE trading-day window."""
+    try:
+        from market_session_guard import is_nse_trading_day
+        if not is_nse_trading_day(now_ist.date()):
+            return False, "WEEKEND_OR_NSE_HOLIDAY"
+    except Exception as exc:
+        return False, f"NSE_CALENDAR_UNAVAILABLE:{type(exc).__name__}"
+    if now_ist.time() < time(8, 50) or now_ist.time() > time(15, 0):
+        return False, "OUTSIDE_0850_TO_1500_IST_COLLECTION_WINDOW"
     return True, "IN_WINDOW"
 
 
@@ -464,7 +612,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--drive-root", default="/tmp/Indian_Market_Research")
     parser.add_argument("--market-window", action="store_true",
-                        help="Skip scheduled runs outside NSE business days and 07:30-15:30 IST.")
+                        help="Skip scheduled runs outside NSE trading days and 08:50-15:00 IST.")
     parser.add_argument("--max-article-age-hours", type=int, default=MAX_ARTICLE_AGE_HOURS)
     args = parser.parse_args()
     if args.max_article_age_hours < 1:
