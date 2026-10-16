@@ -219,6 +219,33 @@ def _error_pct(actual: Any, predicted: Any) -> float:
     return a / p - 1.0
 
 
+def _latest_revision_per_symbol_date(frame: pd.DataFrame) -> pd.DataFrame:
+    """Choose the most recently created prediction revision per target date/symbol."""
+    if frame.empty or not {"prediction_date", "symbol"}.issubset(frame.columns):
+        return frame.copy()
+
+    out = frame.copy()
+    if "created_at" not in out.columns:
+        out["created_at"] = ""
+    out["_created_at_order"] = pd.to_datetime(
+        out["created_at"], errors="coerce", utc=True
+    )
+    # Keep historical revisions in the authoritative JSONL ledger; this compact
+    # CSV view surfaces only the newest revision for each symbol and target date.
+    out = (
+        out.sort_values(
+            ["prediction_date", "symbol", "_created_at_order", "prediction_id"],
+            kind="mergesort",
+            na_position="first",
+        )
+        .drop_duplicates(["prediction_date", "symbol"], keep="last")
+        .drop(columns=["_created_at_order"])
+        .sort_values(["prediction_date", "symbol"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    return out
+
+
 def build_delivery_csv_ledger() -> pd.DataFrame:
     predictions = pd.DataFrame(load_records())
     validations = pd.DataFrame(load_validation_records())
@@ -311,6 +338,10 @@ def build_delivery_csv_ledger() -> pd.DataFrame:
             "actual_date": actual_date,
             "symbol": str(p.get("symbol", "")).upper(),
             "signal": str(p.get("signal", "")),
+            "raw_model_signal": str(p.get("raw_model_signal", "")),
+            "signal_reason": str(p.get("signal_reason", "")),
+            "prediction_revision": str(p.get("prediction_revision", "")),
+            "created_at": str(p.get("created_at", "")),
             "probability_up": _safe_float(p.get("probability_up_next_session")),
             "expected_return": _safe_float(p.get("predicted_return_next_session")),
             "reference_open": _safe_float(p.get("reference_open")),
@@ -348,12 +379,7 @@ def build_delivery_csv_ledger() -> pd.DataFrame:
     if df.empty:
         return df
 
-    return (
-        df.sort_values(["prediction_date", "symbol", "prediction_id"])
-        .drop_duplicates(["prediction_date", "symbol"], keep="last")
-        .sort_values(["prediction_date", "symbol"])
-        .reset_index(drop=True)
-    )
+    return _latest_revision_per_symbol_date(df)
 
 
 def sync_delivery_csv_ledger() -> dict[str, Any]:
