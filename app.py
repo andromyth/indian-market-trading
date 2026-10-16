@@ -69,6 +69,7 @@ from historical_replay import (
 )
 from prediction_history_ui import render_delivery_forecast, render_prediction_history
 from daily_ohlc_forecast import forecast_next_sessions, guard_daily_forecast_for_display
+from rolling_daily_ohlc_audit import run_rolling_origin_audit
 from nse_data_layer import (
     fetch_equity_history as nse_fetch_equity_history,
     fetch_intraday_1m_current as nse_fetch_intraday_1m_current,
@@ -1363,6 +1364,105 @@ if interface_mode == "Live Test":
                     "Opening, high, low and closing values are direct model estimates anchored on the latest observed close. "
                     "Each session has a separate holdout skill check against a training-median baseline. "
                     "The table is an OHLC forecast, not a broker signal and not a promise of a particular price."
+                )
+
+            st.divider()
+            st.subheader("Rolling-origin OHLC diagnostic")
+            st.caption(
+                "Runs a read-only expanding-window backtest on the selected stock using the NSE session calendar. "
+                "It reports raw versus coherent forecast errors, median-return and previous-close baselines, and "
+                "how often the OHLC correction forces High to equal Close. This audit does not change production."
+            )
+            if st.button("Run rolling-origin OHLC audit", key=f"run_rolling_ohlc_audit::{selected_root}"):
+                with st.spinner(f"Running rolling-origin audit for {selected_root} across historical NSE sessions…"):
+                    try:
+                        audit_history = _cached_daily_ohlc_history(selected_symbol, refresh_revision)
+                        from cross_sectional_daily_ohlc_audit import load_daily_history
+                        calendar_frame, calendar_source = load_daily_history("^NSEI", "900d")
+                        if calendar_frame is None or calendar_frame.empty:
+                            raise RuntimeError("Could not load the NIFTY/NSE session calendar.")
+                        calendar = pd.DatetimeIndex(calendar_frame.index).normalize().unique().sort_values()
+                        audit_report, audit_predictions, audit_metrics = run_rolling_origin_audit(
+                            audit_history, calendar, symbol=selected_root,
+                            min_train_origins=160, step_sessions=5, max_origins=24,
+                            min_evaluation_origins=10,
+                        )
+                        audit_report["calendar_source"] = calendar_source
+                        st.session_state["rolling_ohlc_audit_result"] = {
+                            "symbol": selected_root,
+                            "report": audit_report,
+                            "predictions": audit_predictions,
+                            "metrics": audit_metrics,
+                        }
+                    except Exception as exc:
+                        st.session_state["rolling_ohlc_audit_result"] = {
+                            "symbol": selected_root,
+                            "report": {
+                                "status": "AUDIT_ERROR",
+                                "reason": f"{type(exc).__name__}: {exc}",
+                                "safety": {"read_only": True, "production_model_changed": False, "orders_placed": False},
+                            },
+                            "predictions": pd.DataFrame(),
+                            "metrics": pd.DataFrame(),
+                        }
+
+            audit_state = st.session_state.get("rolling_ohlc_audit_result", {})
+            if isinstance(audit_state, dict) and audit_state.get("symbol") == selected_root:
+                rolling_report = audit_state.get("report", {}) or {}
+                rolling_predictions = audit_state.get("predictions", pd.DataFrame())
+                rolling_metrics = audit_state.get("metrics", pd.DataFrame())
+                st.markdown("**Rolling-origin results**")
+                if rolling_report.get("status") == "COMPLETE":
+                    summary = rolling_report.get("aggregate_close_metric", {}) or {}
+                    a1, a2, a3, a4 = st.columns(4)
+                    a1.metric("Out-of-sample origins", str(rolling_report.get("rolling_origin_count", 0)))
+                    a2.metric("Close MAE · model", f"{float(summary.get('coherent_mae_bps', float('nan'))):.1f} bps")
+                    a3.metric("Close MAE · median baseline", f"{float(summary.get('median_baseline_mae_bps', float('nan'))):.1f} bps")
+                    a4.metric("Close directional accuracy", f"{float(summary.get('coherent_directional_accuracy_pct', float('nan'))):.1f}%")
+                elif rolling_report.get("status"):
+                    st.warning(
+                        f"Audit status: {str(rolling_report.get('status')).replace('_', ' ')}. "
+                        + str(rolling_report.get("reason", "More usable history/origins may be required."))
+                    )
+                correction = rolling_report.get("coherence_corrections", {}) or {}
+                if correction:
+                    st.caption(
+                        "OHLC coherence: "
+                        f"High=Close after correction in {float(correction.get('high_equals_close_after_coherence_pct', 0)):.1f}% of origin/horizon rows; "
+                        f"raw High below raw Close in {float(correction.get('raw_high_below_close_pct', 0)):.1f}%; "
+                        f"high corrected {correction.get('rows_high_corrected', 0)} times, "
+                        f"low corrected {correction.get('rows_low_corrected', 0)} times."
+                    )
+                if not rolling_metrics.empty:
+                    st.dataframe(rolling_metrics, width="stretch", hide_index=True, height=360)
+                    st.download_button(
+                        "Download rolling-origin metrics CSV",
+                        data=rolling_metrics.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{selected_root.lower()}_rolling_ohlc_metrics.csv",
+                        mime="text/csv",
+                        key=f"download_rolling_ohlc_metrics::{selected_root}",
+                    )
+                if not rolling_predictions.empty:
+                    detail_columns = [
+                        "origin_date", "target_date", "horizon", "anchor_close",
+                        "actual_close_price", "raw_close_forecast_price", "coherent_close_forecast_price",
+                        "actual_high_price", "raw_high_forecast_price", "coherent_high_forecast_price",
+                        "high_corrected", "high_equals_close_after_coherence", "raw_high_below_close",
+                    ]
+                    st.dataframe(
+                        rolling_predictions[[col for col in detail_columns if col in rolling_predictions.columns]],
+                        width="stretch", hide_index=True, height=300,
+                    )
+                    st.download_button(
+                        "Download rolling-origin prediction details CSV",
+                        data=rolling_predictions.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{selected_root.lower()}_rolling_ohlc_predictions.csv",
+                        mime="text/csv",
+                        key=f"download_rolling_ohlc_predictions::{selected_root}",
+                    )
+                st.caption(
+                    "Evaluation only: all issue dates are refit with a seven-session label purge. "
+                    "No production model, ledger, or trading eligibility setting is changed."
                 )
 
     else:
