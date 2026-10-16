@@ -123,6 +123,9 @@ def build_audit_report(
             "pending_snapshot_recovery_errors": len(
                 (manifest.get("pending_snapshot_recovery") or {}).get("errors") or []
             ),
+            "pending_manifest_recovery_errors": len(
+                (manifest.get("pending_manifest_recovery") or {}).get("errors") or []
+            ),
             "manifest_error": manifest_error,
         })
 
@@ -213,6 +216,11 @@ def build_audit_report(
         "total_pending_snapshot_recovery_errors": int(
             pd.to_numeric(
                 frame["pending_snapshot_recovery_errors"], errors="coerce"
+            ).fillna(0).sum()
+        ),
+        "total_pending_manifest_recovery_errors": int(
+            pd.to_numeric(
+                frame["pending_manifest_recovery_errors"], errors="coerce"
             ).fillna(0).sum()
         ),
         "forecast_scope_note": (
