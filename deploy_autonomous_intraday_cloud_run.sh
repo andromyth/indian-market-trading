@@ -62,6 +62,30 @@ for secret_name in "${required_secrets[@]}"; do
   fi
 done
 
+# Full-universe minute capture requires INDstocks read-only market-data access.
+# Prefer the unattended TOTP credential set; a manual access token expires after 24 hours.
+auto_broker_auth=true
+for secret_name in "indstocks-client-id" "indstocks-mpin" "indstocks-totp-secret"; do
+  if ! gcloud secrets describe "$secret_name" --project "$PROJECT_ID" >/dev/null 2>&1 \
+      || ! gcloud secrets versions access latest --secret "$secret_name" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    auto_broker_auth=false
+  fi
+done
+manual_broker_auth=false
+if gcloud secrets describe "indstocks-access-token" --project "$PROJECT_ID" >/dev/null 2>&1 \
+    && gcloud secrets versions access latest --secret "indstocks-access-token" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  manual_broker_auth=true
+fi
+if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" != "true" ]]; then
+  echo "Full-universe minute data capture requires INDstocks credentials in Secret Manager."
+  echo "Configure indstocks-client-id + indstocks-mpin + indstocks-totp-secret (recommended),"
+  echo "or a temporary indstocks-access-token for a short smoke test."
+  exit 2
+fi
+if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" == "true" ]]; then
+  echo "WARNING: Using a manual INDstocks token; it normally expires after 24 hours." >&2
+fi
+
 # OAuth user credentials are sufficient for My Drive read/write. An optional
 # valid service-account key may be used for Drive read/list while OAuth handles writes.
 secret_mappings=(
