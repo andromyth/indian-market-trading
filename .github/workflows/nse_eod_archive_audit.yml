@@ -1,6 +1,13 @@
 name: NSE EOD archive audit
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nse_eod_archive_audit.yml"
+      - "nse_eod_archive_audit.py"
+      - "tests/test_nse_eod_archive_audit.py"
   workflow_dispatch:
     inputs:
       start:
