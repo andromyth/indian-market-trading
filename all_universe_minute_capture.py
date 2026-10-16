@@ -232,13 +232,32 @@ def _quote_row(
 
 
 def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist both a minute-specific audit record and a latest status pointer."""
     path = local_dir / "latest_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_clean(payload), indent=2, sort_keys=True), encoding="utf-8")
-    result = store.upload_or_update(path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json")
-    if result.get("status") != "OK":
-        raise RuntimeError(f"Drive manifest write was not confirmed: {result}")
-    return result
+    encoded = json.dumps(_clean(payload), indent=2, sort_keys=True)
+    path.write_text(encoded, encoding="utf-8")
+
+    minute = pd.to_datetime(payload.get("cycle_minute_ist"), errors="coerce")
+    if pd.isna(minute):
+        raise RuntimeError("Cannot persist a per-minute manifest without cycle_minute_ist")
+    minute_name = f"manifest_{minute:%Y%m%d_%H%M}.json"
+    minute_path = local_dir / minute_name
+    minute_path.write_text(encoded, encoding="utf-8")
+    minute_remote = f"{REMOTE_ROOT}/{minute:%Y/%m/%d}/{minute_name}"
+
+    minute_result = store.upload_or_update(
+        minute_path, minute_remote, mime_type="application/json"
+    )
+    if minute_result.get("status") != "OK":
+        raise RuntimeError(f"Drive per-minute manifest write was not confirmed: {minute_result}")
+
+    latest_result = store.upload_or_update(
+        path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json"
+    )
+    if latest_result.get("status") != "OK":
+        raise RuntimeError(f"Drive latest-manifest write was not confirmed: {latest_result}")
+    return {"minute_manifest": minute_result, "latest_manifest": latest_result}
 
 
 
@@ -450,9 +469,17 @@ def capture_all_universe_minute_snapshot(
             })
 
     try:
-        _write_manifest(store, local_dir, manifest)
+        manifest["manifest_drive_sync"] = _write_manifest(store, local_dir, manifest)
     except Exception as exc:
         manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
         manifest["status"] = "PERSISTENCE_ERROR"
+        # Make a best-effort second write of the per-minute audit showing the
+        # failed manifest sync; never mask the original failure in the result.
+        try:
+            manifest["manifest_recovery_sync"] = _write_manifest(store, local_dir, manifest)
+        except Exception as retry_exc:
+            manifest["manifest_recovery_sync_error"] = (
+                f"{type(retry_exc).__name__}: {retry_exc}"
+            )
 
     return _clean(manifest)
