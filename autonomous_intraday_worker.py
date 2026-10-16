@@ -211,7 +211,13 @@ def segment_should_stop(now: datetime, segment: str) -> bool:
 
 
 def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
-    universe = load_official_nse_universe(force_refresh=False)
+    try:
+        universe = load_official_nse_universe(force_refresh=False)
+    except Exception as exc:
+        # Continue collecting broad-market publisher news even if the official
+        # symbol master is temporarily unavailable. Symbol matching is withheld.
+        universe = pd.DataFrame()
+        _log("news_universe_unavailable", error=f"{type(exc).__name__}: {exc}")
     sources = fetch_watchlist_articles()
     news_collection: dict[str, Any] = {"status": "NOT_RUN"}
     try:
