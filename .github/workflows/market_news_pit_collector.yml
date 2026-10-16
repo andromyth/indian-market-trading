@@ -2,11 +2,11 @@ name: Market news PIT collector
 
 on:
   workflow_dispatch:
-  # GitHub cron is UTC. These entries cover 07:30-15:30 IST at 15-minute intervals.
-  # The module independently checks weekends, the NSE holiday calendar and its collection window.
+  # GitHub cron is UTC (IST = UTC+05:30). Poll headlines from 07:30 through 22:00 IST every day,
+  # including weekends/NSE holidays because non-trading-day news can affect the next session.
   schedule:
-    - cron: "*/15 2-9 * * 1-5"
-    - cron: "0 10 * * 1-5"
+    - cron: "*/15 2-15 * * *"
+    - cron: "0,15,30 16 * * *"
 
 permissions:
   contents: read

@@ -453,11 +453,10 @@ def _download_remote(store: Any, remote: str, local: Path) -> bool:
 
 
 def _within_collection_window(now_ist: datetime) -> tuple[bool, str]:
-    from market_session_guard import is_nse_trading_day
-    if not is_nse_trading_day(now_ist.date()):
-        return False, "WEEKEND_OR_NSE_HOLIDAY"
-    if now_ist.time() < time(7, 30) or now_ist.time() > time(15, 30):
-        return False, "OUTSIDE_PREOPEN_TO_SESSION_WINDOW"
+    # News can affect the next NSE session even on exchange holidays/weekends.
+    # This is a news-collection window, deliberately independent of the cash session.
+    if now_ist.time() < time(7, 30) or now_ist.time() > time(22, 0):
+        return False, "OUTSIDE_0730_TO_2200_IST_COLLECTION_WINDOW"
     return True, "IN_WINDOW"
 
 
