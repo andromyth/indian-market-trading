@@ -323,10 +323,10 @@ def main() -> int:
     result = append_predictions(records, sync_drive=sync_drive)
     # A successful process exit must mean the JSONL prediction ledger reached
     # Drive. A failed upload is a hard failure so the workflow retries.
-    if sync_drive and result.get("status") == "APPENDED" and result.get("new_rows", 0) > 0 and not result.get("synced"):
+    if sync_drive and not result.get("synced"):
         raise RuntimeError(
-            "ALL-NSE Delivery batch was generated locally but was not synced "
-            f"to the persistent Google Drive ledger: {result}"
+            "The local ALL-NSE Delivery prediction ledger could not be synced "
+            f"to Google Drive (including any earlier pending rows): {result}"
         )
 
     # Rebuild the one-row-per-symbol/date CSV view from the authoritative
