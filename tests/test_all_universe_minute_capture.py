@@ -192,6 +192,9 @@ def test_service_health_clears_recovered_quote_coverage_warning():
 
     original = dict(STATE)
     try:
+        STATE["all_universe_capture_error"] = None
+        STATE["all_universe_capture_warning"] = None
+        STATE["last_error"] = None
         _record_tick_result({
             "status": "PASS",
             "all_universe_capture": {
