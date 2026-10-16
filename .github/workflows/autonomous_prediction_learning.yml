@@ -1,0 +1,95 @@
+name: Autonomous prediction learning diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "First ledger date YYYY-MM-DD; blank uses the last 30 calendar days"
+        required: false
+        default: ""
+      end_date:
+        description: "Last ledger date YYYY-MM-DD; blank uses today in IST"
+        required: false
+        default: ""
+  # Existing outcome audit starts at 16:00 IST; learning runs later to allow it to finish.
+  schedule:
+    - cron: "0 11 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autonomous-prediction-learning
+  cancel-in-progress: false
+
+jobs:
+  learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve learning date range and NSE session
+        id: target
+        env:
+          REQUESTED_START_DATE: ${{ inputs.start_date }}
+          REQUESTED_END_DATE: ${{ inputs.end_date }}
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from market_session_guard import is_nse_trading_day
+
+          today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          start_text = os.environ.get("REQUESTED_START_DATE", "").strip()
+          end_text = os.environ.get("REQUESTED_END_DATE", "").strip()
+          end = date.fromisoformat(end_text) if end_text else today
+          start = date.fromisoformat(start_text) if start_text else end - timedelta(days=29)
+          if end < start:
+              raise SystemExit("learning end date is before start date")
+          should_run = is_nse_trading_day(end)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"start_date={start.isoformat()}\n")
+              out.write(f"end_date={end.isoformat()}\n")
+              out.write(f"should_run={'true' if should_run else 'false'}\n")
+          print(f"learning_start={start} learning_end={end} trading_day={should_run}")
+          PY
+
+      - name: Verify Google Drive read/write access
+        if: steps.target.outputs.should_run == 'true'
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status(require_write=True)
+          print(status)
+          if not status.get("configured") or status.get("reachable") is False or status.get("write_ready") is False:
+              raise SystemExit("Google Drive read/write preflight failed: " + str(status.get("reason", "not ready")))
+          PY
+
+      - name: Diagnose prediction errors and evaluate challenger corrections
+        if: steps.target.outputs.should_run == 'true'
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          python -u prediction_learning_engine.py \
+            --start-date "${{ steps.target.outputs.start_date }}" \
+            --end-date "${{ steps.target.outputs.end_date }}" \
+            --segment service \
+            --train-fraction 0.70
