@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
   # 07:15 IST on weekdays, after the overnight production refresh retries.
   # The runner also verifies the expected prior NSE session and refuses stale PIT.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  schedule:
+    - cron: "45 1 * * 1-5"
 jobs:
   beta-v2-cycle:
     runs-on: ubuntu-latest
