@@ -139,5 +139,5 @@ def test_pit_merge_normalizes_microsecond_and_nanosecond_utc_keys():
     })
     merged = merge_pit_layer(base, layer, ["news_available"], "news")
     assert int(merged.loc[0, "news_available"]) == 1
-    assert str(merged.loc[0, "decision_timestamp"].dtype) == "datetime64[ns, UTC]"
+    assert str(merged["decision_timestamp"].dtype) == "datetime64[ns, UTC]"
 
