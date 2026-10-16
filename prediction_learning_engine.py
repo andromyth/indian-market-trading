@@ -996,6 +996,11 @@ def main() -> int:
     parser.add_argument("--out-dir", default="diagnostics/prediction_learning")
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--no-sync-drive", action="store_true", help="Write local files only.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit nonzero if no matured prediction outcomes can be scored.",
+    )
     args = parser.parse_args()
     today = datetime.now(IST).date()
     try:
@@ -1012,6 +1017,8 @@ def main() -> int:
         sync_drive=not args.no_sync_drive, train_fraction=args.train_fraction,
     )
     print(json.dumps(_json_safe(result), indent=2, sort_keys=True, default=str))
+    if args.strict and result.get("status") != "COMPLETED":
+        return 2
     return 0 if result.get("status") in {"COMPLETED", "NO_MATURED_OUTCOMES", "NO_OUTCOME_ROWS"} else 2
 
 
