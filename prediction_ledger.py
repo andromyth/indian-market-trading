@@ -218,7 +218,10 @@ def append_predictions(records: list[dict[str, Any]], sync_drive: bool = True) -
 
     synced = False
     sync_error = None
-    if sync_drive and to_write:
+    if sync_drive:
+        # Also retry syncing when this batch contains no new IDs. A prior run
+        # can append locally and fail the Drive upload; without this retry path,
+        # the next idempotent run would skip the rows forever.
         try:
             from persistent_store import GoogleDriveStore
             g = GoogleDriveStore()
