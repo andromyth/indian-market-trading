@@ -1095,6 +1095,7 @@ class AutonomousIntradayWorker:
                     )
                     record = {
                         **result,
+                        "symbol": root,
                         "forecast_key": forecast_key,
                         "worker_observed_at_utc": now.tz_convert("UTC").isoformat(),
                         "worker_observed_at_ist": now.isoformat(),
