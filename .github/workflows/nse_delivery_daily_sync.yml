@@ -10,7 +10,8 @@ on:
   # Security-wise MTO delivery archives can appear later than the first
   # post-close fetch. Retry in the evening so the current session is available
   # before the Delivery production compilation window.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  schedule:
+    - cron: '15 14,15 * * 1-5'
 concurrency:
   group: nse-delivery-daily-sync
   cancel-in-progress: false
