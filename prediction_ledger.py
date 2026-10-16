@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -22,6 +23,67 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Forecast/output fields participate in identity so a recomputed prediction for
+# the same symbol, target date, decision timestamp and model is stored as a
+# distinct auditable revision when its signal, price forecast or readiness changes.
+_REVISION_FIELDS = (
+    "prediction_for_date",
+    "pit_snapshot_date",
+    "reference_session",
+    "signal",
+    "raw_model_signal",
+    "signal_status",
+    "signal_reason",
+    "quality_gate_block_reasons",
+    "production_data_quality_gate",
+    "production_data_quality_score",
+    "probability_up_next_session",
+    "probability_down_next_session",
+    "predicted_return_next_session",
+    "predicted_price_next_session",
+    "predicted_price_change_next_session",
+    "predicted_open",
+    "predicted_high",
+    "predicted_low",
+    "confidence",
+    "feature_count",
+    "non_missing_feature_count",
+    "feature_non_missing_fraction",
+    "data_readiness_score",
+)
+
+
+def _canonical_revision_value(value: Any) -> Any:
+    """Convert prediction output values to deterministic JSON-safe primitives."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_revision_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_revision_value(item) for item in value]
+    try:
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        return round(numeric, 8)
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def prediction_revision_fingerprint(record: dict[str, Any]) -> str:
+    """Short content fingerprint for idempotent, auditable forecast revisions."""
+    payload = {
+        key: _canonical_revision_value(record[key])
+        for key in _REVISION_FIELDS
+        if key in record
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _stable_id(record: dict[str, Any]) -> str:
     keys = [
         str(record.get("symbol", "")),
@@ -29,6 +91,7 @@ def _stable_id(record: dict[str, Any]) -> str:
         str(record.get("prediction_horizon", "")),
         str(record.get("decision_timestamp", "")),
         str(record.get("model_version", "")),
+        prediction_revision_fingerprint(record),
     ]
     return hashlib.sha256("|".join(keys).encode("utf-8")).hexdigest()[:24]
 
@@ -102,6 +165,7 @@ def append_prediction(record: dict[str, Any], sync_drive: bool = True) -> dict[s
     _ensure_local()
     x = dict(record)
     x.setdefault("created_at", _utc())
+    x.setdefault("prediction_revision", prediction_revision_fingerprint(x))
     x["prediction_id"] = x.get("prediction_id") or _stable_id(x)
 
     existing = {r.get("prediction_id") for r in load_records()}
@@ -139,6 +203,7 @@ def append_predictions(records: list[dict[str, Any]], sync_drive: bool = True) -
     for record in records:
         x = dict(record)
         x.setdefault("created_at", _utc())
+        x.setdefault("prediction_revision", prediction_revision_fingerprint(x))
         x["prediction_id"] = x.get("prediction_id") or _stable_id(x)
         pid = str(x["prediction_id"])
         if pid in existing or pid in seen:
