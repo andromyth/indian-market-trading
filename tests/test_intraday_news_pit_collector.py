@@ -90,4 +90,4 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
     assert archive["decision_timestamp"].notna().all()
     manifest_upload = next(x for x in uploaded if x["remote_path"].endswith(".json"))
     manifest = json.loads(manifest_upload["bytes"])
-    assert manifest["pit_timestamp_rule"].startswith("decision_timestamp is first collector-observed time")
+    assert manifest["pit_timestamp_rule"].startswith("New rows use collector first-seen time")
