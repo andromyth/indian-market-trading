@@ -1,6 +1,6 @@
 # Unattended intraday prediction service (Google Cloud Run)
 
-This deploys a **persistent background worker**, so prediction continues when the Streamlit dashboard/browser is closed. It polls once per minute during the regular NSE cash session, refreshes the dynamic news-based watchlist every 15 minutes, uses completed one-minute bars, checks stock/benchmark freshness, calls the existing saved Beta V2 horizons, and writes bars/predictions/health to Google Drive.
+This deploys an unattended Cloud Run worker, so prediction continues when the Streamlit dashboard/browser is closed. It polls once per minute during the regular NSE cash session, refreshes the dynamic news-based watchlist every 15 minutes, uses completed one-minute bars, checks stock/benchmark freshness, calls the existing saved Beta V2 horizons, and writes an immutable minute-level snapshot containing observed prices and the predictions made at that time. The full daily prediction ledger and bar partitions are also synced to Google Drive.
 
 It deliberately scores the top five news-matched watchlist symbols by default, not the entire NSE universe each minute. The existing hourly full-universe ingestion workflow remains separate. No orders are placed.
 
@@ -66,13 +66,13 @@ Open Google Cloud Console → **Cloud Run** → indian-market-intraday-worker �
 1. google_drive_preflight with configured=true, reachable=true, and write_ready=true.
 2. cloud_run_worker_loop_started.
 3. During an NSE session: minute_tick_started, stock_data_collected, intraday_prediction_completed, and cloud_run_tick_result.
-4. Every five cycles: drive_flush_completed with status OK, and the remote ledger/status paths under production_data/intraday_predictions/.
+4. Every tick: minute_prediction_actual_snapshot_persisted with status OK and a path under production_data/intraday_minute_snapshots/YYYY/MM/DD/. Each snapshot contains the latest observed stock/benchmark prices and that minute's forecast rows.\n5. Every five cycles: drive_flush_completed with status OK and the daily prediction/bar partitions synced to Google Drive.\n6. After market close: the scheduled Autonomous intraday prediction-vs-actual audit validates matured forecasts and writes CSV/JSON reports under production_data/intraday_predictions/outcomes_audit/YYYY/MM/DD/.
 
 A weekend, NSE holiday, pre-open or post-close log should show MARKET_CLOSED/no market data cycle. Stale/missing stock or benchmark candles cause the affected prediction to be withheld rather than guessed.
 
 ## Important constraints
 
 - One minute is a polling target, not an exchange-feed latency guarantee. The loop can take longer than one minute if an upstream source or model artifact download is slow; it never fabricates bars to catch up.
-- If the service restarts, it rebuilds its in-memory watchlist from recent headlines and resumes. Completed bars, prediction JSONL and worker status are synced to Drive every five cycles and on shutdown.
+- If the service restarts, it rebuilds its in-memory watchlist from recent headlines and resumes. The daily prediction ledger is hydrated from Drive before appending so a cold instance does not overwrite earlier same-day records. A per-minute prediction/actual snapshot is written to Drive on each completed tick; completed bars, the daily ledger and worker status are additionally synced every five cycles and on shutdown.\n- The GitHub Actions workflow `Autonomous intraday prediction-vs-actual audit` runs at 16:00 IST on weekdays, skips NSE holidays, and uploads the daily audit CSV/JSON after joining persisted forecasts to actual one-minute closes. Outcomes are finalized only when the forecast horizon has elapsed and a target bar is available.
 - Existing trained classifier bundles must have their price-regression heads fitted once for numerical predicted prices to appear. Use COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py once if the active horizon bundles still report RETRAIN_REQUIRED.
 - Cloud Run minimum-instance and instance-based CPU settings are billable. Monitor the Google Cloud credits/billing page and scale down/delete the service if you no longer need it.
