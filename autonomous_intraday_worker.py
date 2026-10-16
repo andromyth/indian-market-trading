@@ -213,6 +213,18 @@ def segment_should_stop(now: datetime, segment: str) -> bool:
 def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
     universe = load_official_nse_universe(force_refresh=False)
     sources = fetch_watchlist_articles()
+    news_collection: dict[str, Any] = {"status": "NOT_RUN"}
+    try:
+        from intraday_news_pit_collector import collect_and_publish_live_news
+        news_collection = collect_and_publish_live_news(
+            source_result=sources, universe=universe
+        )
+    except Exception as exc:
+        news_collection = {
+            "collection_status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        _log("live_news_pit_collection_failed", error=news_collection["error"])
     built = build_stock_watchlist(universe, sources, max_stocks=max_stocks)
     symbols = []
     for item in built.get("stocks", []) or []:
@@ -236,6 +248,16 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
         "source_status": built.get("sources", []),
         "dynamic_symbols": symbols,
         "message": built.get("message"),
+        "news_collection": {
+            key: news_collection.get(key)
+            for key in (
+                "collection_status", "successful_feed_count", "configured_feed_count",
+                "new_articles_observed", "archive_rows", "archive_symbol_count",
+                "checked_at_utc", "archive_remote_path", "manifest_remote_path",
+                "coverage_complete", "coverage_note", "error",
+            )
+            if key in news_collection
+        },
     }
 
 
@@ -709,9 +731,9 @@ class AutonomousIntradayWorker:
         if self.symbols:
             due = force or elapsed >= self.refresh_watchlist_seconds
         else:
-            # Avoid re-querying all five news publishers every single minute
-            # while still retrying fairly quickly when no symbols have matched.
-            due = force or self.last_watchlist_refresh == 0.0 or elapsed >= 300
+            # Keep RSS scraping and PIT publication on the same 15-minute cadence
+            # even when no headline could be mapped to a symbol.
+            due = force or self.last_watchlist_refresh == 0.0 or elapsed >= self.refresh_watchlist_seconds
         if not due:
             return
         try:
@@ -720,7 +742,12 @@ class AutonomousIntradayWorker:
             self.watchlist_meta = meta
             if symbols:
                 self.symbols = symbols
-            _log("watchlist_refreshed", symbols=self.symbols, metadata=meta)
+            _log(
+                "watchlist_refreshed",
+                symbols=self.symbols,
+                metadata=meta,
+                news_collection=meta.get("news_collection", {}),
+            )
         except Exception as exc:
             # Retain the latest successful watchlist and apply a backoff after errors.
             self.last_watchlist_refresh = monotonic_now
