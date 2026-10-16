@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,21 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 PIT_REMOTE = "processed/live_news/website_news_pit_2026.parquet"
 MANIFEST_REMOTE = "processed/live_news/website_news_manifest_2026.json"
 MAX_ARCHIVE_DAYS = 7
+
+# Independent broad-market queries complement the narrower "stocks to watch"
+# queries used by the dashboard watchlist. All are publisher-restricted.
+BROAD_MARKET_SOURCES = (
+    ("Economic Times Market News", "economictimes.indiatimes.com",
+     '("Nifty" OR "Sensex" OR "stock market" OR "shares" OR "earnings" OR "RBI" OR "SEBI")'),
+    ("Moneycontrol Market News", "moneycontrol.com",
+     '("Nifty" OR "Sensex" OR "stock market" OR "shares" OR "earnings" OR "RBI" OR "SEBI")'),
+    ("Financial Express Market News", "financialexpress.com",
+     '("Nifty" OR "Sensex" OR "stock market" OR "shares" OR "earnings" OR "RBI" OR "SEBI")'),
+    ("Mint Market News", "livemint.com",
+     '("Nifty" OR "Sensex" OR "stock market" OR "shares" OR "earnings" OR "RBI" OR "SEBI")'),
+    ("CNBC-TV18 Market News", "cnbctv18.com",
+     '("Nifty" OR "Sensex" OR "stock market" OR "shares" OR "earnings" OR "RBI" OR "SEBI")'),
+)
 
 
 def _download_if_present(store: Any, remote_path: str, local_path: Path) -> bool:
@@ -77,7 +93,9 @@ def collect_and_publish_live_news(
     so publisher endpoints are not scraped twice in a single 15-minute cycle.
     """
     from delivery_training_universe import load_official_nse_universe
-    from market_watchlist import fetch_watchlist_articles, build_alias_map, extract_mentions
+    from market_watchlist import (
+        fetch_watchlist_articles, build_alias_map, extract_mentions, _fetch_source
+    )
     from persistent_store import GoogleDriveStore
 
     current = now or datetime.now(IST)
@@ -95,6 +113,40 @@ def collect_and_publish_live_news(
         old = pd.DataFrame()
 
     source_result = source_result or fetch_watchlist_articles(now=checked_utc)
+    # Add broader publisher-restricted market, macro, earnings and regulatory news.
+    # The already-fetched watchlist feeds are reused; only these five additional
+    # queries are requested, once per 15-minute worker refresh.
+    broad_results = []
+    with ThreadPoolExecutor(max_workers=len(BROAD_MARKET_SOURCES)) as pool:
+        futures = {
+            pool.submit(_fetch_source, source, checked_utc): source
+            for source in BROAD_MARKET_SOURCES
+        }
+        for future in as_completed(futures):
+            publisher, domain, _ = futures[future]
+            try:
+                broad_results.append(future.result())
+            except Exception as exc:
+                broad_results.append({
+                    "publisher": publisher,
+                    "domain": domain,
+                    "status": "ERROR",
+                    "articles": [],
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+    source_result = dict(source_result)
+    source_result["sources"] = list(source_result.get("sources", []) or []) + [
+        {
+            key: source.get(key)
+            for key in ("publisher", "domain", "status", "error")
+        } | {"article_count": len(source.get("articles", []) or [])}
+        for source in broad_results
+    ]
+    source_result["articles"] = list(source_result.get("articles", []) or []) + [
+        article
+        for source in broad_results
+        for article in (source.get("articles", []) or [])
+    ]
     source_status = source_result.get("sources", []) or []
     # NO_RECENT_ARTICLES means the publisher query succeeded but returned no fresh items;
     # only ERROR indicates a failed source request. Do not mislabel healthy quiet feeds.
