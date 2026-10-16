@@ -1,0 +1,401 @@
+"""Minute-level full-NSE market quote snapshots and forecast outcome matching.
+
+This module records observed INDstocks prices for the full official NSE equity
+universe. It deliberately distinguishes a provider quote snapshot from an
+exchange-timestamped OHLCV candle. Predictions are attached only when the
+existing prediction engine actually emitted them.
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+IST = ZoneInfo("Asia/Kolkata")
+BATCH_SIZE = 900  # Provider documents a maximum of 1,000 symbols per request.
+REMOTE_ROOT = "production_data/all_universe_minute_snapshots"
+
+
+def _clean(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): _clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean(v) for v in value]
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return _clean(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, (str, int, bool)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _instrument_map() -> dict[str, str]:
+    """Map canonical NSE symbols to INDstocks NSE security codes."""
+    from indstocks_client import _load_instruments
+
+    master = _load_instruments("NSE")
+    if master is None or master.empty:
+        raise RuntimeError("INDstocks returned an empty NSE instrument master")
+    frame = master.copy()
+    frame.columns = [str(c).strip().upper() for c in frame.columns]
+    required = {"TRADING_SYMBOL", "SECURITY_ID"}
+    if not required.issubset(frame.columns):
+        raise RuntimeError(
+            "INDstocks instrument master lacks TRADING_SYMBOL/SECURITY_ID"
+        )
+    if "EXCH" in frame.columns:
+        frame = frame.loc[frame["EXCH"].astype(str).str.upper().eq("NSE")]
+    if "SERIES" in frame.columns:
+        ordinary = frame.loc[frame["SERIES"].astype(str).str.upper().eq("EQ")]
+        if not ordinary.empty:
+            frame = ordinary
+    frame["TRADING_SYMBOL"] = frame["TRADING_SYMBOL"].astype(str).str.strip().str.upper()
+    frame["SECURITY_ID"] = frame["SECURITY_ID"].astype(str).str.strip()
+    frame = frame.loc[frame["SECURITY_ID"].str.fullmatch(r"\d+")]
+    frame = frame.drop_duplicates("TRADING_SYMBOL", keep="first")
+    return {
+        str(row.TRADING_SYMBOL): f"NSE_{row.SECURITY_ID}"
+        for row in frame[["TRADING_SYMBOL", "SECURITY_ID"]].itertuples(index=False)
+        if str(row.TRADING_SYMBOL).strip()
+    }
+
+
+def _load_forecast_rows(ledger_path: Path | None) -> list[dict[str, Any]]:
+    if ledger_path is None or not Path(ledger_path).is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with Path(ledger_path).open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("forecast_key"):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows
+
+
+def _prediction_map(snapshot_rows: list[dict[str, Any]] | None) -> dict[str, list[dict[str, Any]]]:
+    mapped: dict[str, list[dict[str, Any]]] = {}
+    for snapshot in snapshot_rows or []:
+        symbol = str(snapshot.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        predictions = snapshot.get("predictions") or []
+        if isinstance(predictions, list):
+            for pred in predictions:
+                if isinstance(pred, dict):
+                    mapped.setdefault(symbol, []).append(_clean(pred))
+    return mapped
+
+
+def _outcomes_for_observation(
+    symbol: str,
+    actual_price: float | None,
+    observed_at: pd.Timestamp,
+    forecasts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Match only forecasts whose intended target falls in this observed minute."""
+    if actual_price is None:
+        return []
+    obs_minute_utc = observed_at.tz_convert("UTC").floor("min")
+    outcomes: list[dict[str, Any]] = []
+    for forecast in forecasts:
+        if str(forecast.get("symbol") or "").strip().upper().replace(".NS", "") != symbol:
+            continue
+        target = pd.to_datetime(
+            forecast.get("target_timestamp_utc"), errors="coerce", utc=True
+        )
+        if pd.isna(target) or target.floor("min") != obs_minute_utc:
+            continue
+        reference = _as_float(
+            forecast.get("reference_close", forecast.get("actual_observed_close"))
+        )
+        predicted_price = _as_float(forecast.get("predicted_price"))
+        signal = str(forecast.get("signal") or "").strip().upper()
+        actual_return_pct = (
+            (actual_price / reference - 1.0) * 100.0
+            if reference is not None and reference > 0 else None
+        )
+        directional_correct = None
+        if actual_return_pct is not None:
+            if signal == "BUY":
+                directional_correct = actual_return_pct > 0.0
+            elif signal == "SELL":
+                directional_correct = actual_return_pct < 0.0
+        outcomes.append({
+            "forecast_key": forecast.get("forecast_key"),
+            "symbol": symbol,
+            "horizon_min": forecast.get("horizon_min"),
+            "target_timestamp_utc": target.isoformat(),
+            "actual_quote_observed_at_utc": observed_at.tz_convert("UTC").isoformat(),
+            "actual_target_price": actual_price,
+            "actual_target_price_source": "INDSTOCKS_BATCH_QUOTE",
+            "actual_price_timestamp_basis": "collector_observation_time_not_exchange_tick_timestamp",
+            "reference_close": reference,
+            "actual_return_pct_from_reference": actual_return_pct,
+            "predicted_price": predicted_price,
+            "absolute_price_error": (
+                abs(actual_price - predicted_price)
+                if predicted_price is not None else None
+            ),
+            "signal": signal or None,
+            "directional_correct_before_costs": directional_correct,
+            "outcome_status": "MATCHED_TARGET_MINUTE_QUOTE",
+            "validation_note": (
+                "Point-in-time quote observed during the target minute; this is not "
+                "a substitute for an exchange-stamped one-minute candle close."
+            ),
+        })
+    return outcomes
+
+
+def _quote_row(
+    symbol: str,
+    instrument_code: str | None,
+    quote: dict[str, Any] | None,
+    observed_at: pd.Timestamp,
+    cycle_minute: pd.Timestamp,
+    prediction_map: dict[str, list[dict[str, Any]]],
+    forecast_rows: list[dict[str, Any]],
+    provider_error: str | None = None,
+) -> dict[str, Any]:
+    quote = quote or {}
+    ltp = _as_float(quote.get("live_price", quote.get("ltp")))
+    forecasts = prediction_map.get(symbol, [])
+    outcomes = _outcomes_for_observation(symbol, ltp, observed_at, forecast_rows)
+    status = (
+        "PASS" if ltp is not None
+        else "QUOTE_REQUEST_ERROR" if provider_error
+        else "MISSING_QUOTE"
+    )
+    return {
+        "record_type": "all_universe_minute_market_observation",
+        "schema_version": "all-universe-minute-snapshot-v1",
+        "symbol": symbol,
+        "exchange": "NSE",
+        "instrument_code": instrument_code,
+        "cycle_minute_ist": cycle_minute.isoformat(),
+        "quote_observed_at_utc": observed_at.tz_convert("UTC").isoformat(),
+        "quote_observed_at_ist": observed_at.isoformat(),
+        "quote_timestamp_basis": "collector_observation_time_not_exchange_tick_timestamp",
+        "quote_source": "INDSTOCKS_BATCH_QUOTE",
+        "quote_status": status,
+        "quote_error": provider_error,
+        "actual_observed_price": ltp,
+        "day_open": _as_float(quote.get("day_open")),
+        "day_high": _as_float(quote.get("day_high")),
+        "day_low": _as_float(quote.get("day_low")),
+        "previous_close": _as_float(quote.get("prev_close")),
+        "day_volume": _as_float(quote.get("volume")),
+        "day_change_pct": _as_float(quote.get("day_change_percentage")),
+        "is_one_minute_ohlcv_candle": False,
+        "forecast_status": "AVAILABLE" if forecasts else "NO_FORECAST_EMITTED_FOR_SYMBOL",
+        "forecast_count": len(forecasts),
+        "current_forecasts_json": json.dumps(_clean(forecasts), separators=(",", ":")),
+        "matched_outcome_count": len(outcomes),
+        "matched_outcomes_json": json.dumps(_clean(outcomes), separators=(",", ":")),
+    }
+
+
+def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    path = local_dir / "latest_manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_clean(payload), indent=2, sort_keys=True), encoding="utf-8")
+    result = store.upload_or_update(path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json")
+    return result
+
+
+def capture_all_universe_minute_snapshot(
+    *,
+    now: datetime | pd.Timestamp,
+    worker_root: Path,
+    daily_ledger: Path | None,
+    prediction_snapshots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Fetch a batch quote for each official NSE equity, match available outcomes,
+    and persist an idempotent Parquet snapshot plus a coverage manifest to Drive.
+    """
+    from delivery_training_universe import official_nse_symbols
+    from indstocks_client import _request, configured
+    from persistent_store import GoogleDriveStore
+
+    now_ts = pd.Timestamp(now)
+    now_ts = now_ts.tz_localize(IST) if now_ts.tzinfo is None else now_ts.tz_convert(IST)
+    cycle_minute = now_ts.floor("min")
+    local_dir = Path(worker_root) / "all_universe_minute_snapshots"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    remote_day = cycle_minute.strftime("%Y/%m/%d")
+    remote_path = (
+        f"{REMOTE_ROOT}/{remote_day}/"
+        f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+    )
+    manifest: dict[str, Any] = {
+        "schema_version": "all-universe-minute-snapshot-v1",
+        "cycle_minute_ist": cycle_minute.isoformat(),
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "INDSTOCKS_BATCH_QUOTE",
+        "status": "STARTING",
+        "expected_symbol_count": 0,
+        "quoted_symbol_count": 0,
+        "missing_quote_count": 0,
+        "unmapped_symbol_count": 0,
+        "forecast_symbol_count": 0,
+        "matched_outcome_count": 0,
+        "remote_snapshot_path": remote_path,
+    }
+
+    store = GoogleDriveStore()
+    if not configured():
+        manifest.update({
+            "status": "BLOCKED_PROVIDER_CREDENTIALS",
+            "error": (
+                "INDstocks credentials are not configured. Set INDSTOCKS_ACCESS_TOKEN "
+                "or INDSTOCKS_CLIENT_ID, INDSTOCKS_MPIN and INDSTOCKS_TOTP_SECRET "
+                "in the Cloud Run service's secret-backed environment."
+            ),
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        try:
+            _write_manifest(store, local_dir, manifest)
+        except Exception as exc:
+            manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
+        return manifest
+
+    universe = sorted({
+        str(s).strip().upper().replace(".NS", "")
+        for s in official_nse_symbols(force_refresh=False)
+        if str(s).strip()
+    })
+    instruments = _instrument_map()
+    reverse = {code: symbol for symbol, code in instruments.items() if symbol in set(universe)}
+    prediction_map = _prediction_map(prediction_snapshots)
+    forecast_rows = _load_forecast_rows(daily_ledger)
+    manifest["expected_symbol_count"] = len(universe)
+    manifest["unmapped_symbol_count"] = sum(1 for symbol in universe if symbol not in instruments)
+    manifest["forecast_symbol_count"] = sum(1 for symbol in universe if prediction_map.get(symbol))
+
+    rows: list[dict[str, Any]] = []
+    request_errors = 0
+    all_codes = [
+        (symbol, instruments[symbol])
+        for symbol in universe
+        if symbol in instruments
+    ]
+
+    for offset in range(0, len(all_codes), BATCH_SIZE):
+        batch = all_codes[offset:offset + BATCH_SIZE]
+        codes = [code for _, code in batch]
+        try:
+            response = _request(
+                "GET",
+                "/market/quotes/full",
+                params={"scrip-codes": ",".join(codes)},
+            )
+            body = response.json()
+            data = body.get("data", {}) if isinstance(body, dict) else {}
+            if not isinstance(data, dict):
+                raise RuntimeError("INDstocks quote response has no data object")
+            success = (
+                body.get("success") is True
+                or str(body.get("status", "")).strip().lower() == "success"
+            )
+            if not success:
+                raise RuntimeError(
+                    str(body.get("message") or body.get("error") or "quote request not successful")
+                )
+            observed_at = pd.Timestamp.now(tz=IST)
+            for symbol, code in batch:
+                quote = data.get(code)
+                rows.append(_quote_row(
+                    symbol, code, quote if isinstance(quote, dict) else None,
+                    observed_at, cycle_minute, prediction_map, forecast_rows,
+                ))
+        except Exception as exc:
+            request_errors += 1
+            observed_at = pd.Timestamp.now(tz=IST)
+            error = f"{type(exc).__name__}: {exc}"
+            for symbol, code in batch:
+                rows.append(_quote_row(
+                    symbol, code, None, observed_at, cycle_minute,
+                    prediction_map, forecast_rows, provider_error=error,
+                ))
+
+    for symbol in universe:
+        if symbol not in instruments:
+            rows.append(_quote_row(
+                symbol, None, None, pd.Timestamp.now(tz=IST), cycle_minute,
+                prediction_map, forecast_rows,
+                provider_error="Symbol missing from INDstocks instrument master",
+            ))
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        manifest["status"] = "NO_ROWS"
+        manifest["error"] = "The all-universe quote collector returned no rows."
+    else:
+        local_path = local_dir / f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+        temp_path = local_path.with_suffix(".tmp.parquet")
+        frame.to_parquet(temp_path, index=False, compression="zstd")
+        temp_path.replace(local_path)
+        try:
+            drive_result = store.upload_or_update(
+                local_path, remote_path, mime_type="application/vnd.apache.parquet"
+            )
+            manifest["snapshot_drive_sync"] = drive_result
+            if drive_result.get("status") != "OK":
+                raise RuntimeError(f"Drive snapshot upload was not confirmed: {drive_result}")
+            manifest["status"] = "OK" if request_errors == 0 and frame["quote_status"].eq("PASS").all() else "PARTIAL"
+            manifest["quoted_symbol_count"] = int(frame["quote_status"].eq("PASS").sum())
+            manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
+            manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
+            manifest["row_count"] = int(len(frame))
+            manifest["snapshot_bytes"] = int(local_path.stat().st_size)
+            manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+            manifest["snapshot_drive_path"] = remote_path
+        except Exception as exc:
+            manifest.update({
+                "status": "PERSISTENCE_ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+                "local_snapshot_path": str(local_path),
+                "row_count": int(len(frame)),
+            })
+
+    try:
+        _write_manifest(store, local_dir, manifest)
+    except Exception as exc:
+        manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
+        if manifest.get("status") == "OK":
+            manifest["status"] = "PERSISTENCE_ERROR"
+
+    return _clean(manifest)
