@@ -148,3 +148,76 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
     assert frame.loc["AAA", "quote_status"] == "PASS"
     assert frame.loc["BBB", "quote_status"] == "MISSING_QUOTE"
     assert frame.loc["BBB", "actual_observed_price"] != frame.loc["BBB", "actual_observed_price"]
+
+
+
+def test_pending_snapshot_upload_is_retried_once_and_receipt_prevents_reupload(tmp_path):
+    class FakeDriveStore:
+        def __init__(self):
+            self.paths = []
+
+        def upload_or_update(self, local_path, remote_path, mime_type=None):
+            self.paths.append(remote_path)
+            return {"status": "OK", "remote_path": remote_path}
+
+    local_dir = tmp_path / "all_universe_minute_snapshots"
+    local_dir.mkdir()
+    pending = local_dir / "snapshot_20261016_1005.parquet"
+    pending.write_bytes(b"prior-local-snapshot")
+    store = FakeDriveStore()
+
+    recovered = capture._upload_pending_snapshots(
+        store, local_dir, "snapshot_20261016_1006.parquet"
+    )
+
+    assert recovered["attempted"] == 1
+    assert recovered["recovered"] == 1
+    assert recovered["errors"] == []
+    assert store.paths == [
+        "production_data/all_universe_minute_snapshots/2026/10/16/"
+        "snapshot_20261016_1005.parquet"
+    ]
+    assert pending.with_suffix(".uploaded.json").is_file()
+
+    second_attempt = capture._upload_pending_snapshots(
+        store, local_dir, "snapshot_20261016_1006.parquet"
+    )
+    assert second_attempt["attempted"] == 0
+    assert second_attempt["recovered"] == 0
+    assert len(store.paths) == 1
+
+
+def test_service_health_clears_recovered_quote_coverage_warning():
+    from autonomous_intraday_worker_service import STATE, _record_tick_result
+
+    original = dict(STATE)
+    try:
+        _record_tick_result({
+            "status": "PASS",
+            "all_universe_capture": {
+                "status": "PARTIAL",
+                "expected_symbol_count": 2600,
+                "quoted_symbol_count": 2598,
+                "missing_quote_count": 2,
+            },
+        })
+        assert STATE["all_universe_capture_warning"] == (
+            "Quote coverage incomplete: 2598/2600 NSE symbols"
+        )
+        assert STATE["last_error"] == STATE["all_universe_capture_warning"]
+
+        _record_tick_result({
+            "status": "PASS",
+            "all_universe_capture": {
+                "status": "OK",
+                "expected_symbol_count": 2600,
+                "quoted_symbol_count": 2600,
+                "missing_quote_count": 0,
+            },
+        })
+        assert STATE["all_universe_capture_warning"] is None
+        assert STATE["all_universe_capture_error"] is None
+        assert STATE["last_error"] is None
+    finally:
+        STATE.clear()
+        STATE.update(original)
