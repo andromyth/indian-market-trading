@@ -468,6 +468,15 @@ def capture_all_universe_minute_snapshot(
                 "row_count": int(len(frame)),
             })
 
+    if pending_recovery.get("errors") and manifest.get("status") not in {
+        "BLOCKED_PROVIDER_CREDENTIALS", "NO_ROWS", "PERSISTENCE_ERROR"
+    }:
+        manifest["status"] = "PERSISTENCE_ERROR"
+        manifest["error"] = (
+            "One or more previous minute snapshots still failed Drive recovery; "
+            "see pending_snapshot_recovery.errors."
+        )
+
     try:
         manifest["manifest_drive_sync"] = _write_manifest(store, local_dir, manifest)
     except Exception as exc:
