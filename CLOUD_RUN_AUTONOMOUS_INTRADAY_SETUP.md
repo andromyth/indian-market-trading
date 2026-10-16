@@ -4,6 +4,16 @@ This deploys an unattended Cloud Run worker, so prediction continues when the St
 
 It deliberately scores the top five news-matched watchlist symbols by default, not the entire NSE universe each minute. The existing hourly full-universe ingestion workflow remains separate. No orders are placed.
 
+## Live website-news collection
+
+During each 15-minute watchlist refresh, `intraday_news_pit_collector.py` reuses the watchlist publisher results and also queries broader market/macro/earnings/regulatory headlines from Economic Times, Moneycontrol, Financial Express, Mint, and CNBC-TV18. It records collection time, publisher/domain, headline URL, matched NSE symbols, sentiment, and article identifiers; repeated RSS items are deduplicated in the rolling seven-day point-in-time archive.
+
+Google Drive outputs:
+- `processed/live_news/website_news_pit_2026.parquet` — rolling article/symbol PIT dataset.
+- `processed/live_news/website_news_manifest_2026.json` — source health, last collection time, row counts and explicit coverage caveat.
+
+The worker reloads the new archive before same-cycle inference and attaches symbol/market news context to the minute-level forecast snapshot and prediction ledger. A successful feed refresh means the configured publishers were reachable; it does **not** mean every NSE stock's news coverage is exhaustive. The current saved classifier's feature contract is unchanged, so this news context is persisted alongside each forecast but is not yet a numeric input to the locked classifier. Incorporating it into model probabilities would require a separately validated feature-contract/training change.
+
 ## Why Cloud Run rather than an all-day GitHub Actions job?
 
 The repository is private. An all-day GitHub-hosted worker job every trading day would consume substantial included/billed runner minutes. Cloud Run is configured with one instance, CPU always allocated, and a durable Google Drive output path. Google documents that background threads need at least one minimum instance and that instance-based billing charges for the full instance lifecycle, including idle time. Credits can cover this temporarily; it is not guaranteed free after they expire.
