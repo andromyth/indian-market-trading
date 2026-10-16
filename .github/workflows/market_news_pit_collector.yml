@@ -1,6 +1,14 @@
 name: Market news PIT collector
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/market_news_pit_collector.yml"
+      - "market_news_pit_collector.py"
+      - "market_watchlist.py"
+      - "delivery_training_universe.py"
   workflow_dispatch:
   # GitHub cron is UTC (IST = UTC+05:30). Poll headlines from 07:30 through 22:00 IST every day,
   # including weekends/NSE holidays because non-trading-day news can affect the next session.
