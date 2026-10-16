@@ -77,7 +77,8 @@ def test_feature_error_associations_preserve_row_alignment():
     result = _feature_error_associations(frame, min_samples=3)
     assert result
     assert result[0]["feature"] == "trend"
-    assert result[0]["spearman_correlation_with_return_residual"] == pytest.approx(1.0)
+    assert result[0]["residual_type"] == "expected_return_residual"
+    assert result[0]["spearman_correlation_with_residual"] == pytest.approx(1.0)
 
 
 def test_learning_report_never_auto_applies_corrections():
