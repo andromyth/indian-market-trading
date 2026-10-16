@@ -55,6 +55,7 @@ jobs:
           PY
 
       - name: Verify Google Drive read/write access
+        id: drive_preflight
         if: steps.target.outputs.should_run == 'true'
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -84,3 +85,17 @@ jobs:
             --end-date "${{ steps.target.outputs.audit_date }}" \
             --segment service \
             --sync-drive
+
+      - name: Audit full-universe minute snapshots and persist coverage report
+        if: always() && steps.target.outputs.should_run == 'true' && steps.drive_preflight.outcome == 'success'
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          python -u audit_all_universe_minute_snapshots.py \
+            --date "${{ steps.target.outputs.audit_date }}" \
+            --sync-drive \
+            --strict
