@@ -208,6 +208,10 @@ def _quote_row(
         "quote_observed_at_utc": observed_at.tz_convert("UTC").isoformat(),
         "quote_observed_at_ist": observed_at.isoformat(),
         "quote_timestamp_basis": "collector_observation_time_not_exchange_tick_timestamp",
+        "quote_freshness_status": (
+            "PROVIDER_PRICE_PRESENT_TIMESTAMP_NOT_SUPPLIED"
+            if ltp is not None else "UNAVAILABLE"
+        ),
         "quote_source": "INDSTOCKS_BATCH_QUOTE",
         "quote_status": status,
         "quote_error": provider_error,
