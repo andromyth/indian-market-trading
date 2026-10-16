@@ -848,13 +848,9 @@ class AutonomousIntradayWorker:
         now = pd.Timestamp.now(tz=IST)
         self.last_minute_snapshot_rows = []
         self._refresh_watchlist_if_due()
-        collected_at = (self.watchlist_meta.get("news_collection") or {}).get("checked_at_utc")
-        collection_is_new = bool(
-            collected_at and collected_at != self.news_manifest.get("checked_at_utc")
-        )
-        # If this cycle just scraped/published new headlines, reload that exact
-        # archive before inference rather than waiting for the separate timer.
-        self._refresh_news_context_if_due(force=collection_is_new)
+        # Probe the Drive manifest each minute; if the 15-minute collector has
+        # published a newer snapshot, reload it before this cycle's inference.
+        self._refresh_news_context_if_due()
         summary = {
             "cycle": self.cycle_count,
             "observed_at_utc": now.tz_convert("UTC").isoformat(),
