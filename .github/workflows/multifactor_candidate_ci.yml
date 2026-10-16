@@ -50,6 +50,8 @@ jobs:
           all_nse_delivery_model.py
           directional_ensemble.py
           prediction_validation.py
+          prediction_ledger.py
+          delivery_prediction_csv_ledger.py
           model_health.py
           autonomous_engine.py
           delivery_production_refresh.py
@@ -129,6 +131,7 @@ jobs:
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py
           tests/test_prediction_validation_scorecard.py
+          tests/test_prediction_ledger_revisions.py
           tests/test_delivery_validation_active_model.py
           tests/test_delivery_policy_precision_gate.py
           tests/test_delivery_policy_date_block_holdout.py
