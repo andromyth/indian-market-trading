@@ -214,10 +214,10 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
     try:
         universe = load_official_nse_universe(force_refresh=False)
     except Exception as exc:
-        # Retain broad headline collection/watchlist checks even if the NSE
-        # security master is temporarily unavailable; matching is withheld.
+        # A missing symbol master blocks symbol matching, but the independent
+        # market-news collector continues on its own scheduled workflow.
         universe = pd.DataFrame()
-        _log("news_universe_unavailable", error=f"{type(exc).__name__}: {exc}")
+        _log("watchlist_universe_unavailable", error=f"{type(exc).__name__}: {exc}")
     sources = fetch_watchlist_articles()
     built = build_stock_watchlist(universe, sources, max_stocks=max_stocks)
     symbols = []
@@ -243,7 +243,6 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
         "dynamic_symbols": symbols,
         "message": built.get("message"),
     }
-
 
 def _fetch_yfinance_1m(ticker: str) -> pd.DataFrame:
     """Fetch Yahoo's latest one-minute bars without the shared dashboard adapter.
