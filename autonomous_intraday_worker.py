@@ -479,22 +479,61 @@ class AutonomousIntradayWorker:
     def _refresh_news_context_if_due(self, force: bool = False) -> None:
         """Load the latest publisher-news PIT archive after the 15-minute collection."""
         monotonic_now = time_module.monotonic()
-        if not force and self.last_news_context_refresh and (
-            monotonic_now - self.last_news_context_refresh < 15 * 60
-        ):
-            return
-        self.last_news_context_refresh = monotonic_now
+        interval_due = force or not self.last_news_context_refresh or (
+            monotonic_now - self.last_news_context_refresh >= 15 * 60
+        )
         cache_dir = self.root / "news_cache"
         pit_path = cache_dir / "website_news_pit_2026.parquet"
         manifest_path = cache_dir / "website_news_manifest_2026.json"
         try:
             from persistent_store import GoogleDriveStore
             store = GoogleDriveStore()
+            probe_path = cache_dir / "website_news_manifest_probe.json"
+            try:
+                probe_found = _download_drive_file_if_present(
+                    store, "processed/live_news/website_news_manifest_2026.json", probe_path
+                )
+                remote_manifest = (
+                    json.loads(probe_path.read_text(encoding="utf-8"))
+                    if probe_found and probe_path.exists() else {}
+                )
+            except Exception as probe_exc:
+                if not interval_due:
+                    _log(
+                        "website_news_manifest_probe_failed",
+                        error=f"{type(probe_exc).__name__}: {probe_exc}",
+                        retained_existing_context=True,
+                    )
+                    return
+                probe_found = False
+                remote_manifest = {}
+                _log(
+                    "website_news_manifest_probe_failed",
+                    error=f"{type(probe_exc).__name__}: {probe_exc}",
+                    will_attempt_full_refresh=True,
+                )
+
+            remote_checked_at = remote_manifest.get("checked_at_utc")
+            cached_checked_at = self.news_manifest.get("checked_at_utc")
+            manifest_changed = bool(
+                remote_checked_at and remote_checked_at != cached_checked_at
+            )
+            if not interval_due and not manifest_changed:
+                return
+
+            self.last_news_context_refresh = monotonic_now
+            if probe_found:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                manifest_path.write_text(
+                    probe_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                manifest_found = True
+            else:
+                manifest_found = _download_drive_file_if_present(
+                    store, "processed/live_news/website_news_manifest_2026.json", manifest_path
+                )
             pit_found = _download_drive_file_if_present(
                 store, "processed/live_news/website_news_pit_2026.parquet", pit_path
-            )
-            manifest_found = _download_drive_file_if_present(
-                store, "processed/live_news/website_news_manifest_2026.json", manifest_path
             )
             self.news_manifest = (
                 json.loads(manifest_path.read_text(encoding="utf-8"))
