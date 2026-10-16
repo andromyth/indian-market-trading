@@ -144,6 +144,7 @@ def test_cloud_run_worker_runs_at_most_one_cycle_per_minute(tmp_path, monkeypatc
         root=tmp_path,
         flush_every=5,
     )
+    monkeypatch.setattr(worker, "_hydrate_daily_ledger", lambda: None)
     calls = []
     monkeypatch.setattr(
         worker,
@@ -206,6 +207,7 @@ def test_cloud_run_partial_prediction_tick_flushes_immediately(tmp_path, monkeyp
         root=tmp_path,
         flush_every=5,
     )
+    monkeypatch.setattr(worker, "_hydrate_daily_ledger", lambda: None)
     monkeypatch.setattr(
         worker,
         "_cycle",
@@ -251,6 +253,7 @@ def test_worker_health_records_empty_prediction_output_as_failure(tmp_path, monk
         root=tmp_path,
         flush_every=5,
     )
+    monkeypatch.setattr(worker, "_hydrate_daily_ledger", lambda: None)
     monkeypatch.setattr(
         worker,
         "_cycle",
@@ -326,6 +329,7 @@ def test_cloud_run_worker_final_minute_flushes_successful_prediction_batch(tmp_p
         root=tmp_path,
         flush_every=5,
     )
+    monkeypatch.setattr(worker, "_hydrate_daily_ledger", lambda: None)
     monkeypatch.setattr(
         worker,
         "_cycle",
@@ -395,3 +399,57 @@ def test_cloud_run_closed_tick_retries_final_flush_when_local_ledger_exists(tmp_
     assert result["status"] == "MARKET_CLOSED"
     assert result["run_status"] == "STOPPED"
     assert flush_calls == [True]
+
+
+
+def test_minute_snapshot_persists_prediction_and_actual_price_to_drive(tmp_path, monkeypatch):
+    import json
+    import sys
+    from types import SimpleNamespace
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    uploads = []
+
+    class FakeDriveStore:
+        def upload_or_update(self, local_path, remote_path, mime_type=None):
+            with open(local_path, encoding="utf-8") as handle:
+                content = handle.read()
+            uploads.append({
+                "remote_path": remote_path,
+                "mime_type": mime_type,
+                "content": content,
+            })
+            return {"status": "updated", "path": remote_path}
+
+    monkeypatch.setitem(
+        sys.modules, "persistent_store", SimpleNamespace(GoogleDriveStore=FakeDriveStore)
+    )
+    worker = AutonomousIntradayWorker(segment="service", root=tmp_path)
+    worker.last_minute_snapshot_rows = [{
+        "record_type": "intraday_minute_observation",
+        "symbol": "SBIN",
+        "actual_observed_close": 812.35,
+        "actual_observed_timestamp_ist": "2026-10-14T10:14:00+05:30",
+        "predictions": [{
+            "horizon_min": 5,
+            "signal": "BUY",
+            "predicted_price": 814.0,
+            "outcome_status": "WAITING_FOR_HORIZON",
+        }],
+    }]
+
+    result = worker._persist_minute_snapshot(
+        pd.Timestamp("2026-10-14 10:15:00", tz=IST), {"status": "PASS"}
+    )
+
+    assert result["status"] == "OK"
+    assert result["snapshot_rows"] == 1
+    assert result["prediction_rows"] == 1
+    assert uploads[0]["remote_path"] == (
+        "production_data/intraday_minute_snapshots/2026/10/14/"
+        "snapshot_20261014_1015.jsonl"
+    )
+    saved = json.loads(uploads[0]["content"].strip())
+    assert saved["actual_observed_close"] == 812.35
+    assert saved["predictions"][0]["predicted_price"] == 814.0
+    assert saved["predictions"][0]["outcome_status"] == "WAITING_FOR_HORIZON"
