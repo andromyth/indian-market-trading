@@ -578,7 +578,7 @@ def main() -> int:
         (manifest_path, MANIFEST_REMOTE, "application/json"),
     ):
         upload = store.upload_or_update(local, remote, mime_type=mime_type)
-        print(json.dumps({"upload_path": remote, "result": str(upload)}, flush=True))
+        print(json.dumps({"upload_path": remote, "result": str(upload)}, default=str), flush=True)
 
     print(json.dumps(manifest, indent=2, default=str), flush=True)
     # Partial source availability is useful data but must not be described as full coverage.
