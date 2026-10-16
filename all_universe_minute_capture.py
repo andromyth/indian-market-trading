@@ -207,6 +207,9 @@ def _quote_row(
 ) -> dict[str, Any]:
     quote = quote or {}
     ltp = _as_float(quote.get("live_price", quote.get("ltp")))
+    if ltp is not None and ltp <= 0:
+        provider_error = provider_error or "Provider returned a non-positive live price"
+        ltp = None
     forecasts = prediction_map.get(symbol, [])
     outcomes = _outcomes_for_observation(symbol, ltp, observed_at, forecast_rows)
     status = (
