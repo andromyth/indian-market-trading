@@ -159,10 +159,12 @@ def build_audit_report(
             and row["manifest_present"]
             and pd.notna(row["expected_symbol_count"])
             and pd.notna(row["quoted_symbol_count"])
+            and pd.notna(row["missing_quote_count"])
+            and pd.notna(row["unmapped_symbol_count"])
             and int(row["expected_symbol_count"]) > 0
             and int(row["quoted_symbol_count"]) == int(row["expected_symbol_count"])
-            and int(row["missing_quote_count"] or 0) == 0
-            and int(row["unmapped_symbol_count"] or 0) == 0
+            and int(row["missing_quote_count"]) == 0
+            and int(row["unmapped_symbol_count"]) == 0
         )
     ]
     statuses_data_complete = bool(all(
