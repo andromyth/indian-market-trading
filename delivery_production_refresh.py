@@ -365,7 +365,13 @@ def main():
         pd.to_numeric(panel["ready_market_context"],errors="coerce").eq(1)
     )
     panel["production_optional_state_known"]=panel[["ready_news","ready_events","ready_fno","ready_fundamentals"]].apply(pd.to_numeric,errors="coerce").notna().all(axis=1)
-    panel["production_data_quality_gate"]=panel["production_core_ready"]&panel["production_optional_state_known"]
+    # Keep the strict gate; make every block explainable instead of silently
+    # converting unknown source state into a generic HOLD downstream.
+    from delivery_quality_gate import quality_gate_reasons
+    panel["production_data_quality_gate_reasons"] = panel.apply(
+        lambda row: json.dumps(quality_gate_reasons(row)), axis=1
+    )
+    panel["production_data_quality_gate"] = panel["production_data_quality_gate_reasons"].eq("[]")
     latest_date=pd.to_datetime(panel["decision_timestamp"],utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
     if expected_date is not None and latest_date != expected_date:
         raise RuntimeError(
@@ -395,6 +401,16 @@ def main():
         "production_feature_coverage_pct":round(float(panel["production_feature_coverage"].mean()*100),3),
         "production_rows_all_59_features":int(panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()),
         "production_data_quality_gate_pct":readiness_summary(panel["production_data_quality_gate"])["ready_pct"],
+        "production_data_quality_gate_block_reason_counts": {
+            reason: int(sum(reason in json.loads(raw) for raw in panel["production_data_quality_gate_reasons"]))
+            for reason in sorted({
+                reason
+                for raw in panel["production_data_quality_gate_reasons"]
+                for reason in json.loads(raw)
+            })
+        },
+        "production_data_quality_gate_pass_rows": int(panel["production_data_quality_gate"].sum()),
+        "production_data_quality_gate_blocked_rows": int((~panel["production_data_quality_gate"]).sum()),
         "ipo_policy":"Any current official NSE equity becomes eligible automatically after 60 clean sessions.",
         "model_weights_changed":False,"model_promotion_performed":False
     }
