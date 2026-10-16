@@ -329,7 +329,12 @@ def main():
             if local.exists() and local.stat().st_size>0: source_status[k]="LOCAL"
             elif _download_file(store,remote,local): source_status[k]="DOWNLOADED"
             else: source_status[k]="MISSING"
-        missing=[k for k,v in source_status.items() if v=="MISSING"]
+        # The filing catalogue is refreshable from NSE directly; its absence
+        # in Drive must not consume the entire upstream wait window.
+        missing=[
+            k for k,v in source_status.items()
+            if v=="MISSING" and k!="fundamental_filing_catalog"
+        ]
         if not missing or datetime.now(timezone.utc)>=deadline:
             break
         print(f"Waiting for upstream source files: {', '.join(missing)}",flush=True)
