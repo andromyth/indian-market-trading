@@ -106,3 +106,38 @@ def test_collect_sources_reports_each_feed_without_failing_the_batch():
     assert status[0]["status"] == "PASS"
     assert status[1]["source_id"] == "bad"
     assert status[1]["status"] == "ERROR"
+
+
+def test_financial_news_classifier_uses_finance_context_and_impact():
+    from market_news_pit_collector import classify_financial_news
+
+    positive = classify_financial_news(
+        "SBIN wins order contract and beats estimates in strong results",
+        sentiment_score=0.0,
+        source_weight=0.95,
+    )
+    negative = classify_financial_news(
+        "Regulator imposes penalty after accounting fraud investigation",
+        sentiment_score=0.0,
+        source_weight=0.95,
+    )
+
+    assert positive["news_signal"] == "NEWS_BUY_BIAS"
+    assert positive["news_event_category"] in {"ORDER_CONTRACT", "EARNINGS_RESULTS"}
+    assert positive["news_direction_score"] > 0
+    assert negative["news_signal"] == "NEWS_SELL_BIAS"
+    assert negative["news_event_category"] == "FRAUD_REGULATORY"
+    assert negative["event_impact_score"] >= 0.95
+
+
+def test_financial_news_classifier_does_not_treat_cleared_fraud_allegation_as_bearish():
+    from market_news_pit_collector import classify_financial_news
+
+    result = classify_financial_news(
+        "Company cleared of fraud allegations after regulator closes probe",
+        sentiment_score=0.0,
+        source_weight=0.9,
+    )
+
+    assert result["news_signal"] != "NEWS_SELL_BIAS"
+    assert "negation_or_exoneration_detected" in result["news_signal_reason"]
