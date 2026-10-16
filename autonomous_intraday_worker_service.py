@@ -48,9 +48,39 @@ WORKER = AutonomousIntradayWorker(
 
 def _record_tick_result(result: dict[str, Any]) -> None:
     status = str(result.get("status", "")).upper()
+    capture = result.get("all_universe_capture") or {}
+    capture_status = str(capture.get("status") or "NOT_RUN").upper()
+    capture_error = capture.get("error")
     with STATE_LOCK:
         STATE["last_tick_at_utc"] = datetime.now(timezone.utc).isoformat()
         STATE["last_tick_result"] = _clean_json(result)
+        STATE["all_universe_capture_status"] = capture_status
+        STATE["all_universe_capture_last_result"] = _clean_json({
+            key: capture.get(key)
+            for key in (
+                "cycle_minute_ist", "expected_symbol_count", "quoted_symbol_count",
+                "missing_quote_count", "unmapped_symbol_count", "forecast_symbol_count",
+                "matched_outcome_count", "snapshot_drive_path", "remote_snapshot_path",
+                "status", "error",
+            )
+            if key in capture
+        })
+        if capture_status in {
+            "ERROR", "PERSISTENCE_ERROR", "BLOCKED_PROVIDER_CREDENTIALS", "NO_ROWS"
+        }:
+            STATE["all_universe_capture_error"] = str(
+                capture_error or f"Full-universe capture status is {capture_status}"
+            )
+        elif capture_status == "OK":
+            STATE["all_universe_capture_error"] = None
+        elif capture_status == "PARTIAL":
+            STATE["all_universe_capture_warning"] = (
+                f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
+                f"{capture.get('expected_symbol_count', 0)} NSE symbols"
+            )
+        elif capture_status == "NOT_RUN":
+            STATE["all_universe_capture_warning"] = "Full-universe capture did not run on this tick."
+
         if status in {
             "ERROR", "PARTIAL", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"
         }:
@@ -74,9 +104,9 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 and result.get("run_status") in {"STOPPED", "IDLE", "STARTING"}
             )
         ):
-            # A routine successful tick without a persistence flush must not
-            # hide an earlier Drive-write failure.
-            STATE["last_error"] = None
+            # Keep the health endpoint degraded until both the regular worker
+            # and the independent all-universe persistence path recover.
+            STATE["last_error"] = STATE.get("all_universe_capture_error")
 
 
 def _public_status() -> dict[str, Any]:
@@ -132,11 +162,16 @@ class WorkerHandler(BaseHTTPRequestHandler):
             return
         status = _public_status()
         error = status.get("last_error")
+        capture_status = status.get("all_universe_capture_status", "NOT_RUN")
+        capture_warning = status.get("all_universe_capture_warning")
         payload = {
-            "status": "degraded" if error else "ok",
+            "status": "degraded" if (error or capture_status not in {"OK", "PARTIAL", "NOT_RUN"}) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
             "last_error": error,
+            "all_universe_capture_status": capture_status,
+            "all_universe_capture": status.get("all_universe_capture_last_result"),
+            "all_universe_capture_warning": capture_warning,
             "nse_time_ist": status.get("nse_time_ist"),
             "tick_interval_seconds": status.get("tick_interval_seconds"),
         }
@@ -187,6 +222,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "reason": result.get("reason"),
                 "error": result.get("error"),
                 "flush": result.get("flush"),
+                "all_universe_capture": result.get("all_universe_capture"),
             })
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
