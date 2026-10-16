@@ -237,6 +237,45 @@ def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dic
     return result
 
 
+
+def _upload_pending_snapshots(store: Any, local_dir: Path, current_name: str) -> dict[str, Any]:
+    """Retry local minute shards whose Drive upload was not confirmed."""
+    result: dict[str, Any] = {"attempted": 0, "recovered": 0, "errors": []}
+    for local_path in sorted(local_dir.glob("snapshot_*.parquet")):
+        if local_path.name == current_name:
+            continue
+        marker_path = local_path.with_suffix(".uploaded.json")
+        if marker_path.is_file():
+            continue
+        try:
+            stamp = datetime.strptime(local_path.stem, "snapshot_%Y%m%d_%H%M")
+            remote = (
+                f"{REMOTE_ROOT}/{stamp:%Y/%m/%d}/"
+                f"snapshot_{stamp:%Y%m%d_%H%M}.parquet"
+            )
+            result["attempted"] += 1
+            upload = store.upload_or_update(
+                local_path, remote, mime_type="application/vnd.apache.parquet"
+            )
+            if upload.get("status") != "OK":
+                raise RuntimeError(f"Drive retry was not confirmed: {upload}")
+            marker_path.write_text(
+                json.dumps({
+                    "status": "OK",
+                    "remote_path": remote,
+                    "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
+            result["recovered"] += 1
+        except Exception as exc:
+            result["errors"].append({
+                "local_path": str(local_path),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return result
+
+
 def capture_all_universe_minute_snapshot(
     *,
     now: datetime | pd.Timestamp,
@@ -277,6 +316,10 @@ def capture_all_universe_minute_snapshot(
     }
 
     store = GoogleDriveStore()
+    pending_recovery = _upload_pending_snapshots(
+        store, local_dir, f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+    )
+    manifest["pending_snapshot_recovery"] = pending_recovery
     if not configured():
         manifest.update({
             "status": "BLOCKED_PROVIDER_CREDENTIALS",
@@ -382,6 +425,14 @@ def capture_all_universe_minute_snapshot(
             manifest["snapshot_drive_sync"] = drive_result
             if drive_result.get("status") != "OK":
                 raise RuntimeError(f"Drive snapshot upload was not confirmed: {drive_result}")
+            local_path.with_suffix(".uploaded.json").write_text(
+                json.dumps({
+                    "status": "OK",
+                    "remote_path": remote_path,
+                    "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
             manifest["status"] = "OK" if request_errors == 0 and frame["quote_status"].eq("PASS").all() else "PARTIAL"
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
