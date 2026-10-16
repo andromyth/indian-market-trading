@@ -68,8 +68,14 @@ def collect_and_publish_live_news(
     *,
     now: datetime | None = None,
     root: Path = Path("data/autonomous_intraday/news_pit"),
+    source_result: dict[str, Any] | None = None,
+    universe: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Fetch publisher RSS search results, merge PIT rows, and publish archive+manifest."""
+    """Fetch publisher RSS search results, merge PIT rows, and publish archive+manifest.
+
+    Callers may pass the source result already fetched for the same watchlist refresh
+    so publisher endpoints are not scraped twice in a single 15-minute cycle.
+    """
     from delivery_training_universe import load_official_nse_universe
     from market_watchlist import fetch_watchlist_articles, build_alias_map, extract_mentions
     from persistent_store import GoogleDriveStore
@@ -88,10 +94,10 @@ def collect_and_publish_live_news(
     else:
         old = pd.DataFrame()
 
-    source_result = fetch_watchlist_articles(now=checked_utc)
+    source_result = source_result or fetch_watchlist_articles(now=checked_utc)
     source_status = source_result.get("sources", []) or []
     successful_feeds = sum(str(x.get("status", "")).upper() == "PASS" for x in source_status)
-    universe = load_official_nse_universe(force_refresh=False)
+    universe = universe if universe is not None else load_official_nse_universe(force_refresh=False)
     aliases = build_alias_map(universe)
     rows: list[dict[str, Any]] = []
     article_ids_seen: set[str] = set()
