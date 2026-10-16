@@ -58,6 +58,16 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
             "NAME OF COMPANY": ["Reliance Industries Limited", "Tata Consultancy Services Limited"],
         }),
     )
+    monkeypatch.setattr(
+        "market_watchlist._fetch_source",
+        lambda source, now_utc: {
+            "publisher": source[0],
+            "domain": source[1],
+            "status": "NO_RECENT_ARTICLES",
+            "articles": [],
+            "error": None,
+        },
+    )
     monkeypatch.setitem(
         sys.modules,
         "persistent_store",
@@ -75,7 +85,8 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
     )
 
     assert result["collection_status"] == "PASS"
-    assert result["successful_feed_count"] == 4
+    assert result["successful_feed_count"] == 8
+    assert result["configured_feed_count"] == 8
     assert result["new_articles_observed"] == 1
     assert result["coverage_complete"] is False
     assert "not exhaustive" in result["coverage_note"]
