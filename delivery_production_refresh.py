@@ -20,6 +20,7 @@ REMOTE_SOURCES = {
     "fundamentals": "corporate/pit_fundamentals_all_nse_2025_2026.parquet",
     "fundamental_availability": "corporate/pit_fundamental_availability_2025_2026.parquet",
     "fundamental_availability_meta": "corporate/pit_fundamental_availability_2025_2026.meta.json",
+    "fundamental_filing_catalog": "corporate/nse_integrated_filing_catalog_2025_2026.json",
 }
 MIN_HISTORY = 60
 
@@ -46,6 +47,59 @@ def readiness_summary(values: pd.Series) -> dict[str, float | int]:
 def _store():
     from persistent_store import GoogleDriveStore
     return GoogleDriveStore()
+
+
+def _refresh_fundamental_availability(store, symbols: list[str]) -> dict:
+    """Refresh official NSE filing coverage through the current session before gating signals.
+
+    A stale-but-complete historical catalogue is not current coverage. The
+    candidate builder's paginated NSE catalogue refreshes when its cache window
+    or age is stale, then rebuilds the availability index for the current
+    universe. Upload all three artifacts so retries reuse the verified result.
+    """
+    from colab_build_all_nse_delivery_multifactor_candidate import (
+        FUND_AVAILABILITY,
+        FUND_AVAILABILITY_META,
+        FUND_CATALOG_CACHE,
+        _build_fundamental_availability,
+        _catalog_all,
+    )
+
+    catalog = _catalog_all(force_refresh=False)
+    report = _build_fundamental_availability(catalog, symbols)
+    if report.get("coverage_complete") is not True:
+        raise RuntimeError(
+            "NSE fundamental filing availability is not complete through the "
+            f"current session: {report}"
+        )
+    today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
+    if report.get("coverage_end") != today_ist:
+        raise RuntimeError(
+            "NSE fundamental filing catalogue is stale: "
+            f"coverage_end={report.get('coverage_end')}, required={today_ist}"
+        )
+    store.upload_or_update(
+        FUND_CATALOG_CACHE,
+        "corporate/nse_integrated_filing_catalog_2025_2026.json",
+        mime_type="application/json",
+    )
+    store.upload_or_update(
+        FUND_AVAILABILITY,
+        "corporate/pit_fundamental_availability_2025_2026.parquet",
+        mime_type="application/octet-stream",
+    )
+    store.upload_or_update(
+        FUND_AVAILABILITY_META,
+        "corporate/pit_fundamental_availability_2025_2026.meta.json",
+        mime_type="application/json",
+    )
+    return {
+        **report,
+        "catalog_rows": len(catalog),
+        "catalog_persisted": True,
+        "availability_index_persisted": True,
+        "coverage_end_required": today_ist,
+    }
 
 def _is_retryable_download_error(exc: Exception) -> bool:
     """Return true only for transient Drive/network failures worth retrying."""
@@ -333,8 +387,17 @@ def main():
     _stage("PANEL PHASE: building multifactor production panel")
     panel=make_panel(bulk,trainable,sort_output=False,delivery=delivery)
     _stage(f"PANEL BUILT: rows={len(panel):,}, cols={len(panel.columns):,}")
+    _stage("FUNDAMENTAL AVAILABILITY PHASE: refreshing official NSE filing coverage")
+    fundamental_availability_refresh = _refresh_fundamental_availability(
+        store, trainable
+    )
+    _stage(
+        "FUNDAMENTAL AVAILABILITY REFRESH DONE: "
+        + json.dumps(fundamental_availability_refresh, default=str)
+    )
     _stage("OPTIONAL SOURCES PHASE: merging F&O/news/events/fundamentals")
     panel,source_audit=merge_optional(panel)
+    source_audit["fundamental_availability_daily_refresh"] = fundamental_availability_refresh
     _stage(f"OPTIONAL SOURCES MERGED: rows={len(panel):,}, cols={len(panel.columns):,}")
 
     # Distinguish "source is present and this symbol has no applicable item"
