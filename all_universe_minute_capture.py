@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 IST = ZoneInfo("Asia/Kolkata")
-BATCH_SIZE = 900  # Provider documents a maximum of 1,000 symbols per request.
+BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET URLs.
 REMOTE_ROOT = "production_data/all_universe_minute_snapshots"
 
 
