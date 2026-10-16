@@ -214,23 +214,11 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
     try:
         universe = load_official_nse_universe(force_refresh=False)
     except Exception as exc:
-        # Continue collecting broad-market publisher news even if the official
-        # symbol master is temporarily unavailable. Symbol matching is withheld.
+        # Retain broad headline collection/watchlist checks even if the NSE
+        # security master is temporarily unavailable; matching is withheld.
         universe = pd.DataFrame()
         _log("news_universe_unavailable", error=f"{type(exc).__name__}: {exc}")
     sources = fetch_watchlist_articles()
-    news_collection: dict[str, Any] = {"status": "NOT_RUN"}
-    try:
-        from intraday_news_pit_collector import collect_and_publish_live_news
-        news_collection = collect_and_publish_live_news(
-            source_result=sources, universe=universe
-        )
-    except Exception as exc:
-        news_collection = {
-            "collection_status": "ERROR",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-        _log("live_news_pit_collection_failed", error=news_collection["error"])
     built = build_stock_watchlist(universe, sources, max_stocks=max_stocks)
     symbols = []
     for item in built.get("stocks", []) or []:
@@ -254,16 +242,6 @@ def _watchlist(max_stocks: int) -> tuple[list[str], dict]:
         "source_status": built.get("sources", []),
         "dynamic_symbols": symbols,
         "message": built.get("message"),
-        "news_collection": {
-            key: news_collection.get(key)
-            for key in (
-                "collection_status", "successful_feed_count", "configured_feed_count",
-                "new_articles_observed", "archive_rows", "archive_symbol_count",
-                "checked_at_utc", "archive_remote_path", "manifest_remote_path",
-                "coverage_complete", "coverage_note", "error",
-            )
-            if key in news_collection
-        },
     }
 
 
