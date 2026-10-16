@@ -252,4 +252,5 @@ def collect_intraday_news(
         "drive_persistence_status": report["drive_persistence_status"],
         "drive_archive_path": report.get("drive_archive_path"),
     }, sort_keys=True), flush=True)
+    report["source_result"] = source_result
     return report
