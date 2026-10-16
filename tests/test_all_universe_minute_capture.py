@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 import all_universe_minute_capture as capture
 
@@ -41,7 +42,7 @@ def test_outcome_match_uses_actual_quote_in_target_minute_only():
     assert len(outcomes) == 1
     assert outcomes[0]["forecast_key"] == "AAA|target-1"
     assert outcomes[0]["actual_target_price"] == 101.0
-    assert outcomes[0]["actual_return_pct_from_reference"] == 1.0
+    assert outcomes[0]["actual_return_pct_from_reference"] == pytest.approx(1.0)
     assert outcomes[0]["absolute_price_error"] == 2.0
     assert outcomes[0]["directional_correct_before_costs"] is True
     assert outcomes[0]["outcome_status"] == "MATCHED_TARGET_MINUTE_QUOTE"
