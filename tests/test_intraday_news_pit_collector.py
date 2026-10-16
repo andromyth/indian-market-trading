@@ -85,8 +85,8 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
     )
 
     assert result["collection_status"] == "PASS"
-    assert result["successful_feed_count"] == 8
-    assert result["configured_feed_count"] == 8
+    assert result["successful_feed_count"] == 9
+    assert result["configured_feed_count"] == 10
     assert result["new_articles_observed"] == 1
     assert result["coverage_complete"] is False
     assert "not exhaustive" in result["coverage_note"]
