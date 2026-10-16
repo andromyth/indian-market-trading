@@ -287,6 +287,7 @@ def main() -> int:
     parser.add_argument("--segment", default="service", choices=["service", "morning", "afternoon", "once"])
     parser.add_argument("--tolerance-seconds", type=int, default=60)
     parser.add_argument("--out-dir", default="diagnostics/autonomous_intraday_outcomes")
+    parser.add_argument("--sync-drive", action="store_true", help="Upload the generated outcome CSV and JSON report to Google Drive.")
     args = parser.parse_args()
 
     today = datetime.now(IST).date()
@@ -417,6 +418,37 @@ def main() -> int:
         ],
     }
     json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if args.sync_drive:
+        remote_root = (
+            f"{WORKER_LEDGER_ROOT}/outcomes_audit/"
+            f"{end_date:%Y/%m/%d}"
+        )
+        remote_csv = f"{remote_root}/{csv_path.name}"
+        remote_json = f"{remote_root}/{json_path.name}"
+        csv_upload = store.upload_or_update(
+            csv_path, remote_csv, mime_type="text/csv"
+        )
+        report["google_drive_sync"] = {
+            "status": "CSV_UPLOADED_JSON_PENDING",
+            "csv_path": remote_csv,
+            "json_path": remote_json,
+            "csv_upload_result": str(csv_upload),
+        }
+        json_path.write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        json_upload = store.upload_or_update(
+            json_path, remote_json, mime_type="application/json"
+        )
+        report["google_drive_sync"]["status"] = "OK"
+        report["google_drive_sync"]["json_upload_result"] = str(json_upload)
+        json_path.write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        store.upload_or_update(
+            json_path, remote_json, mime_type="application/json"
+        )
+        print("OUTCOME_REPORTS_UPLOADED_TO_DRIVE:", remote_csv, remote_json)
     print(json.dumps(report, indent=2, default=str))
     return 0 if validated_count else 2
 
