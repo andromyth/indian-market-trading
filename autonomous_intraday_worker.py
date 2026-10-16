@@ -1294,8 +1294,11 @@ class AutonomousIntradayWorker:
         try:
             from all_universe_minute_capture import capture_all_universe_minute_snapshot
 
+            # Use the actual capture start time, not the tick-start time:
+            # the model/watchlist cycle can cross a minute boundary.
+            capture_now = pd.Timestamp.now(tz=IST)
             all_universe_capture = capture_all_universe_minute_snapshot(
-                now=now,
+                now=capture_now,
                 worker_root=self.root,
                 daily_ledger=self.daily_ledger,
                 prediction_snapshots=self.last_minute_snapshot_rows,
