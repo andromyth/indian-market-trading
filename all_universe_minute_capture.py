@@ -104,17 +104,33 @@ def _load_forecast_rows(ledger_path: Path | None) -> list[dict[str, Any]]:
     return rows
 
 
-def _prediction_map(snapshot_rows: list[dict[str, Any]] | None) -> dict[str, list[dict[str, Any]]]:
+def _prediction_map(
+    snapshot_rows: list[dict[str, Any]] | None,
+    cycle_minute: pd.Timestamp,
+) -> dict[str, list[dict[str, Any]]]:
+    """Include only forecasts actually emitted during this collector minute."""
     mapped: dict[str, list[dict[str, Any]]] = {}
     for snapshot in snapshot_rows or []:
         symbol = str(snapshot.get("symbol") or "").strip().upper()
         if not symbol:
             continue
         predictions = snapshot.get("predictions") or []
-        if isinstance(predictions, list):
-            for pred in predictions:
-                if isinstance(pred, dict):
-                    mapped.setdefault(symbol, []).append(_clean(pred))
+        if not isinstance(predictions, list):
+            continue
+        for pred in predictions:
+            if not isinstance(pred, dict):
+                continue
+            observed_at = pd.to_datetime(
+                pred.get("worker_observed_at_utc")
+                or pred.get("worker_observed_at_ist"),
+                errors="coerce",
+                utc=True,
+            )
+            if pd.isna(observed_at):
+                continue
+            if observed_at.tz_convert(IST).floor("min") != cycle_minute:
+                continue
+            mapped.setdefault(symbol, []).append(_clean(pred))
     return mapped
 
 
@@ -365,7 +381,7 @@ def capture_all_universe_minute_snapshot(
         if str(s).strip()
     })
     instruments = _instrument_map()
-    prediction_map = _prediction_map(prediction_snapshots)
+    prediction_map = _prediction_map(prediction_snapshots, cycle_minute)
     forecast_rows = _load_forecast_rows(daily_ledger)
     manifest["expected_symbol_count"] = len(universe)
     manifest["unmapped_symbol_count"] = sum(1 for symbol in universe if symbol not in instruments)
