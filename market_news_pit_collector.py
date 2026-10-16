@@ -711,6 +711,8 @@ def build_pit_layer(
             "news_source_weight", "news_title", "news_url", "news_article_id",
             "news_event_category", "event_impact_score", "news_direction_score",
             "news_signal", "news_signal_strength", "news_signal_reason",
+            "news_analysis_method", "news_semantic_confidence", "news_semantic_relevance",
+            "news_semantic_summary", "news_semantic_model",
             "published_at_utc", "first_seen_at_utc",
         ])
     now = (now_utc or datetime.now(UTC)).astimezone(UTC)
@@ -750,6 +752,51 @@ def build_pit_layer(
         except (TypeError, ValueError):
             source_weight = 0.0
         news_analysis = classify_financial_news(text, score, source_weight)
+        semantic_status = str(article.get("semantic_analysis_status") or "").strip().upper()
+        semantic_confidence = _finite_score(article.get("semantic_confidence"), 0.0, 1.0)
+        semantic_relevance = _finite_score(article.get("semantic_relevance_score"), 0.0, 1.0)
+        semantic_direction = _finite_score(article.get("semantic_direction_score"), -1.0, 1.0)
+        semantic_impact = _finite_score(article.get("semantic_event_impact_score"), 0.0, 1.0)
+        semantic_category = str(article.get("semantic_event_category") or "").upper()
+        analysis_method = "HEURISTIC_FALLBACK"
+        if (
+            semantic_status == "PASS"
+            and semantic_confidence is not None
+            and semantic_confidence >= GEMINI_NEWS_MIN_CONFIDENCE
+            and semantic_relevance is not None
+            and semantic_relevance >= GEMINI_NEWS_MIN_RELEVANCE
+            and semantic_direction is not None
+            and semantic_impact is not None
+            and semantic_category in SEMANTIC_NEWS_CATEGORIES
+        ):
+            semantic_signal = (
+                "NEWS_BUY_BIAS" if semantic_direction >= 0.18
+                else ("NEWS_SELL_BIAS" if semantic_direction <= -0.18 else "NEWS_NEUTRAL")
+            )
+            raw_strength = float(np.clip(
+                0.70 * abs(semantic_direction)
+                + 0.20 * semantic_impact
+                + 0.10 * source_weight,
+                0.0, 1.0,
+            ))
+            semantic_reason = _clean_text(article.get("semantic_reason"), 500)
+            semantic_evidence = _clean_text(article.get("semantic_evidence"), 350)
+            news_analysis = {
+                "news_event_category": semantic_category,
+                "event_impact_score": semantic_impact,
+                "news_direction_score": semantic_direction,
+                "news_signal": semantic_signal,
+                "news_signal_strength": float(raw_strength * semantic_confidence),
+                "news_signal_reason": (
+                    f"semantic_model={article.get('semantic_model')}; "
+                    f"confidence={semantic_confidence:.2f}; "
+                    f"relevance={semantic_relevance:.2f}; {semantic_reason}; "
+                    f"evidence={semantic_evidence}"
+                )[:1400],
+            }
+            analysis_method = "GEMINI_SEMANTIC"
+        elif semantic_status == "PASS":
+            analysis_method = "HEURISTIC_FALLBACK_LOW_AI_CONFIDENCE"
         available = pd.Timestamp(available).tz_convert("UTC")
         for symbol in symbols:
             rows.append({
@@ -762,6 +809,11 @@ def build_pit_layer(
                 "news_source_count": 1,
                 "news_source_weight": source_weight,
                 **news_analysis,
+                "news_analysis_method": analysis_method,
+                "news_semantic_confidence": semantic_confidence if semantic_status == "PASS" else np.nan,
+                "news_semantic_relevance": semantic_relevance if semantic_status == "PASS" else np.nan,
+                "news_semantic_summary": _clean_text(article.get("semantic_summary"), 350) if semantic_status == "PASS" else "",
+                "news_semantic_model": str(article.get("semantic_model") or "") if semantic_status == "PASS" else "",
                 "news_title": title[:500],
                 "news_url": str(article.get("url") or ""),
                 "news_article_id": str(article.get("article_id") or ""),
@@ -793,6 +845,11 @@ def build_pit_layer(
         news_direction_score=("news_direction_score", "mean"),
         news_signal_strength=("news_signal_strength", "max"),
         news_signal_reason=("news_signal_reason", lambda s: " | ".join(list(dict.fromkeys(str(v) for v in s if v))[:3])),
+        news_analysis_method=("news_analysis_method", lambda s: ";".join(sorted(set(str(v) for v in s if v))[:3])),
+        news_semantic_confidence=("news_semantic_confidence", "mean"),
+        news_semantic_relevance=("news_semantic_relevance", "mean"),
+        news_semantic_summary=("news_semantic_summary", "last"),
+        news_semantic_model=("news_semantic_model", lambda s: ";".join(sorted(set(str(v) for v in s if v))[:3])),
         news_title=("news_title", "last"),
         news_url=("news_url", "last"),
         news_article_id=("news_article_id", lambda s: ";".join(sorted(set(str(v) for v in s if v))[:8])),
@@ -923,8 +980,10 @@ def main() -> int:
     existing_articles = pd.read_parquet(articles_path) if articles_path.exists() and articles_path.stat().st_size else pd.DataFrame()
     fresh_articles, feed_status = collect_sources(now_utc=now_utc)
     article_archive = merge_article_archive(existing_articles, fresh_articles, now_utc, analyzer=analyzer)
+    article_archive, semantic_analysis_stats = analyze_pending_articles_with_gemini(article_archive)
+    print(json.dumps({"semantic_news_analysis": semantic_analysis_stats}, default=str), flush=True)
 
-    # Sentiment scores are archived with the article, not used as an unvalidated trade rule.
+    # Semantic analysis is cached by article ID; the deterministic classifier remains the fallback.
     # If sentiment library is absent, prices/news availability still flow through the pipeline.
     if analyzer is not None and "sentiment_compound" not in article_archive.columns:
         article_archive["sentiment_compound"] = np.nan
@@ -965,7 +1024,13 @@ def main() -> int:
         "retained_article_count": len(article_archive),
         "symbol_news_rows": len(pit),
         "matched_symbols": int(pit.loc[pit["symbol"].ne("MARKET"), "symbol"].nunique()) if not pit.empty else 0,
-        "sentiment_model": "VADER plus explainable finance-cue classifier; NEWS_BUY_BIAS/NEWS_SELL_BIAS are heuristic overlays, not calibrated probabilities or order instructions",
+        "sentiment_model": (
+            "Gemini structured financial-news analysis when GEMINI_API_KEY/GOOGLE_API_KEY is configured, "
+            "with confidence/relevance gates and an explainable VADER/finance-cue fallback; "
+            "news bias scores are not calibrated probabilities or order instructions"
+        ),
+        "news_analysis_mode": semantic_analysis_stats.get("mode"),
+        "semantic_analysis": semantic_analysis_stats,
         "nse_universe": universe_status,
         "drive_preflight": {
             key: drive_status.get(key) for key in (
