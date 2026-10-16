@@ -392,39 +392,57 @@ def _calibration_bins(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def _feature_error_associations(frame: pd.DataFrame, min_samples: int = 100) -> list[dict[str, Any]]:
-    """Rank associations between logged inputs and outcome residuals (not causal explanations)."""
+    """Rank associations between logged inputs and residuals (not causal explanations)."""
     if frame.empty or "diagnostic_feature_snapshot" not in frame:
         return []
     valid = frame.loc[frame["validation_status"].eq("VALIDATED")].copy()
-    aligned: list[tuple[dict[str, Any], float]] = []
+    observations: list[dict[str, Any]] = []
     for _, row in valid.iterrows():
         snap = row.get("diagnostic_feature_snapshot")
         if not isinstance(snap, dict):
             snap = _feature_snapshot({"diagnostic_feature_snapshot": snap})
         actual = _num(row.get("actual_return"))
+        probability = _num(row.get("probability_up"))
         expected = _num(row.get("expected_return"))
-        if snap and np.isfinite(actual) and np.isfinite(expected):
-            aligned.append((snap, actual - expected))
-    if len(aligned) < min_samples:
-        return []
-    feature_names = sorted({str(name) for snap, _ in aligned for name in snap if not str(name).startswith("_")})
-    residual = np.asarray([resid for _, resid in aligned], dtype=float)
-    results = []
-    for name in feature_names:
-        values = np.asarray([_num(snap.get(name)) for snap, _ in aligned], dtype=float)
-        mask = np.isfinite(values) & np.isfinite(residual)
-        if int(mask.sum()) < min_samples or float(np.nanstd(values[mask])) <= 1e-12:
+        if not snap or not np.isfinite(actual):
             continue
-        correlation = float(pd.Series(values[mask]).corr(pd.Series(residual[mask]), method="spearman"))
-        if np.isfinite(correlation):
-            results.append({
-                "feature": name,
-                "samples": int(mask.sum()),
-                "spearman_correlation_with_return_residual": correlation,
-                "absolute_correlation": abs(correlation),
-                "interpretation": "observational association only; not causal feature importance",
-            })
-    return sorted(results, key=lambda item: item["absolute_correlation"], reverse=True)[:50]
+        record: dict[str, Any] = {"features": snap}
+        if np.isfinite(probability) and 0 <= probability <= 1:
+            record["classification_probability_residual"] = _binary_label(actual) - probability
+        if np.isfinite(expected):
+            record["expected_return_residual"] = actual - expected
+        if len(record) > 1:
+            observations.append(record)
+    if len(observations) < min_samples:
+        return []
+    feature_names = sorted({
+        str(name)
+        for record in observations
+        for name in record["features"]
+        if not str(name).startswith("_")
+    })
+    results = []
+    for residual_name in ("classification_probability_residual", "expected_return_residual"):
+        eligible = [record for record in observations if residual_name in record]
+        if len(eligible) < min_samples:
+            continue
+        residual = np.asarray([record[residual_name] for record in eligible], dtype=float)
+        for name in feature_names:
+            values = np.asarray([_num(record["features"].get(name)) for record in eligible], dtype=float)
+            mask = np.isfinite(values) & np.isfinite(residual)
+            if int(mask.sum()) < min_samples or float(np.nanstd(values[mask])) <= 1e-12:
+                continue
+            correlation = float(pd.Series(values[mask]).corr(pd.Series(residual[mask]), method="spearman"))
+            if np.isfinite(correlation):
+                results.append({
+                    "feature": name,
+                    "residual_type": residual_name,
+                    "samples": int(mask.sum()),
+                    "spearman_correlation_with_residual": correlation,
+                    "absolute_correlation": abs(correlation),
+                    "interpretation": "observational association only; not causal feature importance",
+                })
+    return sorted(results, key=lambda item: item["absolute_correlation"], reverse=True)[:100]
 
 
 def _root_cause_findings(frame: pd.DataFrame, groups: list[dict[str, Any]], calibration: list[dict[str, Any]], dedup: dict[str, Any]) -> list[dict[str, Any]]:
@@ -783,7 +801,7 @@ def build_learning_report(
             "priority": "INFO",
             "finding": "FEATURE_LEVEL_ATTRIBUTION_NOT_YET_AVAILABLE",
             "evidence": "Matured outcomes can be segmented by input quality, but exact numeric feature snapshots are missing or do not yet meet the minimum sample threshold.",
-            "recommended_action": "Enable diagnostic_feature_snapshot on new inference rows and collect at least 100 matched observations with usable return forecasts per feature before interpreting associations.",
+            "recommended_action": "Exact numeric inference features are now logged for new forecasts. Accumulate at least 100 matured, joined observations with valid probability or return residuals before interpreting feature associations.",
         })
     report = {
         "status": "COMPLETED" if len(validated) else "NO_MATURED_OUTCOMES",
