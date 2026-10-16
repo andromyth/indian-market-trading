@@ -86,6 +86,16 @@ Open Google Cloud Console → **Cloud Run** → indian-market-intraday-worker �
 
 A weekend, NSE holiday, pre-open or post-close log should show MARKET_CLOSED/no market data cycle. Stale/missing stock or benchmark candles cause the affected prediction to be withheld rather than guessed.
 
+## Prediction learning and error diagnosis
+
+The separate `prediction_learning_engine.py` module runs at **16:30 IST on weekdays** through `.github/workflows/autonomous_prediction_learning.yml`, after the existing 16:00 IST outcomes audit. It reads persisted forecast ledgers and matching actual one-minute bar partitions, de-duplicates repeated forecast identities, and produces diagnosis slices by symbol, horizon, active model version, signal, input source, feature coverage and time of day.
+
+It tests probability calibration and expected-return bias corrections with an earlier-time training segment and a later, untouched holdout. Corrections are saved as review-only candidate profiles under `production_data/intraday_predictions/learning/YYYY/MM/DD/`; no candidate is automatically applied to the live model or signal thresholds. The report includes outcome coverage gaps, duplicate records, stale input age, poor-performing segments, probability calibration and price-forecast MAE versus the no-change baseline.
+
+New intraday inference rows also store the exact numeric model inputs in `diagnostic_feature_snapshot`, with missing/non-finite values encoded as null, together with the champion's bundle/model version. This enables association analysis between feature values and probability/return residuals after target bars mature. Those associations are diagnostic evidence, not causal proof. Since this instrumentation is code running in Cloud Run, **redeploy the updated service** before expecting new forecast records to contain it. Historical predictions that did not store exact feature values cannot be reconstructed reliably after the fact.
+
+Learning outputs include a detailed matured-outcome CSV, segment-metrics CSV, feature-error-associations CSV, JSON diagnostic report and candidate-corrections JSON. The candidate profiles require subsequent shadow testing and an explicit promotion decision before any production use.
+
 ## Important constraints
 
 - One minute is a polling target, not an exchange-feed latency guarantee. The loop can take longer than one minute if an upstream source or model artifact download is slow; it never fabricates bars to catch up.
