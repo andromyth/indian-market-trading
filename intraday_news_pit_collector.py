@@ -96,7 +96,12 @@ def collect_and_publish_live_news(
 
     source_result = source_result or fetch_watchlist_articles(now=checked_utc)
     source_status = source_result.get("sources", []) or []
-    successful_feeds = sum(str(x.get("status", "")).upper() == "PASS" for x in source_status)
+    # NO_RECENT_ARTICLES means the publisher query succeeded but returned no fresh items;
+    # only ERROR indicates a failed source request. Do not mislabel healthy quiet feeds.
+    successful_feeds = sum(
+        str(x.get("status", "")).upper() in {"PASS", "NO_RECENT_ARTICLES"}
+        for x in source_status
+    )
     universe = universe if universe is not None else load_official_nse_universe(force_refresh=False)
     aliases = build_alias_map(universe)
     rows: list[dict[str, Any]] = []
@@ -120,7 +125,8 @@ def collect_and_publish_live_news(
         sentiment = _sentiment(text)
         base = {
             "article_id": article_id,
-            "decision_timestamp": published,
+            "decision_timestamp": pd.Timestamp(checked_utc),
+            "published_at_utc": published.isoformat(),
             "news_article_count": 1,
             "news_source": f"{publisher};{domain}",
             "news_sentiment": sentiment,
@@ -186,7 +192,7 @@ def collect_and_publish_live_news(
         "archive_window_days": MAX_ARCHIVE_DAYS,
         "coverage_complete": False,
         "coverage_note": "Publisher RSS/search coverage is sampled and is not exhaustive for every NSE symbol; missing mentions must not be interpreted as confirmed no-news.",
-        "pit_timestamp_rule": "publisher published timestamp in UTC; future-dated items are excluded",
+        "pit_timestamp_rule": "decision_timestamp is first collector-observed time in UTC; publisher published_at_utc is retained separately; future-dated items are excluded",
         "archive_remote_path": PIT_REMOTE,
         "manifest_remote_path": MANIFEST_REMOTE,
     }
