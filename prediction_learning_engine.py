@@ -396,38 +396,26 @@ def _feature_error_associations(frame: pd.DataFrame, min_samples: int = 100) -> 
     if frame.empty or "diagnostic_feature_snapshot" not in frame:
         return []
     valid = frame.loc[frame["validation_status"].eq("VALIDATED")].copy()
-    if valid.empty:
-        return []
-    features: dict[str, list[float]] = {}
-    residuals: list[float] = []
-    row_ids: list[int] = []
-    for idx, row in valid.iterrows():
+    aligned: list[tuple[dict[str, Any], float]] = []
+    for _, row in valid.iterrows():
         snap = row.get("diagnostic_feature_snapshot")
         if not isinstance(snap, dict):
             snap = _feature_snapshot({"diagnostic_feature_snapshot": snap})
         actual = _num(row.get("actual_return"))
         expected = _num(row.get("expected_return"))
-        if not np.isfinite(actual) or not np.isfinite(expected):
-            continue
-        residuals.append(actual - expected)
-        row_ids.append(idx)
-        for key, value in snap.items():
-            if str(key).startswith("_"):
-                continue
-            features.setdefault(str(key), []).append(_num(value))
-    if len(residuals) < min_samples:
+        if snap and np.isfinite(actual) and np.isfinite(expected):
+            aligned.append((snap, actual - expected))
+    if len(aligned) < min_samples:
         return []
-    residual = np.asarray(residuals, dtype=float)
+    feature_names = sorted({str(name) for snap, _ in aligned for name in snap if not str(name).startswith("_")})
+    residual = np.asarray([resid for _, resid in aligned], dtype=float)
     results = []
-    # Rebuild aligned values with NaN fill. Feature snapshots are one-to-one with
-    # source rows; a short array means the feature was absent for later records.
-    for name, values in features.items():
-        aligned = np.full(len(residual), np.nan, dtype=float)
-        aligned[:min(len(values), len(aligned))] = np.asarray(values[:len(aligned)], dtype=float)
-        mask = np.isfinite(aligned) & np.isfinite(residual)
-        if int(mask.sum()) < min_samples or float(np.nanstd(aligned[mask])) <= 1e-12:
+    for name in feature_names:
+        values = np.asarray([_num(snap.get(name)) for snap, _ in aligned], dtype=float)
+        mask = np.isfinite(values) & np.isfinite(residual)
+        if int(mask.sum()) < min_samples or float(np.nanstd(values[mask])) <= 1e-12:
             continue
-        correlation = float(pd.Series(aligned[mask]).corr(pd.Series(residual[mask]), method="spearman"))
+        correlation = float(pd.Series(values[mask]).corr(pd.Series(residual[mask]), method="spearman"))
         if np.isfinite(correlation):
             results.append({
                 "feature": name,
@@ -755,26 +743,40 @@ def build_learning_report(
         ),
     )
     cal_bins = pd.DataFrame(_calibration_bins(validated))
-    candidates = {
-        "probability_calibration": _fit_probability_calibrator(split_train, split_test, split_time),
-        "return_bias_correction": _fit_return_correction(split_train, split_test, split_time),
-    }
+    # Fit a distinct challenger for each horizon and model version. Mixing, for
+    # example, 5-minute and 30-minute outcomes in one calibrator can hide horizon
+    # differences and produce a misleading improvement.
+    candidates: dict[str, Any] = {}
+    if not validated.empty:
+        for (horizon, version), horizon_group in validated.groupby(
+            ["horizon_min", "model_version"], dropna=False
+        ):
+            tr, te, candidate_split_time = chronological_split(
+                horizon_group, train_fraction=train_fraction
+            )
+            key = f"h{int(horizon) if pd.notna(horizon) else 'unknown'}__{str(version).replace('/', '_')}"
+            candidates[key] = {
+                "horizon_min": int(horizon) if pd.notna(horizon) else None,
+                "model_version": str(version),
+                "probability_calibration": _fit_probability_calibrator(tr, te, candidate_split_time),
+                "return_bias_correction": _fit_return_correction(tr, te, candidate_split_time),
+            }
     feature_associations = _feature_error_associations(validated)
     findings = _root_cause_findings(x, group_rows, [], ingest_report)
-    if len(validated) >= MIN_CALIBRATION_TRAIN + MIN_CALIBRATION_TEST:
-        if candidates["probability_calibration"].get("status") == "ELIGIBLE_FOR_REVIEW":
+    for candidate_key, candidate in candidates.items():
+        if candidate.get("probability_calibration", {}).get("status") == "ELIGIBLE_FOR_REVIEW":
             findings.append({
                 "priority": "REVIEW",
                 "finding": "PROBABILITY_CALIBRATION_CANDIDATE_PASSES_HOLDOUT_GATE",
-                "evidence": candidates["probability_calibration"],
-                "recommended_action": "Export as a challenger calibration profile and shadow-test before any activation.",
+                "evidence": {"candidate_key": candidate_key, **candidate["probability_calibration"]},
+                "recommended_action": "Export as a horizon/model-specific challenger calibration profile and shadow-test before any activation.",
             })
-        if candidates["return_bias_correction"].get("status") == "ELIGIBLE_FOR_REVIEW":
+        if candidate.get("return_bias_correction", {}).get("status") == "ELIGIBLE_FOR_REVIEW":
             findings.append({
                 "priority": "REVIEW",
                 "finding": "RETURN_CORRECTION_CANDIDATE_PASSES_HOLDOUT_GATE",
-                "evidence": candidates["return_bias_correction"],
-                "recommended_action": "Compare candidate price-return MAE over another later period and transaction/slippage assumptions before activation.",
+                "evidence": {"candidate_key": candidate_key, **candidate["return_bias_correction"]},
+                "recommended_action": "Compare the horizon/model-specific candidate over another later period and transaction/slippage assumptions before activation.",
             })
     if not feature_associations:
         findings.append({
