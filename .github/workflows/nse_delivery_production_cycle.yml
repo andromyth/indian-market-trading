@@ -171,6 +171,7 @@ jobs:
           import os
           from datetime import date
           from collections import Counter
+          import pandas as pd
           from delivery_all_nse_prediction_cycle import _next_trading_day
           from prediction_ledger import load_records
 
@@ -188,9 +189,33 @@ jobs:
                   "NO_PERSISTED_ACTIVE_DELIVERY_BATCH: "
                   f"reference={reference_date} prediction_for={prediction_date}"
               )
+          # The append-only ledger deliberately retains older prediction
+          # revisions. Verify only the newest persisted revision per symbol,
+          # not every historical revision for this target date.
+          batch_frame = pd.DataFrame(batch)
+          if "created_at" not in batch_frame.columns:
+              batch_frame["created_at"] = ""
+          if "prediction_id" not in batch_frame.columns:
+              batch_frame["prediction_id"] = ""
+          batch_frame["symbol"] = batch_frame["symbol"].astype(str).str.strip().str.upper()
+          batch_frame["_created_at_order"] = pd.to_datetime(
+              batch_frame["created_at"], errors="coerce", utc=True
+          )
+          batch_frame["_prediction_id_order"] = batch_frame["prediction_id"].astype(str)
+          batch_frame = (
+              batch_frame.sort_values(
+                  ["symbol", "_created_at_order", "_prediction_id_order"],
+                  kind="mergesort",
+                  na_position="first",
+              )
+              .drop_duplicates("symbol", keep="last")
+          )
+          batch = batch_frame.drop(
+              columns=["_created_at_order", "_prediction_id_order"]
+          ).to_dict("records")
           symbols = [str(row.get("symbol", "")).strip().upper() for row in batch]
           if not all(symbols) or len(symbols) != len(set(symbols)):
-              raise SystemExit("INVALID_PERSISTED_BATCH: empty or duplicate symbols")
+              raise SystemExit("INVALID_PERSISTED_BATCH: empty or duplicate latest symbols")
           if any(int(row.get("feature_count", 0) or 0) != 59 for row in batch):
               raise SystemExit("INVALID_PERSISTED_BATCH: production feature_count is not 59")
           versions = sorted({str(row.get("model_version", "")) for row in batch})
