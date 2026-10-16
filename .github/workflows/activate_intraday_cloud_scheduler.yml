@@ -5,6 +5,13 @@ name: Activate Cloud Run intraday schedules
 # intraday worker. The Google service account must have Cloud Scheduler list,
 # get, and pause/resume permissions in the project before this can succeed.
 on:
+  # An explicit change to this activation workflow resumes only existing
+  # Cloud Scheduler jobs for indian-market-intraday-worker, then verifies state.
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/activate_intraday_cloud_scheduler.yml'
   workflow_dispatch:
 
 permissions:
