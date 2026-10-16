@@ -55,13 +55,13 @@ def _google_news_feed(domain: str, terms: str = "stock market OR shares OR NSE O
 # longer publish. Publisher-filtered Google News RSS is used as a fallback.
 SOURCES: tuple[dict[str, Any], ...] = (
     {
-        "source_id": "economic_times_stocks",
+        "source_id": "economic_times_stocks_search",
         "publisher": "Economic Times",
         "domain": "economictimes.indiatimes.com",
-        "url": "https://economictimes.indiatimes.com/markets/stocks/rss.cms",
-        "method": "publisher_rss",
-        "source_weight": 0.95,
-        "required": True,
+        "url": _google_news_feed("economictimes.indiatimes.com", "stocks OR shares OR earnings OR NSE"),
+        "method": "publisher_filtered_news_rss",
+        "source_weight": 0.90,
+        "required": False,
     },
     {
         "source_id": "economic_times_markets",
