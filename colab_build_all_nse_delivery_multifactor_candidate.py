@@ -1156,25 +1156,27 @@ def merge_optional(panel, source_cache=None):
             web_news["decision_timestamp"], errors="coerce", utc=True
         ).astype("datetime64[ns, UTC]")
         web_news = web_news.dropna(subset=["symbol", "decision_timestamp"])
-    if news is None or news.empty:
-        combined_news = web_news.copy()
-    elif web_news.empty:
-        combined_news = news.copy()
-    else:
-        combined_news = pd.concat([news, web_news], ignore_index=True, sort=False)
+    if news is None:
+        news = pd.DataFrame()
+    # Keep publisher news separate from the existing model's news_available
+    # training-time definition. Publisher rows join as independent context below.
     audit["website_market_news"] = {
         "path": str(web_news_path),
         "exists": bool(not web_news.empty),
         "rows": int(len(web_news)),
         "symbols": int(web_news["symbol"].nunique()) if not web_news.empty else 0,
-        "note": "news_available is part of the locked 59-feature Delivery model; sentiment remains auxiliary context.",
+        "note": (
+            "Publisher news is compiled as web_news_available and auxiliary "
+            "sentiment/source fields; it does not overwrite the official-announcement "
+            "news_available feature used by the locked classifier."
+        ),
     }
 
     # These flags mean "at least one announcement/event in the last 7 days",
     # not "this symbol ever had a row in the archive". Old news must expire.
     freshness = pd.Timedelta(days=7)
-    # Collapse simultaneous official/web items to one deterministic row per symbol/time.
-    news = combined_news.copy()
+    # Collapse simultaneous official-NSE items to one deterministic row per symbol/time.
+    news = news.copy()
     if not news.empty and "news_available" in news.columns:
         news["symbol"] = news["symbol"].map(normalize_symbol)
         news["decision_timestamp"] = pd.to_datetime(
@@ -1202,23 +1204,33 @@ def merge_optional(panel, source_cache=None):
             out["news_available"] = np.nan
         audit["news"] = {"exists": False, "rows": 0, "freshness_days": 7}
 
-    # Auxiliary sentiment/counts are persisted with the assembled panel for
-    # audit and future research, but are not supplied to the locked classifier.
-    news_context_cols = [
+    # Publisher news is point-in-time auxiliary context until a news-augmented
+    # classifier has been trained and validated. Keep its availability distinct
+    # from the official-NSE news feature the deployed Delivery model expects.
+    web_context_cols = [
         c for c in (
-            "news_sentiment", "news_article_count", "news_source_count",
-            "news_source_weight",
+            "news_available", "news_sentiment", "news_article_count",
+            "news_source_count", "news_source_weight",
         ) if c in web_news.columns
     ] if not web_news.empty else []
-    if news_context_cols:
-        context = web_news[["symbol", "decision_timestamp"] + news_context_cols].copy()
-        for col in news_context_cols:
+    if web_context_cols:
+        context = web_news[["symbol", "decision_timestamp"] + web_context_cols].copy()
+        context = context.rename(columns={"news_available": "web_news_available"})
+        value_cols = [c for c in web_context_cols if c != "news_available"]
+        for col in value_cols:
             context[col] = pd.to_numeric(context[col], errors="coerce")
+        aggregations = {}
+        if "web_news_available" in context.columns:
+            aggregations["web_news_available"] = "max"
+        for col in value_cols:
+            aggregations[col] = (
+                "max" if col in {"news_article_count", "news_source_count"} else "mean"
+            )
         context = context.groupby(
             ["symbol", "decision_timestamp"], as_index=False
-        ).mean(numeric_only=True)
+        ).agg(aggregations)
         out = merge_pit_layer(
-            out, context, news_context_cols, "web_news_context", max_age=freshness
+            out, context, list(aggregations), "web_news_context", max_age=freshness
         )
 
     # The base panel does not necessarily contain this optional flag.

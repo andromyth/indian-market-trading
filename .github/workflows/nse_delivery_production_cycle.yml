@@ -20,6 +20,7 @@ on:
       - "nse_delivery_data_layer.py"
       - "persistent_store.py"
       - "multifactor_data_layer_v2.py"
+      - "colab_build_all_nse_delivery_multifactor_candidate.py"
       - "delivery_training_universe.py"
       - "selfdriving/sd_news_collect.py"
       - "prediction_ledger.py"
