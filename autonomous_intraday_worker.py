@@ -28,6 +28,7 @@ from delivery_training_universe import benchmark_for_symbol, load_official_nse_u
 from market_watchlist import build_stock_watchlist, fetch_watchlist_articles
 
 IST = ZoneInfo("Asia/Kolkata")
+FOLDER_MIME = "application/vnd.google-apps.folder"
 DEFAULT_ROOT = Path("data/autonomous_intraday")
 FLUSH_EVERY_DEFAULT = 5
 WATCHLIST_REFRESH_SECONDS_DEFAULT = 15 * 60
@@ -47,6 +48,33 @@ def _log(event: str, **fields: Any) -> None:
         **fields,
     }
     print("[AUTONOMOUS_INTRADAY] " + json.dumps(_clean_json(payload), sort_keys=True), flush=True)
+
+
+def _download_drive_file_if_present(store: Any, remote_path: str, local_path: Path) -> bool:
+    """Download an existing Drive file without creating missing folders/files."""
+    parts = [part for part in remote_path.replace("\\", "/").split("/") if part]
+    if not parts:
+        return False
+    parent = store.root_id
+    for part in parts[:-1]:
+        hit = store._find_child(parent, part, FOLDER_MIME)
+        if not hit:
+            return False
+        parent = hit["id"]
+    hit = store._find_child(parent, parts[-1])
+    if not hit:
+        return False
+
+    from googleapiclient.http import MediaIoBaseDownload
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    request = store.service.files().get_media(fileId=hit["id"])
+    with local_path.open("wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return True
 
 
 def _clean_json(value: Any) -> Any:
@@ -386,6 +414,8 @@ class AutonomousIntradayWorker:
         self.run_status = "STARTING"
         self.last_cycle_summary: dict = {}
         self.last_tick_key: str | None = None
+        self.last_minute_snapshot_rows: list[dict[str, Any]] = []
+        self._hydrated_ledger_day: str | None = None
 
     def _ensure_paths(self, now: pd.Timestamp) -> None:
         d = now.tz_convert(IST)
@@ -393,6 +423,102 @@ class AutonomousIntradayWorker:
         daily = self.root / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
         daily.mkdir(parents=True, exist_ok=True)
         self.daily_ledger = daily / f"predictions_{self.segment}.jsonl"
+
+    def _hydrate_daily_ledger(self) -> None:
+        """Restore the current day's append-only ledger before any Drive overwrite."""
+        if self.daily_ledger is None:
+            return
+        ledger_parts = self.daily_ledger.relative_to(self.root).parts
+        if len(ledger_parts) < 4:
+            raise RuntimeError(f"Unexpected worker ledger path: {self.daily_ledger}")
+        ledger_day = "/".join(ledger_parts[:3])
+        if self._hydrated_ledger_day == ledger_day:
+            return
+        if self.daily_ledger.is_file() and self.daily_ledger.stat().st_size > 0:
+            self._hydrated_ledger_day = ledger_day
+            return
+
+        from persistent_store import GoogleDriveStore
+
+        remote = (
+            f"production_data/intraday_predictions/{ledger_day}/"
+            f"predictions_{self.segment}.jsonl"
+        )
+        try:
+            found = _download_drive_file_if_present(
+                GoogleDriveStore(), remote, self.daily_ledger
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot safely hydrate existing Drive prediction ledger before write: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self._hydrated_ledger_day = ledger_day
+        _log(
+            "daily_prediction_ledger_hydrated",
+            ledger_day=ledger_day,
+            remote_path=remote,
+            existing_remote_ledger_found=found,
+            local_bytes=(
+                self.daily_ledger.stat().st_size
+                if self.daily_ledger.is_file() else 0
+            ),
+        )
+
+    def _persist_minute_snapshot(
+        self, now: pd.Timestamp, tick_result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist a compact, immutable prediction + observed-price shard every minute."""
+        if not self.last_minute_snapshot_rows:
+            return {"status": "SKIPPED", "reason": "no snapshot rows"}
+        local_now = now.tz_convert(IST)
+        day_dir = self.root / f"{local_now:%Y}" / f"{local_now:%m}" / f"{local_now:%d}"
+        snapshot_dir = day_dir / "minute_snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"snapshot_{local_now:%Y%m%d_%H%M}.jsonl"
+        local_path = snapshot_dir / filename
+
+        rows = []
+        for source_row in self.last_minute_snapshot_rows:
+            row = dict(source_row)
+            row["worker_cycle"] = self.cycle_count
+            row["tick_status"] = tick_result.get("status")
+            row["snapshot_filename"] = filename
+            rows.append(row)
+        with local_path.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(
+                    json.dumps(_clean_json(row), sort_keys=True, separators=(",", ":"))
+                    + "\\n"
+                )
+
+        relative_day = f"{local_now:%Y/%m/%d}"
+        remote = (
+            f"production_data/intraday_minute_snapshots/{relative_day}/{filename}"
+        )
+        from persistent_store import GoogleDriveStore
+
+        store = GoogleDriveStore()
+        upload_result = store.upload_or_update(
+            local_path, remote, mime_type="application/x-ndjson"
+        )
+        prediction_count = sum(
+            len(row.get("predictions") or []) for row in rows
+        )
+        _log(
+            "minute_prediction_actual_snapshot_persisted",
+            remote_path=remote,
+            snapshot_rows=len(rows),
+            prediction_rows=prediction_count,
+            status="OK",
+        )
+        return {
+            "status": "OK",
+            "remote_path": remote,
+            "snapshot_rows": len(rows),
+            "prediction_rows": prediction_count,
+            "upload_result": _clean_json(upload_result),
+        }
 
     def _persist_bars_locally(
         self, symbol: str, frame: pd.DataFrame, source: str
@@ -455,6 +581,7 @@ class AutonomousIntradayWorker:
 
     def _cycle(self) -> dict:
         now = pd.Timestamp.now(tz=IST)
+        self.last_minute_snapshot_rows = []
         self._refresh_watchlist_if_due()
         summary = {
             "cycle": self.cycle_count,
@@ -475,6 +602,16 @@ class AutonomousIntradayWorker:
         }
         if not self.symbols:
             summary["errors"].append("No news-matched watchlist symbols; no prediction was fabricated.")
+            self.last_minute_snapshot_rows = [{
+                "record_type": "intraday_minute_observation",
+                "observation_timestamp_utc": now.tz_convert("UTC").isoformat(),
+                "observation_timestamp_ist": now.isoformat(),
+                "worker_segment": self.segment,
+                "watchlist_symbols": [],
+                "data_quality_status": "BLOCKED",
+                "status_reason": "NO_NEWS_MATCHED_WATCHLIST",
+                "predictions": [],
+            }]
             self.last_cycle_summary = summary
             _log("cycle_no_watchlist", **summary)
             return summary
@@ -500,9 +637,11 @@ class AutonomousIntradayWorker:
                 _log("benchmark_unavailable", benchmark=benchmark, error=f"{type(exc).__name__}: {exc}")
 
         prediction_rows: list[dict] = []
+        snapshot_rows: list[dict] = []
         for symbol in self.symbols:
             root = symbol.replace(".NS", "").replace(".BO", "").upper()
             benchmark = benchmark_for_symbol(f"{root}.NS")
+            snapshot: dict[str, Any] | None = None
             try:
                 raw, source, source_meta = _fetch_stock_bars(root)
                 completed = current_session_completed(raw, now)
@@ -526,6 +665,49 @@ class AutonomousIntradayWorker:
                     local_rows=int(local_rows),
                 )
 
+                benchmark_data = market_frames.get(benchmark)
+                benchmark_frame = benchmark_data[0] if benchmark_data else pd.DataFrame()
+                benchmark_latest = (
+                    pd.Timestamp(benchmark_frame.index.max())
+                    if not benchmark_frame.empty else None
+                )
+                snapshot = {
+                    "record_type": "intraday_minute_observation",
+                    "observation_id": f"{now:%Y%m%d_%H%M}|{root}",
+                    "observation_timestamp_utc": now.tz_convert("UTC").isoformat(),
+                    "observation_timestamp_ist": now.isoformat(),
+                    "symbol": root,
+                    "actual_observed_close": _clean_json(completed["Close"].iloc[-1]),
+                    "actual_observed_timestamp_utc": (
+                        completed.index.max().tz_convert("UTC").isoformat()
+                    ),
+                    "actual_observed_timestamp_ist": completed.index.max().isoformat(),
+                    "actual_data_source": source,
+                    "source_metadata": source_meta,
+                    "stock_freshness": stock_freshness,
+                    "benchmark_symbol": benchmark,
+                    "benchmark_observed_close": (
+                        _clean_json(benchmark_frame["Close"].iloc[-1])
+                        if not benchmark_frame.empty else None
+                    ),
+                    "benchmark_observed_timestamp_utc": (
+                        benchmark_latest.tz_convert("UTC").isoformat()
+                        if benchmark_latest is not None else None
+                    ),
+                    "benchmark_observed_timestamp_ist": (
+                        benchmark_latest.isoformat()
+                        if benchmark_latest is not None else None
+                    ),
+                    "benchmark_data_source": benchmark_data[1] if benchmark_data else None,
+                    "benchmark_freshness": benchmark_data[2] if benchmark_data else None,
+                    "data_quality_status": "PASS" if fresh and benchmark_data else "BLOCKED",
+                    "status_reason": None if fresh and benchmark_data else (
+                        "STALE_STOCK_CANDLE" if not fresh else "FRESH_BENCHMARK_UNAVAILABLE"
+                    ),
+                    "predictions": [],
+                }
+                snapshot_rows.append(snapshot)
+
                 if not fresh:
                     summary["stale_symbols"].append(root)
                     summary["errors"].append({
@@ -536,6 +718,8 @@ class AutonomousIntradayWorker:
                     continue
 
                 if benchmark not in market_frames:
+                    snapshot["data_quality_status"] = "BLOCKED"
+                    snapshot["status_reason"] = f"NO_FRESH_BENCHMARK_CONTEXT:{benchmark}"
                     summary["errors"].append({
                         "symbol": root,
                         "error": f"No fresh benchmark context ({benchmark}); prediction withheld",
@@ -543,6 +727,8 @@ class AutonomousIntradayWorker:
                     continue
 
                 if len(completed) < 80:
+                    snapshot["data_quality_status"] = "BLOCKED"
+                    snapshot["status_reason"] = "MODEL_WARMUP_INSUFFICIENT_HISTORY"
                     summary["warmup_symbols"].append({
                         "symbol": root,
                         "rows": int(len(completed)),
@@ -582,8 +768,25 @@ class AutonomousIntradayWorker:
                         if str(result.get("signal") or "").upper() == "ABSTAIN":
                             summary["prediction_abstains"] += 1
 
+                    decision_ts = pd.to_datetime(
+                        result.get("decision_timestamp"), errors="coerce", utc=True
+                    )
+                    try:
+                        horizon_min = int(result.get("horizon_min"))
+                    except (TypeError, ValueError):
+                        horizon_min = 0
+                    target_ts = (
+                        decision_ts + pd.Timedelta(minutes=horizon_min)
+                        if not pd.isna(decision_ts) and horizon_min > 0
+                        else pd.NaT
+                    )
+                    forecast_key = (
+                        f"{root}|{decision_ts.isoformat() if not pd.isna(decision_ts) else now.tz_convert('UTC').isoformat()}"
+                        f"|{horizon_min}|{result.get('model_version', '')}"
+                    )
                     record = {
                         **result,
+                        "forecast_key": forecast_key,
                         "worker_observed_at_utc": now.tz_convert("UTC").isoformat(),
                         "worker_observed_at_ist": now.isoformat(),
                         "source": source,
@@ -592,8 +795,28 @@ class AutonomousIntradayWorker:
                         "benchmark_source": market_frames[benchmark][1],
                         "benchmark_latest_candle_ist": market_frames[benchmark][0].index.max().isoformat(),
                         "worker_segment": self.segment,
+                        "actual_observed_close": _clean_json(completed["Close"].iloc[-1]),
+                        "actual_observed_timestamp_utc": completed.index.max().tz_convert("UTC").isoformat(),
+                        "actual_observed_timestamp_ist": completed.index.max().isoformat(),
+                        "actual_observed_is_horizon_outcome": False,
+                        "target_timestamp_utc": (
+                            target_ts.isoformat() if not pd.isna(target_ts) else None
+                        ),
+                        "outcome_status": (
+                            "WAITING_FOR_HORIZON" if not pd.isna(target_ts)
+                            else "NOT_VALIDATABLE"
+                        ),
+                        "actual_horizon_close": None,
+                        "actual_horizon_timestamp_utc": None,
                     }
+                    if prediction_failure:
+                        record["prediction_health_status"] = "BLOCKED"
+                        record["prediction_health_error"] = prediction_failure["error"]
+                    else:
+                        record["prediction_health_status"] = "PASS"
+                        record["prediction_health_error"] = None
                     prediction_rows.append(record)
+                    snapshot["predictions"].append(record)
                     summary["predictions_written"] += 1
                 _log(
                     "intraday_prediction_completed",
@@ -622,12 +845,28 @@ class AutonomousIntradayWorker:
                 )
             except Exception as exc:
                 summary["stock_fetch_errors"] += 1
+                error_text = f"{type(exc).__name__}: {exc}"
                 summary["errors"].append({
                     "symbol": root,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": error_text,
                 })
-                _log("symbol_cycle_failed", symbol=root, error=f"{type(exc).__name__}: {exc}")
+                if snapshot is None:
+                    snapshot_rows.append({
+                        "record_type": "intraday_minute_observation",
+                        "observation_id": f"{now:%Y%m%d_%H%M}|{root}",
+                        "observation_timestamp_utc": now.tz_convert("UTC").isoformat(),
+                        "observation_timestamp_ist": now.isoformat(),
+                        "symbol": root,
+                        "data_quality_status": "FETCH_ERROR",
+                        "status_reason": error_text,
+                        "predictions": [],
+                    })
+                else:
+                    snapshot["data_quality_status"] = "PREDICTION_OR_PROCESSING_ERROR"
+                    snapshot["status_reason"] = error_text
+                _log("symbol_cycle_failed", symbol=root, error=error_text)
 
+        self.last_minute_snapshot_rows = snapshot_rows
         self._append_rows(prediction_rows)
         self.last_cycle_summary = summary
         _log("cycle_completed", **summary)
@@ -702,6 +941,14 @@ class AutonomousIntradayWorker:
         if self.last_tick_key == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "minute": minute_key}
 
+        try:
+            self._hydrate_daily_ledger()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.run_status = "PERSISTENCE_ERROR"
+            _log("daily_prediction_ledger_hydration_failed", minute=minute_key, error=error)
+            return {"status": "PERSISTENCE_ERROR", "minute": minute_key, "error": error}
+
         self.last_tick_key = minute_key
         self.run_status = "RUNNING"
         self.cycle_count += 1
@@ -722,6 +969,23 @@ class AutonomousIntradayWorker:
             result = {"status": "ERROR", "minute": minute_key, "error": error}
             _log("minute_tick_failed", minute=minute_key, error=error)
 
+        # Save the compact prediction + contemporaneous actual-price snapshot on
+        # every minute tick. The larger bars and append-only daily ledger remain
+        # batched to control Drive writes.
+        if self.last_minute_snapshot_rows:
+            try:
+                snapshot_result = self._persist_minute_snapshot(now, result)
+                result["minute_snapshot"] = snapshot_result
+                if snapshot_result.get("status") != "OK":
+                    result["status"] = "PERSISTENCE_ERROR"
+                    self.run_status = "PERSISTENCE_ERROR"
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                result["minute_snapshot"] = {"status": "ERROR", "error": error}
+                result["status"] = "PERSISTENCE_ERROR"
+                self.run_status = "PERSISTENCE_ERROR"
+                _log("minute_snapshot_persist_failed", minute=minute_key, error=error)
+
         # Persist immediately on any degraded tick so failed inference rows and
         # their health status survive even when the scheduler runs a one-off tick.
         # Cloud Run instances are ephemeral: force the final 15:29 IST prediction
@@ -731,7 +995,7 @@ class AutonomousIntradayWorker:
         final_session_tick = final_minute_start <= now_dt.time() < CLOSE
         should_flush = (
             self.cycle_count % self.flush_every == 0
-            or result["status"] in {"ERROR", "PARTIAL"}
+            or result["status"] in {"ERROR", "PARTIAL", "PERSISTENCE_ERROR"}
             or final_session_tick
         )
         if should_flush:
