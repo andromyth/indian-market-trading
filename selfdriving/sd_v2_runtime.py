@@ -606,16 +606,26 @@ def beta_intraday_predict(
         h = frame[frame["horizon_min"].eq(horizon)].copy()
         horizon_started_perf = _perf_time.perf_counter()
         model_cache_hit = False
+        model_version = "UNKNOWN"
         try:
             state, bundle_obj, artifact_load_seconds, model_cache_hit = (
                 _load_intraday_champion(horizon)
             )
             champion = state.get("champion")
+            if isinstance(champion, dict):
+                model_version = str(
+                    champion.get("model_version")
+                    or champion.get("version")
+                    or champion.get("bundle_version")
+                    or champion.get("file")
+                    or "UNKNOWN"
+                )
             if not champion or bundle_obj is None:
                 rows.append({
                     "symbol": root,
                     "horizon_min": horizon,
                     "decision_timestamp": str(latest_ts),
+                    "model_version": model_version if champion else "NO_CHAMPION",
                     "signal": "ABSTAIN",
                     "reason": "NO_CHAMPION",
                 })
@@ -642,6 +652,7 @@ def beta_intraday_predict(
                     "decision_timestamp": str(latest_ts),
                     "signal": "ABSTAIN",
                     "reason": "MODEL_FEATURE_CONTRACT_MISSING",
+                    "model_version": model_version,
                     "missing_model_features": missing_model_features[:10],
                     "active_model_feature_count": len(model_features),
                     "diagnostic_feature_snapshot": _diagnostic_feature_snapshot(X, model_features),
@@ -656,6 +667,7 @@ def beta_intraday_predict(
                     "decision_timestamp": str(latest_ts),
                     "signal": "ABSTAIN",
                     "signal_reason": "INSUFFICIENT_ACTIVE_MODEL_FEATURE_COVERAGE",
+                    "model_version": model_version,
                     "reason": (
                         f"Active model feature coverage is {coverage:.1%}; "
                         f"at least {MIN_LIVE_FEATURE_COVERAGE:.0%} is required."
@@ -721,6 +733,7 @@ def beta_intraday_predict(
                 "price_forecast_validation": price_forecast_validation,
                 "probability_up": p,
                 "signal": signal,
+                "model_version": model_version,
                 "feature_coverage": coverage,
                 "active_model_feature_count": len(model_features),
                 "diagnostic_feature_snapshot": _diagnostic_feature_snapshot(X, model_features),
