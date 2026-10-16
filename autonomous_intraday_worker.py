@@ -1287,6 +1287,43 @@ class AutonomousIntradayWorker:
             result = {"status": "ERROR", "minute": minute_key, "error": error}
             _log("minute_tick_failed", minute=minute_key, error=error)
 
+        # Capture current market quotes for the full official NSE equity
+        # universe independently of the smaller news-selected prediction watchlist.
+        # The separate manifest reports coverage gaps and Drive persistence errors.
+        try:
+            from all_universe_minute_capture import capture_all_universe_minute_snapshot
+
+            all_universe_capture = capture_all_universe_minute_snapshot(
+                now=now,
+                worker_root=self.root,
+                daily_ledger=self.daily_ledger,
+                prediction_snapshots=self.last_minute_snapshot_rows,
+            )
+            result["all_universe_capture"] = all_universe_capture
+            if all_universe_capture.get("status") != "OK":
+                _log(
+                    "all_universe_minute_capture_degraded",
+                    minute=minute_key,
+                    capture_status=all_universe_capture.get("status"),
+                    expected_symbol_count=all_universe_capture.get("expected_symbol_count"),
+                    quoted_symbol_count=all_universe_capture.get("quoted_symbol_count"),
+                    missing_quote_count=all_universe_capture.get("missing_quote_count"),
+                    snapshot_drive_path=all_universe_capture.get("snapshot_drive_path"),
+                    error=all_universe_capture.get("error"),
+                )
+        except Exception as exc:
+            capture_error = f"{type(exc).__name__}: {exc}"
+            result["all_universe_capture"] = {
+                "status": "ERROR",
+                "error": capture_error,
+                "cycle_minute_ist": minute_key,
+            }
+            _log(
+                "all_universe_minute_capture_failed",
+                minute=minute_key,
+                error=capture_error,
+            )
+
         # Save the compact prediction + contemporaneous actual-price snapshot on
         # every minute tick. The larger bars and append-only daily ledger remain
         # batched to control Drive writes.
