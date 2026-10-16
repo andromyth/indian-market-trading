@@ -244,7 +244,7 @@ def collect_and_publish_live_news(
         "archive_window_days": MAX_ARCHIVE_DAYS,
         "coverage_complete": False,
         "coverage_note": "Publisher RSS/search coverage is sampled and is not exhaustive for every NSE symbol; missing mentions must not be interpreted as confirmed no-news.",
-        "pit_timestamp_rule": "decision_timestamp is first collector-observed time in UTC; publisher published_at_utc is retained separately; future-dated items are excluded",
+        "pit_timestamp_rule": "New rows use collector first-seen time in UTC and retain published_at_utc separately; legacy rows keep their original decision_timestamp because first-seen time cannot be reconstructed; future-dated items are excluded",
         "archive_remote_path": PIT_REMOTE,
         "manifest_remote_path": MANIFEST_REMOTE,
     }
