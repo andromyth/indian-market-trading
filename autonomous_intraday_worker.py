@@ -489,7 +489,7 @@ class AutonomousIntradayWorker:
             for row in rows:
                 fh.write(
                     json.dumps(_clean_json(row), sort_keys=True, separators=(",", ":"))
-                    + "\\n"
+                    + "\n"
                 )
 
         relative_day = f"{local_now:%Y/%m/%d}"
