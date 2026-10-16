@@ -6,14 +6,16 @@ It deliberately scores the top five news-matched watchlist symbols by default, n
 
 ## Live website-news collection
 
-The scheduled GitHub Actions workflow `Market news PIT collector` runs every 15 minutes during the NSE market window and skips weekends/NSE holidays. It runs `market_news_pit_collector.py`, which uses publisher RSS endpoints where available and publisher-restricted Google News RSS queries where a direct feed is unavailable. Coverage spans the configured financial publishers and broad market/macro/earnings/regulatory headlines; the collector records publication and first-seen times, publisher/domain, headline URL, matched NSE symbols, sentiment/event context, and source-health metadata. Repeated items are deduplicated in the rolling seven-day point-in-time archive.
+The dedicated `market_news_pit_collector.py` module runs through the scheduled GitHub Actions workflow every 15 minutes during NSE trading hours. It uses direct publisher RSS where dependable (Economic Times Markets, Mint Markets, Business Standard Markets) and publisher-filtered Google News RSS for Economic Times, Moneycontrol, Financial Express and CNBC-TV18. It records article title/summary, URL, publisher, publication and first-seen timestamps, sentiment, source health and point-in-time symbol matching. It does not scrape full articles or bypass paywalls.
 
 Google Drive outputs:
-- `processed/live_news/website_news_articles_2026.parquet` — source-level article archive.
-- `processed/live_news/website_news_pit_2026.parquet` — rolling article/symbol PIT dataset.
-- `processed/live_news/website_news_manifest_2026.json` — source health, last collection time, row counts and explicit coverage caveat.
+- `processed/live_news/website_news_articles_2026.parquet` — deduplicated article archive.
+- `processed/live_news/website_news_pit_2026.parquet` — rolling seven-day point-in-time article/symbol dataset.
+- `processed/live_news/website_news_manifest_2026.json` — source health, last collection time, row counts and coverage status.
 
-The intraday worker is read-only for this shared news archive. It checks the small manifest on each minute cycle and reloads the archive whenever a newer collection timestamp appears, before running that cycle's inference. Symbol/market news context is attached to the minute-level forecast snapshot and prediction ledger. A successful feed refresh means configured sources responded; it does **not** mean every NSE stock's news coverage is exhaustive. The locked classifier's trained feature contract remains unchanged, so news context is stored alongside forecasts but is not yet a numeric input to classifier probabilities. Using news to change probabilities requires a separately validated model feature-contract/training change.
+The intraday worker checks the small manifest each minute and reloads the PIT dataset before inference when a new collection is published. It attaches the derived per-symbol/market news context and transparent `NEWS_BUY_BIAS`, `NEWS_SELL_BIAS`, `NEWS_NEUTRAL`, or `NEWS_INSUFFICIENT_DATA` context to the minute-level forecast snapshot and prediction ledger. These news labels are context—not a substitute for the trained model's signal—and the locked classifier's numeric feature contract is unchanged. Incorporating news into model probabilities would require a separately validated feature-contract/training change.
+
+A successful refresh means the configured feeds met the collector's source-health gate; it does **not** guarantee exhaustive coverage for every NSE stock. Missing stock-specific news must not be treated as proof that no news exists.
 
 ## Why Cloud Run rather than an all-day GitHub Actions job?
 
