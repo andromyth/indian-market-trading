@@ -78,6 +78,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
                 f"{capture.get('expected_symbol_count', 0)} NSE symbols"
             )
+            STATE["last_error"] = STATE["all_universe_capture_warning"]
         elif capture_status == "NOT_RUN":
             STATE["all_universe_capture_warning"] = "Full-universe capture did not run on this tick."
 
@@ -165,7 +166,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         capture_status = status.get("all_universe_capture_status", "NOT_RUN")
         capture_warning = status.get("all_universe_capture_warning")
         payload = {
-            "status": "degraded" if (error or capture_status not in {"OK", "PARTIAL", "NOT_RUN"}) else "ok",
+            "status": "degraded" if (error or capture_status not in {"OK", "NOT_RUN"} or capture_warning) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
             "last_error": error,
@@ -175,7 +176,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             "nse_time_ist": status.get("nse_time_ist"),
             "tick_interval_seconds": status.get("tick_interval_seconds"),
         }
-        self._send_json(503 if error else 200, payload)
+        self._send_json(503 if payload["status"] == "degraded" else 200, payload)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path.rstrip("/") != "/tick":
