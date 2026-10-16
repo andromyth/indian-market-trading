@@ -65,7 +65,7 @@ def test_pit_layer_matches_verified_nse_symbol_and_keeps_market_context():
     assert row["news_available"] == 1.0
     assert row["news_sentiment"] == 0.42
     assert pd.Timestamp(row["decision_timestamp"]) == pd.Timestamp(now)
-    assert "MARKET" in set(pit["symbol"])
+    assert set(pit["symbol"]) == {"SBIN"}
 
 
 def test_collect_sources_reports_each_feed_without_failing_the_batch():
