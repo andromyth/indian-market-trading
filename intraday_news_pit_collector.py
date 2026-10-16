@@ -1,8 +1,9 @@
 """Incremental 15-minute, point-in-time publisher-news collector for live intraday forecasts.
 
-The archive is a publisher-RSS sample, not a guarantee of exhaustive news coverage
-for every NSE-listed security. Published timestamps are retained as PIT availability
-times; the trained classifier's feature contract is not changed by this module.
+The archive is a publisher-restricted RSS sample, not a guarantee of exhaustive
+news coverage for every NSE-listed security. Publisher publication times are retained
+separately from collector first-seen times; the trained classifier's feature contract
+is not changed by this module.
 """
 from __future__ import annotations
 
