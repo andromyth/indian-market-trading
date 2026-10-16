@@ -52,10 +52,10 @@ def _record_tick_result(result: dict[str, Any]) -> None:
     capture_status = str(capture.get("status") or "NOT_RUN").upper()
     capture_error = capture.get("error")
     with STATE_LOCK:
-        previous_capture_issue = (
-            STATE.get("all_universe_capture_error")
-            or STATE.get("all_universe_capture_warning")
-        )
+        previous_capture_issues = {
+            STATE.get("all_universe_capture_error"),
+            STATE.get("all_universe_capture_warning"),
+        }
         STATE["last_tick_at_utc"] = datetime.now(timezone.utc).isoformat()
         STATE["last_tick_result"] = _clean_json(result)
         STATE["all_universe_capture_status"] = capture_status
@@ -78,9 +78,10 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         elif capture_status == "OK":
             STATE["all_universe_capture_error"] = None
             STATE["all_universe_capture_warning"] = None
-            if previous_capture_issue and STATE.get("last_error") == previous_capture_issue:
+            if STATE.get("last_error") in previous_capture_issues:
                 STATE["last_error"] = None
         elif capture_status == "PARTIAL":
+            STATE["all_universe_capture_error"] = None
             STATE["all_universe_capture_warning"] = (
                 f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
                 f"{capture.get('expected_symbol_count', 0)} NSE symbols"
