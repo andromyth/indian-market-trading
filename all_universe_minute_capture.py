@@ -232,6 +232,8 @@ def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dic
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_clean(payload), indent=2, sort_keys=True), encoding="utf-8")
     result = store.upload_or_update(path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json")
+    if result.get("status") != "OK":
+        raise RuntimeError(f"Drive manifest write was not confirmed: {result}")
     return result
 
 
