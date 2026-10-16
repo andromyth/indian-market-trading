@@ -221,3 +221,23 @@ def test_service_health_clears_recovered_quote_coverage_warning():
     finally:
         STATE.clear()
         STATE.update(original)
+
+
+
+def test_current_forecast_map_excludes_stale_snapshot_rows():
+    cycle_minute = pd.Timestamp("2026-10-16 10:05:00", tz=IST)
+    snapshot_rows = [{
+        "symbol": "AAA",
+        "predictions": [
+            {
+                "forecast_key": "new",
+                "worker_observed_at_utc": "2026-10-16T04:35:12+00:00",
+            },
+            {
+                "forecast_key": "stale",
+                "worker_observed_at_utc": "2026-10-16T04:34:12+00:00",
+            },
+        ],
+    }]
+    result = capture._prediction_map(snapshot_rows, cycle_minute)
+    assert [row["forecast_key"] for row in result["AAA"]] == ["new"]
