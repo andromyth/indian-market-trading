@@ -120,3 +120,37 @@ def test_learning_report_never_auto_applies_corrections():
     assert "h5__test-model" in report["candidate_corrections"]
     assert not groups.empty
     assert not bins.empty
+
+
+
+def test_feature_error_associations_work_without_return_regression_head():
+    frame = pd.DataFrame({
+        "validation_status": ["VALIDATED"] * 5,
+        "actual_return": [0.01, -0.01, 0.01, -0.01, 0.01],
+        "probability_up": [0.2, 0.8, 0.3, 0.7, 0.4],
+        "expected_return": [float("nan")] * 5,
+        "diagnostic_feature_snapshot": [
+            {"feature_x": float(i)} for i in range(5)
+        ],
+    })
+    result = _feature_error_associations(frame, min_samples=3)
+    assert result
+    assert all(
+        row["residual_type"] == "classification_probability_residual"
+        for row in result
+    )
+
+
+def test_runtime_diagnostic_snapshot_records_exact_inputs_and_nulls():
+    from selfdriving.sd_v2_runtime import _diagnostic_feature_snapshot
+
+    frame = pd.DataFrame({
+        "price_return_1": [0.012345],
+        "volume_ratio": [float("nan")],
+    })
+    result = _diagnostic_feature_snapshot(
+        frame, ["price_return_1", "volume_ratio", "missing_column"]
+    )
+    assert result["price_return_1"] == pytest.approx(0.012345)
+    assert result["volume_ratio"] is None
+    assert result["missing_column"] is None
