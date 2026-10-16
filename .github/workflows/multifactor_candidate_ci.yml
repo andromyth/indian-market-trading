@@ -33,6 +33,7 @@ jobs:
           multifactor_data_layer_v2.py
           nse_data_layer.py
           nse_bulk_eod_ingest.py
+          nse_eod_archive_audit.py
           data_fetcher.py
           market_watchlist.py
           indstocks_client.py
@@ -123,6 +124,7 @@ jobs:
           tests/test_autonomous_intraday_worker.py
           tests/test_intraday_bundle_cache.py
           tests/test_nse_eod_archive_presence.py
+          tests/test_nse_eod_archive_audit.py
           tests/test_nse_index_daily_snapshot_fallback.py
           tests/test_market_session_guard.py
           tests/test_gdrive_auth_precedence.py

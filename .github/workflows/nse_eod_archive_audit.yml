@@ -49,13 +49,18 @@ jobs:
             END='${{ inputs.end }}'
           else
             START='2026-01-01'
-            END="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
+            END=''
           fi
 
           if [ -z "$START" ]; then START='2026-01-01'; fi
-          if [ -z "$END" ]; then END="$(TZ=Asia/Kolkata date +%Y-%m-%d)"; fi
 
-          PYTHONUNBUFFERED=1 python -u nse_eod_archive_audit.py             --start "$START"             --end "$END"
+          # Let the Python auditor determine the last completed EOD date when
+          # --end is omitted: before 16:00 IST, today's archive is not yet due.
+          if [ -n "$END" ]; then
+            PYTHONUNBUFFERED=1 python -u nse_eod_archive_audit.py --start "$START" --end "$END"
+          else
+            PYTHONUNBUFFERED=1 python -u nse_eod_archive_audit.py --start "$START"
+          fi
 
       - name: Upload audit report
         if: always()

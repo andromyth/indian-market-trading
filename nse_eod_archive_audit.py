@@ -13,8 +13,9 @@ import argparse
 import io
 import json
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from googleapiclient.http import MediaIoBaseDownload
@@ -114,6 +115,25 @@ def _download_parquet(store: GoogleDriveStore, file_id: str) -> pd.DataFrame:
         _, done = downloader.next_chunk()
     buf.seek(0)
     return pd.read_parquet(buf)
+
+
+IST = ZoneInfo("Asia/Kolkata")
+EOD_AUDIT_CUTOFF = time(16, 0)  # buffer after the 15:30 IST cash-market close
+
+
+def default_audit_end_date(now: datetime | None = None) -> date:
+    """Return the latest calendar date whose NSE EOD archive should exist.
+
+    Before 16:00 IST, today's cash-market EOD archive is not yet expected.
+    Explicit --end dates still override this automatic cutoff for intentional
+    historical/manual audits.
+    """
+    current = now or datetime.now(IST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    else:
+        current = current.astimezone(IST)
+    return current.date() if current.time().replace(tzinfo=None) >= EOD_AUDIT_CUTOFF else current.date() - timedelta(days=1)
 
 
 def expected_equity_dates(start: date, end: date) -> list[date]:
@@ -347,7 +367,7 @@ def main() -> None:
     ap.add_argument("--end", default=None)
     args = ap.parse_args()
 
-    end = date.fromisoformat(args.end) if args.end else date.today()
+    end = date.fromisoformat(args.end) if args.end else default_audit_end_date()
     start = date.fromisoformat(args.start)
     if end < start:
         raise SystemExit("--end cannot be before --start")
