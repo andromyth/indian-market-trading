@@ -10,12 +10,12 @@ on:
       - "market_watchlist.py"
       - "delivery_training_universe.py"
   workflow_dispatch:
-  # GitHub cron uses UTC. Runs 08:50, then every 15 minutes, ending at 14:50 IST.
-  # The Python guard skips weekends and NSE holidays.
+  # GitHub cron uses UTC. Scheduled collection runs 08:50 through 14:50 IST.
+  # Scheduled runs use the market-window guard; pushes/manual runs allow a one-off catch-up.
   schedule:
     - cron: "20,35,50 3 * * 1-5"
     - cron: "5,20,35,50 4-8 * * 1-5"
-    - cron: "5,20,30 9 * * 1-5"
+    - cron: "5,20 9 * * 1-5"
 
 permissions:
   contents: read
@@ -50,6 +50,8 @@ jobs:
       - name: Collect current RSS headlines and persist PIT outputs
         run: |
           set -euo pipefail
-          python -u market_news_pit_collector.py \
-            --drive-root /tmp/Indian_Market_Research \
-            --market-window
+          args=(--drive-root /tmp/Indian_Market_Research)
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            args+=(--market-window)
+          fi
+          python -u market_news_pit_collector.py "${args[@]}"
