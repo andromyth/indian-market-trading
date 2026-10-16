@@ -493,7 +493,7 @@ class AutonomousIntradayWorker:
         )
 
     def _refresh_news_context_if_due(self, force: bool = False) -> None:
-        """Refresh the publisher-news PIT archive from Google Drive every 15 minutes."""
+        """Load the latest publisher-news PIT archive after the 15-minute collection."""
         monotonic_now = time_module.monotonic()
         if not force and self.last_news_context_refresh and (
             monotonic_now - self.last_news_context_refresh < 15 * 60
@@ -506,27 +506,21 @@ class AutonomousIntradayWorker:
         try:
             from persistent_store import GoogleDriveStore
             store = GoogleDriveStore()
-            _download_drive_file_if_present(
+            pit_found = _download_drive_file_if_present(
                 store, "processed/live_news/website_news_pit_2026.parquet", pit_path
             )
-            _download_drive_file_if_present(
+            manifest_found = _download_drive_file_if_present(
                 store, "processed/live_news/website_news_manifest_2026.json", manifest_path
             )
-            # Scrape and persist fresh headlines before this cycle builds any forecasts.
-            # The collector preserves the existing PIT archive and records source health.
-            from live_news_scraper import refresh_live_news_archive
-            universe = load_official_nse_universe(force_refresh=False)
-            self.news_manifest = refresh_live_news_archive(
-                universe=universe,
-                pit_path=pit_path,
-                manifest_path=manifest_path,
-                drive_store=store,
+            self.news_manifest = (
+                json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest_found and manifest_path.exists() else {}
             )
-            if not pit_path.exists():
+            if not pit_found or not pit_path.exists():
                 self.news_context_status = "MISSING"
                 self.news_context_by_symbol = {}
                 self.market_news_context = {}
-                _log("website_news_context_unavailable", reason="No PIT archive could be created from the current source results")
+                _log("website_news_context_unavailable", reason="PIT archive is not yet present in Google Drive")
                 return
             frame = pd.read_parquet(pit_path)
             if frame.empty or "symbol" not in frame.columns or "decision_timestamp" not in frame.columns:
