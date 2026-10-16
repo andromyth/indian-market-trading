@@ -855,6 +855,7 @@ def build_learning_report(
         "diagnostic_slices": groups_sorted[:100],
         "feature_error_associations": feature_associations,
         "candidate_corrections": candidates,
+        "finding_count": int(len(findings)),
         "root_cause_findings": sorted(
             findings,
             key=lambda item: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "REVIEW": 3, "INFO": 4}.get(item.get("priority"), 5),
@@ -923,7 +924,13 @@ def run_learning(
     report_path = out_dir / f"prediction_learning_report_{tag}.json"
     profile_path = out_dir / f"candidate_corrections_{tag}.json"
     associations_path = out_dir / f"feature_error_associations_{tag}.csv"
-    frame.to_csv(outcomes_path, index=False)
+    export_frame = frame.copy()
+    if "diagnostic_feature_snapshot" in export_frame.columns:
+        export_frame["diagnostic_feature_snapshot"] = export_frame[
+            "diagnostic_feature_snapshot"
+        ].map(lambda value: json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
+              if isinstance(value, dict) else "")
+    export_frame.to_csv(outcomes_path, index=False)
     groups.to_csv(groups_path, index=False)
     pd.DataFrame(report.get("feature_error_associations", [])).to_csv(associations_path, index=False)
     report_path.write_text(json.dumps(_json_safe(report), indent=2, sort_keys=True, default=str), encoding="utf-8")
