@@ -67,3 +67,18 @@ def test_audit_fails_when_a_minute_snapshot_is_missing():
     )
     assert report["quality_gate_pass"] is False
     assert missing_key in report["missing_snapshot_minutes"]
+
+
+
+def test_audit_accepts_recovered_drive_write_when_artifacts_are_present():
+    session_date = date(2026, 10, 16)
+    files, manifests = _complete_day_files(session_date)
+    recovered_key = "20261016_1005"
+    recovered_id = f"manifest-{recovered_key}"
+    manifests[recovered_id]["status"] = "PERSISTENCE_ERROR"
+
+    report, _ = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id]
+    )
+    assert report["quality_gate_pass"] is True
+    assert recovered_key in report["recovered_persistence_issue_minutes"]
