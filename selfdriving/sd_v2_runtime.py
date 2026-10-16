@@ -489,6 +489,28 @@ def beta_delivery_predict(symbol: str, global_cues: pd.DataFrame | None = None,
     return row
 
 
+def _diagnostic_feature_snapshot(X, model_features: list[str]) -> dict[str, float | None]:
+    """Record exact numeric inputs passed to this prediction bundle for later error analysis.
+
+    NaN/inf values are represented as null. The snapshot contains input features only,
+    not outcomes or target columns, so it can be joined to this forecast after maturity.
+    """
+    if X is None or len(X) == 0:
+        return {str(name): None for name in model_features}
+    first = X.iloc[0]
+    snapshot: dict[str, float | None] = {}
+    for name in model_features:
+        if name not in first.index:
+            snapshot[str(name)] = None
+            continue
+        try:
+            value = float(first[name])
+        except (TypeError, ValueError):
+            value = float("nan")
+        snapshot[str(name)] = value if np.isfinite(value) else None
+    return snapshot
+
+
 def beta_intraday_predict(
     symbol: str,
     price_df: pd.DataFrame,
@@ -617,10 +639,12 @@ def beta_intraday_predict(
                 rows.append({
                     "symbol": root,
                     "horizon_min": horizon,
+                    "decision_timestamp": str(latest_ts),
                     "signal": "ABSTAIN",
                     "reason": "MODEL_FEATURE_CONTRACT_MISSING",
                     "missing_model_features": missing_model_features[:10],
                     "active_model_feature_count": len(model_features),
+                    "diagnostic_feature_snapshot": _diagnostic_feature_snapshot(X, model_features),
                 })
                 continue
 
@@ -638,6 +662,7 @@ def beta_intraday_predict(
                     ),
                     "feature_coverage": coverage,
                     "active_model_feature_count": len(model_features),
+                    "diagnostic_feature_snapshot": _diagnostic_feature_snapshot(X, model_features),
                 })
                 continue
 
@@ -698,6 +723,7 @@ def beta_intraday_predict(
                 "signal": signal,
                 "feature_coverage": coverage,
                 "active_model_feature_count": len(model_features),
+                "diagnostic_feature_snapshot": _diagnostic_feature_snapshot(X, model_features),
                 "minimum_active_model_feature_coverage": MIN_LIVE_FEATURE_COVERAGE,
                 "signal_reason": (
                     "VALIDATED_THRESHOLD"
@@ -728,7 +754,7 @@ def beta_intraday_predict(
                     "model_prediction_seconds": round(model_prediction_seconds, 6),
                     "horizon_total_seconds": round(_perf_time.perf_counter() - horizon_started_perf, 6),
                     "input_cadence_median_minutes": price_input_report.get("median_interval_minutes"),
-                    "decision_schedule_minutes": 5,
+                    "decision_schedule_minutes": decision_interval_minutes,
                 }
                 row_out["runtime_diagnostics"] = metrics
                 runtime_event(
