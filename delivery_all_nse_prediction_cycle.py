@@ -2,13 +2,13 @@
 """Generate one idempotent ALL-NSE Delivery prediction batch from the PIT snapshot.
 
 This stage scores the already-built 59-feature production snapshot. It does not
-retrain, promote, or modify model artifacts. A prediction is persisted once per
-(symbol, mode, horizon, decision timestamp, model version).
+retrain, promote, or modify model artifacts. Repeated identical outputs are
+idempotent; changed output for the same symbol/date/model is stored as a
+separate, auditable prediction revision.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import re
 from datetime import date, timedelta
@@ -20,7 +20,11 @@ import numpy as np
 import pandas as pd
 
 from all_nse_delivery_model import _load_models, _signal_policy, _safe_float
-from delivery_prediction_csv_ledger import load_eod_history, project_next_session_ohlc
+from delivery_prediction_csv_ledger import (
+    load_eod_history,
+    project_next_session_ohlc,
+    sync_delivery_csv_ledger,
+)
 from prediction_ledger import append_predictions
 from delivery_quality_gate import apply_quality_gate, quality_gate_reasons
 
@@ -233,17 +237,6 @@ def main() -> int:
     for i, row in x.iterrows():
         symbol = str(row["symbol"])
         non_missing = int(matrix.iloc[i].notna().sum())
-        prediction_id = hashlib.sha256(
-            "|".join(
-                [
-                    symbol,
-                    "Delivery",
-                    "next_session",
-                    prediction_for_date,
-                    model_version,
-                ]
-            ).encode("utf-8")
-        ).hexdigest()[:24]
         records.append(
             {
                 "prediction_id": prediction_id,
@@ -328,14 +321,30 @@ def main() -> int:
 
     sync_drive = not args.no_sync_drive
     result = append_predictions(records, sync_drive=sync_drive)
-    # A successful process exit must mean today's production batch reached the
-    # shared ledger. A failed Drive upload is a hard failure so the hourly
-    # workflow retries instead of silently leaving the dashboard on stale data.
+    # A successful process exit must mean the JSONL prediction ledger reached
+    # Drive. A failed upload is a hard failure so the workflow retries.
     if sync_drive and result.get("status") == "APPENDED" and result.get("new_rows", 0) > 0 and not result.get("synced"):
         raise RuntimeError(
             "ALL-NSE Delivery batch was generated locally but was not synced "
             f"to the persistent Google Drive ledger: {result}"
         )
+
+    # Rebuild the one-row-per-symbol/date CSV view from the authoritative
+    # revision-aware JSONL ledger on every synced run. This also repairs a stale
+    # CSV after an interrupted earlier upload, including when no new rows append.
+    csv_sync_result = None
+    if sync_drive:
+        csv_sync_result = sync_delivery_csv_ledger(eod_history=ohlc_history)
+        print(
+            "DELIVERY_PREDICTION_CSV_LEDGER_SYNC:",
+            __import__("json").dumps(csv_sync_result, default=str),
+            flush=True,
+        )
+        if csv_sync_result.get("status") != "SYNCED":
+            raise RuntimeError(
+                "Delivery prediction JSONL ledger is available, but the "
+                f"latest-revision CSV view did not sync to Drive: {csv_sync_result}"
+            )
 
     if factor_weightage_report is not None:
         try:
