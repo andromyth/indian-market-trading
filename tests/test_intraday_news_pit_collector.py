@@ -32,8 +32,10 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
         "checked_at_utc": "2026-10-16T10:30:00+00:00",
         "sources": [
             {"publisher": "Economic Times", "domain": "economictimes.indiatimes.com", "status": "PASS", "article_count": 1},
-            {"publisher": "Moneycontrol", "domain": "moneycontrol.com", "status": "PASS", "article_count": 1},
+            {"publisher": "Moneycontrol", "domain": "moneycontrol.com", "status": "NO_RECENT_ARTICLES", "article_count": 0},
             {"publisher": "Mint", "domain": "livemint.com", "status": "PASS", "article_count": 1},
+            {"publisher": "Business Standard", "domain": "business-standard.com", "status": "NO_RECENT_ARTICLES", "article_count": 0},
+            {"publisher": "CNBC-TV18", "domain": "cnbctv18.com", "status": "ERROR", "article_count": 0},
         ],
         "articles": [{
             "title": "Reliance Industries announces quarterly results",
@@ -73,7 +75,7 @@ def test_live_news_collector_publishes_pit_rows_and_non_exhaustive_manifest(tmp_
     )
 
     assert result["collection_status"] == "PASS"
-    assert result["successful_feed_count"] == 3
+    assert result["successful_feed_count"] == 4
     assert result["new_articles_observed"] == 1
     assert result["coverage_complete"] is False
     assert "not exhaustive" in result["coverage_note"]
