@@ -78,9 +78,10 @@ Open Google Cloud Console → **Cloud Run** → indian-market-intraday-worker �
 2. cloud_run_worker_loop_started.
 3. During an NSE session: minute_tick_started, stock_data_collected, intraday_prediction_completed, and cloud_run_tick_result.
 4. Every tick: `all_universe_capture_status=OK` plus a snapshot path under `production_data/all_universe_minute_snapshots/YYYY/MM/DD/`. Confirm `quoted_symbol_count` equals `expected_symbol_count`; `PARTIAL`, `PERSISTENCE_ERROR` or `BLOCKED_PROVIDER_CREDENTIALS` indicates incomplete coverage.
-5. Check `latest_manifest.json` and the snapshot Parquet row count for that minute. Rows whose quote status is not PASS are explicit gaps, not valid prices.
-6. The separate per-minute prediction snapshot remains under `production_data/intraday_minute_snapshots/YYYY/MM/DD/`; the forecast model itself is still watchlist scoped.
-7. After market close, review forecast outcome reports under `production_data/intraday_predictions/outcomes_audit/YYYY/MM/DD/`. Target-minute quote matches in the full-universe archive are not the same as exchange-stamped one-minute candle closes.
+5. Check `latest_manifest.json`, each `manifest_YYYYMMDD_HHMM.json`, and the snapshot Parquet row count for each minute. Rows whose quote status is not PASS are explicit gaps, not valid prices.
+6. The daily workflow also audits 375 regular-session minute slots and stores JSON/CSV results under `production_data/all_universe_minute_snapshots/audits/YYYY/MM/DD/`. A strict audit fails if minute snapshots/manifests are missing, duplicated, incomplete, or have quote gaps.
+7. The separate per-minute prediction snapshot remains under `production_data/intraday_minute_snapshots/YYYY/MM/DD/`; the forecast model itself is still watchlist scoped.
+8. After market close, review forecast outcome reports under `production_data/intraday_predictions/outcomes_audit/YYYY/MM/DD/`. Target-minute quote matches in the full-universe archive are not the same as exchange-stamped one-minute candle closes.
 
 
 A weekend, NSE holiday, pre-open or post-close log should show MARKET_CLOSED/no market data cycle. Stale/missing stock or benchmark candles cause the affected prediction to be withheld rather than guessed.
