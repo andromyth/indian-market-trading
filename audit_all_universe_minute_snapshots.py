@@ -148,9 +148,28 @@ def build_audit_report(
     total_outcomes = pd.to_numeric(
         frame["matched_outcome_count"], errors="coerce"
     ).fillna(0).sum()
-    statuses_all_ok = bool(frame["capture_status"].eq("OK").all())
     all_snapshots_present = snapshots_present == expected_count
     all_manifests_present = manifests_present == expected_count
+    recovered_persistence_issue_minutes = [
+        str(row["minute_key_ist"])
+        for row in rows
+        if (
+            row["capture_status"] == "PERSISTENCE_ERROR"
+            and row["snapshot_present"]
+            and row["manifest_present"]
+            and pd.notna(row["expected_symbol_count"])
+            and pd.notna(row["quoted_symbol_count"])
+            and int(row["expected_symbol_count"]) > 0
+            and int(row["quoted_symbol_count"]) == int(row["expected_symbol_count"])
+            and int(row["missing_quote_count"] or 0) == 0
+            and int(row["unmapped_symbol_count"] or 0) == 0
+        )
+    ]
+    statuses_data_complete = bool(all(
+        row["capture_status"] == "OK"
+        or str(row["minute_key_ist"]) in recovered_persistence_issue_minutes
+        for row in rows
+    ))
     coverage_pct = (
         float(total_quoted_symbols / total_expected_symbols * 100.0)
         if total_expected_symbols else 0.0
@@ -158,7 +177,7 @@ def build_audit_report(
     quality_gate_pass = bool(
         all_snapshots_present
         and all_manifests_present
-        and statuses_all_ok
+        and statuses_data_complete
         and duplicate_snapshot_files == 0
         and duplicate_manifest_files == 0
         and int(total_missing_quotes) == 0
@@ -180,6 +199,7 @@ def build_audit_report(
             key for key in expected if not minute_manifest_files[key]
         ],
         "corrupt_manifest_minutes": corrupt_manifests,
+        "recovered_persistence_issue_minutes": recovered_persistence_issue_minutes,
         "duplicate_snapshot_files": duplicate_snapshot_files,
         "duplicate_manifest_files": duplicate_manifest_files,
         "capture_status_counts": status_counts,
@@ -203,6 +223,11 @@ def build_audit_report(
         ),
         "quality_gate_pass": quality_gate_pass,
         "audit_status": "PASS" if quality_gate_pass else "NEEDS_ATTENTION",
+        "audit_note": (
+            "PERSISTENCE_ERROR minutes are considered recovered only when both the "
+            "snapshot and manifest now exist and quote coverage is complete; the original "
+            "status remains visible in capture_status_counts."
+        ),
         "audited_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     return report, frame
