@@ -239,7 +239,6 @@ def main() -> int:
         non_missing = int(matrix.iloc[i].notna().sum())
         records.append(
             {
-                "prediction_id": prediction_id,
                 "symbol": symbol,
                 "mode": "Delivery",
                 "prediction_horizon": "next_session",
