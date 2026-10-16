@@ -1,15 +1,47 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import pandas as pd
 
-from refresh_canonical_cash_master_from_bulk_eod import _merge_master, _master_stats
+from refresh_canonical_cash_master_from_bulk_eod import (
+    REMOTE_REPORT,
+    _merge_master,
+    _master_stats,
+    _write_report,
+)
 
 
 class IncrementalCashMasterMergeTests(unittest.TestCase):
+    def test_write_report_persists_json_and_syncs_to_drive(self):
+        with tempfile.TemporaryDirectory(prefix="cash-master-report-test-") as directory:
+            report_path = Path(directory) / "diagnostics" / "cash_master.json"
+            report = {"status": "NO_CHANGES_NEEDED", "rows": 123}
+
+            class FakeStore:
+                def __init__(self):
+                    self.calls = []
+
+                def upload_or_update(self, path, remote_path, mime_type):
+                    self.calls.append((path, remote_path, mime_type))
+
+            store = FakeStore()
+            _write_report(report_path, report, store)
+
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8")), report
+            )
+            self.assertEqual(
+                store.calls,
+                [(report_path, REMOTE_REPORT, "application/json")],
+            )
+            self.assertFalse(
+                report_path.with_suffix(report_path.suffix + ".tmp").exists()
+            )
+
     def test_new_official_rows_append_and_overlapping_identity_is_refreshed(self):
         with tempfile.TemporaryDirectory(prefix="cash-master-test-") as directory:
             root = Path(directory)

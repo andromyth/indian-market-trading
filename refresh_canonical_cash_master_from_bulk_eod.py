@@ -43,6 +43,32 @@ def _quote_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _write_report(
+    report_path: Path,
+    report: dict[str, Any],
+    store=None,
+) -> None:
+    """Write the report atomically and mirror it to Google Drive when supplied.
+
+    The report is used on success and early-blocking/error paths, so this helper
+    must always persist locally first and only then attempt the optional Drive sync.
+    """
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = report_path.with_suffix(report_path.suffix + ".tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        temporary_path.replace(report_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    if store is not None:
+        store.upload_or_update(
+            report_path, REMOTE_REPORT, mime_type="application/json"
+        )
+
+
 REMOTE_MASTER = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.parquet"
 REMOTE_META = "production_data/nse_official/ALL_NSE_CASH_HISTORY_2016_2026_IDENTITY_PRESERVED.meta.json"
 REMOTE_REPORT = "diagnostics/canonical_cash_master_validation/cash_master_incremental_refresh_latest.json"
