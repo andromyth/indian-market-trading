@@ -882,6 +882,15 @@ def run_learning(
     unique_loaded = [(date_by_identity.get(forecast_identity(row), ""), row) for row in deduped]
     frame, build_report = _build_outcomes(store, unique_loaded)
     build_report.update({key: value for key, value in ingest.items() if key not in build_report})
+    # Preserve duplicate evidence from the entire input ledger, before deduplication
+    # intentionally removes duplicate weights from the scored dataset.
+    build_report.update({
+        key: value for key, value in dedup_report.items()
+        if key in {
+            "input_rows", "unique_forecasts", "duplicate_rows_removed",
+            "duplicate_forecast_keys", "malformed_identity_rows", "duplicate_examples",
+        }
+    })
     report, groups, bins = build_learning_report(frame, build_report, train_fraction=train_fraction)
     report["date_range"] = {"start": start_date.isoformat(), "end": end_date.isoformat()}
     report["segment"] = segment
