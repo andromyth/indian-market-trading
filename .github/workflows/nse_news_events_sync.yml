@@ -1,6 +1,12 @@
 name: NSE ALL-NSE news and events sync
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nse_news_events_sync.yml"
+      - "build_all_nse_news_events_pit.py"
   workflow_dispatch:
     inputs:
       start:
@@ -11,7 +17,16 @@ on:
         description: 'Optional last NSE date (YYYY-MM-DD)'
         required: false
         default: ''
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  # Refresh after market close and retry before the next session's pre-open run.
+  # GitHub cron uses UTC: 22:00 IST = 16:30 UTC; 05:30 IST = 00:00 UTC.
+  schedule:
+    - cron: "30 16 * * 1-5"
+    - cron: "0 0 * * 1-5"
+
+concurrency:
+  group: nse-news-events-sync
+  cancel-in-progress: false
+
 jobs:
   sync-nse-news-events:
     runs-on: ubuntu-latest
