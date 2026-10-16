@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import json as jsonlib
+
 import pandas as pd
 
 from market_news_pit_collector import (
@@ -141,3 +143,86 @@ def test_financial_news_classifier_does_not_treat_cleared_fraud_allegation_as_be
 
     assert result["news_signal"] != "NEWS_SELL_BIAS"
     assert "negation_or_exoneration_detected" in result["news_signal_reason"]
+
+
+def test_semantic_news_analysis_uses_validated_gemini_signal_in_pit_layer():
+    from market_news_pit_collector import analyze_pending_articles_with_gemini
+
+    now = datetime(2026, 10, 16, 4, 0, tzinfo=timezone.utc)
+    article = _article(now)
+    article["title"] = "State Bank of India faces a major regulatory penalty after fraud investigation"
+    article["summary"] = "Regulator imposed a fine following an accounting investigation."
+    archive = merge_article_archive(
+        pd.DataFrame(), [article], now, analyzer=_FakeAnalyzer()
+    )
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "text": jsonlib.dumps({
+                                "articles": [{
+                                    "article_id": "article-1",
+                                    "event_category": "FRAUD_REGULATORY",
+                                    "direction_score": -0.82,
+                                    "impact_score": 0.96,
+                                    "confidence": 0.91,
+                                    "relevance_score": 0.98,
+                                    "summary": "A serious regulatory event could weigh on the bank.",
+                                    "rationale": "The headline describes a penalty and fraud investigation.",
+                                    "evidence": ["regulatory penalty", "fraud investigation"],
+                                }]
+                            })
+                        }]
+                    }
+                }]
+            }
+
+    def fake_post(url, headers, json, timeout):
+        assert "models/gemini-2.5-flash:generateContent" in url
+        assert headers["x-goog-api-key"] == "test-key"
+        assert timeout == (5, 45)
+        submitted = jsonlib.loads(json["contents"][0]["parts"][0]["text"].split("\n\n", 1)[1])
+        assert submitted["articles"][0]["article_id"] == "article-1"
+        return _Response()
+
+    enriched, stats = analyze_pending_articles_with_gemini(
+        archive, api_key="test-key", request_fn=fake_post, max_articles=10, batch_size=20
+    )
+    aliases = {
+        "STATE BANK OF INDIA": {"symbol": "SBIN", "alias": "STATE BANK OF INDIA"},
+        "SBIN": {"symbol": "SBIN", "alias": "SBIN"},
+    }
+    pit = build_pit_layer(enriched, aliases, now_utc=now)
+    row = pit.loc[pit["symbol"].eq("SBIN")].iloc[0]
+
+    assert stats["mode"] == "GEMINI_SEMANTIC_WITH_HEURISTIC_FALLBACK"
+    assert stats["analyzed_count"] == 1
+    assert enriched.iloc[0]["semantic_analysis_status"] == "PASS"
+    assert row["news_analysis_method"] == "GEMINI_SEMANTIC"
+    assert row["news_signal"] == "NEWS_SELL_BIAS"
+    assert row["news_direction_score"] == -0.82
+    assert row["news_event_category"] == "FRAUD_REGULATORY"
+    assert row["news_semantic_confidence"] == 0.91
+
+
+def test_semantic_news_analysis_falls_back_cleanly_without_api_key(monkeypatch):
+    from market_news_pit_collector import analyze_pending_articles_with_gemini
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    frame = pd.DataFrame([{
+        "article_id": "article-no-key",
+        "title": "Company announces quarterly results",
+        "summary": "Results were in line with expectations.",
+    }])
+    enriched, stats = analyze_pending_articles_with_gemini(frame, api_key="")
+
+    assert stats["mode"] == "HEURISTIC_FALLBACK_NO_API_KEY"
+    assert stats["api_key_configured"] is False
+    assert enriched.loc[0, "semantic_analysis_status"] == ""
