@@ -303,33 +303,103 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
         if "row_identity_key" not in columns:
             raise RuntimeError("Existing master lacks row_identity_key; refusing to merge.")
 
+        # Older official UDiFF rows can have a NULL derived identity when
+        # listing_id was not carried forward, even though stable source identifiers
+        # are present. Rebuild the missing listing/key deterministically using the
+        # identity-preserving rebuild's existing rules. If series is absent but
+        # symbol+ISIN are present, mark SERIES:UNKNOWN explicitly instead of
+        # silently dropping the historical row.
         master_relation = f"read_parquet({m_sql})"
         null_key_row = con.execute(f"""
-            SELECT COUNT(*) FILTER (WHERE row_identity_key IS NULL)
+            SELECT COUNT(*)
             FROM read_parquet({m_sql})
+            WHERE row_identity_key IS NULL
+               OR TRIM(CAST(row_identity_key AS VARCHAR)) = ''
+               OR UPPER(TRIM(CAST(row_identity_key AS VARCHAR))) IN ('NAN', 'NONE', '<NA>')
         """).fetchone()
         null_master_identity_keys = int((null_key_row[0] if null_key_row else 0) or 0)
         if null_master_identity_keys:
-            # Repair a null key only when the canonical listing_id and trade date
-            # are present. This is the exact composition used by add_identity:
-            # row_identity_key = listing_id + '|DATE:' + YYYY-MM-DD.
-            # If either source component is missing, fail closed; never guess or
-            # silently drop a row from the historical master.
             missing_components = {"listing_id", "date"} - set(columns)
             if missing_components:
                 raise RuntimeError(
                     "Cannot safely repair null master identity keys; missing columns: "
                     + ", ".join(sorted(missing_components))
                 )
-            unrepairable = int(con.execute(f"""
-                SELECT COUNT(*)
+
+            def _source_text_expr(column: str) -> str:
+                return (
+                    f"NULLIF(TRIM(CAST({_quote_ident(column)} AS VARCHAR)), '')"
+                    if column in columns else "NULL::VARCHAR"
+                )
+
+            symbol_expr = _source_text_expr("symbol")
+            series_expr = _source_text_expr("series")
+            isin_expr = _source_text_expr("isin")
+            current_listing_expr = _source_text_expr("listing_id")
+            symbol_valid = (
+                f"({symbol_expr} IS NOT NULL AND "
+                f"UPPER({symbol_expr}) NOT IN ('NAN', 'NONE', '<NA>'))"
+            )
+            series_valid = (
+                f"({series_expr} IS NOT NULL AND "
+                f"UPPER({series_expr}) NOT IN ('NAN', 'NONE', '<NA>'))"
+            )
+            isin_valid = (
+                f"({isin_expr} IS NOT NULL AND "
+                f"UPPER({isin_expr}) NOT IN ('NAN', 'NONE', '<NA>'))"
+            )
+            derived_listing_expr = f"""
+                CASE
+                  WHEN {current_listing_expr} IS NOT NULL
+                       AND UPPER({current_listing_expr}) NOT IN ('NAN', 'NONE', '<NA>')
+                    THEN CAST({_quote_ident("listing_id")} AS VARCHAR)
+                  WHEN {symbol_valid} AND {series_valid} AND {isin_valid}
+                    THEN 'ISIN:' || UPPER({isin_expr})
+                         || '|SERIES:' || UPPER({series_expr})
+                         || '|SYMBOL:' || UPPER({symbol_expr})
+                  WHEN {symbol_valid} AND {series_valid}
+                    THEN 'SYMBOL:' || UPPER({symbol_expr})
+                         || '|SERIES:' || UPPER({series_expr})
+                  WHEN {symbol_valid} AND {isin_valid}
+                    THEN 'ISIN:' || UPPER({isin_expr})
+                         || '|SERIES:UNKNOWN|SYMBOL:' || UPPER({symbol_expr})
+                  ELSE NULL
+                END
+            """
+            con.execute(f"""
+                CREATE TEMP VIEW master_listing_repaired AS
+                SELECT * REPLACE (
+                    ({derived_listing_expr}) AS listing_id
+                )
                 FROM read_parquet({m_sql})
+            """)
+            con.execute("""
+                CREATE TEMP VIEW master_identity_repaired AS
+                SELECT * REPLACE (
+                    CASE
+                      WHEN row_identity_key IS NULL
+                           OR TRIM(CAST(row_identity_key AS VARCHAR)) = ''
+                           OR UPPER(TRIM(CAST(row_identity_key AS VARCHAR))) IN ('NAN', 'NONE', '<NA>')
+                        THEN CASE
+                          WHEN listing_id IS NOT NULL
+                               AND TRIM(CAST(listing_id AS VARCHAR)) <> ''
+                               AND TRY_CAST(date AS DATE) IS NOT NULL
+                            THEN CAST(listing_id AS VARCHAR)
+                                 || '|DATE:'
+                                 || strftime(TRY_CAST(date AS DATE), '%Y-%m-%d')
+                          ELSE NULL
+                        END
+                      ELSE CAST(row_identity_key AS VARCHAR)
+                    END AS row_identity_key
+                )
+                FROM master_listing_repaired
+            """)
+            unrepairable = int(con.execute("""
+                SELECT COUNT(*)
+                FROM master_identity_repaired
                 WHERE row_identity_key IS NULL
-                  AND (
-                    listing_id IS NULL
-                    OR TRIM(CAST(listing_id AS VARCHAR)) = ''
-                    OR TRY_CAST(date AS DATE) IS NULL
-                  )
+                  OR TRIM(CAST(row_identity_key AS VARCHAR)) = ''
+                  OR UPPER(TRIM(CAST(row_identity_key AS VARCHAR))) IN ('NAN', 'NONE', '<NA>')
             """).fetchone()[0])
             if unrepairable:
                 diagnostic_columns = [
@@ -339,35 +409,21 @@ def _merge_master(master: Path, incoming: Path, output: Path) -> dict[str, Any]:
                 diagnostic_projection = ", ".join(
                     (
                         f"CAST({_quote_ident(column)} AS VARCHAR) AS {_quote_ident(column)}"
-                        if column in columns
-                        else f"NULL::VARCHAR AS {_quote_ident(column)}"
+                        if column in columns else f"NULL::VARCHAR AS {_quote_ident(column)}"
                     )
                     for column in diagnostic_columns
                 )
                 sample = con.execute(f"""
                     SELECT {diagnostic_projection}
-                    FROM read_parquet({m_sql})
+                    FROM master_identity_repaired
                     WHERE row_identity_key IS NULL
                     LIMIT 3
                 """).fetchall()
                 raise RuntimeError(
                     "Cannot safely repair null master identity keys because "
-                    f"{unrepairable} row(s) lack listing_id or a valid date; "
+                    f"{unrepairable} row(s) lack listing_id or a valid date or derivable source identity; "
                     f"identity diagnostic sample={sample!r}; refusing to merge."
                 )
-            con.execute(f"""
-                CREATE TEMP VIEW master_identity_repaired AS
-                SELECT * REPLACE (
-                    CASE
-                      WHEN row_identity_key IS NULL THEN
-                        CAST(listing_id AS VARCHAR)
-                        || '|DATE:'
-                        || strftime(TRY_CAST(date AS DATE), '%Y-%m-%d')
-                      ELSE row_identity_key
-                    END AS row_identity_key
-                )
-                FROM read_parquet({m_sql})
-            """)
             master_relation = "master_identity_repaired"
 
         incoming_rows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet({i_sql})").fetchone()[0])

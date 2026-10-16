@@ -119,6 +119,48 @@ class IncrementalCashMasterMergeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "lack listing_id or a valid date"):
                 _merge_master(master, incoming, output)
 
+    def test_repairs_missing_listing_and_series_using_explicit_unknown_series(self):
+        with tempfile.TemporaryDirectory(prefix="cash-master-udiff-identity-repair-") as directory:
+            root = Path(directory)
+            master = root / "master.parquet"
+            incoming = root / "incoming.parquet"
+            output = root / "output.parquet"
+
+            # Reproduce the production failure: symbol, ISIN and date exist,
+            # but this historical STK row has no series/listing_id/identity key.
+            pd.DataFrame([
+                {
+                    "row_identity_key": None, "listing_id": None,
+                    "symbol": "910TCAP28", "series": None,
+                    "isin": "INE306N08292", "date": "2026-10-01",
+                    "instrument_id": "21225", "close": 100.0,
+                },
+            ]).to_parquet(master, index=False)
+            pd.DataFrame([
+                {
+                    "row_identity_key": "SYMBOL:BBB|SERIES:EQ|DATE:2026-10-02",
+                    "listing_id": "SYMBOL:BBB|SERIES:EQ", "symbol": "BBB",
+                    "series": "EQ", "date": "2026-10-02", "close": 200.0,
+                },
+            ]).to_parquet(incoming, index=False)
+
+            result = _merge_master(master, incoming, output)
+            merged = pd.read_parquet(output)
+            repaired = merged.loc[merged["symbol"] == "910TCAP28"].iloc[0]
+
+            self.assertEqual(result["repaired_null_master_identity_keys"], 1)
+            self.assertEqual(
+                repaired["listing_id"],
+                "ISIN:INE306N08292|SERIES:UNKNOWN|SYMBOL:910TCAP28",
+            )
+            self.assertEqual(
+                repaired["row_identity_key"],
+                "ISIN:INE306N08292|SERIES:UNKNOWN|SYMBOL:910TCAP28|DATE:2026-10-01",
+            )
+            stats = _master_stats(output)
+            self.assertEqual(stats["null_identity_key_rows"], 0)
+            self.assertEqual(stats["duplicate_identity_key_rows"], 0)
+
     def test_refresh_rejects_master_without_identity_key(self):
         with tempfile.TemporaryDirectory(prefix="cash-master-test-") as directory:
             root = Path(directory)

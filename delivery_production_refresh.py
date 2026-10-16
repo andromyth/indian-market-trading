@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, io, json, os, re
+import argparse, io, json, os, re, socket, time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import pandas as pd
@@ -47,30 +47,69 @@ def _store():
     from persistent_store import GoogleDriveStore
     return GoogleDriveStore()
 
-def _download_file(store, remote: str, local: Path) -> bool:
+def _is_retryable_download_error(exc: Exception) -> bool:
+    """Return true only for transient Drive/network failures worth retrying."""
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None) or getattr(exc, "status_code", None)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError, socket.timeout)):
+        return True
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return any(token in name or token in message for token in (
+        "timeout", "timed out", "connection reset", "connection aborted",
+        "temporarily unavailable", "incompleteread", "server disconnected",
+    ))
+
+
+def _download_file(store, remote: str, local: Path, retries: int = 4) -> bool:
+    """Download a Drive file atomically, retrying transient read failures."""
     parts = [p for p in remote.strip("/").split("/") if p]
-    parent = store.root_id
-    for part in parts[:-1]:
-        hit = store._find_child(parent, part)
-        if not hit:
-            return False
-        parent = hit["id"]
-    hit = store._find_child(parent, parts[-1])
-    if not hit:
+    if not parts:
         return False
     from googleapiclient.http import MediaIoBaseDownload
+
     local.parent.mkdir(parents=True, exist_ok=True)
     temp = local.with_suffix(local.suffix + ".tmp")
-    with temp.open("wb") as fh:
-        downloader = MediaIoBaseDownload(
-            fh,
-            store.service.files().get_media(fileId=hit["id"]),
-        )
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-    temp.replace(local)
-    return True
+    attempts = max(1, int(retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            parent = store.root_id
+            for part in parts[:-1]:
+                hit = store._find_child(parent, part)
+                if not hit:
+                    return False
+                parent = hit["id"]
+            hit = store._find_child(parent, parts[-1])
+            if not hit:
+                return False
+
+            temp.unlink(missing_ok=True)
+            with temp.open("wb") as fh:
+                downloader = MediaIoBaseDownload(
+                    fh,
+                    store.service.files().get_media(fileId=hit["id"]),
+                )
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            if temp.stat().st_size == 0:
+                raise RuntimeError(f"Drive download returned an empty file: {remote}")
+            temp.replace(local)
+            return True
+        except Exception as exc:
+            temp.unlink(missing_ok=True)
+            if attempt >= attempts or not _is_retryable_download_error(exc):
+                raise
+            delay = min(2 ** (attempt - 1), 8)
+            _stage(
+                f"DRIVE DOWNLOAD RETRY: path={remote}, "
+                f"attempt={attempt}/{attempts}, "
+                f"error={type(exc).__name__}: {exc}, sleep_seconds={delay}"
+            )
+            time.sleep(delay)
+    return False
 
 def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> None:
     if depth < 0: return
