@@ -1,8 +1,10 @@
 # Unattended intraday prediction service (Google Cloud Run)
 
-This deploys an unattended Cloud Run worker, so prediction continues when the Streamlit dashboard/browser is closed. It polls once per minute during the regular NSE cash session, refreshes the dynamic news-based watchlist every 15 minutes, uses completed one-minute bars, checks stock/benchmark freshness, calls the existing saved Beta V2 horizons, and writes an immutable minute-level snapshot containing observed prices and the predictions made at that time. The full daily prediction ledger and bar partitions are also synced to Google Drive.
+This private Cloud Run worker is scheduled once per minute during regular NSE cash-market hours. It retains the existing prediction engine, checks freshness, and writes prediction snapshots and daily ledgers to Google Drive.
 
-It deliberately scores the top five news-matched watchlist symbols by default, not the entire NSE universe each minute. The existing hourly full-universe ingestion workflow remains separate. No orders are placed.
+**Full-universe market observations are separate from forecasts.** Each tick also calls the read-only INDstocks full-quote endpoint in batches of up to 900 instruments and writes one Parquet row for every symbol in the official NSE equity universe, including explicit missing/unmapped quote rows. Minute snapshots are stored under `production_data/all_universe_minute_snapshots/YYYY/MM/DD/snapshot_YYYYMMDD_HHMM.parquet`; `latest_manifest.json` tracks expected/quoted/missing symbols, matched outcomes, and Drive persistence status. An actual forecast is attached only for symbols and horizons emitted by the existing model. The current forecast engine still focuses on its dynamic news-selected watchlist (five symbols by default); this change does not claim the locked classifier predicts all NSE stocks.
+
+INDstocks full quotes provide a **collector-time live price snapshot**, not an exchange-timestamped one-minute OHLCV candle. Outcome matches are therefore explicitly labelled as observed target-minute quote matches. For true exchange-stamped minute-bar evaluation, use a validated one-minute candle feed and retain its source timestamp. No orders are placed.
 
 ## Live website-news collection
 
@@ -46,13 +48,9 @@ The worker can use the OAuth user token for both Google Drive reads and writes. 
 
 The deployment preflight checks actual Google Drive read/write access and refuses to run if it fails. JSON formatting alone is not proof that the account can access the configured Drive folder.
 
-Optional broker credentials can be added to Secret Manager using these names to enable the authenticated INDstocks source:
-- indstocks-client-id
-- indstocks-mpin
-- indstocks-totp-secret
-- indstocks-access-token (manual token fallback)
+For the required full-universe minute-quote archive, provision **either** a valid `indstocks-access-token` secret (manual token, expires after 24 hours) **or all three** secrets `indstocks-client-id`, `indstocks-mpin` and `indstocks-totp-secret` for automatic read-only authentication. The deploy script maps these secrets into the Cloud Run worker when they exist. Without an available INDstocks authentication method, full-universe snapshots will be marked `BLOCKED_PROVIDER_CREDENTIALS` and the service health will be degraded; a collection attempt is not proof that Drive data was written.
 
-If optional broker secrets are absent, the worker still tries the configured NSE/historical fallbacks. Do not expose these values in terminal output.
+Do not expose these values in terminal output. Never paste credentials into GitHub source files or chat.
 
 ## 2. Deploy the worker
 
@@ -79,7 +77,11 @@ Open Google Cloud Console → **Cloud Run** → indian-market-intraday-worker �
 1. google_drive_preflight with configured=true, reachable=true, and write_ready=true.
 2. cloud_run_worker_loop_started.
 3. During an NSE session: minute_tick_started, stock_data_collected, intraday_prediction_completed, and cloud_run_tick_result.
-4. Every tick: minute_prediction_actual_snapshot_persisted with status OK and a path under production_data/intraday_minute_snapshots/YYYY/MM/DD/. Each snapshot contains the latest observed stock/benchmark prices and that minute's forecast rows.\n5. Every five cycles: drive_flush_completed with status OK and the daily prediction/bar partitions synced to Google Drive.\n6. After market close: the scheduled Autonomous intraday prediction-vs-actual audit validates matured forecasts and writes CSV/JSON reports under production_data/intraday_predictions/outcomes_audit/YYYY/MM/DD/.
+4. Every tick: `all_universe_capture_status=OK` plus a snapshot path under `production_data/all_universe_minute_snapshots/YYYY/MM/DD/`. Confirm `quoted_symbol_count` equals `expected_symbol_count`; `PARTIAL`, `PERSISTENCE_ERROR` or `BLOCKED_PROVIDER_CREDENTIALS` indicates incomplete coverage.
+5. Check `latest_manifest.json` and the snapshot Parquet row count for that minute. Rows whose quote status is not PASS are explicit gaps, not valid prices.
+6. The separate per-minute prediction snapshot remains under `production_data/intraday_minute_snapshots/YYYY/MM/DD/`; the forecast model itself is still watchlist scoped.
+7. After market close, review forecast outcome reports under `production_data/intraday_predictions/outcomes_audit/YYYY/MM/DD/`. Target-minute quote matches in the full-universe archive are not the same as exchange-stamped one-minute candle closes.
+
 
 A weekend, NSE holiday, pre-open or post-close log should show MARKET_CLOSED/no market data cycle. Stale/missing stock or benchmark candles cause the affected prediction to be withheld rather than guessed.
 
