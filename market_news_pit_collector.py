@@ -4,7 +4,7 @@
 The collector uses publisher RSS endpoints where available and publisher-filtered
 Google News RSS only where a direct feed is not dependable. It stores headline,
 short feed summary, source URL, publication time, first-seen time and sentiment;
-it does not scrape full articles or bypass paywalls. It never produces trade signals.
+it does not scrape full articles or bypass paywalls. It produces an explainable, non-tradable news-bias overlay, but never places orders or changes the locked production model's output.
 
 Outputs (local beneath --drive-root; uploaded to Google Drive when credentials exist):
   processed/live_news/website_news_articles_2026.parquet
@@ -703,7 +703,7 @@ def main() -> int:
         "retained_article_count": len(article_archive),
         "symbol_news_rows": len(pit),
         "matched_symbols": int(pit.loc[pit["symbol"].ne("MARKET"), "symbol"].nunique()) if not pit.empty else 0,
-        "sentiment_model": "VADER compound; metadata only until a news-augmented predictor is separately trained and validated",
+        "sentiment_model": "VADER plus explainable finance-cue classifier; NEWS_BUY_BIAS/NEWS_SELL_BIAS are heuristic overlays, not calibrated probabilities or order instructions",
         "nse_universe": universe_status,
         "drive_preflight": {
             key: drive_status.get(key) for key in (
