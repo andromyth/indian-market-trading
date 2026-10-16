@@ -92,6 +92,7 @@ jobs:
           rolling_daily_ohlc_audit.py
           autonomous_intraday_worker.py
           autonomous_intraday_worker_service.py
+          all_universe_minute_capture.py
           nse_intraday_all_universe_sync.py
           audit_autonomous_intraday_outcomes.py
 
@@ -127,6 +128,7 @@ jobs:
           tests/test_cross_sectional_daily_ohlc_audit.py
           tests/test_rolling_daily_ohlc_audit.py
           tests/test_autonomous_intraday_worker.py
+          tests/test_all_universe_minute_capture.py
           tests/test_intraday_bundle_cache.py
           tests/test_nse_eod_archive_presence.py
           tests/test_nse_eod_archive_audit.py
