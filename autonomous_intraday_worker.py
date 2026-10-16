@@ -552,26 +552,88 @@ class AutonomousIntradayWorker:
                 frame["news_source"] = "UNKNOWN"
             if "news_sentiment" not in frame:
                 frame["news_sentiment"] = np.nan
+            if "news_direction_score" not in frame:
+                frame["news_direction_score"] = frame["news_sentiment"]
+            if "event_impact_score" not in frame:
+                frame["event_impact_score"] = 0.25
+            if "news_source_weight" not in frame:
+                frame["news_source_weight"] = 0.5
             frame["news_article_count"] = pd.to_numeric(
                 frame["news_article_count"], errors="coerce"
             ).fillna(1)
             frame["news_sentiment"] = pd.to_numeric(frame["news_sentiment"], errors="coerce")
+            frame["news_direction_score"] = pd.to_numeric(frame["news_direction_score"], errors="coerce")
+            frame["event_impact_score"] = pd.to_numeric(
+                frame["event_impact_score"], errors="coerce"
+            ).fillna(0.25).clip(0.0, 1.0)
+            frame["news_source_weight"] = pd.to_numeric(
+                frame["news_source_weight"], errors="coerce"
+            ).fillna(0.5).clip(0.0, 1.0)
             self.news_context_by_symbol = {}
             if not frame.empty:
                 for symbol, group in frame.loc[frame["symbol"].ne("MARKET")].groupby("symbol"):
                     latest = group.sort_values("decision_timestamp").iloc[-1]
-                    source_values = {
+                    source_values_7d = {
                         publisher.strip()
                         for value in group["news_source"].dropna().astype(str)
                         for publisher in value.split(";") if publisher.strip()
                     }
+                    recent = group.loc[
+                        group["decision_timestamp"].ge(now_utc - pd.Timedelta(hours=24))
+                    ].copy()
+                    recent["age_hours"] = (
+                        now_utc - recent["decision_timestamp"]
+                    ).dt.total_seconds() / 3600.0
+                    recent = recent.loc[recent["age_hours"].between(0.0, 24.0)]
+                    if not recent.empty:
+                        weights = (
+                            recent["news_source_weight"]
+                            * (0.5 + 0.5 * recent["event_impact_score"])
+                            * np.exp(-recent["age_hours"] / 18.0)
+                        ).clip(lower=0.01)
+                        direction = recent["news_direction_score"].fillna(
+                            recent["news_sentiment"]
+                        ).fillna(0.0)
+                        weighted_score = float(np.average(direction, weights=weights))
+                        positive_weight = float(weights.loc[direction.gt(0.08)].sum())
+                        negative_weight = float(weights.loc[direction.lt(-0.08)].sum())
+                        total_weight = max(float(weights.sum()), 1e-9)
+                        directional_agreement = max(positive_weight, negative_weight) / total_weight
+                        max_impact = float(recent["event_impact_score"].max())
+                        source_values_24h = {
+                            publisher.strip()
+                            for value in recent["news_source"].dropna().astype(str)
+                            for publisher in value.split(";") if publisher.strip()
+                        }
+                        article_count_24h = int(recent["news_article_count"].sum())
+                    else:
+                        weighted_score = 0.0
+                        directional_agreement = 0.0
+                        max_impact = 0.0
+                        source_values_24h = set()
+                        article_count_24h = 0
                     sentiments = group["news_sentiment"].dropna()
+                    context_strength = float(np.clip(
+                        0.70 * abs(weighted_score)
+                        + 0.20 * max_impact
+                        + 0.10 * min(len(source_values_24h) / 3.0, 1.0),
+                        0.0, 1.0,
+                    ))
                     self.news_context_by_symbol[str(symbol)] = {
                         "scope": "SYMBOL",
                         "article_count_7d": int(group["news_article_count"].sum()),
-                        "source_count_7d": int(len(source_values)),
-                        "sources_7d": sorted(source_values)[:12],
+                        "article_count_24h": article_count_24h,
+                        "source_count_7d": int(len(source_values_7d)),
+                        "source_count_24h": int(len(source_values_24h)),
+                        "sources_7d": sorted(source_values_7d)[:12],
+                        "sources_24h": sorted(source_values_24h)[:12],
                         "mean_sentiment_7d": float(sentiments.mean()) if not sentiments.empty else None,
+                        "news_direction_score_24h": weighted_score,
+                        "news_directional_agreement_24h": float(directional_agreement),
+                        "news_event_impact_24h": max_impact,
+                        "news_signal_strength": context_strength,
+                        "news_signal": "NEWS_INSUFFICIENT_DATA",
+                        "news_signal_reason": "NEWS_SOURCE_STATUS_NOT_YET_CHECKED",
                         "latest_news_available_at_utc": latest["decision_timestamp"].isoformat(),
                         "latest_headline": str(latest.get("news_title") or "")[:500],
                         "latest_news_source": str(latest.get("news_source") or ""),
@@ -614,6 +676,36 @@ class AutonomousIntradayWorker:
                 self.news_context_status = "UNKNOWN"
             else:
                 self.news_context_status = "STALE_OR_PARTIAL"
+            for context in self.news_context_by_symbol.values():
+                score = float(context.get("news_direction_score_24h") or 0.0)
+                agreement = float(context.get("news_directional_agreement_24h") or 0.0)
+                count = int(context.get("article_count_24h") or 0)
+                source_count = int(context.get("source_count_24h") or 0)
+                impact = float(context.get("news_event_impact_24h") or 0.0)
+                if self.news_context_status != "FRESH":
+                    signal = "NEWS_INSUFFICIENT_DATA"
+                    reason = "NEWS_FEED_ARCHIVE_STALE_OR_PARTIAL"
+                elif count == 0:
+                    signal = "NEWS_INSUFFICIENT_DATA"
+                    reason = "NO_DIRECT_STOCK_NEWS_IN_LAST_24H"
+                elif abs(score) < 0.12:
+                    signal = "NEWS_NEUTRAL"
+                    reason = "RECENT_NEWS_HAS_NO_CLEAR_DIRECTIONAL_EDGE"
+                elif score >= 0.18 and agreement >= 0.60 and (
+                    source_count >= 2 or count >= 2 or impact >= 0.85
+                ):
+                    signal = "NEWS_BUY_BIAS"
+                    reason = "POSITIVE_FINANCIAL_NEWS_WITH_SUFFICIENT_SUPPORT"
+                elif score <= -0.18 and agreement >= 0.60 and (
+                    source_count >= 2 or count >= 2 or impact >= 0.85
+                ):
+                    signal = "NEWS_SELL_BIAS"
+                    reason = "NEGATIVE_FINANCIAL_NEWS_WITH_SUFFICIENT_SUPPORT"
+                else:
+                    signal = "NEWS_INSUFFICIENT_DATA"
+                    reason = "WEAK_OR_CONFLICTING_NEWS_EVIDENCE"
+                context["news_signal"] = signal
+                context["news_signal_reason"] = reason
             _log(
                 "website_news_context_refreshed",
                 status=self.news_context_status,
@@ -623,6 +715,12 @@ class AutonomousIntradayWorker:
                 manifest_age_minutes=age_minutes,
                 successful_feed_count=feed_successes,
                 collection_status=self.news_manifest.get("collection_status"),
+                signal_counts={
+                    status: sum(1 for value in self.news_context_by_symbol.values()
+                                if value.get("news_signal") == status)
+                    for status in ("NEWS_BUY_BIAS", "NEWS_SELL_BIAS",
+                                   "NEWS_NEUTRAL", "NEWS_INSUFFICIENT_DATA")
+                },
             )
         except Exception as exc:
             self.news_context_status = "ERROR"
@@ -632,13 +730,21 @@ class AutonomousIntradayWorker:
         symbol = str(symbol or "").strip().upper().replace(".NS", "").replace(".BO", "")
         context = self.news_context_by_symbol.get(symbol)
         if context:
-            return {**context, "context_status": self.news_context_status,
-                    "used_by_locked_intraday_classifier": False}
+            return {
+                **context,
+                "context_status": self.news_context_status,
+                "used_by_locked_intraday_classifier": False,
+                "signal_is_tradable": False,
+            }
         return {
             **(self.market_news_context or {"scope": "MARKET", "article_count_7d": 0}),
             "scope": "MARKET_FALLBACK",
+            "news_signal": "NEWS_INSUFFICIENT_DATA",
+            "news_signal_reason": "NO_DIRECT_STOCK_NEWS_MATCH",
+            "news_signal_strength": 0.0,
             "context_status": self.news_context_status,
             "used_by_locked_intraday_classifier": False,
+            "signal_is_tradable": False,
         }
 
     def _persist_minute_snapshot(
@@ -1007,6 +1113,14 @@ class AutonomousIntradayWorker:
                     else:
                         record["prediction_health_status"] = "PASS"
                         record["prediction_health_error"] = None
+                    news_context = self._news_context_for_symbol(root)
+                    record["website_news_context"] = news_context
+                    record["news_overlay_signal"] = news_context.get(
+                        "news_signal", "NEWS_INSUFFICIENT_DATA"
+                    )
+                    record["news_overlay_strength"] = news_context.get("news_signal_strength", 0.0)
+                    record["news_overlay_reason"] = news_context.get("news_signal_reason")
+                    record["news_overlay_only"] = True
                     prediction_rows.append(record)
                     snapshot["predictions"].append(record)
                     summary["predictions_written"] += 1
