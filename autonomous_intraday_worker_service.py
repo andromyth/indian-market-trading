@@ -73,6 +73,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             )
         elif capture_status == "OK":
             STATE["all_universe_capture_error"] = None
+            STATE["all_universe_capture_warning"] = None
         elif capture_status == "PARTIAL":
             STATE["all_universe_capture_warning"] = (
                 f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
