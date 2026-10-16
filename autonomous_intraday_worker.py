@@ -484,21 +484,27 @@ class AutonomousIntradayWorker:
         try:
             from persistent_store import GoogleDriveStore
             store = GoogleDriveStore()
-            pit_found = _download_drive_file_if_present(
+            _download_drive_file_if_present(
                 store, "processed/live_news/website_news_pit_2026.parquet", pit_path
             )
-            manifest_found = _download_drive_file_if_present(
+            _download_drive_file_if_present(
                 store, "processed/live_news/website_news_manifest_2026.json", manifest_path
             )
-            self.news_manifest = (
-                json.loads(manifest_path.read_text(encoding="utf-8"))
-                if manifest_found and manifest_path.exists() else {}
+            # Scrape and persist fresh headlines before this cycle builds any forecasts.
+            # The collector preserves the existing PIT archive and records source health.
+            from live_news_scraper import refresh_live_news_archive
+            universe = load_official_nse_universe(force_refresh=False)
+            self.news_manifest = refresh_live_news_archive(
+                universe=universe,
+                pit_path=pit_path,
+                manifest_path=manifest_path,
+                drive_store=store,
             )
-            if not pit_found or not pit_path.exists():
+            if not pit_path.exists():
                 self.news_context_status = "MISSING"
                 self.news_context_by_symbol = {}
                 self.market_news_context = {}
-                _log("website_news_context_unavailable", reason="PIT archive is not yet present in Google Drive")
+                _log("website_news_context_unavailable", reason="No PIT archive could be created from the current source results")
                 return
             frame = pd.read_parquet(pit_path)
             if frame.empty or "symbol" not in frame.columns or "decision_timestamp" not in frame.columns:
