@@ -525,16 +525,25 @@ def main() -> int:
     article_archive.to_parquet(articles_path, index=False)
     pit.to_parquet(pit_path, index=False)
 
-    successful = sum(source.get("status") == "PASS" for source in feed_status)
+    healthy_statuses = {"PASS", "NO_RECENT_ARTICLES"}
+    successful = sum(source.get("status") in healthy_statuses for source in feed_status)
     required = [source for source in feed_status if source.get("required")]
-    required_success = sum(source.get("status") == "PASS" for source in required)
+    required_success = sum(source.get("status") in healthy_statuses for source in required)
     manifest = {
         "schema_version": "website-market-news-pit-v1",
         "source": "publisher RSS / publisher-filtered Google News RSS; headline and summary only",
         "collection_status": (
-            "PASS" if successful >= MIN_HEALTHY_FEEDS and required_success >= 2 else "PARTIAL"
+            "PASS" if (
+                successful >= MIN_HEALTHY_FEEDS
+                and required_success >= 2
+                and universe_status.get("status") == "PASS"
+            ) else "PARTIAL"
         ),
-        "coverage_complete": bool(successful >= MIN_HEALTHY_FEEDS and required_success >= 2),
+        "coverage_complete": bool(
+            successful >= MIN_HEALTHY_FEEDS
+            and required_success >= 2
+            and universe_status.get("status") == "PASS"
+        ),
         "checked_at_utc": now_utc.isoformat(),
         "checked_at_ist": now.isoformat(),
         "coverage_start": str(pd.to_datetime(pit["decision_timestamp"], utc=True).min().date()) if not pit.empty else None,

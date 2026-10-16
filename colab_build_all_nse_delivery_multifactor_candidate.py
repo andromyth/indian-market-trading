@@ -1131,6 +1131,7 @@ def merge_optional(panel, source_cache=None):
     }
 
     news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
+    web_news_path = BASE / "processed/live_news/website_news_pit_2026.parquet"
     events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
     news = (
         source_cache.get("news", pd.DataFrame())
@@ -1140,11 +1141,56 @@ def merge_optional(panel, source_cache=None):
         source_cache.get("events", pd.DataFrame())
         if source_cache is not None else load_optional_layer(events_path)
     )
+    # Supplement official NSE announcements with point-in-time publisher headlines.
+    # Feed silence does not assert that all possible news is absent.
+    if source_cache is not None and "web_news" in source_cache:
+        web_news = source_cache.get("web_news", pd.DataFrame())
+    else:
+        web_news = load_optional_layer(web_news_path)
+    if web_news is None:
+        web_news = pd.DataFrame()
+    if not web_news.empty:
+        web_news = web_news.copy()
+        web_news["symbol"] = web_news["symbol"].map(normalize_symbol)
+        web_news["decision_timestamp"] = pd.to_datetime(
+            web_news["decision_timestamp"], errors="coerce", utc=True
+        ).astype("datetime64[ns, UTC]")
+        web_news = web_news.dropna(subset=["symbol", "decision_timestamp"])
+    if news is None or news.empty:
+        combined_news = web_news.copy()
+    elif web_news.empty:
+        combined_news = news.copy()
+    else:
+        combined_news = pd.concat([news, web_news], ignore_index=True, sort=False)
+    audit["website_market_news"] = {
+        "path": str(web_news_path),
+        "exists": bool(not web_news.empty),
+        "rows": int(len(web_news)),
+        "symbols": int(web_news["symbol"].nunique()) if not web_news.empty else 0,
+        "note": "news_available is part of the locked 59-feature Delivery model; sentiment remains auxiliary context.",
+    }
 
     # These flags mean "at least one announcement/event in the last 7 days",
     # not "this symbol ever had a row in the archive". Old news must expire.
     freshness = pd.Timedelta(days=7)
+    # Collapse simultaneous official/web items to one deterministic row per symbol/time.
+    news = combined_news.copy()
     if not news.empty and "news_available" in news.columns:
+        news["symbol"] = news["symbol"].map(normalize_symbol)
+        news["decision_timestamp"] = pd.to_datetime(
+            news["decision_timestamp"], errors="coerce", utc=True
+        ).astype("datetime64[ns, UTC]")
+        news = news.dropna(subset=["symbol", "decision_timestamp"])
+        if "news_source" not in news:
+            news["news_source"] = "UNKNOWN"
+        news = news.groupby(
+            ["symbol", "decision_timestamp"], as_index=False
+        ).agg(
+            news_available=("news_available", "max"),
+            news_source=("news_source", lambda values: ";".join(
+                sorted(set(str(v) for v in values if pd.notna(v) and str(v).strip()))[:8]
+            )),
+        )
         out = merge_pit_layer(out, news, ["news_available"], "news", max_age=freshness)
         audit["news"] = {
             "exists": True, "rows": int(len(news)),
@@ -1155,6 +1201,25 @@ def merge_optional(panel, source_cache=None):
         if "news_available" not in out.columns:
             out["news_available"] = np.nan
         audit["news"] = {"exists": False, "rows": 0, "freshness_days": 7}
+
+    # Auxiliary sentiment/counts are persisted with the assembled panel for
+    # audit and future research, but are not supplied to the locked classifier.
+    news_context_cols = [
+        c for c in (
+            "news_sentiment", "news_article_count", "news_source_count",
+            "news_source_weight",
+        ) if c in web_news.columns
+    ] if not web_news.empty else []
+    if news_context_cols:
+        context = web_news[["symbol", "decision_timestamp"] + news_context_cols].copy()
+        for col in news_context_cols:
+            context[col] = pd.to_numeric(context[col], errors="coerce")
+        context = context.groupby(
+            ["symbol", "decision_timestamp"], as_index=False
+        ).mean(numeric_only=True)
+        out = merge_pit_layer(
+            out, context, news_context_cols, "web_news_context", max_age=freshness
+        )
 
     # The base panel does not necessarily contain this optional flag.
     # Create an explicitly unknown column before combining the separate
@@ -1733,6 +1798,7 @@ def _load_panel_source_cache() -> dict:
     """Load the smaller optional PIT layers once per panel process, not once per symbol batch."""
     fno_path = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
     news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
+    web_news_path = BASE / "processed/live_news/website_news_pit_2026.parquet"
     events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
     manifest_path = (
         BASE / "processed/pit_replay/nse_all_universe_raw_2026/"
@@ -1743,6 +1809,7 @@ def _load_panel_source_cache() -> dict:
     cache = {
         "fno": pd.read_parquet(fno_path) if fno_path.exists() and fno_path.stat().st_size else pd.DataFrame(),
         "news": load_optional_layer(news_path),
+        "web_news": load_optional_layer(web_news_path),
         "events": load_optional_layer(events_path),
         "fundamentals": pd.read_parquet(fundamentals_path) if fundamentals_path.exists() and fundamentals_path.stat().st_size else pd.DataFrame(),
         "fundamentals_path": str(fundamentals_path),
@@ -1753,7 +1820,8 @@ def _load_panel_source_cache() -> dict:
     print(
         "Optional PIT source cache: "
         f"F&O rows={len(cache['fno']):,}; news rows={len(cache['news']):,}; "
-        f"event rows={len(cache['events']):,}; fundamental rows={len(cache['fundamentals']):,}; "
+        f"website-news rows={len(cache['web_news']):,}; event rows={len(cache['events']):,}; "
+        f"fundamental rows={len(cache['fundamentals']):,}; "
         f"filing-index rows={len(cache['fundamental_availability']):,}",
         flush=True,
     )

@@ -416,6 +416,11 @@ class AutonomousIntradayWorker:
         self.last_tick_key: str | None = None
         self.last_minute_snapshot_rows: list[dict[str, Any]] = []
         self._hydrated_ledger_day: str | None = None
+        self.last_news_context_refresh = 0.0
+        self.news_context_by_symbol: dict[str, dict[str, Any]] = {}
+        self.market_news_context: dict[str, Any] = {}
+        self.news_manifest: dict[str, Any] = {}
+        self.news_context_status = "UNKNOWN"
 
     def _ensure_paths(self, now: pd.Timestamp) -> None:
         d = now.tz_convert(IST)
@@ -464,6 +469,149 @@ class AutonomousIntradayWorker:
                 if self.daily_ledger.is_file() else 0
             ),
         )
+
+    def _refresh_news_context_if_due(self, force: bool = False) -> None:
+        """Refresh the publisher-news PIT archive from Google Drive every 15 minutes."""
+        monotonic_now = time_module.monotonic()
+        if not force and self.last_news_context_refresh and (
+            monotonic_now - self.last_news_context_refresh < 15 * 60
+        ):
+            return
+        self.last_news_context_refresh = monotonic_now
+        cache_dir = self.root / "news_cache"
+        pit_path = cache_dir / "website_news_pit_2026.parquet"
+        manifest_path = cache_dir / "website_news_manifest_2026.json"
+        try:
+            from persistent_store import GoogleDriveStore
+            store = GoogleDriveStore()
+            pit_found = _download_drive_file_if_present(
+                store, "processed/live_news/website_news_pit_2026.parquet", pit_path
+            )
+            manifest_found = _download_drive_file_if_present(
+                store, "processed/live_news/website_news_manifest_2026.json", manifest_path
+            )
+            self.news_manifest = (
+                json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest_found and manifest_path.exists() else {}
+            )
+            if not pit_found or not pit_path.exists():
+                self.news_context_status = "MISSING"
+                self.news_context_by_symbol = {}
+                self.market_news_context = {}
+                _log("website_news_context_unavailable", reason="PIT archive is not yet present in Google Drive")
+                return
+            frame = pd.read_parquet(pit_path)
+            if frame.empty or "symbol" not in frame.columns or "decision_timestamp" not in frame.columns:
+                self.news_context_status = "EMPTY_OR_INVALID"
+                self.news_context_by_symbol = {}
+                self.market_news_context = {}
+                _log("website_news_context_unavailable", reason="PIT archive schema is empty or invalid")
+                return
+            frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+            frame["decision_timestamp"] = pd.to_datetime(
+                frame["decision_timestamp"], errors="coerce", utc=True
+            )
+            now_utc = pd.Timestamp.now(tz="UTC")
+            cutoff = now_utc - pd.Timedelta(days=7)
+            frame = frame.dropna(subset=["decision_timestamp"])
+            frame = frame.loc[
+                frame["decision_timestamp"].le(now_utc)
+                & frame["decision_timestamp"].ge(cutoff)
+            ].copy()
+            if "news_article_count" not in frame:
+                frame["news_article_count"] = 1
+            if "news_source" not in frame:
+                frame["news_source"] = "UNKNOWN"
+            if "news_sentiment" not in frame:
+                frame["news_sentiment"] = np.nan
+            frame["news_article_count"] = pd.to_numeric(
+                frame["news_article_count"], errors="coerce"
+            ).fillna(1)
+            frame["news_sentiment"] = pd.to_numeric(frame["news_sentiment"], errors="coerce")
+            self.news_context_by_symbol = {}
+            if not frame.empty:
+                for symbol, group in frame.loc[frame["symbol"].ne("MARKET")].groupby("symbol"):
+                    latest = group.sort_values("decision_timestamp").iloc[-1]
+                    source_values = {
+                        publisher.strip()
+                        for value in group["news_source"].dropna().astype(str)
+                        for publisher in value.split(";") if publisher.strip()
+                    }
+                    sentiments = group["news_sentiment"].dropna()
+                    self.news_context_by_symbol[str(symbol)] = {
+                        "scope": "SYMBOL",
+                        "article_count_7d": int(group["news_article_count"].sum()),
+                        "source_count_7d": int(len(source_values)),
+                        "sources_7d": sorted(source_values)[:12],
+                        "mean_sentiment_7d": float(sentiments.mean()) if not sentiments.empty else None,
+                        "latest_news_available_at_utc": latest["decision_timestamp"].isoformat(),
+                        "latest_headline": str(latest.get("news_title") or "")[:500],
+                        "latest_news_source": str(latest.get("news_source") or ""),
+                    }
+            market_rows = frame.loc[frame["symbol"].eq("MARKET")]
+            if market_rows.empty:
+                market_rows = frame
+            market_sentiment = market_rows["news_sentiment"].dropna()
+            market_sources = {
+                publisher.strip()
+                for value in market_rows["news_source"].dropna().astype(str)
+                for publisher in value.split(";") if publisher.strip()
+            }
+            latest_market = (
+                market_rows.sort_values("decision_timestamp").iloc[-1]
+                if not market_rows.empty else None
+            )
+            self.market_news_context = {
+                "scope": "MARKET",
+                "article_count_7d": int(market_rows["news_article_count"].sum()),
+                "source_count_7d": int(len(market_sources)),
+                "sources_7d": sorted(market_sources)[:12],
+                "mean_sentiment_7d": float(market_sentiment.mean()) if not market_sentiment.empty else None,
+                "latest_news_available_at_utc": (
+                    pd.Timestamp(latest_market["decision_timestamp"]).isoformat()
+                    if latest_market is not None else None
+                ),
+                "latest_headline": str(latest_market.get("news_title") or "")[:500] if latest_market is not None else "",
+                "latest_news_source": str(latest_market.get("news_source") or "") if latest_market is not None else "",
+            }
+            checked_at = pd.to_datetime(self.news_manifest.get("checked_at_utc"), errors="coerce", utc=True)
+            age_minutes = (
+                float((now_utc - checked_at).total_seconds() / 60.0)
+                if pd.notna(checked_at) else None
+            )
+            feed_successes = int(self.news_manifest.get("successful_feed_count", 0) or 0)
+            if self.news_manifest.get("collection_status") == "PASS" and age_minutes is not None and 0 <= age_minutes <= 45 and feed_successes >= 3:
+                self.news_context_status = "FRESH"
+            elif age_minutes is None:
+                self.news_context_status = "UNKNOWN"
+            else:
+                self.news_context_status = "STALE_OR_PARTIAL"
+            _log(
+                "website_news_context_refreshed",
+                status=self.news_context_status,
+                pit_rows=len(frame),
+                symbol_contexts=len(self.news_context_by_symbol),
+                checked_at_utc=self.news_manifest.get("checked_at_utc"),
+                manifest_age_minutes=age_minutes,
+                successful_feed_count=feed_successes,
+                collection_status=self.news_manifest.get("collection_status"),
+            )
+        except Exception as exc:
+            self.news_context_status = "ERROR"
+            _log("website_news_context_refresh_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _news_context_for_symbol(self, symbol: str) -> dict[str, Any]:
+        symbol = str(symbol or "").strip().upper().replace(".NS", "").replace(".BO", "")
+        context = self.news_context_by_symbol.get(symbol)
+        if context:
+            return {**context, "context_status": self.news_context_status,
+                    "used_by_locked_intraday_classifier": False}
+        return {
+            **(self.market_news_context or {"scope": "MARKET", "article_count_7d": 0}),
+            "scope": "MARKET_FALLBACK",
+            "context_status": self.news_context_status,
+            "used_by_locked_intraday_classifier": False,
+        }
 
     def _persist_minute_snapshot(
         self, now: pd.Timestamp, tick_result: dict[str, Any]
@@ -583,12 +731,15 @@ class AutonomousIntradayWorker:
         now = pd.Timestamp.now(tz=IST)
         self.last_minute_snapshot_rows = []
         self._refresh_watchlist_if_due()
+        self._refresh_news_context_if_due()
         summary = {
             "cycle": self.cycle_count,
             "observed_at_utc": now.tz_convert("UTC").isoformat(),
             "observed_at_ist": now.isoformat(),
             "watchlist_symbols": list(self.symbols),
             "watchlist_status": self.watchlist_meta.get("status"),
+            "news_context_status": self.news_context_status,
+            "news_context_checked_at_utc": self.news_manifest.get("checked_at_utc"),
             "stock_fetch_ok": 0,
             "stock_fetch_errors": 0,
             "fresh_benchmark_count": 0,
@@ -704,6 +855,7 @@ class AutonomousIntradayWorker:
                     "status_reason": None if fresh and benchmark_data else (
                         "STALE_STOCK_CANDLE" if not fresh else "FRESH_BENCHMARK_UNAVAILABLE"
                     ),
+                    "website_news_context": self._news_context_for_symbol(root),
                     "predictions": [],
                 }
                 snapshot_rows.append(snapshot)
@@ -808,6 +960,7 @@ class AutonomousIntradayWorker:
                         ),
                         "actual_horizon_close": None,
                         "actual_horizon_timestamp_utc": None,
+                        "website_news_context": self._news_context_for_symbol(root),
                     }
                     if prediction_failure:
                         record["prediction_health_status"] = "BLOCKED"

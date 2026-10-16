@@ -36,6 +36,7 @@ jobs:
           nse_eod_archive_audit.py
           data_fetcher.py
           market_watchlist.py
+          market_news_pit_collector.py
           indstocks_client.py
           indstocks_smoke_test.py
           google_drive_oauth_login.py
@@ -140,6 +141,7 @@ jobs:
           tests/test_delivery_policy_active_model_filter.py
           tests/test_intraday_multihorizon_validation.py
           tests/test_market_watchlist.py
+          tests/test_market_news_pit_collector.py
           tests/test_live_signal_guards.py
           tests/test_live_accuracy_audit_inputs.py
           tests/test_strict_delivery_walkforward.py
