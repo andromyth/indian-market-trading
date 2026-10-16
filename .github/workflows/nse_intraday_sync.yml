@@ -15,7 +15,8 @@ on:
   # regular cash session. Persisted 1-minute data is then available to the
   # live 5-minute prediction engine without a manual Colab run.
   # 09:15, 10:15, ... 15:15 IST = 03:45, 04:45, ... 09:45 UTC.
-  # Cron schedule paused at user request; manual workflow_dispatch remains available.
+  schedule:
+    - cron: '45 3-9 * * 1-5'
 concurrency:
   group: nse-all-universe-intraday
   cancel-in-progress: false
