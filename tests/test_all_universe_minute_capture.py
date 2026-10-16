@@ -140,6 +140,16 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
         "snapshot_20261016_1005.parquet"
     )
     uploaded = next(item for item in fake_store.uploads if item["remote_path"] == remote_snapshot)
+    assert any(
+        item["remote_path"]
+        == "production_data/all_universe_minute_snapshots/2026/10/16/manifest_20261016_1005.json"
+        for item in fake_store.uploads
+    )
+    assert any(
+        item["remote_path"]
+        == "production_data/all_universe_minute_snapshots/latest_manifest.json"
+        for item in fake_store.uploads
+    )
     local_parquet = tmp_path / "copy.parquet"
     local_parquet.write_bytes(uploaded["bytes"])
     frame = pd.read_parquet(local_parquet).set_index("symbol")
