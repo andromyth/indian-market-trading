@@ -93,6 +93,8 @@ jobs:
           autonomous_intraday_worker.py
           autonomous_intraday_worker_service.py
           prediction_learning_engine.py
+          calibration_autopilot.py
+          calibration_overlay.py
           all_universe_minute_capture.py
           audit_all_universe_minute_snapshots.py
           nse_intraday_all_universe_sync.py
@@ -100,6 +102,21 @@ jobs:
 
       - name: Validate Cloud Run deployment script syntax
         run: bash -n deploy_autonomous_intraday_cloud_run.sh
+
+      - name: Verify calibration files use ASCII-only source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          paths = [
+              Path("calibration_autopilot.py"),
+              Path("calibration_overlay.py"),
+              Path("tests/test_calibration_autopilot.py"),
+              Path("CALIBRATION_AUTOPILOT.md"),
+          ]
+          bad = [(str(p), ch) for p in paths for ch in p.read_text(encoding="utf-8") if ch in "\u2013\u2014"]
+          if bad:
+              raise SystemExit(f"Non-ASCII dash found in touched file: {bad[0]}")
+          PY
 
       - name: Build Cloud Run worker container
         run: docker build --tag indian-market-intraday-worker:ci .
@@ -131,6 +148,7 @@ jobs:
           tests/test_rolling_daily_ohlc_audit.py
           tests/test_autonomous_intraday_worker.py
           tests/test_prediction_learning_engine.py
+          tests/test_calibration_autopilot.py
           tests/test_all_universe_minute_capture.py
           tests/test_all_universe_minute_audit.py
           tests/test_intraday_bundle_cache.py
