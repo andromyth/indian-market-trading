@@ -26,6 +26,7 @@ import pandas as pd
 from market_session_guard import CLOSE, OPEN, is_nse_trading_day
 from delivery_training_universe import benchmark_for_symbol, load_official_nse_universe
 from market_watchlist import build_stock_watchlist, fetch_watchlist_articles
+import calibration_overlay as calibration_overlay_module
 
 IST = ZoneInfo("Asia/Kolkata")
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -426,6 +427,37 @@ class AutonomousIntradayWorker:
         self.market_news_context: dict[str, Any] = {}
         self.news_manifest: dict[str, Any] = {}
         self.news_context_status = "UNKNOWN"
+        self._calibration = None
+        self._calibration_init_error_logged = False
+
+    def _apply_calibration(self, rows: list[dict]) -> list[dict]:
+        """Apply the optional fail-open calibration overlay to a batch of forecasts."""
+        mode = calibration_overlay_module.resolve_mode(os.getenv("PREDICTION_CALIBRATION_MODE", "shadow"))
+        if mode == "off" or not rows:
+            return rows
+        try:
+            if self._calibration is None:
+                def load_profile_document():
+                    from persistent_store import GoogleDriveStore
+
+                    store = GoogleDriveStore()
+                    remote = "production_data/intraday_predictions/learning/calibration/active_calibration_profile.json"
+                    local = self.root / "calibration" / "active_calibration_profile.json"
+                    if not _download_drive_file_if_present(store, remote, local):
+                        return None
+                    return json.loads(local.read_text(encoding="utf-8"))
+
+                self._calibration = calibration_overlay_module.CalibrationOverlay(
+                    load_profile_document, mode=mode, refresh_seconds=900
+                )
+            else:
+                self._calibration.mode = mode
+            return [self._calibration.annotate(row) for row in rows]
+        except Exception as exc:
+            if not self._calibration_init_error_logged:
+                _log("calibration_overlay_unavailable", error=f"{type(exc).__name__}: {exc}", fail_open=True)
+                self._calibration_init_error_logged = True
+            return rows
 
     def _ensure_paths(self, now: pd.Timestamp) -> None:
         d = now.tz_convert(IST)
@@ -1052,6 +1084,7 @@ class AutonomousIntradayWorker:
                     market_frames[benchmark][0],
                     decision_interval_minutes=1,
                 )
+                predictions = self._apply_calibration(predictions)
                 if not predictions:
                     empty_error = {
                         "symbol": root,
