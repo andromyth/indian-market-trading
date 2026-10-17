@@ -2,9 +2,8 @@ name: Self-driving daily cycle (global cues, news archive, predict, validate)
 
 on:
   workflow_dispatch:
-  # 20:00 IST on weekdays, after the EOD, F&O and news/events syncs.
-  schedule:
-    - cron: '30 14 * * 1-5'
+  # Legacy V1 research cycle stays available on demand. Beta V2 is the scheduled
+  # shadow-model cycle; the active production Delivery model is independent.
 jobs:
   cycle:
     runs-on: ubuntu-latest
