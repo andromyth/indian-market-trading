@@ -12,7 +12,7 @@ It never edits the underlying model artifact and never places orders. The overla
 | `calibration_overlay.py` | Worker-side overlay; loads active profile document and annotates or applies each forecast row. |
 | `prediction_learning_engine.py` | Scores matured outcomes on the raw forecast, runs the autopilot, and persists registry and profile documents. |
 | `autonomous_intraday_worker.py` | Calls the overlay after raw inference; failures do not block raw forecasts. |
-| `tests/test_calibration_autopilot.py` | Regression tests covering fitting, lifecycle, overlay, persistence, engine integration, and worker integration. |
+| `tests/test_calibration_autopilot.py` | 35 regression tests covering fitting, lifecycle, overlay, persistence, engine integration, and worker integration. |
 
 ## Lifecycle
 
