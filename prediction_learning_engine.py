@@ -36,11 +36,25 @@ from audit_autonomous_intraday_outcomes import (
 
 IST = ZoneInfo("Asia/Kolkata")
 LEARNING_ROOT = f"{WORKER_LEDGER_ROOT}/learning"
+CALIBRATION_REMOTE_DIR = f"{LEARNING_ROOT}/calibration"
+REGISTRY_NAME = "calibration_registry.json"
+ACTIVE_PROFILE_NAME = "active_calibration_profile.json"
+AUTOPILOT_FAILURE_STATUSES = {"STATE_LOAD_FAILED", "UPLOAD_FAILED"}
 MIN_GROUP_SAMPLES = 25
 MIN_CALIBRATION_TRAIN = 200
 MIN_CALIBRATION_TEST = 60
 MIN_RETURN_TRAIN = 200
 MIN_RETURN_TEST = 60
+
+
+def raw_forecast_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy whose scored fields always refer to the original raw forecast."""
+    view = dict(record)
+    for field in ("probability_up", "signal", "expected_return", "predicted_price"):
+        raw_key = f"{field}_raw"
+        if raw_key in record and record[raw_key] is not None:
+            view[field] = record[raw_key]
+    return view
 
 
 def _num(value: Any) -> float:
@@ -607,6 +621,7 @@ def _build_outcomes(store: Any, records: list[tuple[str, dict[str, Any]]]) -> tu
     rows: list[dict[str, Any]] = []
     load_errors: list[str] = []
     for record in deduped:
+        record = raw_forecast_view(record)
         identity = forecast_identity(record)
         ledger_date = ledger_date_by_identity.get(identity)
         if not ledger_date:
@@ -654,9 +669,15 @@ def _build_outcomes(store: Any, records: list[tuple[str, dict[str, Any]]]) -> tu
             "benchmark_symbol": str(record.get("benchmark_symbol") or "UNKNOWN"),
             "signal": str(record.get("signal") or "UNKNOWN").upper(),
             "probability_up": _num(record.get("probability_up")),
+            "probability_up_calibrated": _num(record.get("probability_up_calibrated")),
+            "calibration_profile_id": record.get("calibration_profile_id"),
+            "calibration_stage": record.get("calibration_stage"),
+            "calibration_applied": bool(record.get("calibration_applied", False)),
             "confidence": str(record.get("confidence") or "UNKNOWN"),
             "expected_return": _num(record.get("expected_return")),
+            "expected_return_calibrated": _num(record.get("expected_return_calibrated")),
             "predicted_price": _num(record.get("predicted_price")),
+            "predicted_price_calibrated": _num(record.get("predicted_price_calibrated")),
             "feature_coverage": _num(record.get("feature_coverage")),
             "active_model_feature_count": _num(record.get("active_model_feature_count")),
             "missing_model_features_count": len(missing_features) if isinstance(missing_features, list) else np.nan,
@@ -686,6 +707,88 @@ def _build_outcomes(store: Any, records: list[tuple[str, dict[str, Any]]]) -> tu
         "bar_partition_cache_entries": len(bar_cache),
         "bar_load_errors": load_errors,
     }
+
+
+def _run_calibration_autopilot(store: Any, frame: pd.DataFrame | None, output_dir: str | Path) -> dict[str, Any]:
+    """Fit, gate and persist reviewable calibration state without touching model artifacts.
+
+    A malformed or unreadable remote registry is never replaced with empty state.
+    Local mode is used when store is None, which makes this function testable offline.
+    """
+    from calibration_autopilot import (
+        ACTIVE_PROFILE_NAME as AP_ACTIVE_NAME,
+        REGISTRY_NAME as AP_REGISTRY_NAME,
+        AutopilotStateError,
+        load_state,
+        new_state,
+        run_autopilot,
+    )
+
+    local_dir = Path(output_dir) / "calibration"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    registry_path = local_dir / AP_REGISTRY_NAME
+    active_path = local_dir / AP_ACTIVE_NAME
+    report_path = local_dir / "calibration_autopilot_report.json"
+    remote_registry = f"{CALIBRATION_REMOTE_DIR}/{AP_REGISTRY_NAME}"
+    remote_active = f"{CALIBRATION_REMOTE_DIR}/{AP_ACTIVE_NAME}"
+
+    try:
+        if store is None:
+            payload = registry_path.read_bytes() if registry_path.exists() else None
+        else:
+            payload = _download_drive_bytes(store, remote_registry)
+        state = load_state(payload)
+    except Exception as exc:
+        result = {
+            "status": "STATE_LOAD_FAILED",
+            "registry_overwritten": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        report_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+        return result
+
+    try:
+        new_state_value, active_doc, report = run_autopilot(frame, state)
+        registry_path.write_text(json.dumps(new_state_value, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        active_path.write_text(json.dumps(active_doc, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    except Exception as exc:
+        result = {"status": "AUTOPILOT_RUN_FAILED", "registry_overwritten": False,
+                  "error": f"{type(exc).__name__}: {exc}"}
+        report_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+        return result
+
+    registry_overwritten = True
+    uploads = {}
+    if store is not None:
+        # Upload the registry only after its previous version was read successfully.
+        # The active document is uploaded second and can be regenerated from the registry.
+        for key, path, remote in (
+            ("registry", registry_path, remote_registry),
+            ("active_profile", active_path, remote_active),
+        ):
+            try:
+                response = store.upload_or_update(path, remote, mime_type="application/json")
+            except Exception as exc:
+                response = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+            uploads[key] = response
+            if response.get("status") != "OK":
+                result = {"status": "UPLOAD_FAILED", "registry_overwritten": key == "active_profile",
+                          "failed_item": key, "uploads": uploads, "report": report}
+                report_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str), encoding="utf-8")
+                return result
+    status = "NO_MATURED_OUTCOMES" if report.get("status") == "NO_MATURED_OUTCOMES" else "COMPLETED"
+    result = {
+        "status": status,
+        "registry_overwritten": registry_overwritten,
+        "profiles_live": len(active_doc.get("profiles", [])),
+        "keys_evaluated": report.get("summary", {}).get("keys_evaluated", 0),
+        "local_registry_path": str(registry_path),
+        "local_active_profile_path": str(active_path),
+        "uploads": uploads,
+    }
+    report_path.write_text(json.dumps({"result": result, "report": report}, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return result
 
 
 def _json_safe(value: Any) -> Any:
@@ -918,6 +1021,10 @@ def run_learning(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    calibration_result = _run_calibration_autopilot(store, frame, out_dir)
+    report["calibration_autopilot"] = calibration_result
+    if calibration_result.get("status") in AUTOPILOT_FAILURE_STATUSES | {"AUTOPILOT_RUN_FAILED"}:
+        report["status"] = "CALIBRATION_AUTOPILOT_FAILED"
     tag = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}_{segment}"
     outcomes_path = out_dir / f"learning_outcomes_{tag}.csv"
     groups_path = out_dir / f"learning_slices_{tag}.csv"
@@ -1018,6 +1125,8 @@ def main() -> int:
     )
     print(json.dumps(_json_safe(result), indent=2, sort_keys=True, default=str))
     if args.strict and result.get("status") != "COMPLETED":
+        return 2
+    if result.get("calibration_autopilot", {}).get("status") in AUTOPILOT_FAILURE_STATUSES | {"AUTOPILOT_RUN_FAILED"}:
         return 2
     return 0 if result.get("status") in {"COMPLETED", "NO_MATURED_OUTCOMES", "NO_OUTCOME_ROWS"} else 2
 
