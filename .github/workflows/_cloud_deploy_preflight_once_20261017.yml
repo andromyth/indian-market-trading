@@ -33,9 +33,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gcloud run services describe indian-market-intraday-worker \
-            --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/service.json
-          python - <<'PY'
+          if gcloud run services describe indian-market-intraday-worker \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/service.json; then
+            python - <<'PY'
           import json
           s = json.load(open("/tmp/service.json", encoding="utf-8"))
           print("CLOUD_RUN_SERVICE")
@@ -53,6 +53,9 @@ jobs:
               "calibrationMode": next((e.get("value") for e in s.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [{}])[0].get("env", []) if e.get("name") == "PREDICTION_CALIBRATION_MODE"), "(unset; code default applies)")
           }, indent=2))
           PY
+          else
+            echo "CLOUD_RUN_SERVICE=unavailable_to_GitHub_service_account (run.services.get denied)"
+          fi
           gcloud scheduler jobs list --project="$PROJECT_ID" --location="$REGION" --format=json > /tmp/jobs.json
           python - <<'PY'
           import json
