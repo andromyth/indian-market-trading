@@ -325,7 +325,7 @@ def prepare_fit_frame(group: pd.DataFrame, rules: Rules) -> tuple[pd.DataFrame, 
     stale_n = int(stale.sum())
     x = x.loc[~stale].copy()
     x["y"] = (x["ret"] > 0).astype(float)
-    return x.reset_index(drop=True), {"rows_in": int(rows_in), "rows_after_validity": int(rows_in - int((~(x.index.isin([]))).sum()) if False else len(x) + stale_n), "stale_input_rows_excluded": stale_n, "rows_used": int(len(x)), "sessions_used": int(x["session_date"].nunique())}
+    return x.reset_index(drop=True), {"rows_in": int(rows_in), "rows_after_validity": int(len(x) + stale_n), "stale_input_rows_excluded": stale_n, "rows_used": int(len(x)), "sessions_used": int(x["session_date"].nunique())}
 
 
 def rolling_origin_folds(dates: Any, rules: Rules) -> list[tuple[list[str], list[str]]]:
