@@ -1,13 +1,12 @@
 name: NSE Delivery production cycle
 
 on:
-  # A change to the autonomous production-refresh path should run through the
-  # real data path immediately, rather than waiting for the evening schedule.
+  # Implementation changes to the production refresh run the end-to-end data path.
+  # Schedule-only edits do not launch an unnecessary full refresh.
   push:
     branches:
       - main
     paths:
-      - ".github/workflows/nse_delivery_production_cycle.yml"
       - "backfill_missing_delivery_pit_snapshots.py"
       - "delivery_production_refresh.py"
       - "nse_bulk_eod_ingest.py"
@@ -36,15 +35,14 @@ on:
         description: 'Optional NSE production session date YYYY-MM-DD'
         required: false
         default: ''
-  # Post-market retries, followed by early-morning retries. GitHub cron is UTC:
-  # 20:45-23:45 IST = 15:15-18:15 UTC (weekdays).
-  # 00:45-04:45 IST = 19:15-23:15 UTC (Sunday-Thursday UTC).
-  # 05:45-06:45 IST = 00:15-01:15 UTC (weekdays).
-  # The script's NSE-session/holiday guard decides whether a session is valid.
+  # Three freshness-gated full production checkpoints in Asia/Kolkata:
+  # 21:45 IST = 16:15 UTC (Mon-Fri); 01:45 IST = 20:15 UTC (Sun-Thu);
+  # 06:45 IST = 01:15 UTC (Mon-Fri). Cron days are UTC; session/holiday guards
+  # keep the batch pinned to the latest completed NSE session.
   schedule:
-    - cron: "15 15-18 * * 1-5"
-    - cron: "15 19-23 * * 0-4"
-    - cron: "15 0-1 * * 1-5"
+    - cron: "15 16 * * 1-5"
+    - cron: "15 20 * * 0-4"
+    - cron: "15 1 * * 1-5"
 # Prevent overlapping production refreshes while never cancelling a scheduled
 # retry. A normal run is ~5-6 minutes, well below the hourly cadence.
 concurrency:
