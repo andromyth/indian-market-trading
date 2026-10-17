@@ -32,33 +32,52 @@ RANK_SOURCE = ["ret_1", "ret_3", "ret_6", "ret_12", "ret_24", "volume_ratio", "d
 
 
 def ensure_delivery_targets(panel: pd.DataFrame) -> pd.DataFrame:
-    """Create causal next-session return labels from symbol/date/close when absent."""
+    """Create causal next-session labels when the panel does not provide y_return.
+
+    A trusted upstream y_return is sufficient for training; in that case the
+    close column is not required. If labels must be constructed locally, close
+    prices are required and the label uses the next observed session for each
+    symbol only.
+    """
     x = panel.copy()
-    if "symbol" not in x.columns or "date" not in x.columns or "close" not in x.columns:
-        raise ValueError("Delivery panel requires symbol, date and close")
+    if "symbol" not in x.columns or "date" not in x.columns:
+        raise ValueError("Delivery panel requires symbol and date")
 
     x["symbol"] = x["symbol"].astype(str).str.upper().str.strip()
     x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
-    x["close"] = pd.to_numeric(x["close"], errors="coerce")
-    x = (
-        x.dropna(subset=["symbol", "date", "close"])
-         .sort_values(["symbol", "date"])
-         .drop_duplicates(["symbol", "date"], keep="last")
-         .reset_index(drop=True)
-    )
 
-    # If a trusted upstream y_return exists, retain it; otherwise derive it
-    # strictly from the next observed trading session for the same symbol.
     if "y_return" not in x.columns:
+        if "close" not in x.columns:
+            raise ValueError("Delivery panel requires close when y_return is absent")
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = (
+            x.dropna(subset=["symbol", "date", "close"])
+             .sort_values(["symbol", "date"])
+             .drop_duplicates(["symbol", "date"], keep="last")
+             .reset_index(drop=True)
+        )
         x["y_return"] = (
             x.groupby("symbol", sort=False)["close"].shift(-1) / x["close"] - 1.0
         )
+    else:
+        # Preserve the supplied point-in-time label while enforcing stable,
+        # unique symbol/session keys. Do not discard a valid label because
+        # an optional reference-close feature is absent.
+        if "close" in x.columns:
+            x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = (
+            x.dropna(subset=["symbol", "date"])
+             .sort_values(["symbol", "date"])
+             .drop_duplicates(["symbol", "date"], keep="last")
+             .reset_index(drop=True)
+        )
+
     x["y_return"] = pd.to_numeric(x["y_return"], errors="coerce").replace(
         [np.inf, -np.inf], np.nan
     )
 
-    # The final session per symbol has no realised next-session label yet and
-    # must never enter training.
+    # The final session per symbol has no realised next-session label yet when
+    # labels are locally derived; it remains NaN and is excluded from training.
     return x
 
 

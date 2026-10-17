@@ -8,7 +8,7 @@ from selfdriving.sd_registry import GateRules, Registry, gate, psi, live_check
 from selfdriving.sd_global_cues import GLOBAL_SERIES, attach_global_features, availability
 from selfdriving.sd_news_features import build_news_features, score_news_frame
 from selfdriving.sd_intraday_features import build_intraday_panel
-from selfdriving.sd_cycle import train_stage, predict_stage, select_groups
+from selfdriving.sd_cycle import train_stage, predict_stage, select_groups, ensure_delivery_targets
 
 FAST = ModelConfig(hgb_params=dict(max_depth=3, learning_rate=0.1, max_iter=60, min_samples_leaf=100,
                                    l2_regularization=5.0, max_bins=31, early_stopping=False, random_state=7))
@@ -30,6 +30,29 @@ def make_panel(signal: float, n_sym=80, n_days=330, seed=0):
         df["y_return"] = ret
         rows.append(df)
     return pd.concat(rows, ignore_index=True)
+
+
+def test_trusted_delivery_labels_do_not_require_close():
+    panel = pd.DataFrame({
+        "symbol": ["AAA", "AAA"],
+        "date": pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        "y_return": [0.02, -0.01],
+        "ret_1": [0.1, -0.2],
+    })
+    out = ensure_delivery_targets(panel)
+    assert out["y_return"].tolist() == [0.02, -0.01]
+    assert "close" not in out.columns
+
+
+def test_delivery_labels_are_derived_only_when_close_exists():
+    panel = pd.DataFrame({
+        "symbol": ["AAA", "AAA"],
+        "date": pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        "close": [100.0, 105.0],
+    })
+    out = ensure_delivery_targets(panel)
+    assert np.isclose(out["y_return"].iloc[0], 0.05)
+    assert np.isnan(out["y_return"].iloc[-1])
 
 
 def test_purge_and_embargo():

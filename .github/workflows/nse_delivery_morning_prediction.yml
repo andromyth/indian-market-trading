@@ -7,11 +7,9 @@ on:
         description: "Optional NSE prediction session date YYYY-MM-DD"
         required: false
         default: ""
-  # 08:00 IST on NSE trading weekdays = 02:30 UTC. The run uses the
-  # immediately preceding NSE session and retains the quality gate; a blocked
-  # batch must not be reported as usable directional signals.
-  schedule:
-    - cron: "30 2 * * 1-5"
+  # Manual recovery/backfill only. The scheduled Delivery production cycle is
+  # authoritative and generates/verifies the next-session batch at 06:45 IST.
+  # Avoid a second full PIT rebuild/prediction job that can be queued until after open.
 concurrency:
   group: nse-delivery-morning-prediction
   cancel-in-progress: false

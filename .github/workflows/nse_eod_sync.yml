@@ -1,13 +1,12 @@
 name: NSE EOD official data sync
 
 on:
-  # A merge that changes the EOD refresh/audit implementation should validate
-  # the deployed data path immediately, not wait for the evening cron.
+  # Changes to executable EOD refresh/audit code trigger validation immediately.
+  # Schedule-only edits do not launch a full ingestion pass.
   push:
     branches:
       - main
     paths:
-      - ".github/workflows/nse_eod_sync.yml"
       - "refresh_canonical_cash_master_from_bulk_eod.py"
       - "audit_live_prediction_health.py"
 
@@ -26,12 +25,13 @@ on:
         required: false
         default: '14'
 
-  # Retry official EOD ingestion after close and before the pre-open prediction.
-  # Times are IST converted to UTC; the script's session/holiday guards still apply.
+  # Three strategic attempts preserve post-close ingestion and overnight recovery:
+  # 20:15 IST = 14:45 UTC (Mon-Fri); 23:45 IST = 18:15 UTC (Mon-Fri);
+  # 05:15 IST = 23:45 UTC (Sun-Thu). Session and holiday guards still apply.
   schedule:
-    - cron: "45 15,17 * * 1-5"
-    - cron: "45 19,21,23 * * 0-4"
-    - cron: "45 0 * * 1-5"
+    - cron: "45 14 * * 1-5"
+    - cron: "15 18 * * 1-5"
+    - cron: "45 23 * * 0-4"
 
 concurrency:
   group: nse-eod-sync
