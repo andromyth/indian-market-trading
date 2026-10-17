@@ -70,7 +70,7 @@ jobs:
                       "schedule": j.get("schedule"),
                       "timeZone": j.get("timeZone"),
                       "state": j.get("state"),
-                      "lastAttemptTime": (j.get("status") or {}).get("lastAttemptTime"),
+                      "lastAttemptTime": j.get("lastAttemptTime"),
                       "lastAttemptStatus": (j.get("status") or {}).get("code"),
                   })
           print("MATCHED_SCHEDULER_JOBS")
@@ -89,8 +89,8 @@ jobs:
           if not principal:
               raise SystemExit("GOOGLE_SERVICE_ACCOUNT_JSON has no client_email")
           PY
-          gcloud projects get-iam-policy "$PROJECT_ID" --format=json > /tmp/project-iam.json
-          python - <<'PY'
+          if gcloud projects get-iam-policy "$PROJECT_ID" --format=json > /tmp/project-iam.json 2>/tmp/project-iam.err; then
+            python - <<'PY'
           import json, os
           principal = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]).get("client_email", "")
           policy = json.load(open("/tmp/project-iam.json", encoding="utf-8"))
@@ -101,6 +101,10 @@ jobs:
           })
           print("DEPLOYER_PROJECT_ROLES=" + json.dumps(roles))
           PY
+          else
+            echo "PROJECT_IAM_POLICY=unavailable_to_GitHub_service_account"
+            tail -n 3 /tmp/project-iam.err || true
+          fi
           for secret in google-drive-root-id google-oauth-token-json indstocks-client-id indstocks-mpin indstocks-totp-secret indstocks-access-token; do
             if gcloud secrets describe "$secret" --project="$PROJECT_ID" >/dev/null 2>&1; then
               if gcloud secrets versions access latest --secret="$secret" --project="$PROJECT_ID" >/dev/null 2>&1; then
