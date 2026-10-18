@@ -546,6 +546,10 @@ def drive_status(require_write: bool = False) -> dict:
                     "auth_method": cfg.get("auth_method"),
                     "write_auth_method": None,
                     "root_name": meta.get("name"),
+                    # Safe OAuth diagnostics only; never return token values.
+                    "oauth_write_configured": bool(cfg.get("oauth_write_configured")),
+                    "oauth_refresh_token_present": bool(oauth_info.get("refresh_token")) if isinstance(oauth_info, dict) else False,
+                    "oauth_write_error": cfg.get("oauth_write_error"),
                 }
 
         return {
@@ -560,9 +564,23 @@ def drive_status(require_write: bool = False) -> dict:
             "write_auth_method": write_auth_method,
             "client_email": cfg.get("client_email"),
             "root_name": meta.get("name"),
+            # Safe OAuth diagnostics only; never return token values.
+            "oauth_write_configured": bool(cfg.get("oauth_write_configured")) if cfg.get("auth_method") == "service_account" else None,
+            "oauth_refresh_token_present": bool(cfg.get("oauth_write_token_info", {}).get("refresh_token")) if isinstance(cfg.get("oauth_write_token_info"), dict) else False,
+            "oauth_write_error": cfg.get("oauth_write_error"),
         }
     except Exception as exc:
-        return {"configured": True, "reachable": False, "reason": f"Google Drive check failed: {type(exc).__name__}: {exc}", "client_email": cfg.get("client_email")}
+        return {
+            "configured": True,
+            "reachable": False,
+            "reason": f"Google Drive check failed: {type(exc).__name__}: {exc}",
+            "client_email": cfg.get("client_email"),
+            # Do not expose credential JSON or token values in diagnostics.
+            "auth_method": cfg.get("auth_method"),
+            "oauth_write_configured": bool(cfg.get("oauth_write_configured")) if cfg.get("auth_method") == "service_account" else None,
+            "oauth_refresh_token_present": bool(cfg.get("oauth_write_token_info", {}).get("refresh_token")) if isinstance(cfg.get("oauth_write_token_info"), dict) else False,
+            "oauth_write_error": cfg.get("oauth_write_error"),
+        }
 
 
 def _discover_drive_root_folder(
