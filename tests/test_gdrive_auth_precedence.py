@@ -74,3 +74,33 @@ def test_service_account_writer_rejects_invalid_user_oauth_token(monkeypatch):
     monkeypatch.setattr(persistent_store, "_drive_credentials", rejected_oauth)
     with pytest.raises(RuntimeError, match="OAuth user token required to upload"):
         store._get_write_service()
+
+
+def test_invalid_oauth_write_json_is_reported_without_exposing_secret(monkeypatch):
+    import persistent_store
+
+    monkeypatch.setenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        json.dumps({
+            "type": "service_account",
+            "client_email": "market-data-bot@example.iam.gserviceaccount.com",
+        }),
+    )
+    monkeypatch.setenv("GOOGLE_OAUTH_TOKEN_JSON", json.dumps({
+        "type": "authorized_user",
+        "client_id": "test-client-id",
+        "client_secret": "do-not-print-this",
+        # Intentionally missing refresh_token.
+    }))
+    monkeypatch.setenv("GOOGLE_DRIVE_ROOT_ID", "test-root-folder-id")
+    monkeypatch.delenv("GDRIVE_ROOT_FOLDER_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_DRIVE_ROOT_FOLDER_ID", raising=False)
+    monkeypatch.delenv("DRIVE_ROOT_FOLDER_ID", raising=False)
+
+    cfg = persistent_store.gdrive_config()
+
+    assert cfg["auth_method"] == "service_account"
+    assert cfg["oauth_write_configured"] is True
+    assert cfg["oauth_write_token_info"] is None
+    assert cfg["oauth_write_error"] == "OAuth token JSON has no refresh_token"
+    assert "do-not-print-this" not in str(cfg)
