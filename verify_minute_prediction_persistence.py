@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -287,7 +288,13 @@ def main() -> int:
     all_universe: dict[str, dict] = {}
     outcomes: dict[str, dict] = {}
 
-    for offset in range(7):
+    try:
+        lookback_days = int(os.getenv("MINUTE_PERSISTENCE_AUDIT_LOOKBACK_DAYS", "7"))
+    except (TypeError, ValueError):
+        lookback_days = 7
+    lookback_days = max(1, min(7, lookback_days))
+
+    for offset in range(lookback_days):
         day = today - timedelta(days=offset)
         day_key = day.isoformat()
         y, m, d = f"{day:%Y}", f"{day:%m}", f"{day:%d}"
@@ -449,6 +456,7 @@ def main() -> int:
         "checked_at_ist": now.isoformat(),
         "drive_preflight": drive_safe,
         "current_day": today.isoformat(),
+        "lookback_days_scanned": lookback_days,
         "worker_status_latest": worker,
         "watchlist_minute_snapshots_by_day": watch_snapshots,
         "prediction_ledger_by_day": ledgers,
