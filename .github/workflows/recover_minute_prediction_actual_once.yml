@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: recover-minute-prediction-actual-once
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   one-shot-recovery:
@@ -71,7 +71,21 @@ jobs:
           python -u - <<'PY'
           import json
           import sys
+          import all_universe_minute_capture
           from autonomous_intraday_worker import AutonomousIntradayWorker
+
+          # Recovery scope is the missing prediction + contemporaneous actual-price
+          # snapshot. Avoid letting the separate full-universe quote batch block
+          # this durable watchlist snapshot; the regular Cloud Run service owns
+          # full-universe capture and it is audited separately below.
+          def skip_full_universe_for_recovery(*, now=None, worker_root=None, daily_ledger=None, prediction_snapshots=None):
+              print("FULL_UNIVERSE_CAPTURE_DEFERRED_FOR_RECOVERY_TICK", flush=True)
+              return {
+                  "status": "SKIPPED_FOR_ONE_SHOT_RECOVERY",
+                  "cycle_minute_ist": str(now),
+                  "reason": "isolating the watchlist prediction/actual persistence path from the full-universe capture path",
+              }
+          all_universe_minute_capture.capture_all_universe_minute_snapshot = skip_full_universe_for_recovery
 
           worker = AutonomousIntradayWorker(
               segment="once",
