@@ -67,6 +67,7 @@ jobs:
           PY
 
       - name: Run one real prediction/actual tick and flush to Drive
+        timeout-minutes: 4
         run: |
           python -u - <<'PY'
           import json
@@ -90,7 +91,7 @@ jobs:
           worker = AutonomousIntradayWorker(
               segment="once",
               interval_seconds=60,
-              max_stocks=5,
+              max_stocks=1,
               max_cycles=1,
           )
           result = worker.tick_once()
