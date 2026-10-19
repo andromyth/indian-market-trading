@@ -453,3 +453,31 @@ def test_minute_snapshot_persists_prediction_and_actual_price_to_drive(tmp_path,
     assert saved["actual_observed_close"] == 812.35
     assert saved["predictions"][0]["predicted_price"] == 814.0
     assert saved["predictions"][0]["outcome_status"] == "WAITING_FOR_HORIZON"
+
+
+
+def test_service_drive_preflight_failure_is_diagnostic_not_startup_exception(monkeypatch):
+    import persistent_store
+    from autonomous_intraday_worker_service import STATE, _preflight
+
+    original = dict(STATE)
+    monkeypatch.setattr(
+        persistent_store,
+        "drive_status",
+        lambda require_write=True: {
+            "configured": True,
+            "reachable": False,
+            "write_ready": False,
+            "auth_method": "oauth",
+            "reason": "simulated expired OAuth token",
+        },
+    )
+    try:
+        result = _preflight()
+        assert result["ready"] is False
+        assert STATE["drive_preflight_status"] == "ERROR"
+        assert "simulated expired OAuth token" in STATE["drive_preflight"]["reason"]
+        assert "Google Drive preflight failed" in STATE["last_error"]
+    finally:
+        STATE.clear()
+        STATE.update(original)
