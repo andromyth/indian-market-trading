@@ -89,7 +89,9 @@ jobs:
           all_universe_minute_capture.capture_all_universe_minute_snapshot = skip_full_universe_for_recovery
 
           worker = AutonomousIntradayWorker(
-              segment="once",
+              # Use the production service ledger namespace so the read-only
+              # persistence audit sees this one-off recovery record.
+              segment="service",
               interval_seconds=60,
               max_stocks=1,
               max_cycles=1,
