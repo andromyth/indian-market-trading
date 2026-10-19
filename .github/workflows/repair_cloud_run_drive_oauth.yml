@@ -2,11 +2,6 @@ name: Repair Cloud Run Google Drive OAuth secret
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/repair_cloud_run_drive_oauth.yml"
 
 permissions:
   contents: read
@@ -89,7 +84,4 @@ jobs:
               --project="$PROJECT_ID" \
               --data-file=-
           echo "Validated OAuth token was added as a new Secret Manager version."
-          gcloud secrets versions list google-oauth-token-json \
-            --project="$PROJECT_ID" \
-            --limit=1 \
-            --format='table(name,state,createTime)'
+          echo "No versions.list permission is required for this recovery workflow."
