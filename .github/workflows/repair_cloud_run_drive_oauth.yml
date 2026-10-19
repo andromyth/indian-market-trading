@@ -1,0 +1,95 @@
+name: Repair Cloud Run Google Drive OAuth secret
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/repair_cloud_run_drive_oauth.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-repair-secret:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PROJECT_ID: indian-market-trading
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Drive auth dependencies
+        run: python -m pip install --disable-pip-version-check google-api-python-client google-auth google-auth-oauthlib pandas numpy pyarrow fsspec
+
+      - name: Validate repository OAuth credential against the existing Drive root
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from persistent_store import drive_status
+
+          result = drive_status(require_write=True)
+          safe = {
+              key: result.get(key)
+              for key in (
+                  "configured", "reachable", "write_ready",
+                  "auth_method", "write_auth_method",
+                  "oauth_write_configured", "oauth_refresh_token_present",
+                  "reason", "oauth_write_error",
+              )
+          }
+          print("REPOSITORY_DRIVE_CREDENTIAL_CHECK:", json.dumps(safe, sort_keys=True))
+          if (
+              not result.get("configured")
+              or result.get("reachable") is not True
+              or result.get("write_ready") is not True
+              or result.get("write_auth_method") != "oauth"
+          ):
+              raise SystemExit(
+                  "Repository OAuth token did not pass a real Google Drive read/write check; "
+                  "Secret Manager was not changed."
+              )
+          PY
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Add validated OAuth token as a new Secret Manager version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pipe the validated secret from the GitHub Actions secret directly to
+          # Secret Manager. Never print it, write it to the workspace, or commit it.
+          printf '%s' "$GOOGLE_OAUTH_TOKEN_JSON" | \
+            gcloud secrets versions add google-oauth-token-json \
+              --project="$PROJECT_ID" \
+              --data-file=-
+          echo "Validated OAuth token was added as a new Secret Manager version."
+          gcloud secrets versions list google-oauth-token-json \
+            --project="$PROJECT_ID" \
+            --limit=1 \
+            --format='table(name,state,createTime)'
