@@ -6,6 +6,11 @@ name: Activate Cloud Run intraday schedules
 # get, and pause/resume permissions in the project before this can succeed.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/activate_intraday_cloud_scheduler.yml"
 
 permissions:
   contents: read
@@ -17,6 +22,10 @@ jobs:
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -103,4 +112,72 @@ jobs:
           if failures:
               raise SystemExit("Cloud Scheduler activation not verified: " + "; ".join(failures))
           print(f"SUCCESS: verified {len(target_jobs)} intraday worker schedule(s) ENABLED.")
+
+          # Force exactly one invocation for the schedule covering the current
+          # Kolkata market time. This tests the real private Cloud Run path,
+          # rather than treating ENABLED scheduler state as proof of persistence.
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          hhmm = now.hour * 100 + now.minute
+          active_name = None
+          if now.weekday() < 5 and 915 <= hhmm <= 959:
+              active_name = "intraday-worker-0915-0959"
+          elif now.weekday() < 5 and 1000 <= hhmm <= 1459:
+              active_name = "intraday-worker-1000-1459"
+          elif now.weekday() < 5 and 1500 <= hhmm <= 1530:
+              active_name = "intraday-worker-1500-1530"
+          if active_name:
+              available_names = {PurePosixPath(str(j.get("name", ""))).name for j in target_jobs}
+              if active_name not in available_names:
+                  raise SystemExit(f"Current-session scheduler job not found: {active_name}")
+              print(f"REQUESTING_ONE_OFF_TICK: job={active_name}, time_ist={now.isoformat()}")
+              subprocess.run(
+                  ["gcloud", "scheduler", "jobs", "run", active_name,
+                   "--project", project, "--location", region, "--quiet"],
+                  check=True,
+              )
+              print("ONE_OFF_TICK_REQUEST_ACCEPTED")
+          else:
+              print(f"NO_LIVE_TICK_REQUESTED: outside weekday cash-session hours ({now.isoformat()})")
+          PY
+
+      - name: Install persistence audit dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Recheck Google Drive after the live tick
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 25
+          python -u verify_minute_prediction_persistence.py | tee /tmp/minute-persistence-audit.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          output = Path("/tmp/minute-persistence-audit.log").read_text(encoding="utf-8")
+          begin = "MINUTE_PERSISTENCE_AUDIT_JSON_BEGIN"
+          end = "MINUTE_PERSISTENCE_AUDIT_JSON_END"
+          if begin not in output or end not in output:
+              raise SystemExit("The Drive audit did not emit its expected report markers.")
+          report_text = output.split(begin, 1)[1].split(end, 1)[0].strip()
+          report = json.loads(report_text)
+          verdict = report.get("verdict") or {}
+          summary = {
+              "checked_at_ist": report.get("checked_at_ist"),
+              "worker_run_status": (report.get("worker_status_latest") or {}).get("run_status"),
+              "worker_status_age_minutes": (report.get("worker_status_latest") or {}).get("modified_age_minutes"),
+              "watchlist_minute_snapshots_fresh": verdict.get("watchlist_minute_snapshots_fresh"),
+              "watchlist_actual_observation_rows_present": verdict.get("watchlist_actual_observation_rows_present"),
+              "watchlist_prediction_rows_present_recently": verdict.get("watchlist_prediction_rows_present_recently"),
+              "today_prediction_ledger_recent_and_nonempty": verdict.get("today_prediction_ledger_recent_and_nonempty"),
+              "full_universe_minute_capture_fresh_and_status_ok": verdict.get("full_universe_minute_capture_fresh_and_status_ok"),
+              "overall": verdict.get("overall"),
+          }
+          print("POST_TICK_PERSISTENCE_VERDICT:", json.dumps(summary, sort_keys=True))
+          if verdict.get("overall") != "PASS_CURRENT_MINUTE_PREDICTION_AND_ACTUAL_SNAPSHOT_STORAGE":
+              raise SystemExit(
+                  "Live tick was requested, but current prediction/actual persistence is still not verified. "
+                  "Check Cloud Run deployment revision and worker logs; the GitHub service account cannot deploy Cloud Run."
+              )
           PY
