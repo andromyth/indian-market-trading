@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,8 @@ STATE: dict[str, Any] = {
     "last_tick_at_utc": None,
     "last_tick_result": None,
     "last_error": None,
+    "drive_preflight_status": "NOT_CHECKED",
+    "drive_preflight": {"reason": "Drive startup preflight is pending."},
 }
 
 WORKER = AutonomousIntradayWorker(
@@ -134,10 +137,33 @@ def _public_status() -> dict[str, Any]:
     })
 
 
-def _preflight() -> None:
-    from persistent_store import drive_status
+def _preflight() -> dict[str, Any]:
+    """Check Drive outside the listener's startup path and retain safe diagnostics.
 
-    status = drive_status(require_write=True)
+    A credential/network error must never prevent the HTTP server from binding
+    PORT. Failed preflight keeps /healthz degraded and blocks /tick; the monitor
+    retries so a repaired OAuth/Drive configuration can recover without a new
+    revision.
+    """
+    try:
+        from persistent_store import drive_status
+
+        status = drive_status(require_write=True)
+        if not isinstance(status, dict):
+            status = {
+                "configured": False,
+                "reachable": False,
+                "write_ready": False,
+                "reason": "drive_status returned a non-object result",
+            }
+    except Exception as exc:
+        status = {
+            "configured": False,
+            "reachable": False,
+            "write_ready": False,
+            "reason": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
     safe = {
         key: status.get(key)
         for key in (
@@ -145,16 +171,30 @@ def _preflight() -> None:
             "auth_method", "write_auth_method", "reason",
         )
     }
-    _log("google_drive_preflight", **safe)
-    if (
-        not status.get("configured")
-        or status.get("reachable") is False
-        or status.get("write_ready") is False
-    ):
-        raise RuntimeError(
-            "Google Drive read/write authentication is required for unattended operation: "
-            + str(status.get("reason", "preflight failed"))
-        )
+    ready = bool(status.get("configured")) and status.get("reachable") is not False and status.get("write_ready") is not False
+
+    with STATE_LOCK:
+        STATE["drive_preflight_status"] = "OK" if ready else "ERROR"
+        STATE["drive_preflight"] = safe
+        if not ready:
+            STATE["last_error"] = (
+                "Google Drive preflight failed: "
+                + str(status.get("reason") or "Drive read/write access is not ready")
+            )
+        elif str(STATE.get("last_error") or "").startswith("Google Drive preflight failed:"):
+            STATE["last_error"] = None
+
+    _log("google_drive_preflight", status="OK" if ready else "ERROR", **safe)
+    return {"ready": ready, **safe}
+
+
+def _drive_preflight_monitor() -> None:
+    """Retry Drive readiness in the background after the HTTP listener is live."""
+    while True:
+        result = _preflight()
+        # Retry unhealthy credentials quickly, and periodically revalidate
+        # healthy credentials so revoked/expired OAuth access blocks new ticks.
+        time.sleep(60 if result.get("ready") else 20)
 
 
 class WorkerHandler(BaseHTTPRequestHandler):
@@ -176,11 +216,19 @@ class WorkerHandler(BaseHTTPRequestHandler):
         error = status.get("last_error")
         capture_status = status.get("all_universe_capture_status", "NOT_RUN")
         capture_warning = status.get("all_universe_capture_warning")
+        drive_preflight_status = status.get("drive_preflight_status", "NOT_CHECKED")
         payload = {
-            "status": "degraded" if (error or capture_status not in {"OK", "NOT_RUN"} or capture_warning) else "ok",
+            "status": "degraded" if (
+                error
+                or capture_status not in {"OK", "NOT_RUN"}
+                or capture_warning
+                or drive_preflight_status != "OK"
+            ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
             "last_error": error,
+            "drive_preflight_status": drive_preflight_status,
+            "drive_preflight": status.get("drive_preflight"),
             "all_universe_capture_status": capture_status,
             "all_universe_capture": status.get("all_universe_capture_last_result"),
             "all_universe_capture_warning": capture_warning,
@@ -199,6 +247,33 @@ class WorkerHandler(BaseHTTPRequestHandler):
             self._send_json(409, {"status": "TICK_ALREADY_RUNNING"})
             return
         try:
+            # Never create predictions that cannot be durably stored. If the
+            # background preflight has not succeeded (or has lost readiness),
+            # retry it once in this request and return an explicit diagnostic
+            # rather than silently dropping prediction/actual rows.
+            with STATE_LOCK:
+                drive_ready = STATE.get("drive_preflight_status") == "OK"
+            if not drive_ready:
+                preflight = _preflight()
+                if not preflight.get("ready"):
+                    error = str(
+                        preflight.get("reason")
+                        or "Google Drive read/write access is not ready"
+                    )
+                    _log("cloud_run_tick_blocked_drive_preflight", reason=error)
+                    self._send_json(503, {
+                        "status": "DRIVE_PREFLIGHT_FAILED",
+                        "error": error,
+                        "drive_preflight": {
+                            key: preflight.get(key)
+                            for key in (
+                                "configured", "reachable", "write_ready",
+                                "auth_method", "write_auth_method", "reason",
+                            )
+                        },
+                    })
+                    return
+
             # Drain the small scheduler payload, if any.
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
@@ -249,15 +324,24 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    _preflight()
+    # Bind and start the HTTP listener before any Google API/token refresh.
+    # Cloud Run's startup probe must be able to connect even when Drive OAuth
+    # is expired or temporarily unreachable; /tick remains gated on write-ready.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), WorkerHandler)
     server.daemon_threads = True
+    monitor = threading.Thread(
+        target=_drive_preflight_monitor,
+        name="drive-preflight-monitor",
+        daemon=True,
+    )
+    monitor.start()
     _log(
         "cloud_run_worker_api_started",
         port=PORT,
         worker_root=str(WORKER_ROOT),
         tick_endpoint="/tick",
         health_endpoint="/healthz",
+        startup_gate="Drive preflight runs asynchronously; /tick is blocked until Drive is write-ready.",
         note="Cloud Scheduler calls /tick; service is private and must not be made public.",
     )
     try:
