@@ -77,10 +77,14 @@ if gcloud secrets describe "indstocks-access-token" --project "$PROJECT_ID" >/de
   manual_broker_auth=true
 fi
 if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" != "true" ]]; then
-  echo "Full-universe minute data capture requires INDstocks credentials in Secret Manager."
-  echo "Configure indstocks-client-id + indstocks-mpin + indstocks-totp-secret (recommended),"
-  echo "or a temporary indstocks-access-token for a short smoke test."
-  exit 2
+  # Keep watchlist prediction + contemporaneous actual-price persistence live
+  # even if the separate full-universe quote provider has not been provisioned.
+  # The worker records an explicit degraded full-universe capture status; it
+  # must not let missing optional broker credentials prevent a deploy that
+  # restores the core minute prediction/actual snapshot path.
+  echo "WARNING: INDstocks credentials are not configured in Secret Manager." >&2
+  echo "The full-universe minute capture will remain blocked until credentials are added." >&2
+  echo "Continuing deployment so the independent watchlist prediction/actual snapshots can persist." >&2
 fi
 if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" == "true" ]]; then
   echo "WARNING: Using a manual INDstocks token; it normally expires after 24 hours." >&2
