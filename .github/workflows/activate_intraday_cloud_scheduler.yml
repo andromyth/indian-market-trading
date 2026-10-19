@@ -138,34 +138,45 @@ jobs:
               if active_name not in available_names:
                   raise SystemExit(f"Current-session scheduler job not found: {active_name}")
               print(f"REQUESTING_ONE_OFF_TICK: job={active_name}, time_ist={now.isoformat()}")
+              from datetime import timezone
+              import time
+              request_started = datetime.now(timezone.utc)
               subprocess.run(
                   ["gcloud", "scheduler", "jobs", "run", active_name,
                    "--project", project, "--location", region, "--quiet"],
                   check=True,
               )
               print("ONE_OFF_TICK_REQUEST_ACCEPTED")
-              # Scheduler's "jobs run" command only confirms enqueueing. Capture
-              # the resulting HTTP attempt status/target so request/auth failures
-              # are distinguishable from a stopped or stale worker.
-              described = subprocess.run(
-                  [
-                      "gcloud", "scheduler", "jobs", "describe", active_name,
-                      "--project", project, "--location", region, "--format=json"
-                  ],
-                  check=True, capture_output=True, text=True,
-              )
-              latest_job = json.loads(described.stdout)
+              # Wait briefly for Cloud Scheduler to publish the actual HTTP result;
+              # "jobs run" by itself only confirms that the invocation was enqueued.
+              latest_job = {}
+              for _ in range(10):
+                  described = subprocess.run(
+                      [
+                          "gcloud", "scheduler", "jobs", "describe", active_name,
+                          "--project", project, "--location", region, "--format=json"
+                      ],
+                      check=True, capture_output=True, text=True,
+                  )
+                  latest_job = json.loads(described.stdout)
+                  last_attempt = latest_job.get("lastAttemptTime")
+                  try:
+                      parsed_attempt = datetime.fromisoformat(str(last_attempt).replace("Z", "+00:00"))
+                  except ValueError:
+                      parsed_attempt = None
+                  if parsed_attempt and parsed_attempt >= request_started:
+                      break
+                  time.sleep(3)
               target = latest_job.get("httpTarget") or {}
               attempt = latest_job.get("lastAttemptStatus") or {}
-              response_status = attempt.get("responseStatus") or {}
               print("CLOUD_SCHEDULER_LAST_ATTEMPT:", json.dumps({
                   "job": active_name,
+                  "request_started_utc": request_started.isoformat(),
                   "lastAttemptTime": latest_job.get("lastAttemptTime"),
-                  "lastAttemptStatus": attempt,
-                  "responseStatus": response_status,
+                  "last_attempt_code": attempt.get("code"),
+                  "last_attempt_message": str(attempt.get("message") or "")[:250],
                   "target_uri": target.get("uri"),
                   "oidc_service_account": (target.get("oidcToken") or {}).get("serviceAccountEmail"),
-                  "oauth_service_account": (target.get("oauthToken") or {}).get("serviceAccountEmail"),
               }, sort_keys=True))
           else:
               print(f"NO_LIVE_TICK_REQUESTED: outside weekday cash-session hours ({now.isoformat()})")
