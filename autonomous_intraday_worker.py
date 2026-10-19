@@ -1321,6 +1321,23 @@ class AutonomousIntradayWorker:
             result = {"status": "ERROR", "minute": minute_key, "error": error}
             _log("minute_tick_failed", minute=minute_key, error=error)
 
+        # Save the compact prediction + contemporaneous actual-price snapshot on
+        # every minute tick. The larger bars and append-only daily ledger remain
+        # batched to control Drive writes.
+        if self.last_minute_snapshot_rows:
+            try:
+                snapshot_result = self._persist_minute_snapshot(now, result)
+                result["minute_snapshot"] = snapshot_result
+                if snapshot_result.get("status") != "OK":
+                    result["status"] = "PERSISTENCE_ERROR"
+                    self.run_status = "PERSISTENCE_ERROR"
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                result["minute_snapshot"] = {"status": "ERROR", "error": error}
+                result["status"] = "PERSISTENCE_ERROR"
+                self.run_status = "PERSISTENCE_ERROR"
+                _log("minute_snapshot_persist_failed", minute=minute_key, error=error)
+
         # Capture current market quotes for the full official NSE equity
         # universe independently of the smaller news-selected prediction watchlist.
         # The separate manifest reports coverage gaps and Drive persistence errors.
@@ -1360,23 +1377,6 @@ class AutonomousIntradayWorker:
                 minute=minute_key,
                 error=capture_error,
             )
-
-        # Save the compact prediction + contemporaneous actual-price snapshot on
-        # every minute tick. The larger bars and append-only daily ledger remain
-        # batched to control Drive writes.
-        if self.last_minute_snapshot_rows:
-            try:
-                snapshot_result = self._persist_minute_snapshot(now, result)
-                result["minute_snapshot"] = snapshot_result
-                if snapshot_result.get("status") != "OK":
-                    result["status"] = "PERSISTENCE_ERROR"
-                    self.run_status = "PERSISTENCE_ERROR"
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                result["minute_snapshot"] = {"status": "ERROR", "error": error}
-                result["status"] = "PERSISTENCE_ERROR"
-                self.run_status = "PERSISTENCE_ERROR"
-                _log("minute_snapshot_persist_failed", minute=minute_key, error=error)
 
         # Persist immediately on any degraded tick so failed inference rows and
         # their health status survive even when the scheduler runs a one-off tick.
