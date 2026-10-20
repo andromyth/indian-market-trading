@@ -164,18 +164,62 @@ def _read_jsonl(store: GoogleDriveStore, file_meta: dict, max_bytes: int = 30_00
     }
 
 
-def _snapshot_summary(store: GoogleDriveStore, files: list[dict], now_utc: datetime) -> dict:
+def _snapshot_summary(
+    store: GoogleDriveStore,
+    files: list[dict],
+    now_utc: datetime,
+    session_date: date,
+) -> dict:
+    """Audit each expected one-minute snapshot and its actual/prediction content."""
+    from market_session_guard import CLOSE, OPEN, is_nse_trading_day
+
     snapshots = sorted(
-        [f for f in files if re.fullmatch(r"snapshot_\d{8}_\d{4}\.jsonl", str(f.get("name", "")))],
+        [
+            f for f in files
+            if re.fullmatch(r"snapshot_\d{8}_\d{4}\.jsonl", str(f.get("name", "")))
+        ],
         key=lambda x: x["name"],
     )
-    latest = snapshots[-1] if snapshots else None
+    by_minute: dict[str, list[dict]] = {}
+    for item in snapshots:
+        match = re.fullmatch(r"snapshot_(\d{8}_\d{4})\.jsonl", str(item.get("name", "")))
+        if match:
+            by_minute.setdefault(match.group(1), []).append(item)
+
+    now_ist = now_utc.astimezone(IST)
+    expected_keys: list[str] = []
+    if is_nse_trading_day(session_date):
+        start = datetime.combine(session_date, OPEN, tzinfo=IST)
+        end = datetime.combine(session_date, time(CLOSE.hour, CLOSE.minute - 1), tzinfo=IST)
+        if session_date == now_ist.date():
+            last_completed_minute = now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)
+            end = min(end, last_completed_minute)
+        cursor = start
+        while cursor <= end:
+            expected_keys.append(cursor.strftime("%Y%m%d_%H%M"))
+            cursor += timedelta(minutes=1)
+
+    missing = [key for key in expected_keys if not by_minute.get(key)]
+    duplicates = [key for key in expected_keys if len(by_minute.get(key, [])) > 1]
+    opening_key = datetime.combine(session_date, OPEN, tzinfo=IST).strftime("%Y%m%d_%H%M")
+    required_forecast_keys = [key for key in expected_keys if key != opening_key]
+
     summary = {
         "file_count_today": len(snapshots),
-        "latest_file": latest.get("name") if latest else None,
-        "latest_file_modified_time_utc": latest.get("modifiedTime") if latest else None,
-        "latest_file_modified_age_minutes": _age_minutes(latest.get("modifiedTime"), now_utc) if latest else None,
+        "latest_file": snapshots[-1].get("name") if snapshots else None,
+        "latest_file_modified_time_utc": snapshots[-1].get("modifiedTime") if snapshots else None,
+        "latest_file_modified_age_minutes": _age_minutes(snapshots[-1].get("modifiedTime"), now_utc) if snapshots else None,
         "latest_file_timestamp_age_minutes": None,
+        "expected_snapshot_minutes": len(expected_keys),
+        "expected_prediction_actual_minutes": len(required_forecast_keys),
+        "missing_snapshot_minutes": missing,
+        "duplicate_snapshot_minutes": duplicates,
+        "minutes_with_complete_prediction_and_actual": 0,
+        "incomplete_prediction_actual_minutes": [],
+        "prediction_rows_all_expected_minutes": 0,
+        "actual_symbol_observation_rows_all_expected_minutes": 0,
+        "symbol_observation_rows_all_expected_minutes": 0,
+        "opening_minute_prediction_exempt": opening_key in expected_keys,
         "latest_snapshot_rows": 0,
         "latest_rows_with_actual_observed_close": 0,
         "latest_rows_with_predictions": 0,
@@ -184,39 +228,84 @@ def _snapshot_summary(store: GoogleDriveStore, files: list[dict], now_utc: datet
         "latest_quality_status_counts": {},
         "recent_5_snapshot_files_prediction_rows": 0,
         "recent_5_snapshot_files_actual_rows": 0,
+        "snapshot_read_errors": [],
         "read_error": None,
     }
-    if not latest:
-        return summary
+    latest = snapshots[-1] if snapshots else None
+    if latest:
+        match = re.fullmatch(r"snapshot_(\d{8})_(\d{4})\.jsonl", latest["name"])
+        if match:
+            try:
+                local_dt = datetime.strptime(
+                    match.group(1) + match.group(2), "%Y%m%d%H%M"
+                ).replace(tzinfo=IST)
+                summary["latest_file_timestamp_age_minutes"] = _age_minutes(local_dt.isoformat(), now_utc)
+            except ValueError:
+                pass
 
-    match = re.fullmatch(r"snapshot_(\d{8})_(\d{4})\.jsonl", latest["name"])
-    if match:
-        try:
-            local_dt = datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M").replace(tzinfo=IST)
-            summary["latest_file_timestamp_age_minutes"] = _age_minutes(local_dt.isoformat(), now_utc)
-        except ValueError:
-            pass
-
-    recent = snapshots[-5:]
+    latest_name = latest.get("name") if latest else None
     symbol_predictions: set[str] = set()
-    try:
-        for f in recent:
-            rows = []
-            raw = _read_file_bytes(store, f["id"])
+    recent_names = {f.get("name") for f in snapshots[-5:]}
+    for key in expected_keys:
+        matching_files = by_minute.get(key, [])
+        if not matching_files:
+            if key in required_forecast_keys:
+                summary["incomplete_prediction_actual_minutes"].append(key)
+            continue
+        if len(matching_files) != 1:
+            if key in required_forecast_keys:
+                summary["incomplete_prediction_actual_minutes"].append(key)
+            continue
+        item = matching_files[0]
+        try:
+            raw = _read_file_bytes(store, item["id"])
+            rows: list[dict] = []
+            malformed_rows = 0
             for line in raw.decode("utf-8", errors="replace").splitlines():
-                if line.strip():
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            rows.append(obj)
-                    except json.JSONDecodeError:
-                        continue
-            prediction_rows = sum(len(x.get("predictions") or []) for x in rows)
-            actual_rows = sum(1 for x in rows if x.get("actual_observed_close") is not None)
-            summary["recent_5_snapshot_files_prediction_rows"] += prediction_rows
-            summary["recent_5_snapshot_files_actual_rows"] += actual_rows
-            if f["name"] == latest["name"]:
-                quality = {}
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+                    else:
+                        malformed_rows += 1
+                except json.JSONDecodeError:
+                    malformed_rows += 1
+            if malformed_rows:
+                summary["snapshot_read_errors"].append({
+                    "minute": key,
+                    "error": f"{malformed_rows} malformed/non-object JSONL row(s)",
+                })
+            prediction_rows = sum(len(row.get("predictions") or []) for row in rows)
+            symbol_rows = [row for row in rows if str(row.get("symbol") or "").strip()]
+            actual_rows = [
+                row for row in symbol_rows
+                if row.get("actual_observed_close") is not None
+                and (row.get("actual_observed_timestamp_ist") or row.get("actual_observed_timestamp_utc"))
+            ]
+            summary["prediction_rows_all_expected_minutes"] += prediction_rows
+            summary["actual_symbol_observation_rows_all_expected_minutes"] += len(actual_rows)
+            summary["symbol_observation_rows_all_expected_minutes"] += len(symbol_rows)
+            complete = bool(symbol_rows) and all(
+                str(row.get("data_quality_status") or "").upper() == "PASS"
+                and row.get("actual_observed_close") is not None
+                and (row.get("actual_observed_timestamp_ist") or row.get("actual_observed_timestamp_utc"))
+                and bool(row.get("predictions"))
+                for row in symbol_rows
+            )
+            if key in required_forecast_keys:
+                if complete:
+                    summary["minutes_with_complete_prediction_and_actual"] += 1
+                else:
+                    summary["incomplete_prediction_actual_minutes"].append(key)
+
+            if item.get("name") in recent_names:
+                summary["recent_5_snapshot_files_prediction_rows"] += prediction_rows
+                summary["recent_5_snapshot_files_actual_rows"] += len(actual_rows)
+
+            if item.get("name") == latest_name:
+                quality: dict[str, int] = {}
                 for row in rows:
                     label = str(row.get("data_quality_status") or "UNKNOWN")
                     quality[label] = quality.get(label, 0) + 1
@@ -231,10 +320,23 @@ def _snapshot_summary(store: GoogleDriveStore, files: list[dict], now_utc: datet
                 summary["latest_snapshot_rows"] = len(rows)
                 summary["latest_symbols_with_predictions"] = len(symbol_predictions)
                 summary["latest_quality_status_counts"] = quality
-    except Exception as exc:
-        summary["read_error"] = _safe_error(exc)
-    return summary
+        except Exception as exc:
+            error = _safe_error(exc)
+            summary["snapshot_read_errors"].append({"minute": key, "error": error})
+            if key in required_forecast_keys:
+                summary["incomplete_prediction_actual_minutes"].append(key)
+            if item.get("name") == latest_name:
+                summary["read_error"] = error
 
+    summary["all_expected_snapshot_files_present"] = (
+        len(expected_keys) > 0 and not missing and not duplicates
+    )
+    summary["all_required_minutes_have_predictions_and_actuals"] = (
+        len(required_forecast_keys) > 0
+        and summary["minutes_with_complete_prediction_and_actual"] == len(required_forecast_keys)
+        and not summary["snapshot_read_errors"]
+    )
+    return summary
 
 def _manifest_summary(store: GoogleDriveStore, path: str, now_utc: datetime) -> dict:
     payload, meta = _read_json(store, path)
@@ -302,7 +404,7 @@ def main() -> int:
         watch_path = f"production_data/intraday_minute_snapshots/{y}/{m}/{d}"
         watch_files = _list_path(store, watch_path)
         watch_files = watch_files or []
-        watch_snapshots[day_key] = _snapshot_summary(store, watch_files, now_utc)
+        watch_snapshots[day_key] = _snapshot_summary(store, watch_files, now_utc, day)
 
         ledger_path = f"production_data/intraday_predictions/{y}/{m}/{d}"
         ledger_files = _list_path(store, ledger_path) or []
