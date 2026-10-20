@@ -1,326 +1,283 @@
-"""Persistent, idempotent prediction ledger with optional Google Drive sync."""
+"""
+prediction_ledger.py
+Unified minute-level prediction ledger and live microstructure feature capture
+(volume z-score, VWAP distance, order-flow imbalance, volatility ratios, and event flags)
+with strict Asia/Kolkata session boundary guards.
+"""
+
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import os
-import tempfile
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
-LOCAL_DIR = Path(__file__).resolve().parent / "data" / "prediction_ledger"
-LOCAL_LEDGER = LOCAL_DIR / "prediction_ledger.jsonl"
-REMOTE_LEDGER = "production_data/predictions/prediction_ledger.jsonl"
-LOCAL_VALIDATION = LOCAL_DIR / "prediction_validation.jsonl"
-REMOTE_VALIDATION = "production_data/predictions/prediction_validation.jsonl"
+IST_TZ = "Asia/Kolkata"
+SCHEMA_VERSION = "2.2"
+MARKET_OPEN_TIME = time(9, 15, 0)
+MARKET_LAST_VALID_TARGET_TIME = time(15, 29, 0)
+MIN_FEATURE_COVERAGE = 0.70
 
 
-def _utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def normalize_ist_timestamp(ts: Any) -> pd.Timestamp:
+    """Parse and normalize any timestamp input to timezone-aware Asia/Kolkata."""
+    parsed = pd.Timestamp(ts)
+    if parsed.tzinfo is None:
+        return parsed.tz_localize(IST_TZ)
+    return parsed.tz_convert(IST_TZ)
 
 
-# Forecast/output fields participate in identity so a recomputed prediction for
-# the same symbol, target date, decision timestamp and model is stored as a
-# distinct auditable revision when its signal, price forecast or readiness changes.
-_REVISION_FIELDS = (
-    "prediction_for_date",
-    "pit_snapshot_date",
-    "reference_session",
-    "signal",
-    "raw_model_signal",
-    "signal_status",
-    "signal_reason",
-    "quality_gate_block_reasons",
-    "production_data_quality_gate",
-    "production_data_quality_score",
-    "probability_up_next_session",
-    "probability_down_next_session",
-    "predicted_return_next_session",
-    "predicted_price_next_session",
-    "predicted_price_change_next_session",
-    "predicted_open",
-    "predicted_high",
-    "predicted_low",
-    "confidence",
-    "feature_count",
-    "non_missing_feature_count",
-    "feature_non_missing_fraction",
-    "data_readiness_score",
-)
+def compute_target_timestamp(decision_ts: pd.Timestamp, horizon_min: int) -> pd.Timestamp:
+    """Compute the realized evaluation timestamp for a given forecast horizon."""
+    norm_ts = normalize_ist_timestamp(decision_ts)
+    return norm_ts + pd.Timedelta(minutes=int(horizon_min))
 
 
-def _canonical_revision_value(value: Any) -> Any:
-    """Convert prediction output values to deterministic JSON-safe primitives."""
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, dict):
+def is_within_nse_session(decision_ts: pd.Timestamp, horizon_min: int) -> bool:
+    """
+    Verify that both the decision timestamp and target horizon timestamp fall
+    within active NSE regular trading hours (09:15:00 to 15:29:00 IST) on the same date.
+    """
+    norm_decision = normalize_ist_timestamp(decision_ts)
+    target_ts = compute_target_timestamp(norm_decision, horizon_min)
+
+    if norm_decision.date() != target_ts.date():
+        return False
+    if norm_decision.weekday() >= 5:
+        return False
+    if not (MARKET_OPEN_TIME <= norm_decision.time() <= MARKET_LAST_VALID_TARGET_TIME):
+        return False
+    if not (MARKET_OPEN_TIME <= target_ts.time() <= MARKET_LAST_VALID_TARGET_TIME):
+        return False
+    return True
+
+
+def extract_live_microstructure_features(bars_1m: pd.DataFrame) -> dict[str, Any]:
+    """
+    Extract real-time price, volume, and event features from trailing 1-minute NSE
+    OHLCV bars to feed both inference and state capture.
+    """
+    if bars_1m is None or len(bars_1m) < 5:
         return {
-            str(key): _canonical_revision_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            "volume_zscore_20m": 0.0,
+            "vwap_distance_bps": 0.0,
+            "price_momentum_5m_bps": 0.0,
+            "order_flow_imbalance": 0.0,
+            "volatility_ratio_15m": 1.0,
+            "candle_body_to_wick": 0.5,
+            "event_flags": [],
         }
-    if isinstance(value, (list, tuple)):
-        return [_canonical_revision_value(item) for item in value]
-    try:
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            return None
-        return round(numeric, 8)
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
 
+    ts_col = "timestamp" if "timestamp" in bars_1m.columns else "datetime"
+    df = bars_1m.sort_values(ts_col).copy() if ts_col in bars_1m.columns else bars_1m.copy()
 
-def prediction_revision_fingerprint(record: dict[str, Any]) -> str:
-    """Short content fingerprint for idempotent, auditable forecast revisions."""
-    payload = {
-        key: _canonical_revision_value(record[key])
-        for key in _REVISION_FIELDS
-        if key in record
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float) if "high" in df.columns else close
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float) if "low" in df.columns else close
+    open_p = pd.to_numeric(df["open"], errors="coerce").to_numpy(dtype=float) if "open" in df.columns else close
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).to_numpy(dtype=float) if "volume" in df.columns else np.ones_like(close)
 
+    curr_close = float(close[-1])
+    vol_window = vol[-20:] if len(vol) >= 20 else vol
+    vol_mean = float(np.mean(vol_window))
+    vol_std = float(np.std(vol_window))
+    vol_zscore = (float(vol[-1]) - vol_mean) / max(vol_std, 1.0)
 
-def _stable_id(record: dict[str, Any]) -> str:
-    keys = [
-        str(record.get("symbol", "")),
-        str(record.get("mode", "")),
-        str(record.get("prediction_horizon", "")),
-        str(record.get("decision_timestamp", "")),
-        str(record.get("model_version", "")),
-        prediction_revision_fingerprint(record),
-    ]
-    return hashlib.sha256("|".join(keys).encode("utf-8")).hexdigest()[:24]
+    typical = (high + low + close) / 3.0
+    cum_vwap = float(np.sum(typical * vol) / max(np.sum(vol), 1.0))
+    vwap_dist_bps = ((curr_close - cum_vwap) / max(cum_vwap, 1e-4)) * 10000.0
 
+    ref_5m = float(close[-5])
+    mom_5m_bps = ((curr_close - ref_5m) / max(ref_5m, 1e-4)) * 10000.0
 
-def _ensure_local() -> None:
-    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-    LOCAL_LEDGER.touch(exist_ok=True)
+    bar_range = np.maximum(high - low, 1e-4)
+    signed_body = (close - open_p) / bar_range
+    ofi = float(np.sum(signed_body[-5:] * vol[-5:]) / max(np.sum(vol[-5:]), 1.0))
+    body_to_wick = float(abs(close[-1] - open_p[-1]) / bar_range[-1])
 
+    tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]))
+    atr_short = float(np.mean(tr[-5:])) if len(tr) >= 5 else float(np.mean(tr))
+    atr_long = float(np.mean(tr[-20:])) if len(tr) >= 20 else float(np.mean(tr))
+    vol_ratio = atr_short / max(atr_long, 1e-4)
 
-def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
-    """Download a Drive file using the same OAuth/service-account resolver as the store."""
-    try:
-        from persistent_store import GoogleDriveStore
+    events: list[str] = []
+    if vol_zscore >= 2.0 and body_to_wick >= 0.65:
+        events.append("INSTITUTIONAL_VOL_IGNITION")
+    if vol_zscore >= 2.0 and body_to_wick <= 0.25:
+        events.append("HIGH_VOL_ABSORPTION_PINBAR")
+    if vol_ratio <= 0.65:
+        events.append("VOLATILITY_COIL_COMPRESSION")
+    if abs(vwap_dist_bps) >= 60.0 and np.sign(mom_5m_bps) != np.sign(vwap_dist_bps):
+        events.append("VWAP_MEAN_REVERSION_SNAP")
 
-        g = GoogleDriveStore()
-        parts = remote_relative_path.strip("/").split("/")
-        parent = g.root_id
-
-        for part in parts[:-1]:
-            found = g._find_child(parent, part)
-            if not found:
-                return None
-            parent = found["id"]
-
-        name = parts[-1]
-        found = g._find_child(parent, name)
-        if not found:
-            return None
-
-        from googleapiclient.http import MediaIoBaseDownload
-        import io
-
-        request = g.service.files().get_media(fileId=found["id"])
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-
-        return buf.getvalue()
-    except Exception:
-        return None
-
-
-def _restore_remote_prediction_ledger() -> None:
-    _ensure_local()
-    if LOCAL_LEDGER.stat().st_size:
-        return
-    payload = _drive_file_bytes(REMOTE_LEDGER)
-    if payload:
-        LOCAL_LEDGER.write_bytes(payload)
-
-
-def load_records() -> list[dict[str, Any]]:
-    _restore_remote_prediction_ledger()
-    _ensure_local()
-    records: list[dict[str, Any]] = []
-    with LOCAL_LEDGER.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return records
-
-
-def append_prediction(record: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
-    _ensure_local()
-    x = dict(record)
-    x.setdefault("created_at", _utc())
-    x.setdefault("prediction_revision", prediction_revision_fingerprint(x))
-    x["prediction_id"] = x.get("prediction_id") or _stable_id(x)
-
-    existing = {r.get("prediction_id") for r in load_records()}
-    if x["prediction_id"] in existing:
-        return {"status": "EXISTS", "prediction_id": x["prediction_id"], "synced": False}
-
-    with LOCAL_LEDGER.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(x, default=str, separators=(",", ":")) + "\n")
-
-    synced = False
-    sync_error = None
-    if sync_drive:
-        try:
-            from persistent_store import GoogleDriveStore
-            g = GoogleDriveStore()
-            remote = g.upload_or_update(LOCAL_LEDGER, REMOTE_LEDGER, mime_type="application/x-ndjson")
-            synced = remote.get("status") == "OK"
-        except Exception as exc:
-            sync_error = f"{type(exc).__name__}: {exc}"
-
-    out = {"status": "APPENDED", "prediction_id": x["prediction_id"], "synced": synced}
-    if sync_error:
-        out["sync_error"] = sync_error
-    return out
-
-
-def append_predictions(records: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
-    """Append many predictions efficiently and sync the ledger once."""
-    _ensure_local()
-    existing_records = load_records()
-    existing = {str(r.get("prediction_id")) for r in existing_records if r.get("prediction_id")}
-    to_write: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for record in records:
-        x = dict(record)
-        x.setdefault("created_at", _utc())
-        x.setdefault("prediction_revision", prediction_revision_fingerprint(x))
-        x["prediction_id"] = x.get("prediction_id") or _stable_id(x)
-        pid = str(x["prediction_id"])
-        if pid in existing or pid in seen:
-            continue
-        seen.add(pid)
-        to_write.append(x)
-
-    if to_write:
-        with LOCAL_LEDGER.open("a", encoding="utf-8") as f:
-            for x in to_write:
-                f.write(json.dumps(x, default=str, separators=(",", ":")) + "\n")
-
-    synced = False
-    sync_error = None
-    if sync_drive:
-        # Also retry syncing when this batch contains no new IDs. A prior run
-        # can append locally and fail the Drive upload; without this retry path,
-        # the next idempotent run would skip the rows forever.
-        try:
-            from persistent_store import GoogleDriveStore
-            g = GoogleDriveStore()
-            remote = g.upload_or_update(
-                LOCAL_LEDGER,
-                REMOTE_LEDGER,
-                mime_type="application/x-ndjson",
-            )
-            synced = remote.get("status") == "OK"
-        except Exception as exc:
-            sync_error = f"{type(exc).__name__}: {exc}"
-
-    out = {
-        "status": "APPENDED" if to_write else "NO_NEW_PREDICTIONS",
-        "new_rows": len(to_write),
-        "existing_rows_seen": len(existing),
-        "synced": synced,
-    }
-    if sync_error:
-        out["sync_error"] = sync_error
-    return out
-
-
-def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
-    """Persist the latest validation result per prediction ID as an append-safe state file."""
-    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-    latest: dict[str, dict[str, Any]] = {}
-    if LOCAL_VALIDATION.exists():
-        with LOCAL_VALIDATION.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    if r.get("prediction_id"):
-                        latest[str(r["prediction_id"])] = r
-                except json.JSONDecodeError:
-                    continue
-    for r in results:
-        pid = r.get("prediction_id")
-        if pid:
-            x = dict(r)
-            x["validated_at"] = _utc()
-            latest[str(pid)] = x
-    tmp = LOCAL_VALIDATION.with_suffix(".jsonl.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for r in latest.values():
-            f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
-    os.replace(tmp, LOCAL_VALIDATION)
-    synced = False
-    err = None
-    if sync_drive:
-        try:
-            from persistent_store import GoogleDriveStore
-            g = GoogleDriveStore()
-            out = g.upload_or_update(LOCAL_VALIDATION, REMOTE_VALIDATION, mime_type="application/x-ndjson")
-            synced = out.get("status") == "OK"
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-    result = {"status": "SAVED", "rows": len(latest), "synced": synced}
-    if err:
-        result["sync_error"] = err
-    return result
-
-
-def load_validation_records() -> list[dict[str, Any]]:
-    if not LOCAL_VALIDATION.exists() or LOCAL_VALIDATION.stat().st_size == 0:
-        payload = _drive_file_bytes(REMOTE_VALIDATION)
-        if payload:
-            LOCAL_VALIDATION.write_bytes(payload)
-    if not LOCAL_VALIDATION.exists():
-        return []
-    rows = []
-    with LOCAL_VALIDATION.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return rows
-
-
-def dataframe() -> pd.DataFrame:
-    rows = load_records()
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
-
-
-def summary(records: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
-    rows = list(records) if records is not None else load_records()
     return {
-        "total_predictions": len(rows),
-        "delivery_predictions": sum(str(r.get("mode", "")).lower() == "delivery" for r in rows),
-        "intraday_predictions": sum(str(r.get("mode", "")).lower() == "intraday" for r in rows),
-        "last_prediction_at": max((str(r.get("created_at", "")) for r in rows), default=None),
+        "volume_zscore_20m": round(vol_zscore, 4),
+        "vwap_distance_bps": round(vwap_dist_bps, 2),
+        "price_momentum_5m_bps": round(mom_5m_bps, 2),
+        "order_flow_imbalance": round(ofi, 4),
+        "volatility_ratio_15m": round(vol_ratio, 4),
+        "candle_body_to_wick": round(body_to_wick, 4),
+        "event_flags": events,
     }
 
 
+@dataclass
+class PredictionRecord:
+    symbol: str
+    decision_timestamp: str
+    horizon_min: int
+    signal: str
+    probability_up: float
+    reference_close: float
+    predicted_price: float
+    price_forecast_status: str = "OK"
+    feature_coverage: float = 1.0
+    calibration_profile_id: str = "RAW"
+    atr_15m: float | None = None
+    target_timestamp: str | None = None
+    # Live microstructure context for self-evolving online learning
+    volume_zscore_20m: float = 0.0
+    vwap_distance_bps: float = 0.0
+    price_momentum_5m_bps: float = 0.0
+    order_flow_imbalance: float = 0.0
+    volatility_ratio_15m: float = 1.0
+    candle_body_to_wick: float = 0.5
+    event_flags: list[str] = field(default_factory=list)
+    expert_votes: dict[str, float] = field(default_factory=dict)
+    active_policy_version: str = "v1"
+    schema_version: str = field(default=SCHEMA_VERSION)
 
-def sync_delivery_prediction_csv_ledger() -> dict[str, Any]:
-    """Build and sync the daywise Delivery prediction-vs-actual CSV ledger."""
-    from delivery_prediction_csv_ledger import sync_delivery_csv_ledger
-    return sync_delivery_csv_ledger()
+    def __post_init__(self) -> None:
+        self.symbol = str(self.symbol).strip().upper()
+        self.horizon_min = int(self.horizon_min)
+
+        norm_decision = normalize_ist_timestamp(self.decision_timestamp)
+        target_ts = compute_target_timestamp(norm_decision, self.horizon_min)
+        self.decision_timestamp = norm_decision.isoformat()
+        self.target_timestamp = target_ts.isoformat()
+
+        if self.reference_close is None or not math.isfinite(float(self.reference_close)) or float(self.reference_close) <= 0.0:
+            raise ValueError(
+                f"Invalid reference_close={self.reference_close} for {self.symbol} at {self.decision_timestamp}. "
+                "reference_close must be a finite positive float."
+            )
+        self.reference_close = float(self.reference_close)
+        self.predicted_price = float(self.predicted_price)
+        self.probability_up = float(self.probability_up)
+        self.feature_coverage = float(self.feature_coverage)
+
+        if self.feature_coverage < MIN_FEATURE_COVERAGE:
+            self.price_forecast_status = "LOW_FEATURE_COVERAGE"
+        elif not is_within_nse_session(norm_decision, self.horizon_min):
+            self.price_forecast_status = "OUT_OF_SESSION_HORIZON"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def append_record(ledger_path: str | Path, record: PredictionRecord | dict[str, Any]) -> PredictionRecord:
+    """Validate and append a single prediction record (with microstructure state) to JSONL or CSV."""
+    path = Path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    validated = record if isinstance(record, PredictionRecord) else PredictionRecord(**record)
+    row_dict = validated.to_dict()
+
+    if path.suffix.lower() == ".jsonl":
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row_dict) + "\n")
+    else:
+        csv_row = dict(row_dict)
+        csv_row["event_flags"] = json.dumps(csv_row.get("event_flags", []))
+        csv_row["expert_votes"] = json.dumps(csv_row.get("expert_votes", {}))
+        df_row = pd.DataFrame([csv_row])
+        write_header = not path.exists() or path.stat().st_size == 0
+        df_row.to_csv(path, mode="a", header=write_header, index=False)
+
+    return validated
+
+
+def load_records(
+    ledger_path: str | Path,
+    *,
+    include_out_of_session: bool = False,
+    min_feature_coverage: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Load historical prediction records, normalize timestamps to Asia/Kolkata,
+    restore microstructure state columns, and filter out-of-session horizons.
+    """
+    path = Path(ledger_path)
+    if not path.exists():
+        return pd.DataFrame()
+
+    if path.suffix.lower() == ".jsonl":
+        rows: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.read_csv(path)
+        for json_col, default_val in [("event_flags", "[]"), ("expert_votes", "{}")]:
+            if json_col in df.columns:
+                df[json_col] = df[json_col].fillna(default_val).apply(
+                    lambda x: json.loads(x) if isinstance(x, str) else x
+                )
+
+    if df.empty:
+        return df
+
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["horizon_min"] = pd.to_numeric(df["horizon_min"], errors="coerce").fillna(5).astype(int)
+    df["decision_timestamp"] = pd.to_datetime(df["decision_timestamp"], utc=True).dt.tz_convert(IST_TZ)
+
+    if "target_timestamp" not in df.columns or df["target_timestamp"].isna().any():
+        df["target_timestamp"] = df["decision_timestamp"] + pd.to_timedelta(df["horizon_min"], unit="m")
+    else:
+        df["target_timestamp"] = pd.to_datetime(df["target_timestamp"], utc=True).dt.tz_convert(IST_TZ)
+
+    if "reference_close" not in df.columns:
+        df["reference_close"] = float("nan")
+    else:
+        df["reference_close"] = pd.to_numeric(df["reference_close"], errors="coerce")
+
+    if "price_forecast_status" not in df.columns:
+        df["price_forecast_status"] = "OK"
+
+    # Ensure microstructure columns exist with safe defaults for legacy ledgers
+    defaults = {
+        "volume_zscore_20m": 0.0,
+        "vwap_distance_bps": 0.0,
+        "price_momentum_5m_bps": 0.0,
+        "order_flow_imbalance": 0.0,
+        "volatility_ratio_15m": 1.0,
+        "candle_body_to_wick": 0.5,
+    }
+    for col, d_val in defaults.items():
+        if col not in df.columns:
+            df[col] = d_val
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(d_val)
+
+    in_session_mask = [
+        is_within_nse_session(dec_ts, h)
+        for dec_ts, h in zip(df["decision_timestamp"], df["horizon_min"])
+    ]
+    df.loc[~pd.Series(in_session_mask, index=df.index), "price_forecast_status"] = "OUT_OF_SESSION_HORIZON"
+
+    if not include_out_of_session:
+        df = df[df["price_forecast_status"] != "OUT_OF_SESSION_HORIZON"].copy()
+
+    if "feature_coverage" in df.columns and min_feature_coverage > 0.0:
+        df["feature_coverage"] = pd.to_numeric(df["feature_coverage"], errors="coerce").fillna(1.0)
+        df = df[df["feature_coverage"] >= min_feature_coverage].copy()
+
+    return df.sort_values(["decision_timestamp", "symbol", "horizon_min"]).reset_index(drop=True)
