@@ -30,7 +30,7 @@ jobs:
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
-      MINUTE_PERSISTENCE_AUDIT_LOOKBACK_DAYS: "2"
+      MINUTE_PERSISTENCE_AUDIT_LOOKBACK_DAYS: "7"
 
     steps:
       - name: Checkout main
@@ -76,10 +76,36 @@ jobs:
           }
           rendered = json.dumps(summary, sort_keys=True, default=str)
           print("LIVE_INTRADAY_STATUS_SUMMARY:", rendered)
+
+          # Gate the most recent NSE trading day covered by the lookback.
+          # The 09:15 opening tick is exempt from forecast/actual completeness,
+          # because no completed 09:15 one-minute candle exists at tick start.
+          from datetime import date
+          from market_session_guard import is_nse_trading_day
+          candidates = sorted(
+              (day for day in report.get("watchlist_minute_snapshots_by_day", {}) if is_nse_trading_day(date.fromisoformat(day))),
+              reverse=True,
+          )
+          gate = {"applicable": bool(candidates), "session_date": None, "pass": True, "failures": []}
+          if candidates:
+              session = candidates[0]
+              gate["session_date"] = session
+              watch = report["watchlist_minute_snapshots_by_day"].get(session) or {}
+              ledger = report["prediction_ledger_by_day"].get(session) or {}
+              if watch.get("expected_snapshot_minutes", 0) > 0:
+                  if not watch.get("all_expected_snapshot_files_present"):
+                      gate["failures"].append("missing or duplicate expected minute snapshot files")
+                  if watch.get("expected_prediction_actual_minutes", 0) > 0 and not watch.get("all_required_minutes_have_predictions_and_actuals"):
+                      gate["failures"].append("one or more expected minutes lack a valid prediction plus timestamped actual price for every watchlist symbol")
+                  if not ledger.get("exists") or int(ledger.get("prediction_rows") or 0) == 0:
+                      gate["failures"].append("prediction ledger missing or empty")
+              gate["pass"] = not gate["failures"]
+          print("WATCHLIST_MINUTE_AUDIT_GATE:", json.dumps(gate, sort_keys=True))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("WATCHLIST_MINUTE_AUDIT_OK=" + ("true" if gate["pass"] else "false") + "\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write("## Live intraday persistence audit\n\n")
-              fh.write("```json\n" + json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n```\n")
-          PY
+              fh.write(json.dumps({"summary": summary, "watchlist_minute_gate": gate}, indent=2, sort_keys=True, default=str) + "\n")          PY
 
       - name: Audit latest completed NSE session's full-universe minute snapshots
         shell: bash
@@ -124,6 +150,7 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import os
           from pathlib import Path
 
           output = Path("/tmp/all-universe-minute-audit.log").read_text(encoding="utf-8")
@@ -146,9 +173,11 @@ jobs:
               fh.write("```json\n" + json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n```\n")
           # Make an incomplete capture visible as a failed scheduled audit.
           # The audit files are synced to Drive before this gate is evaluated.
+          failures = []
+          if os.getenv("WATCHLIST_MINUTE_AUDIT_OK", "true").lower() != "true":
+              failures.append("WATCHLIST_MINUTE_CAPTURE_FAILED: per-minute prediction/actual snapshots are missing or incomplete.")
           if report.get("nse_trading_day") and not report.get("quality_gate_pass"):
-              raise SystemExit(
-                  "FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: session snapshot/manifest coverage "
-                  "or data-quality gate is incomplete; inspect the summary above and Drive audit."
-              )
+              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: full-universe snapshot/manifest coverage or quote data-quality gate is incomplete.")
+          if failures:
+              raise SystemExit(" | ".join(failures))
           PY
