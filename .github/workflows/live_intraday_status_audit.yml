@@ -105,7 +105,8 @@ jobs:
               env.write("WATCHLIST_MINUTE_AUDIT_OK=" + ("true" if gate["pass"] else "false") + "\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write("## Live intraday persistence audit\n\n")
-              fh.write(json.dumps({"summary": summary, "watchlist_minute_gate": gate}, indent=2, sort_keys=True, default=str) + "\n")          PY
+              fh.write(json.dumps({"summary": summary, "watchlist_minute_gate": gate}, indent=2, sort_keys=True, default=str) + "\n")
+          PY
 
       - name: Audit latest completed NSE session's full-universe minute snapshots
         shell: bash
@@ -149,7 +150,6 @@ jobs:
 
           python - <<'PY'
           import json
-          import os
           import os
           from pathlib import Path
 
