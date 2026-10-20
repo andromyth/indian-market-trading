@@ -230,9 +230,16 @@ def main() -> int:
             else:
                 old_index = set()
 
-            combined = pd.concat([fetched, existing], axis=0, sort=False).sort_index()
+            # Append only timestamps not already present. This guarantees the
+            # original captured value wins at duplicate timestamps, independent
+            # of pandas sort stability.
+            missing_rows = fetched.loc[~fetched.index.isin(old_index)].copy()
+            if existing.empty:
+                combined = fetched.copy()
+            else:
+                combined = pd.concat([existing, missing_rows], axis=0, sort=False).sort_index()
             combined = combined.loc[~combined.index.duplicated(keep="last")]
-            report["new_timestamps_added"] = int(sum(1 for ts in fetched.index if ts not in old_index))
+            report["new_timestamps_added"] = int(len(missing_rows))
             report["merged_rows"] = int(len(combined))
 
             with tempfile.TemporaryDirectory(prefix="intraday-actual-backfill-") as tmp:
