@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Deploy from the repository root after required secrets are provisioned in
 # Google Secret Manager. Secret values are never printed or embedded in files.
-: "${PROJECT_ID}"
+: "${PROJECT_ID:=indian-market-trading}"
+export PROJECT_ID
 
 REGION="${REGION:-asia-south1}"
 SERVICE_NAME="${SERVICE_NAME:-indian-market-intraday-worker}"
