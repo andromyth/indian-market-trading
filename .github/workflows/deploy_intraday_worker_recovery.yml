@@ -1,0 +1,86 @@
+name: Deploy intraday worker recovery revision
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy_intraday_worker_recovery.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-worker-recovery-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Deploy the tested worker and latest Secret Manager versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_ID="$PROJECT_ID" REGION="$REGION" bash deploy_autonomous_intraday_cloud_run.sh
+
+      - name: Verify ready revision, traffic, scheduler states and startup diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE=indian-market-intraday-worker
+          REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
+          if [[ -z "$REVISION" ]]; then
+            echo "ERROR: Cloud Run has no ready revision after deploy."
+            gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(status)'
+            exit 1
+          fi
+          echo "READY_REVISION=$REVISION"
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(status.latestReadyRevisionName,status.latestCreatedRevisionName,status.traffic)'
+
+          echo "=== Scheduler job states ==="
+          for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530; do
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(name,state,schedule,lastAttemptTime,status)' || exit 1
+          done
+
+          # Wait for the new revision's first asynchronous Drive preflight.
+          for attempt in $(seq 1 12); do
+            LOGS="$(gcloud logging read \
+              "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.revision_name=\"$REVISION\" AND textPayload:\"google_drive_preflight\"" \
+              --project="$PROJECT_ID" --limit=20 --order=desc --format='value(textPayload)' 2>/dev/null || true)"
+            if [[ -n "$LOGS" ]]; then
+              printf '%s\n' "$LOGS"
+              if printf '%s\n' "$LOGS" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"OK"'; then
+                echo "DRIVE_PREFLIGHT=OK"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+
+          echo "ERROR: No successful Drive preflight was confirmed for the new revision."
+          gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.revision_name=\"$REVISION\"" \
+            --project="$PROJECT_ID" --limit=40 --order=desc --format='table(timestamp,severity,textPayload)'
+          exit 1
