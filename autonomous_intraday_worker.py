@@ -1271,10 +1271,17 @@ class AutonomousIntradayWorker:
                 and self.daily_ledger.stat().st_size > 0
             )
             has_local_bar_frames = bool(self.session_frames)
+            # A cold Cloud Run instance starts in STARTING. On a weekend or
+            # exchange holiday it can legitimately receive a scheduler tick but
+            # has no local prediction ledger to flush. Persist STOPPED status once
+            # in that case so Drive does not retain a misleading status from the
+            # previous trading session. Subsequent closed ticks do not re-upload
+            # the status unless there is data or a persistence error to retry.
             should_final_flush = (
                 self.run_status in {"RUNNING", "PERSISTENCE_ERROR", "PERSISTENCE_PENDING"}
+                or self.run_status == "STARTING"
                 or (
-                    self.run_status in {"STARTING", "IDLE"}
+                    self.run_status == "IDLE"
                     and (local_ledger_has_rows or has_local_bar_frames)
                 )
             )
