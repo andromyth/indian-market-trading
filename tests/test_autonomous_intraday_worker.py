@@ -121,7 +121,7 @@ def test_live_inference_can_emit_minute_anchors_while_training_default_stays_fiv
     assert all(ts.second == 0 for ts in minute_anchors)
 
 
-def test_cloud_run_worker_tick_skips_weekend_without_fetching_or_persisting(tmp_path):
+def test_cloud_run_worker_tick_skips_weekend_and_persists_stopped_status_once(tmp_path, monkeypatch):
     from autonomous_intraday_worker import AutonomousIntradayWorker
 
     worker = AutonomousIntradayWorker(
@@ -129,11 +129,30 @@ def test_cloud_run_worker_tick_skips_weekend_without_fetching_or_persisting(tmp_
         root=tmp_path,
         flush_every=5,
     )
+    flush_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_flush",
+        lambda final=False: (
+            flush_calls.append(final)
+            or {
+                "status": "OK",
+                "data_partitions_synced": 0,
+                "ledger_synced": False,
+                "status_synced": True,
+                "errors": [],
+            }
+        ),
+    )
+
     result = worker.tick_once(datetime(2026, 10, 17, 10, 15, tzinfo=IST))
+    second = worker.tick_once(datetime(2026, 10, 17, 10, 16, tzinfo=IST))
 
     assert result["status"] == "MARKET_CLOSED"
+    assert second["status"] == "MARKET_CLOSED"
     assert worker.cycle_count == 0
-    assert worker.run_status == "STARTING"
+    assert worker.run_status == "STOPPED"
+    assert flush_calls == [True]
 
 
 def test_cloud_run_worker_runs_at_most_one_cycle_per_minute(tmp_path, monkeypatch):
