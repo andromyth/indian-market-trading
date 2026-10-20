@@ -70,12 +70,24 @@ jobs:
           print("LIVE_INTRADAY_STATUS_SUMMARY:", json.dumps(summary, sort_keys=True, default=str))
           PY
 
-      - name: Audit expected per-minute full-universe snapshots for today's session
+      - name: Audit latest completed NSE session's full-universe minute snapshots
         shell: bash
         run: |
           set -euo pipefail
-          AUDIT_DATE="$(TZ=Asia/Kolkata date +%F)"
-          echo "AUDIT_SESSION_DATE_IST=$AUDIT_DATE"
+          AUDIT_DATE="$(python - <<'PY'
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from market_session_guard import is_nse_trading_day
+
+          day = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          while not is_nse_trading_day(day):
+              day -= timedelta(days=1)
+          print(day.isoformat())
+          PY
+          )"
+          TODAY_IST="$(TZ=Asia/Kolkata date +%F)"
+          echo "TODAY_IST=$TODAY_IST"
+          echo "LATEST_COMPLETED_NSE_SESSION_IST=$AUDIT_DATE"
           python -u audit_all_universe_minute_snapshots.py --date "$AUDIT_DATE" --sync-drive | tee /tmp/all-universe-minute-audit.log
           python - <<'PY'
           import json
@@ -92,5 +104,6 @@ jobs:
               "quality_gate_pass", "audit_status",
               "drive_json_write", "drive_csv_write",
           )
-          print("FULL_UNIVERSE_MINUTE_AUDIT_SUMMARY:", json.dumps({k: report.get(k) for k in keys}, sort_keys=True))
+          summary = {k: report.get(k) for k in keys}
+          print("FULL_UNIVERSE_MINUTE_AUDIT_SUMMARY:", json.dumps(summary, sort_keys=True))
           PY
