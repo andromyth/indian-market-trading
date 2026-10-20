@@ -10,7 +10,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from delivery_training_universe import official_nse_symbols
-from nse_data_layer import fetch_intraday_1m_current
+import nse_data_layer
+from market_session_guard import is_nse_trading_day
 from persistent_store import GoogleDriveStore
 
 MANIFEST_REMOTE = "production_data/nse_official/intraday_1m/sync_manifests/latest.json"
@@ -55,10 +56,15 @@ def main() -> None:
     market_window = (now_ist.hour, now_ist.minute) >= (9, 10) and (
         now_ist.hour, now_ist.minute
     ) <= (15, 45)
-    if now_ist.weekday() >= 5 or not market_window:
+    trading_day = is_nse_trading_day(now_ist.date())
+    if not trading_day or not market_window:
+        if not trading_day:
+            reason = "weekend or NSE exchange holiday"
+        else:
+            reason = "outside the public intraday quote-chart window"
         print(
-            "INTRADAY SYNC SKIPPED: NSE public current-chart capture is only useful "
-            f"during the trading window; now={now_ist.isoformat()}",
+            f"INTRADAY SYNC SKIPPED: {reason}; "
+            f"now={now_ist.isoformat()}",
             flush=True,
         )
         return
@@ -77,6 +83,9 @@ def main() -> None:
         "target": "production_data/intraday_1m/{YYYY}/{MM}/{DD}/{SYMBOL}.parquet",
         "volume_policy": "never_fabricate_minute_volume",
         "symbols": {},
+        "ok_symbols": 0,
+        "no_data_symbols": 0,
+        "error_symbols": 0,
     }
     print(
         f"INTRADAY NSE ALL-UNIVERSE SYNC: universe={len(universe):,} "
@@ -86,9 +95,30 @@ def main() -> None:
 
     for i, symbol in enumerate(symbols, start=1):
         try:
-            frame = fetch_intraday_1m_current(symbol, sync_drive=True)
-            run["symbols"][symbol] = {"status": "OK", "rows": int(len(frame))}
-            print(f"[{i}/{len(symbols)}] {symbol}: {len(frame):,} 1m rows", flush=True)
+            frame = nse_data_layer.fetch_intraday_1m_current(symbol, sync_drive=True)
+            if frame.empty:
+                # Empty NSE chart payloads previously counted as successful rows.
+                # Preserve a minimal, non-sensitive HTTP diagnostic so a fully
+                # empty run cannot look like a successful data capture.
+                diagnostic = getattr(nse_data_layer, "_last_nse_diagnostic", {}) or {}
+                safe_diagnostic = {
+                    key: diagnostic.get(key)
+                    for key in ("status_code", "content_type", "bytes", "attempt", "path")
+                    if diagnostic.get(key) is not None
+                }
+                run["symbols"][symbol] = {
+                    "status": "NO_DATA",
+                    "rows": 0,
+                    "source_diagnostic": safe_diagnostic,
+                }
+                print(
+                    f"[{i}/{len(symbols)}] {symbol}: NO_DATA 0 1m rows "
+                    f"diagnostic={json.dumps(safe_diagnostic, sort_keys=True)}",
+                    flush=True,
+                )
+            else:
+                run["symbols"][symbol] = {"status": "OK", "rows": int(len(frame))}
+                print(f"[{i}/{len(symbols)}] {symbol}: {len(frame):,} 1m rows", flush=True)
         except Exception as exc:
             run["symbols"][symbol] = {
                 "status": "ERROR",
@@ -104,19 +134,26 @@ def main() -> None:
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
             run["completed_symbols"] = i
             run["ok_symbols"] = sum(v.get("status") == "OK" for v in run["symbols"].values())
+            run["no_data_symbols"] = sum(v.get("status") == "NO_DATA" for v in run["symbols"].values())
             run["error_symbols"] = sum(v.get("status") == "ERROR" for v in run["symbols"].values())
             _write_manifest(run)
 
     run["completed_at"] = datetime.now(timezone.utc).isoformat()
     run["completed_symbols"] = len(symbols)
     run["ok_symbols"] = sum(v.get("status") == "OK" for v in run["symbols"].values())
+    run["no_data_symbols"] = sum(v.get("status") == "NO_DATA" for v in run["symbols"].values())
     run["error_symbols"] = sum(v.get("status") == "ERROR" for v in run["symbols"].values())
     _write_manifest(run)
     print(
         f"INTRADAY SYNC COMPLETE: ok={run['ok_symbols']:,} "
-        f"errors={run['error_symbols']:,}",
+        f"no_data={run['no_data_symbols']:,} errors={run['error_symbols']:,}",
         flush=True,
     )
+    if symbols and run["ok_symbols"] == 0 and run["no_data_symbols"] == len(symbols):
+        raise SystemExit(
+            "No NSE one-minute rows were returned for any requested symbol on a "
+            "declared trading day; treating the capture as failed rather than green."
+        )
 
 
 if __name__ == "__main__":
