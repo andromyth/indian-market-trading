@@ -1,6 +1,13 @@
 name: NSE ALL-universe intraday 1-minute sync
 
 on:
+  # Also run a recovery capture when this workflow definition changes.
+  # Scoped to the workflow file only, so ordinary code pushes do not launch a full-universe sync.
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nse_intraday_sync.yml"
   workflow_dispatch:
     inputs:
       start_index:
