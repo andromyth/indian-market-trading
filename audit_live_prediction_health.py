@@ -203,7 +203,9 @@ def _realised_delivery_diagnostics(
 
 def _intraday_target_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
     """Resolve the same 30-minute endpoint used by the target-bar validator."""
-    raw = row.get("signal_horizon_end") or row.get("target_timestamp")
+    raw = row.get("signal_horizon_end")
+    if raw is None or str(raw).strip().lower() in {"", "nan", "none", "<na>", "nat"}:
+        raw = row.get("target_timestamp")
     parsed = pd.to_datetime(raw, errors="coerce")
     if pd.isna(parsed):
         parsed = pd.to_datetime(row.get("decision_timestamp"), errors="coerce")
@@ -599,6 +601,8 @@ def main() -> int:
         issues.append("The live Delivery accuracy diagnostic has no adequate quality-approved active-model outcome history.")
     if intraday.get("status") == "AUDIT_FAILED":
         issues.append("The certified intraday model manifest/target contract could not be verified.")
+    if intraday_outcomes.get("status") == "AUDIT_FAILED":
+        issues.append("The intraday outcome-coverage audit failed to read or validate its prediction/validation ledgers.")
     if (
         intraday_outcomes.get("recent_matured_target_count", 0) > 0
         and intraday_outcomes.get("status") == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR"
