@@ -1,4 +1,5 @@
 name: Inspect all-NSE capture infrastructure
+# A push to this workflow requests a fresh read-only capture/scheduler diagnostics run.
 
 on:
   workflow_dispatch:
