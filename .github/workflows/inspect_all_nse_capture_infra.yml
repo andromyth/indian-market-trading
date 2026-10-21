@@ -96,5 +96,5 @@ jobs:
           echo "=== Scheduler state and last attempt ==="
           for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
             echo "--- $job ---"
-            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(state,schedule,timeZone,lastAttemptTime,status,httpTarget.uri,httpTarget.httpMethod,httpTarget.oidcToken.serviceAccountEmail)' || true
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(state,schedule,timeZone,lastAttemptTime,scheduleTime,status,attemptDeadline,retryConfig,httpTarget.uri,httpTarget.httpMethod,httpTarget.oidcToken.serviceAccountEmail)' || true
           done
