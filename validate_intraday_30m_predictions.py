@@ -7,13 +7,16 @@ No model artifacts, prediction signals, or policy thresholds are changed.
 from __future__ import annotations
 
 import argparse
+import io
 import json
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from persistent_store import load_persistent_1m
+from persistent_store import INTRADAY_ROOT, normalize_symbol
 from prediction_ledger import (
     IST_TZ,
     is_within_nse_session,
@@ -32,28 +35,102 @@ def _root(symbol: Any) -> str:
 
 
 def _normalise_bars(frame: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize persisted worker bars; naive timestamps in these files are IST."""
     if frame is None or frame.empty:
-        return pd.DataFrame(columns=["close"])
+        return pd.DataFrame(columns=["close"], index=pd.DatetimeIndex([], tz=IST_TZ))
     x = frame.copy()
     lower_to_original = {str(c).strip().lower(): c for c in x.columns}
-    if "timestamp" in lower_to_original:
-        idx = pd.to_datetime(x.pop(lower_to_original["timestamp"]), errors="coerce", utc=True)
-    elif "datetime" in lower_to_original:
-        idx = pd.to_datetime(x.pop(lower_to_original["datetime"]), errors="coerce", utc=True)
-    elif "date" in lower_to_original:
-        idx = pd.to_datetime(x.pop(lower_to_original["date"]), errors="coerce", utc=True)
+    timestamp_col = next(
+        (lower_to_original[k] for k in ("timestamp", "datetime", "date", "_time") if k in lower_to_original),
+        None,
+    )
+    raw_index = x.pop(timestamp_col) if timestamp_col is not None else x.index
+    parsed = pd.DatetimeIndex(pd.to_datetime(raw_index, errors="coerce"))
+    if parsed.tz is None:
+        parsed = parsed.tz_localize(IST_TZ)
     else:
-        idx = pd.to_datetime(x.index, errors="coerce", utc=True)
-    idx = pd.DatetimeIndex(idx).tz_convert(IST_TZ)
-    x.index = idx
+        parsed = parsed.tz_convert(IST_TZ)
+    x.index = parsed
     close_col = lower_to_original.get("close")
     if close_col is None:
         close_col = lower_to_original.get("ltp")
     if close_col is None:
-        return pd.DataFrame(columns=["close"])
+        return pd.DataFrame(columns=["close"], index=pd.DatetimeIndex([], tz=IST_TZ))
     x["close"] = pd.to_numeric(x[close_col], errors="coerce")
     x = x.loc[~x.index.isna()].dropna(subset=["close"]).sort_index()
     return x[["close"]][~x.index.duplicated(keep="last")]
+
+
+def _drive_partition(symbol: str, session_date: date) -> pd.DataFrame:
+    """Read the target-session bar partition from Drive when the local runner lacks it."""
+    from googleapiclient.http import MediaIoBaseDownload
+    from persistent_store import GoogleDriveStore
+
+    root = normalize_symbol(symbol)
+    day_path = f"{session_date:%Y/%m/%d}"
+    safe_symbol = "".join(ch if ch.isalnum() or ch in "_-^" else "_" for ch in root)
+    store = _drive_store()
+    for remote_root in ("production_data/intraday_live_worker", "production_data/intraday_1m"):
+        parts = [p for p in f"{remote_root}/{day_path}/{safe_symbol}.parquet".split("/") if p]
+        parent = store.root_id
+        for part in parts[:-1]:
+            hit = store._find_child(parent, part, "application/vnd.google-apps.folder")
+            if not hit:
+                parent = ""
+                break
+            parent = hit["id"]
+        if not parent:
+            continue
+        hit = store._find_child(parent, parts[-1])
+        if not hit:
+            continue
+        buffer = io.BytesIO()
+        request = store.service.files().get_media(fileId=hit["id"])
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        try:
+            return _normalise_bars(pd.read_parquet(io.BytesIO(buffer.getvalue())))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not parse persisted 1-minute partition for {root} on {session_date}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    return pd.DataFrame(columns=["close"], index=pd.DatetimeIndex([], tz=IST_TZ))
+
+
+_DRIVE_STORE = None
+
+
+def _drive_store():
+    global _DRIVE_STORE
+    if _DRIVE_STORE is None:
+        from persistent_store import GoogleDriveStore
+        _DRIVE_STORE = GoogleDriveStore()
+    return _DRIVE_STORE
+
+
+def _load_target_day_bars(symbol: str, session_date: date) -> pd.DataFrame:
+    """Read one local daily partition; leave remote fallback to the target alignment check."""
+    root = normalize_symbol(symbol)
+    local_path = Path(INTRADAY_ROOT) / f"{session_date:%Y}" / f"{session_date:%m}" / f"{session_date:%d}" / f"{root}.parquet"
+    if local_path.exists() and local_path.stat().st_size:
+        try:
+            local = _normalise_bars(pd.read_parquet(local_path))
+            if not local.empty:
+                return local
+        except Exception:
+            # Remote fallback below is safer than treating a corrupt local cache as actuals.
+            pass
+    return _drive_partition(root, session_date)
+
+
+def _has_target_bar(bars: pd.DataFrame, target: pd.Timestamp, tolerance_seconds: int) -> bool:
+    if bars.empty:
+        return False
+    delta = (bars.index - target).total_seconds()
+    return bool(((delta >= 0) & (delta <= max(1, int(tolerance_seconds)))).any())
 
 
 def _timestamp(value: Any) -> pd.Timestamp | None:
@@ -201,7 +278,7 @@ def main() -> int:
         pid for pid, row in existing.items()
         if str(row.get("validation_status", "")).upper() == "VALIDATED"
         and pd.notna(pd.to_numeric(row.get("actual_return_30m"), errors="coerce"))
-        and pd.notna(pd.to_numeric(row.get("actual_direction_30m") == "UP", errors="coerce"))
+        and str(row.get("actual_direction_30m", "")).upper() in {"UP", "DOWN"}
     }
     pending = [row for row in predictions if str(row["prediction_id"]) not in completed_ids]
     if not pending:
@@ -213,13 +290,34 @@ def main() -> int:
         }, indent=2))
         return 0
 
-    bar_cache: dict[str, pd.DataFrame] = {}
+    bar_cache: dict[tuple[str, date], pd.DataFrame] = {}
     results = []
+    now = pd.Timestamp.now(tz=IST_TZ)
     for record in pending:
         symbol = _root(record.get("symbol"))
-        if symbol not in bar_cache:
-            bar_cache[symbol] = _normalise_bars(load_persistent_1m(symbol))
-        results.append(validate_one(record, bar_cache[symbol], args.tolerance_seconds))
+        decision = _timestamp(record.get("decision_timestamp"))
+        target = _timestamp(record.get("signal_horizon_end") or record.get("target_timestamp"))
+        if target is None and decision is not None:
+            target = decision + pd.Timedelta(minutes=30)
+        if target is None:
+            results.append(validate_one(record, pd.DataFrame(columns=["close"]), args.tolerance_seconds))
+            continue
+        session_date = target.date()
+        key = (symbol, session_date)
+        if key not in bar_cache:
+            # Query remote data only for a target date that has already matured.
+            if target <= now:
+                bar_cache[key] = _load_target_day_bars(symbol, session_date)
+            else:
+                bar_cache[key] = pd.DataFrame(columns=["close"], index=pd.DatetimeIndex([], tz=IST_TZ))
+        bars = bar_cache[key]
+        if target <= now and not _has_target_bar(bars, target, args.tolerance_seconds):
+            remote = _drive_partition(symbol, session_date)
+            if not remote.empty:
+                bars = pd.concat([bars, remote]).sort_index()
+                bars = bars[~bars.index.duplicated(keep="last")]
+                bar_cache[key] = bars
+        results.append(validate_one(record, bars, args.tolerance_seconds))
 
     counts = pd.Series([row.get("validation_status", "UNKNOWN") for row in results]).value_counts().to_dict()
     validated = [row for row in results if row.get("validation_status") == "VALIDATED"]
