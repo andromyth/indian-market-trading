@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import all_nse_minute_prediction_capture as capture
 
@@ -107,3 +108,110 @@ def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
     assert str(frame.index.tz) == "Asia/Kolkata"
     assert frame.iloc[-1]["Close"] == 102
     assert frame.iloc[-1]["Volume"] == 18
+
+
+def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from all_nse_minute_prediction_capture import AllNSEMinutePredictor
+
+    minute = pd.Timestamp.now(tz=IST).floor("min")
+    predictor = AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: None
+    predictor._seed_ready = True
+    predictor._seed_status = "READY"
+    predictor._symbols = ["AAA", "BBB"]
+    predictor._codes = {"AAA": "NSE_1", "BBB": "NSE_2"}
+    predictor._seed_coverage = 2
+    predictor._seed_errors = 0
+    predictor._trained_symbols = {"AAA", "BBB"}
+    predictor._model_status = {
+        "training_symbol_count": 2,
+        "trained_until": "2026-10-20T09:15:00+00:00",
+    }
+
+    idx = pd.date_range(
+        end=minute - pd.Timedelta(minutes=1),
+        periods=60,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    history = pd.DataFrame(
+        {
+            "Open": np.linspace(99, 100, len(idx)),
+            "High": np.linspace(100, 101, len(idx)),
+            "Low": np.linspace(98, 99, len(idx)),
+            "Close": np.linspace(99.5, 100.5, len(idx)),
+            "Volume": np.full(len(idx), 10.0),
+        },
+        index=idx,
+    )
+    predictor._history = {"AAA": history.copy(), "BBB": history.copy()}
+    predictor._market_history = history.copy()
+    predictor._model_api = SimpleNamespace(
+        FEATURES=["f1", "f2"],
+        _latest_features=lambda price_df, market_df=None, decision_timestamp=None: {
+            "f1": 1.0,
+            "f2": 0.5,
+        },
+    )
+    predictor._classifier = SimpleNamespace(
+        predict_proba=lambda frame: np.array([[0.2, 0.8], [0.8, 0.2]])
+    )
+    predictor._regressor = SimpleNamespace(
+        predict=lambda frame: np.array([0.01, -0.01])
+    )
+    predictor._fetch_current_nifty_quote = lambda: (25000.0, minute, None)
+
+    snapshot_dir = tmp_path / "all_universe_minute_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    quote_path = snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
+    pd.DataFrame([
+        {
+            "symbol": "AAA",
+            "quote_status": "PASS",
+            "actual_observed_price": 101.25,
+            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
+            "day_volume": 10000,
+        },
+        {
+            "symbol": "BBB",
+            "quote_status": "PASS",
+            "actual_observed_price": 202.5,
+            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=3)).isoformat(),
+            "day_volume": 20000,
+        },
+    ]).to_parquet(quote_path, index=False)
+
+    class FakeDriveStore:
+        def upload_or_update(self, local_path, remote_relative_path, mime_type="application/octet-stream"):
+            return {
+                "status": "OK",
+                "action": "created",
+                "remote_path": remote_relative_path,
+                "file_id": "fake-drive-id",
+            }
+
+    monkeypatch.setattr("persistent_store.GoogleDriveStore", FakeDriveStore)
+
+    result = predictor.run_for_capture(
+        {"cycle_minute_ist": minute.isoformat(), "status": "OK"},
+        worker_root=tmp_path,
+    )
+
+    assert result["status"] == "OK"
+    assert result["row_count"] == 2
+    assert result["prediction_count"] == 2
+    assert result["quality_gate_pass"] is True
+
+    written = pd.read_parquet(
+        tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
+        f"{minute:%d}" / f"predictions_{minute:%Y%m%d_%H%M}.parquet"
+    ).set_index("symbol")
+    assert written.loc["AAA", "actual_market_value"] == 101.25
+    assert written.loc["AAA", "probability_up_30m"] == pytest.approx(0.8)
+    assert written.loc["AAA", "signal"] == "BUY"
+    assert written.loc["BBB", "actual_market_value"] == 202.5
+    assert written.loc["BBB", "probability_up_30m"] == pytest.approx(0.2)
+    assert written.loc["BBB", "signal"] == "SELL"
