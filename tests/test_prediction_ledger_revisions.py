@@ -173,7 +173,7 @@ def test_explicit_path_keeps_minute_level_dataframe_loader(tmp_path):
         "probability_up": 0.51,
         "reference_close": 100.0,
         "predicted_price": 100.1,
-    }) + "\\n", encoding="utf-8")
+    }) + "\n", encoding="utf-8")
     loaded = load_records(path)
     assert len(loaded) == 1
     assert loaded.iloc[0]["symbol"] == "SBIN"
