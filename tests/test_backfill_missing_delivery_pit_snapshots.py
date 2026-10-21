@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from backfill_missing_delivery_pit_snapshots import plan_snapshot_backfill
+from backfill_missing_delivery_pit_snapshots import _write_report, plan_snapshot_backfill
 from nse_bulk_eod_ingest import business_days
 
 
@@ -93,6 +96,58 @@ class PITSnapshotBackfillPlanTests(unittest.TestCase):
                 pit_dates=set(),
                 max_backfills_per_run=0,
             )
+
+
+class PITSnapshotReportRetryTests(unittest.TestCase):
+    def test_report_write_retries_a_transient_drive_timeout(self):
+        class FlakyStore:
+            def __init__(self):
+                self.calls = 0
+                self.remote_paths = []
+
+            def upload_or_update(self, local_path, remote_path, mime_type=None):
+                self.calls += 1
+                self.remote_paths.append(remote_path)
+                if self.calls == 1:
+                    raise TimeoutError("The read operation timed out")
+                return {"status": "OK"}
+
+        store = FlakyStore()
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "continuity.json"
+            with (
+                patch("backfill_missing_delivery_pit_snapshots.REPORT_PATH", path),
+                patch("backfill_missing_delivery_pit_snapshots.time.sleep") as sleep,
+            ):
+                _write_report(store, {"status": "PASS"})
+                self.assertTrue(path.exists())
+                self.assertEqual(store.calls, 2)
+                self.assertEqual(store.remote_paths, [
+                    "diagnostics/production/pit_snapshot_continuity_latest.json",
+                    "diagnostics/production/pit_snapshot_continuity_latest.json",
+                ])
+                sleep.assert_called_once_with(1)
+
+    def test_report_write_does_not_retry_nontransient_errors(self):
+        class FailingStore:
+            def __init__(self):
+                self.calls = 0
+
+            def upload_or_update(self, local_path, remote_path, mime_type=None):
+                self.calls += 1
+                raise ValueError("invalid report")
+
+        store = FailingStore()
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "continuity.json"
+            with (
+                patch("backfill_missing_delivery_pit_snapshots.REPORT_PATH", path),
+                patch("backfill_missing_delivery_pit_snapshots.time.sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(ValueError, "invalid report"):
+                    _write_report(store, {"status": "PASS"})
+                self.assertEqual(store.calls, 1)
+                sleep.assert_not_called()
 
 
 if __name__ == "__main__":
