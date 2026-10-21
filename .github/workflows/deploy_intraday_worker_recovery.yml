@@ -90,6 +90,7 @@ jobs:
             --project="$PROJECT_ID" \
             --region="$REGION" \
             --source . \
+            --build-service-account "projects/$PROJECT_ID/serviceAccounts/cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com" \
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --port 8080 \
             --cpu 1 \
