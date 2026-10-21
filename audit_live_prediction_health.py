@@ -180,13 +180,19 @@ def _delivery_model_manifest(path: Path = DELIVERY_MANIFEST) -> dict[str, Any]:
     }
 
 
-def _realised_delivery_diagnostics() -> dict[str, Any]:
+def _realised_delivery_diagnostics(
+    latest_official_eod_date: str | None = None,
+) -> dict[str, Any]:
     try:
         from prediction_ledger import load_records, load_validation_records
         from delivery_validation_diagnostics import build_report
         preds = pd.DataFrame(load_records())
         vals = pd.DataFrame(load_validation_records())
-        return build_report(preds, vals)
+        return build_report(
+            preds,
+            vals,
+            latest_official_eod_date=latest_official_eod_date,
+        )
     except Exception as exc:
         return {
             "status": "AUDIT_FAILED",
@@ -473,7 +479,16 @@ def main() -> int:
         delivery_manifest = _delivery_model_manifest()
         report_path = REPORT
 
-    delivery_outcomes = _realised_delivery_diagnostics()
+    # Use the actual official archive date, not the forecast date or the
+    # PIT snapshot date, to distinguish not-yet-matured forecasts from missing
+    # target-aligned validation rows.
+    latest_official_eod_date = (
+        bulk.get("latest_archive_date")
+        or master.get("latest_date")
+    )
+    delivery_outcomes = _realised_delivery_diagnostics(
+        latest_official_eod_date=latest_official_eod_date
+    )
     intraday_outcomes = _intraday_outcome_coverage()
     intraday = _intraday_model_audit()
 
@@ -489,7 +504,8 @@ def main() -> int:
     if pit.get("status") == "NO_PIT_READINESS_REPORT":
         issues.append("No Delivery PIT readiness report could be found.")
     if delivery_outcomes.get("status") in {
-        "NO_ACTIVE_MODEL_DATA", "NO_QUALITY_APPROVED_DATA", "INSUFFICIENT_HISTORY",
+        "NO_ACTIVE_MODEL_DATA", "ACTIVE_MODEL_OUTCOME_GAP",
+        "NO_QUALITY_APPROVED_DATA", "INSUFFICIENT_HISTORY",
         "INSUFFICIENT_SESSION_HISTORY", "AUDIT_FAILED", "NO_DATA",
     }:
         issues.append("The live Delivery accuracy diagnostic has no adequate quality-approved active-model outcome history.")

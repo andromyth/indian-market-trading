@@ -58,6 +58,47 @@ def test_seven_active_rows_are_not_enough_to_claim_target_accuracy():
     assert report["scored_samples"] == 7
 
 
+def test_future_active_targets_are_pending_not_missing_accuracy_data():
+    active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
+    active_preds, _ = _frames(12, active_version, True)
+    active_preds["prediction_id"] = "active-" + active_preds["prediction_id"].astype(str)
+    active_preds["prediction_for_date"] = "2026-10-21"
+
+    legacy_preds, legacy_vals = _frames(3, "2026.09-stage2", True)
+    preds = pd.concat([active_preds, legacy_preds], ignore_index=True)
+    report = build_report(
+        preds,
+        legacy_vals,
+        latest_official_eod_date="2026-10-19",
+    )
+
+    assert report["status"] == "ACTIVE_MODEL_AWAITING_MATURITY"
+    assert report["active_model_prediction_count"] == 12
+    assert report["active_model_scored_samples"] == 0
+    assert report["active_model_matured_prediction_count"] == 0
+    assert report["active_model_waiting_for_target_count"] == 12
+    assert report["all_validated_all_versions_diagnostic_only"]["samples"] == 3
+    assert "unscored until their official target bars arrive" in report["diagnosis"]
+
+
+def test_matured_active_targets_without_validations_remain_a_hard_gap():
+    active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
+    preds, _ = _frames(4, active_version, True)
+    preds["prediction_for_date"] = "2026-10-19"
+
+    report = build_report(
+        preds,
+        pd.DataFrame(),
+        latest_official_eod_date="2026-10-19",
+    )
+
+    assert report["status"] == "ACTIVE_MODEL_OUTCOME_GAP"
+    assert report["active_model_prediction_count"] == 4
+    assert report["active_model_matured_prediction_count"] == 4
+    assert report["active_model_waiting_for_target_count"] == 0
+    assert report["active_model_scored_samples"] == 0
+
+
 def test_large_monitoring_sample_still_does_not_claim_holdout_target():
     active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
     preds, vals = _frames(80, active_version, True)
