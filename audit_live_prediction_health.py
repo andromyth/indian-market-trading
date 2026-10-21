@@ -216,16 +216,29 @@ def _intraday_outcome_coverage() -> dict[str, Any]:
         available = {kind: [name for name in names if name in vals.columns] for kind, names in fields.items()}
         ids = set(intraday.get("prediction_id", pd.Series(dtype=str)).dropna().astype(str))
         matched = vals.loc[vals.get("prediction_id", pd.Series(index=vals.index, dtype=str)).astype(str).isin(ids)].copy() if not vals.empty and "prediction_id" in vals.columns else pd.DataFrame()
-        target_outcome_available = bool(available["realised_return"] or available["realised_direction"])
-        validated_count = 0
+        validated = matched.iloc[0:0].copy()
         if not matched.empty and "validation_status" in matched.columns:
-            validated_count = int(matched["validation_status"].astype(str).str.upper().eq("VALIDATED").sum())
+            validated = matched.loc[
+                matched["validation_status"].astype(str).str.upper().eq("VALIDATED")
+            ].copy()
+
+        # Schema presence alone is not proof that a target-aligned outcome has
+        # been recorded. Require at least one matched VALIDATED row with an
+        # actual return or direction value populated.
+        outcome_mask = pd.Series(False, index=validated.index)
+        for column in available["realised_return"]:
+            outcome_mask |= pd.to_numeric(validated[column], errors="coerce").notna()
+        for column in available["realised_direction"]:
+            outcome_mask |= validated[column].astype(str).str.upper().isin({"UP", "DOWN", "FLAT"})
+        matured = validated.loc[outcome_mask].copy()
+        target_outcome_available = not matured.empty
         return {
             "status": "TARGET_ALIGNED_OUTCOMES_AVAILABLE" if target_outcome_available else "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR",
             "intraday_prediction_count": int(len(intraday)),
             "prediction_ids_available": int(len(ids)),
             "validation_rows_matched_by_prediction_id": int(len(matched)),
-            "matched_validated_rows": validated_count,
+            "matched_validated_rows": int(len(validated)),
+            "validation_rows_with_target_aligned_outcomes": int(len(matured)),
             "realised_30m_fields_found_in_validation_ledger": available["realised_return"] + available["realised_direction"],
             "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
             "accuracy_claim_allowed": False,
