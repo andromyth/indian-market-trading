@@ -85,7 +85,13 @@ def main() -> int:
     }
 
     def history_provider(symbol: str) -> pd.DataFrame:
-        return groups.get(_root(symbol), pd.DataFrame(columns=["Open", "High", "Low", "Close"])).copy()
+        return groups.get(
+            _root(symbol),
+            pd.DataFrame(
+                columns=["Open", "High", "Low", "Close"],
+                index=pd.DatetimeIndex([]),
+            ),
+        ).copy()
 
     records = [
         row for row in load_records()
