@@ -37,10 +37,16 @@ def _norm(frame: pd.DataFrame | None) -> pd.DataFrame:
     }
     x = x.rename(columns={c: aliases.get(str(c).lower(), c) for c in x.columns})
     if "timestamp" in x.columns:
-        idx = pd.to_datetime(x.pop("timestamp"), errors="coerce", utc=True)
+        raw_index = x.pop("timestamp")
     else:
-        idx = pd.to_datetime(x.index, errors="coerce", utc=True)
-    idx = pd.DatetimeIndex(idx).tz_convert("Asia/Kolkata")
+        raw_index = x.index
+    # persistent_store normalizes its naive parquet index to local IST. Do not
+    # reinterpret that index as UTC, which would shift actuals by 5h30m.
+    idx = pd.DatetimeIndex(pd.to_datetime(raw_index, errors="coerce"))
+    if idx.tz is None:
+        idx = idx.tz_localize("Asia/Kolkata")
+    else:
+        idx = idx.tz_convert("Asia/Kolkata")
     x.index = idx
     if "close" not in x.columns:
         return pd.DataFrame()

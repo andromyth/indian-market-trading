@@ -23,6 +23,12 @@ on:
       - "prediction_ledger.py"
       - "prediction_validation.py"
       - "delivery_validation_diagnostics.py"
+      - "validate_intraday_30m_predictions.py"
+      - "validate_delivery_prediction_ledger.py"
+      - "delivery_prediction_csv_ledger.py"
+      - "delivery_production_refresh.py"
+      - "intraday_5m_multihorizon_validation.py"
+      - "tests/test_live_accuracy_audit_inputs.py"
 
 permissions:
   contents: read
@@ -30,8 +36,9 @@ permissions:
 jobs:
   audit-live-accuracy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
+      INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -92,6 +99,62 @@ jobs:
           echo "end_date=$END_DATE" >> "$GITHUB_OUTPUT"
           echo "Auditing $START_DATE through $END_DATE (Asia/Kolkata)"
 
+      - name: Hydrate recent official EOD archive from Drive
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit .market_data
+          set +e
+          python - <<'PY' > accuracy-audit/eod_hydration.json 2> accuracy-audit/eod_hydration_stderr.txt
+          import json
+          from delivery_production_refresh import _download_recent_eod
+          from persistent_store import GoogleDriveStore
+          result = _download_recent_eod(GoogleDriveStore(), lookback_days=45)
+          print(json.dumps(result, indent=2))
+          if int(result.get("files_found", 0)) == 0:
+              raise SystemExit("No official EOD archive files found in Google Drive.")
+          PY
+          rc=$?
+          printf '{"audit":"official_eod_hydration","exit_code":%s}\n' "$rc" > accuracy-audit/eod_hydration_exit.json
+          cat accuracy-audit/eod_hydration.json
+          if [ "$rc" -ne 0 ]; then
+            echo "EOD hydration returned exit code $rc; inspect the stderr artifact."
+            exit "$rc"
+          fi
+
+      - name: Validate matured Delivery predictions against official EOD bars
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit
+          set +e
+          python -u validate_delivery_prediction_ledger.py \
+            > accuracy-audit/delivery_validation.json \
+            2> accuracy-audit/delivery_validation_stderr.txt
+          rc=$?
+          printf '{"audit":"delivery_target_validation","exit_code":%s}\n' "$rc" > accuracy-audit/delivery_validation_exit.json
+          cat accuracy-audit/delivery_validation.json
+          if [ "$rc" -ne 0 ]; then
+            echo "Delivery target validator returned exit code $rc; inspect the stderr artifact."
+            exit "$rc"
+          fi
+
+      - name: Validate matured 30-minute predictions against exact target bars
+        id: validate-30m
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit
+          set +e
+          python -u validate_intraday_30m_predictions.py --lookback-calendar-days 14 \
+            > accuracy-audit/30m_validation.json \
+            2> accuracy-audit/30m_validation_stderr.txt
+          rc=$?
+          printf '{"audit":"intraday_30m_target_validation","exit_code":%s}\n' "$rc" \
+            > accuracy-audit/30m_validation_exit.json
+          cat accuracy-audit/30m_validation.json
+          if [ "$rc" -ne 0 ]; then
+            echo "30-minute target validator returned exit code $rc; inspect the stderr artifact."
+            exit "$rc"
+          fi
+
       - name: Score current Delivery outcomes from the live ledger
         id: delivery
         continue-on-error: true
@@ -149,6 +212,9 @@ jobs:
           from pathlib import Path
 
           reports = [
+              ("Official EOD hydration", Path("accuracy-audit/eod_hydration_exit.json")),
+              ("Delivery target validator", Path("accuracy-audit/delivery_validation_exit.json")),
+              ("30-minute target validator", Path("accuracy-audit/30m_validation_exit.json")),
               ("Delivery live health", Path("accuracy-audit/delivery_audit_exit.json")),
               ("Autonomous Intraday outcomes", Path("accuracy-audit/intraday_audit_exit.json")),
           ]

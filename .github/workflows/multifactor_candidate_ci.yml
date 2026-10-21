@@ -52,6 +52,9 @@ jobs:
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
+          validate_delivery_prediction_ledger.py
+          validate_intraday_30m_predictions.py
+          intraday_5m_multihorizon_validation.py
           self_evolving_intelligence.py
           delivery_prediction_csv_ledger.py
           model_health.py
@@ -160,6 +163,7 @@ jobs:
           tests/test_gdrive_auth_precedence.py
           tests/test_prediction_validation_scorecard.py
           tests/test_prediction_ledger_revisions.py
+          tests/test_target_aligned_prediction_validation.py
           tests/test_delivery_validation_active_model.py
           tests/test_delivery_policy_precision_gate.py
           tests/test_delivery_policy_date_block_holdout.py

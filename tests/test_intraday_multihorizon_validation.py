@@ -28,3 +28,27 @@ def test_validate_one_uses_first_actual_bar_at_or_after_target(monkeypatch) -> N
     assert result["actual_price"] == 102.0
     assert result["target_alignment_seconds"] == 0.0
     assert result["direction_match"] is True
+
+
+
+def test_naive_persistent_bar_index_is_localized_as_ist(monkeypatch):
+    monkeypatch.setattr(
+        validator,
+        "load_persistent_1m",
+        lambda symbol: pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.DatetimeIndex(["2026-10-08 10:30:00"]),
+        ),
+    )
+    record = {
+        "symbol": "SBIN",
+        "decision_timestamp": "2026-10-08T10:00:00+05:30",
+        "horizon_minutes": 30,
+        "current_price": 100.0,
+        "predicted_price": 101.0,
+        "probability_up": 0.7,
+        "signal": "BUY",
+    }
+    result = validator.validate_one(record)
+    assert result["validation_status"] == "VALIDATED"
+    assert result["actual_timestamp"] == "2026-10-08 10:30:00+05:30"

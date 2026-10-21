@@ -568,6 +568,18 @@ def _load_delivery_prediction_records() -> list[dict[str, Any]]:
     return rows
 
 
+def _revision_number(value: Any) -> int:
+    """Parse a legacy revision value without letting fingerprints crash production."""
+    try:
+        parsed = int(value)
+        return max(1, parsed)
+    except (TypeError, ValueError, OverflowError):
+        # Historical ledger versions occasionally populated this field with a
+        # short fingerprint. Preserve the record and treat it as the first
+        # revision in the absence of a reliable integer sequence.
+        return 1
+
+
 def append_predictions(
     records: list[dict[str, Any]],
     sync_drive: bool = True,
@@ -614,7 +626,7 @@ def append_predictions(
             str(row.get("model_version", "")),
         )
         prior_revisions = [
-            max(1, int(prev.get("prediction_revision", 1) or 1))
+            _revision_number(prev.get("prediction_revision", 1) or 1)
             for prev in existing + rows_to_append
             if (
                 str(prev.get("symbol", "")).strip().upper(),
