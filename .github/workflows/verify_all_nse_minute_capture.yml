@@ -91,7 +91,8 @@ jobs:
               LABEL="${item##*:}"
               HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/$PATH_PART")" || HTTP_CODE=000
               echo "${LABEL}_HTTP_STATUS=$HTTP_CODE"
-              if ! python - "$RESPONSE" "$HTTP_CODE" "$LABEL" <<'PY'
+              set +e
+              python - "$RESPONSE" "$HTTP_CODE" "$LABEL" <<'PY'
           import json, sys
           path, code, label = sys.argv[1:]
           try:
@@ -99,7 +100,8 @@ jobs:
           except Exception:
               print(f"{label}_DIAGNOSTIC_BODY_UNAVAILABLE")
               sys.exit(2)
-          if payload.get("probe") not in {"all_nse_quote_capture", "all_nse_minute_prediction_actual"}:
+          expected_probe = "all_nse_quote_capture" if label == "ALL_NSE_QUOTE_CAPTURE" else "all_nse_minute_prediction_actual"
+          if payload.get("probe") != expected_probe:
               print(f"{label}_IDENTITY_CANNOT_READ_PRIVATE_DIAGNOSTIC")
               sys.exit(2)
           print(f"{label}_STATUS={payload.get('status')}")
@@ -108,15 +110,15 @@ jobs:
                   print(f"{label}_{key.upper()}={payload.get(key)}")
           sys.exit(0 if code == "200" and payload.get("status") == "ok" else 1)
           PY
-              then
+              RC=$?
+              set -e
+              if [[ $RC -eq 0 ]]; then
                 AUTH_OK=1
                 if [[ "$PATH_PART" == "capturez" ]]; then CAPTURE_OK=1; else PREDICTION_OK=1; fi
-              else
-                RC=$?
-                if [[ $RC -eq 2 ]]; then
-                  break
-                fi
+              elif [[ $RC -eq 1 ]]; then
                 AUTH_OK=1
+              else
+                break
               fi
             done
             if [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]; then break; fi
