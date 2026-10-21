@@ -364,13 +364,18 @@ def main() -> int:
         for row in validated_in_window
         if row.get("signal") in {"BUY", "SELL"} and row.get("signal_direction_match_30m") is not None
     ]
+    error_count = int(counts.get("INVALID_PREDICTION", 0))
     report = {
-        "status": "PASS" if (args.no_sync_drive or saved.get("synced") is True) else "PERSISTENCE_ERROR",
+        "status": (
+            "PERSISTENCE_ERROR" if not (args.no_sync_drive or saved.get("synced") is True)
+            else ("INVALID_PREDICTIONS" if error_count else "PASS")
+        ),
         "predictions_seen": len(predictions),
         "lookback_start_date": cutoff_date.isoformat(),
         "lookback_end_date": now.date().isoformat(),
         "pending_scored": len(pending),
         "validation_status_counts": counts,
+        "invalid_predictions": error_count,
         "newly_validated": len(validated),
         "validated_outcomes_in_lookback": len(validated_in_window),
         "action_direction_accuracy_descriptive": float(np.mean(action_matches)) if action_matches else None,
@@ -380,7 +385,7 @@ def main() -> int:
         "warning": "Minute-level targets overlap. These are descriptive out-of-sample outcomes, not a portfolio backtest or net-of-cost results.",
     }
     print(json.dumps(report, indent=2, default=str))
-    return 0 if (args.no_sync_drive or saved.get("synced") is True) else 2
+    return 0 if (args.no_sync_drive or saved.get("synced") is True) and error_count == 0 else 2
 
 
 if __name__ == "__main__":
