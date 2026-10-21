@@ -10,6 +10,7 @@ on:
       - "autonomous_intraday_worker.py"
       - "autonomous_intraday_worker_service.py"
       - "all_universe_minute_capture.py"
+      - "all_nse_minute_prediction_capture.py"
       - "persistent_store.py"
       - "indstocks_client.py"
       - "market_session_guard.py"
@@ -95,8 +96,9 @@ jobs:
             --port 8080 \
             --cpu 1 \
             --memory 2Gi \
-            --min 0 \
+            --min 1 \
             --max 1 \
+            --no-cpu-throttling \
             --concurrency 1 \
             --timeout 300 \
             --no-allow-unauthenticated \
