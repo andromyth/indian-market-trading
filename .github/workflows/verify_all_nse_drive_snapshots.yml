@@ -222,32 +222,32 @@ jobs:
                       stamps.append((stamp,file.get("name"),file.get("modifiedTime")))
                   stamps.sort()
                   local_now=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
-              session_open=local_now.replace(hour=9,minute=15,second=0,microsecond=0)
-              session_close=local_now.replace(hour=15,minute=30,second=0,microsecond=0)
-              window_end=min(local_now.replace(second=0,microsecond=0),session_close)
-              if window_end < session_open:
-                  window_start=None
-                  recent=[]
-              else:
-                  window_start=max(session_open,window_end-dt.timedelta(minutes=29))
-                  recent=[x for x in stamps if window_start<=x[0]<=window_end]
-              print(f"{label}_MARKET_WINDOW_START={window_start.strftime('%H:%M') if window_start else 'market-not-open'}")
-              print(f"{label}_MARKET_WINDOW_END={window_end.strftime('%H:%M') if window_start else 'market-not-open'}")
-              print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES={len(recent)}")
-              if recent:
-                  print(f"{label}_OLDEST_FILE_IN_WINDOW={recent[0][1]}")
-                  print(f"{label}_LATEST_FILE={recent[-1][1]}")
-                  print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
-                  gaps=[]
-                  tset={x[0] for x in recent}
-                  cursor=window_start
-                  while cursor<=window_end:
-                      if cursor not in tset:
-                          gaps.append(cursor.strftime("%H:%M"))
-                      cursor+=dt.timedelta(minutes=1)
-                  print(f"{label}_MISSING_MARKET_MINUTES={','.join(gaps) if gaps else 'none'}")
-              else:
-                  print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES=0")
+                  session_open=local_now.replace(hour=9,minute=15,second=0,microsecond=0)
+                  session_close=local_now.replace(hour=15,minute=30,second=0,microsecond=0)
+                  window_end=min(local_now.replace(second=0,microsecond=0),session_close)
+                  if window_end < session_open:
+                      window_start=None
+                      recent=[]
+                  else:
+                      window_start=max(session_open,window_end-dt.timedelta(minutes=29))
+                      recent=[x for x in stamps if window_start<=x[0]<=window_end]
+                  print(f"{label}_MARKET_WINDOW_START={window_start.strftime('%H:%M') if window_start else 'market-not-open'}")
+                  print(f"{label}_MARKET_WINDOW_END={window_end.strftime('%H:%M') if window_start else 'market-not-open'}")
+                  print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES={len(recent)}")
+                  if recent:
+                      print(f"{label}_OLDEST_FILE_IN_WINDOW={recent[0][1]}")
+                      print(f"{label}_LATEST_FILE={recent[-1][1]}")
+                      print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
+                      gaps=[]
+                      tset={x[0] for x in recent}
+                      cursor=window_start
+                      while cursor<=window_end:
+                          if cursor not in tset:
+                              gaps.append(cursor.strftime('%H:%M'))
+                          cursor+=dt.timedelta(minutes=1)
+                      print(f"{label}_MISSING_MARKET_MINUTES={','.join(gaps) if gaps else 'none'}")
+                  else:
+                      print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES=0")
               inspect_day("QUOTE",quotes,qts,"snapshot")
               inspect_day("PREDICTION",predictions,pts,"predictions")
 
