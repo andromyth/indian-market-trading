@@ -52,6 +52,7 @@ jobs:
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
+          self_evolving_intelligence.py
           delivery_prediction_csv_ledger.py
           model_health.py
           autonomous_engine.py
