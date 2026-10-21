@@ -38,37 +38,43 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Wait for the exact commit's deployment to finish
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Wait for ready revision containing the worker code
         shell: bash
         run: |
           set -euo pipefail
           DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py)"
-          echo "SERVICE_CODE_DEPLOY_COMMIT=$DEPLOY_SHA"
-          for attempt in $(seq 1 90); do
-            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${DEPLOY_SHA}&per_page=20")"
-            MATCH="$(printf '%s' "$RUNS" | DEPLOY_SHA="$DEPLOY_SHA" python -c 'import json,os,sys; sha=os.environ["DEPLOY_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))')"
-            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
-            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
-            if [[ "$STATUS" == "completed" ]]; then
-              [[ "$CONCLUSION" == "success" ]] || {
-                echo "ERROR: deployment workflow for service-code commit did not pass."
-                exit 1
-              }
-              echo "DEPLOYMENT_FOR_SERVICE_CODE_COMMIT=PASS"
-              exit 0
+          CODE_COMMIT_TIME="$(git show -s --format=%cI "$DEPLOY_SHA")"
+          echo "SERVICE_CODE_COMMIT=$DEPLOY_SHA"
+          echo "SERVICE_CODE_COMMIT_TIME=$CODE_COMMIT_TIME"
+          for attempt in $(seq 1 60); do
+            REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
+            if [[ -n "$REVISION" ]]; then
+              REVISION_TIME="$(gcloud run revisions describe "$REVISION" --project="$PROJECT_ID" --region="$REGION" --format='value(metadata.creationTimestamp)')"
+              READY="$(gcloud run revisions describe "$REVISION" --project="$PROJECT_ID" --region="$REGION" --format='value(status.conditions[0].status)')"
+              if [[ "$READY" == "True" ]] && python - "$REVISION_TIME" "$CODE_COMMIT_TIME" <<'PY'
+          import datetime, sys
+          def parse(value):
+              return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+          try:
+              sys.exit(0 if parse(sys.argv[1]) >= parse(sys.argv[2]) else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+              then
+                echo "DEPLOYED_READY_REVISION=$REVISION"
+                echo "DEPLOYED_REVISION_CREATION_TIME=$REVISION_TIME"
+                exit 0
+              fi
             fi
             sleep 5
           done
-          echo "ERROR: timed out waiting for deployment of this exact commit."
+          echo "ERROR: no ready Cloud Run revision created after the worker-code commit time."
           exit 1
-
       - name: Probe full-universe quote and prediction capture through Scheduler identity
         shell: bash
         run: |
           set -euo pipefail
-          PROBE_JOB=intraday-worker-0915-0959
+          PROBE_JOB=intraday-worker-finalize-1532
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           ORIGINAL_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
           ORIGINAL_URI="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("uri",""))')"
@@ -83,7 +89,7 @@ jobs:
           fi
           IST_HOUR="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Asia/Kolkata")).hour)')"
           if (( IST_HOUR < 10 || IST_HOUR >= 15 )); then
-            echo "ERROR: safe probe window is 10:00–14:59 IST, outside this job's normal 09:15–09:59 schedule."
+            echo "ERROR: safe probe window is 10:00–14:59 IST, outside this job's normal 15:32 schedule."
             exit 1
           fi
 
