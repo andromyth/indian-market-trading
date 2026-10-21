@@ -105,7 +105,7 @@ def test_validation_loader_exists_and_reads_jsonl(tmp_path, monkeypatch):
         {"prediction_id": "p-1", "validation_status": "VALIDATED"},
         {"prediction_id": "p-2", "validation_status": "WAITING"},
     ]
-    path.write_text("".join(json.dumps(row) + "\\n" for row in rows), encoding="utf-8")
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     monkeypatch.setattr(ledger, "_drive_file_bytes", lambda _remote: None)
 
     assert ledger.load_validation_records() == rows
