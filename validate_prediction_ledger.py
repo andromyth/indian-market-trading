@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from calibration_autopilot import SelfEvolvingIntelligence
+from self_evolving_intelligence import SelfEvolvingIntelligence
 from prediction_ledger import IST_TZ, is_within_nse_session
 
 
