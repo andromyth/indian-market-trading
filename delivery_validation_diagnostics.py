@@ -104,8 +104,11 @@ def build_report(
         "delivery_prediction_unique_id_count": 0,
         "validation_unique_id_count": 0,
         "prediction_validation_id_intersection_count": 0,
+        "active_model_validation_id_intersection_count": 0,
+        "active_model_validated_id_intersection_count": 0,
         "joined_validation_rows_before_status_filter": 0,
         "joined_validated_rows_before_metrics": 0,
+        "joined_active_model_validated_rows": 0,
         "duplicate_validation_rows_collapsed": 0,
         "diagnostics_schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -201,12 +204,23 @@ def build_report(
     p["prediction_id"] = _normalise_prediction_ids(p["prediction_id"])
     prediction_ids = set(p["prediction_id"].dropna().astype(str))
     validation_ids = set(v["prediction_id"].dropna().astype(str))
+    active_ids = set(active_predictions["prediction_id"].dropna().astype(str))
+    validated_ids = (
+        set(v.loc[v["validation_status"].astype(str).str.strip().str.upper().eq("VALIDATED"), "prediction_id"].dropna().astype(str))
+        if "validation_status" in v.columns else set()
+    )
     report["prediction_validation_id_intersection_count"] = int(len(prediction_ids & validation_ids))
+    report["active_model_validation_id_intersection_count"] = int(len(active_ids & validation_ids))
+    report["active_model_validated_id_intersection_count"] = int(len(active_ids & validated_ids))
     x = p.merge(v, on="prediction_id", how="inner")
     report["joined_validation_rows_before_status_filter"] = int(len(x))
     if "validation_status" in x.columns:
         x = x[x["validation_status"].astype(str).str.strip().str.upper().eq("VALIDATED")].copy()
     report["joined_validated_rows_before_metrics"] = int(len(x))
+    if "model_version" in x.columns:
+        report["joined_active_model_validated_rows"] = int(
+            x["model_version"].astype(str).isin(ACTIVE_DELIVERY_MODEL_VERSIONS).sum()
+        )
     if "decision_timestamp" not in x.columns:
         report["diagnosis"] = "Joined prediction ledger lacks decision_timestamp."
         return report
