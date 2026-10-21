@@ -177,3 +177,35 @@ def test_explicit_path_keeps_minute_level_dataframe_loader(tmp_path):
     loaded = load_records(path)
     assert len(loaded) == 1
     assert loaded.iloc[0]["symbol"] == "SBIN"
+
+
+
+def test_append_predictions_handles_legacy_fingerprint_in_revision_field(tmp_path, monkeypatch):
+    import json
+    import prediction_ledger as ledger
+
+    local_dir = tmp_path / "data" / "prediction_ledger"
+    local_dir.mkdir(parents=True)
+    ledger_path = local_dir / "prediction_ledger.jsonl"
+    monkeypatch.setattr(ledger, "LOCAL_DIR", local_dir)
+    monkeypatch.setattr(ledger, "LOCAL_LEDGER", ledger_path)
+    monkeypatch.setattr(ledger, "_drive_file_bytes", lambda _remote: None)
+
+    legacy = _record(
+        prediction_id="legacy-row",
+        prediction_revision="37c7ccab7652d2d0",
+        predicted_price_next_session=101.2,
+    )
+    ledger_path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    changed = _record(predicted_price_next_session=103.4)
+    result = ledger.append_predictions([changed], sync_drive=False)
+
+    assert result["rows_added"] == 1
+    assert result["synced"] is False
+    rows = ledger.load_records()
+    assert len(rows) == 2
+    prior = next(row for row in rows if row["prediction_id"] == "legacy-row")
+    newest = next(row for row in rows if row["prediction_id"] != "legacy-row")
+    assert prior["prediction_revision"] == "37c7ccab7652d2d0"
+    assert newest["prediction_revision"] == 2
