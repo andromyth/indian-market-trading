@@ -577,6 +577,23 @@ class AllNSEMinutePredictor:
         except Exception as exc:
             manifest["manifest_drive_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
             manifest["status"] = "PERSISTENCE_ERROR"
+            # Do not leave a stale per-minute manifest claiming success when the
+            # latest pointer write failed. Retry the immutable minute manifest with
+            # the degraded status recorded, without masking the initial error.
+            try:
+                manifest_path.write_text(
+                    json.dumps(_clean(manifest), indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                retry = store.upload_or_update(
+                    manifest_path, manifest_remote, mime_type="application/json"
+                )
+                if str(retry.get("status") or "").upper() == "OK":
+                    manifest["manifest_recovery_sync"] = _clean(retry)
+            except Exception as retry_exc:
+                manifest["manifest_recovery_error"] = (
+                    f"{type(retry_exc).__name__}: {str(retry_exc)[:200]}"
+                )
         return {
             "status": manifest.get("status"),
             "remote_path": remote,
