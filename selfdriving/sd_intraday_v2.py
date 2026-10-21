@@ -194,7 +194,12 @@ def _session_rows(
         mask = (minutes >= OPEN_MIN) & (minutes < CLOSE_MIN)
         d = d.loc[mask].copy()
         minutes = minutes[mask]
-        if len(d) < 80:
+        # Preserve the 80-row requirement for training/label generation. Live
+        # inference (include_future=False) may attempt a forecast once the
+        # 15-minute opening range is complete; feature-coverage guards in the
+        # runtime decide whether this particular model/horizon can emit a signal.
+        minimum_session_rows = 80 if include_future else 16
+        if len(d) < minimum_session_rows:
             continue
 
         c = d["close"].to_numpy(float)
