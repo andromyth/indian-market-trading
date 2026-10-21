@@ -21,12 +21,34 @@ SNAPSHOT_PREFIX = "snapshot_"
 MANIFEST_PREFIX = "manifest_"
 
 
-def expected_minutes(session_date: date) -> list[str]:
-    """Return 375 expected cash-session minute keys, 09:15 through 15:29 IST."""
+def expected_minutes(
+    session_date: date, *, as_of: datetime | pd.Timestamp | None = None
+) -> list[str]:
+    """Return expected session minutes through the latest completed minute.
+
+    Historical sessions (or a session after its close) require all 375 minutes.
+    For a live session, do not mark future minutes as missing: evaluate only
+    minutes completed before the current minute. Before the open, return no
+    expected minutes so the caller can select the latest completed session.
+    """
     start = datetime.combine(session_date, time(9, 15), tzinfo=IST)
+    end = datetime.combine(session_date, time(15, 29), tzinfo=IST)
+    if as_of is not None:
+        stamp = pd.Timestamp(as_of)
+        stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+        if session_date > stamp.date():
+            return []
+        if session_date == stamp.date():
+            last_completed = stamp.floor("min") - pd.Timedelta(minutes=1)
+            if last_completed < pd.Timestamp(start):
+                return []
+            end = min(end, last_completed.to_pydatetime())
+    if end < start:
+        return []
+    count = int((end - start).total_seconds() // 60) + 1
     return [
         (start + timedelta(minutes=offset)).strftime("%Y%m%d_%H%M")
-        for offset in range(375)
+        for offset in range(count)
     ]
 
 
@@ -84,8 +106,10 @@ def build_audit_report(
     session_date: date,
     files: list[dict[str, Any]],
     manifest_loader,
+    *,
+    as_of: datetime | pd.Timestamp | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    expected = expected_minutes(session_date)
+    expected = expected_minutes(session_date, as_of=as_of)
     groups = _group_by_name(files)
     snapshot_files: dict[str, list[dict[str, Any]]] = {}
     minute_manifest_files: dict[str, list[dict[str, Any]]] = {}
@@ -180,7 +204,8 @@ def build_audit_report(
         if total_expected_symbols else 0.0
     )
     quality_gate_pass = bool(
-        all_snapshots_present
+        expected_count > 0
+        and all_snapshots_present
         and all_manifests_present
         and statuses_data_complete
         and duplicate_snapshot_files == 0
@@ -260,6 +285,7 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
         session_date,
         files,
         lambda file_id: _download_json(store, file_id),
+        as_of=datetime.now(IST),
     )
 
     output_dir = (
@@ -320,7 +346,15 @@ def main() -> int:
     parser.add_argument("--sync-drive", action="store_true", help="Upload audit JSON and CSV to Google Drive")
     parser.add_argument("--strict", action="store_true", help="Exit nonzero when the data-quality gate fails")
     args = parser.parse_args()
-    session_date = date.fromisoformat(args.date) if args.date else datetime.now(IST).date()
+    if args.date:
+        session_date = date.fromisoformat(args.date)
+    else:
+        now = datetime.now(IST)
+        session_date = now.date()
+        if now.time() < time(9, 15):
+            session_date -= timedelta(days=1)
+        while not is_nse_trading_day(session_date):
+            session_date -= timedelta(days=1)
     if not is_nse_trading_day(session_date):
         print(json.dumps({
             "session_date": session_date.isoformat(),
