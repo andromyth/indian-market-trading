@@ -23,6 +23,9 @@ on:
       - "prediction_ledger.py"
       - "prediction_validation.py"
       - "delivery_validation_diagnostics.py"
+      - "validate_intraday_30m_predictions.py"
+      - "intraday_5m_multihorizon_validation.py"
+      - "tests/test_live_accuracy_audit_inputs.py"
 
 permissions:
   contents: read
@@ -92,6 +95,24 @@ jobs:
           echo "end_date=$END_DATE" >> "$GITHUB_OUTPUT"
           echo "Auditing $START_DATE through $END_DATE (Asia/Kolkata)"
 
+      - name: Validate matured 30-minute predictions against exact target bars
+        id: validate-30m
+        continue-on-error: true
+        run: |
+          mkdir -p accuracy-audit
+          set +e
+          python -u validate_intraday_30m_predictions.py --lookback-calendar-days 14 \
+            > accuracy-audit/30m_validation.json \
+            2> accuracy-audit/30m_validation_stderr.txt
+          rc=$?
+          printf '{"audit":"intraday_30m_target_validation","exit_code":%s}\n' "$rc" \
+            > accuracy-audit/30m_validation_exit.json
+          cat accuracy-audit/30m_validation.json
+          if [ "$rc" -ne 0 ]; then
+            echo "30-minute target validator returned exit code $rc; inspect the stderr artifact."
+            exit "$rc"
+          fi
+
       - name: Score current Delivery outcomes from the live ledger
         id: delivery
         continue-on-error: true
@@ -149,6 +170,7 @@ jobs:
           from pathlib import Path
 
           reports = [
+              ("30-minute target validator", Path("accuracy-audit/30m_validation_exit.json")),
               ("Delivery live health", Path("accuracy-audit/delivery_audit_exit.json")),
               ("Autonomous Intraday outcomes", Path("accuracy-audit/intraday_audit_exit.json")),
           ]
