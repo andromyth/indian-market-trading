@@ -89,3 +89,54 @@ def test_intraday_coverage_accepts_a_matched_validated_actual(monkeypatch):
     assert result["status"] == "TARGET_ALIGNED_OUTCOMES_AVAILABLE"
     assert result["validation_rows_with_target_aligned_outcomes"] == 1
     assert result["accuracy_claim_allowed"] is False
+
+
+
+def test_drive_child_lookup_retries_transient_500_error(monkeypatch):
+    import audit_autonomous_intraday_outcomes as audit
+
+    class Response:
+        status = 500
+
+    class TransientDriveError(Exception):
+        resp = Response()
+
+    class Store:
+        root_id = "root"
+
+        def __init__(self):
+            self.calls = 0
+
+        def _find_child(self, parent, name, mime_type=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TransientDriveError("Internal Error")
+            return {"id": "folder-id", "name": name}
+
+    store = Store()
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr("random.random", lambda: 0.0)
+
+    file_id = audit._resolve_drive_id(store, "root-folder/example.jsonl")
+
+    assert file_id == "folder-id"
+    # One transient retry, then a successful parent-folder lookup and file lookup.
+    assert store.calls == 3
+
+
+def test_drive_child_lookup_does_not_retry_confirmed_missing_file():
+    import audit_autonomous_intraday_outcomes as audit
+
+    class Store:
+        root_id = "root"
+
+        def __init__(self):
+            self.calls = 0
+
+        def _find_child(self, parent, name, mime_type=None):
+            self.calls += 1
+            return None
+
+    store = Store()
+    assert audit._resolve_drive_id(store, "missing/folder/file.parquet") is None
+    assert store.calls == 1

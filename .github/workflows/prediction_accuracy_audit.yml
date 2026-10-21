@@ -180,6 +180,7 @@ jobs:
           mkdir -p accuracy-audit/intraday
           set +e
           python -u audit_autonomous_intraday_outcomes.py \
+            --sync-drive \
             --start-date "${{ steps.period.outputs.start_date }}" \
             --end-date "${{ steps.period.outputs.end_date }}" \
             --segment service \
