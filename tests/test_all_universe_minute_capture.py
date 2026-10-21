@@ -254,3 +254,19 @@ def test_current_forecast_map_excludes_stale_snapshot_rows():
     }]
     result = capture._prediction_map(snapshot_rows, cycle_minute)
     assert [row["forecast_key"] for row in result["AAA"]] == ["new"]
+
+
+def test_instrument_map_keeps_supported_non_eq_series_and_prefers_eq(monkeypatch):
+    master = pd.DataFrame([
+        {"EXCH": "NSE", "SECURITY_ID": "11", "TRADING_SYMBOL": "AAA", "SERIES": "BE"},
+        {"EXCH": "NSE", "SECURITY_ID": "22", "TRADING_SYMBOL": "BBB", "SERIES": "BE"},
+        {"EXCH": "NSE", "SECURITY_ID": "23", "TRADING_SYMBOL": "BBB", "SERIES": "EQ"},
+        {"EXCH": "NSE", "SECURITY_ID": "33", "TRADING_SYMBOL": "CCC", "SERIES": "BZ"},
+        {"EXCH": "NSE", "SECURITY_ID": "44", "TRADING_SYMBOL": "DDD", "SERIES": "IV"},
+    ])
+    fake_indstocks = SimpleNamespace(_load_instruments=lambda exchange: master)
+    monkeypatch.setitem(__import__("sys").modules, "indstocks_client", fake_indstocks)
+
+    mapped = capture._instrument_map()
+
+    assert mapped == {"AAA": "NSE_11", "BBB": "NSE_23", "CCC": "NSE_33"}

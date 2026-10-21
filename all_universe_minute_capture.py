@@ -67,14 +67,25 @@ def _instrument_map() -> dict[str, str]:
             "INDstocks instrument master lacks TRADING_SYMBOL/SECURITY_ID"
         )
     if "EXCH" in frame.columns:
-        frame = frame.loc[frame["EXCH"].astype(str).str.upper().eq("NSE")]
+        frame = frame.loc[frame["EXCH"].astype(str).str.upper().eq("NSE")].copy()
     if "SERIES" in frame.columns:
-        ordinary = frame.loc[frame["SERIES"].astype(str).str.upper().eq("EQ")]
-        if not ordinary.empty:
-            frame = ordinary
+        # The official NSE roster also includes eligible BE/BZ/SM/ST/SZ/GB/RR
+        # series. Keep supported equity series instead of dropping all of them
+        # whenever the provider master contains any EQ-series rows. Prefer EQ
+        # for duplicate trading symbols, then retain the first supported series.
+        from delivery_training_universe import EQUITY_SERIES
+
+        frame["SERIES"] = frame["SERIES"].astype(str).str.strip().str.upper()
+        frame = frame.loc[
+            frame["SERIES"].isin(EQUITY_SERIES) | frame["SERIES"].eq("")
+        ].copy()
+        frame["_series_priority"] = frame["SERIES"].ne("EQ").astype("int8")
+    else:
+        frame["_series_priority"] = 1
     frame["TRADING_SYMBOL"] = frame["TRADING_SYMBOL"].astype(str).str.strip().str.upper()
     frame["SECURITY_ID"] = frame["SECURITY_ID"].astype(str).str.strip()
     frame = frame.loc[frame["SECURITY_ID"].str.fullmatch(r"\d+")]
+    frame = frame.sort_values("_series_priority", kind="stable")
     frame = frame.drop_duplicates("TRADING_SYMBOL", keep="first")
     return {
         str(row.TRADING_SYMBOL): f"NSE_{row.SECURITY_ID}"
