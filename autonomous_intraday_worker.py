@@ -1105,12 +1105,18 @@ class AutonomousIntradayWorker:
                     summary["prediction_errors"] += 1
                     summary["errors"].append(empty_error)
                     _log("intraday_prediction_empty", **empty_error)
-                    summary["warmup_symbols"].append({
+                    completed_session = completed.between_time("09:15", "15:29")
+                    diagnostic = {
                         "symbol": root,
                         "rows": int(len(completed)),
-                        "required": 80,
-                        "reason": "runtime produced no eligible rows",
-                    })
+                        "required": 16,
+                        "reason": "runtime returned no eligible decision rows after the worker warmup passed",
+                        "first_candle_ist": pd.Timestamp(completed.index.min()).isoformat(),
+                        "latest_candle_ist": pd.Timestamp(completed.index.max()).isoformat(),
+                        "nse_session_rows": int(len(completed_session)),
+                    }
+                    summary["warmup_symbols"].append(diagnostic)
+                    _log("intraday_prediction_empty_diagnostic", **diagnostic)
                 for result in predictions:
                     prediction_failure = _prediction_row_failure(root, result)
                     if prediction_failure:

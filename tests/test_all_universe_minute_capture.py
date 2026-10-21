@@ -270,3 +270,46 @@ def test_instrument_map_keeps_supported_non_eq_series_and_prefers_eq(monkeypatch
     mapped = capture._instrument_map()
 
     assert mapped == {"AAA": "NSE_11", "BBB": "NSE_23", "CCC": "NSE_33"}
+
+
+
+def test_pending_manifest_recovery_ignores_success_receipt_files(tmp_path):
+    class FakeDriveStore:
+        def __init__(self):
+            self.paths = []
+
+        def upload_or_update(self, local_path, remote_path, mime_type=None):
+            self.paths.append(remote_path)
+            return {"status": "OK", "remote_path": remote_path}
+
+    local_dir = tmp_path / "all_universe_minute_snapshots"
+    local_dir.mkdir()
+    already_uploaded = local_dir / "manifest_20261016_1004.json"
+    already_uploaded.write_text('{"status":"OK"}', encoding="utf-8")
+    already_uploaded.with_suffix(".uploaded.json").write_text(
+        '{"status":"OK"}', encoding="utf-8"
+    )
+    pending = local_dir / "manifest_20261016_1005.json"
+    pending.write_text('{"status":"PARTIAL"}', encoding="utf-8")
+    store = FakeDriveStore()
+
+    recovered = capture._upload_pending_manifests(
+        store, local_dir, "manifest_20261016_1006.json"
+    )
+
+    assert recovered["attempted"] == 1
+    assert recovered["recovered"] == 1
+    assert recovered["errors"] == []
+    assert store.paths == [
+        "production_data/all_universe_minute_snapshots/2026/10/16/"
+        "manifest_20261016_1005.json"
+    ]
+    assert pending.with_suffix(".uploaded.json").is_file()
+
+    second_attempt = capture._upload_pending_manifests(
+        store, local_dir, "manifest_20261016_1006.json"
+    )
+    assert second_attempt["attempted"] == 0
+    assert second_attempt["recovered"] == 0
+    assert second_attempt["errors"] == []
+    assert len(store.paths) == 1

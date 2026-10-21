@@ -8,6 +8,7 @@ existing prediction engine actually emitted them.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -345,6 +346,10 @@ def _upload_pending_manifests(
     """Retry local per-minute manifests whose Drive writes were not confirmed."""
     result: dict[str, Any] = {"attempted": 0, "recovered": 0, "errors": []}
     for local_path in sorted(local_dir.glob("manifest_*.json")):
+        # Success receipts are named manifest_YYYYMMDD_HHMM.uploaded.json and
+        # also match the broad glob above. Only retry canonical minute payloads.
+        if not re.fullmatch(r"manifest_\d{8}_\d{4}\.json", local_path.name):
+            continue
         if local_path.name == current_name:
             continue
         marker_path = local_path.with_suffix(".uploaded.json")
