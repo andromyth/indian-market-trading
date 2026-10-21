@@ -1075,13 +1075,17 @@ class AutonomousIntradayWorker:
                     })
                     continue
 
-                if len(completed) < 80:
+                # Inference may start after the trained 15-minute opening
+                # window. The feature builder and model bundle still enforce
+                # per-feature coverage and emit ABSTAIN when inputs are not ready.
+                # Training keeps its separate 80-row/session minimum.
+                if len(completed) < 16:
                     snapshot["data_quality_status"] = "BLOCKED"
-                    snapshot["status_reason"] = "MODEL_WARMUP_INSUFFICIENT_HISTORY"
+                    snapshot["status_reason"] = "MODEL_WARMUP_INSUFFICIENT_OPENING_HISTORY"
                     summary["warmup_symbols"].append({
                         "symbol": root,
                         "rows": int(len(completed)),
-                        "required": 80,
+                        "required": 16,
                     })
                     continue
 
