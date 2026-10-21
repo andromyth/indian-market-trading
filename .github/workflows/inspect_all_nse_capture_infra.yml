@@ -1,0 +1,46 @@
+name: Inspect all-NSE capture infrastructure
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/inspect_all_nse_capture_infra.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+      - name: Inspect deployment revision, build and scheduled tick activity
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "=== Cloud Run service ==="
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(metadata.generation,status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic,status.conditions)' || true
+          echo "=== Recent Cloud Run revisions ==="
+          gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --sort-by='~metadata.creationTimestamp' --format='table(metadata.name,metadata.creationTimestamp,status.conditions[0].status,status.conditions[0].reason)' || true
+          echo "=== Recent Cloud Builds ==="
+          gcloud builds list --project="$PROJECT_ID" --limit=8 --sort-by='~createTime' --format='table(id,status,createTime,finishTime,logUrl)' || true
+          echo "=== Scheduler state and last attempt ==="
+          for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
+            echo "--- $job ---"
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(state,schedule,timeZone,lastAttemptTime,status,httpTarget.uri,httpTarget.httpMethod)' || true
+          done
