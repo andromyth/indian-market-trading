@@ -48,7 +48,7 @@ jobs:
           echo "SERVICE_CODE_DEPLOY_COMMIT=$DEPLOY_SHA"
           for attempt in $(seq 1 90); do
             RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${DEPLOY_SHA}&per_page=20")"
-            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["DEPLOY_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))' DEPLOY_SHA="$DEPLOY_SHA")"
+            MATCH="$(printf '%s' "$RUNS" | DEPLOY_SHA="$DEPLOY_SHA" python -c 'import json,os,sys; sha=os.environ["DEPLOY_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))')"
             STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
             CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
             if [[ "$STATUS" == "completed" ]]; then
