@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout the commit being verified
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -42,17 +44,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py)"
+          echo "SERVICE_CODE_DEPLOY_COMMIT=$DEPLOY_SHA"
           for attempt in $(seq 1 90); do
-            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${GITHUB_SHA}&per_page=20")"
-            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["GITHUB_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))')"
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${DEPLOY_SHA}&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["DEPLOY_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))' DEPLOY_SHA="$DEPLOY_SHA")"
             STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
             CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
             if [[ "$STATUS" == "completed" ]]; then
               [[ "$CONCLUSION" == "success" ]] || {
-                echo "ERROR: deployment workflow for this exact commit did not pass."
+                echo "ERROR: deployment workflow for service-code commit did not pass."
                 exit 1
               }
-              echo "DEPLOYMENT_FOR_EXACT_COMMIT=PASS"
+              echo "DEPLOYMENT_FOR_SERVICE_CODE_COMMIT=PASS"
               exit 0
             fi
             sleep 5
@@ -117,9 +121,9 @@ jobs:
             for attempt in $(seq 1 20); do
               JOB_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
               set +e
-              check="$(printf '%s' "$JOB_JSON" | python - "$before" <<'PY'
-          import datetime, json, sys
-          job=json.load(sys.stdin)
+              check="$(JOB_JSON="$JOB_JSON" python - "$before" <<'PY'
+          import datetime, json, os, sys
+          job=json.loads(os.environ["JOB_JSON"])
           try:
               before=datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
           except Exception:
