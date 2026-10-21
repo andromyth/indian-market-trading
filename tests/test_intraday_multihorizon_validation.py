@@ -51,4 +51,4 @@ def test_naive_persistent_bar_index_is_localized_as_ist(monkeypatch):
     }
     result = validator.validate_one(record)
     assert result["validation_status"] == "VALIDATED"
-    assert result["actual_timestamp"] == "2026-10-08T10:30:00+05:30"
+    assert result["actual_timestamp"] == "2026-10-08 10:30:00+05:30"
