@@ -50,33 +50,79 @@ def _number(value: Any) -> float:
     return number if np.isfinite(number) else float("nan")
 
 
+def _retryable_drive_error(exc: Exception) -> bool:
+    """Return true for transient Drive/API failures, not for missing objects."""
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "internal error", "backend error", "temporarily unavailable",
+        "rate limit", "timed out", "timeout",
+    ))
+
+
+def _find_child_retry(store: Any, parent: str, name: str, mime_type: str | None = None,
+                      attempts: int = 5) -> dict[str, Any] | None:
+    """Retry only transient Drive listing failures; a confirmed miss remains a miss."""
+    import random
+    import time as time_module
+
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return store._find_child(parent, name, mime_type)
+        except Exception as exc:
+            last_error = exc
+            if not _retryable_drive_error(exc) or attempt + 1 >= attempts:
+                raise
+            time_module.sleep(min(8.0, (0.4 * (2 ** attempt)) + random.random() * 0.25)
+    if last_error:
+        raise last_error
+    return None
+
+
 def _resolve_drive_id(store: Any, remote_path: str, *, folder: bool = False) -> str | None:
     parts = [part for part in remote_path.replace("\\", "/").split("/") if part]
     if not parts:
         return None
     parent = store.root_id
     for part in parts[:-1]:
-        hit = store._find_child(parent, part, FOLDER_MIME)
+        hit = _find_child_retry(store, parent, part, FOLDER_MIME)
         if not hit:
             return None
         parent = hit["id"]
-    hit = store._find_child(parent, parts[-1], FOLDER_MIME if folder else None)
+    hit = _find_child_retry(store, parent, parts[-1], FOLDER_MIME if folder else None)
     return str(hit["id"]) if hit else None
 
 
 def _download_drive_bytes(store: Any, remote_path: str) -> bytes | None:
+    """Resolve and download a Drive file with bounded retries for transient failures."""
+    import random
+    import time as time_module
+    from googleapiclient.http import MediaIoBaseDownload
+
     file_id = _resolve_drive_id(store, remote_path)
     if not file_id:
         return None
-    from googleapiclient.http import MediaIoBaseDownload
-
-    buffer = io.BytesIO()
-    request = store.service.files().get_media(fileId=file_id)
-    downloader = MediaIoBaseDownload(buffer, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buffer.getvalue()
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            buffer = io.BytesIO()
+            request = store.service.files().get_media(fileId=file_id)
+            downloader = MediaIoBaseDownload(buffer, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return buffer.getvalue()
+        except Exception as exc:
+            last_error = exc
+            if not _retryable_drive_error(exc) or attempt >= 4:
+                raise
+            time_module.sleep(min(8.0, 0.4 * (2 ** attempt) + random.random() * 0.25)
+    if last_error:
+        raise last_error
+    return None
 
 
 def _read_ledger(payload: bytes) -> tuple[list[dict[str, Any]], int]:
