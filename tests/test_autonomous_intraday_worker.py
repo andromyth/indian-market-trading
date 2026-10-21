@@ -524,7 +524,7 @@ def test_live_inference_can_record_abstentions_after_opening_window_before_train
 
     assert live_rows
     assert {row["horizon_min"] for row in live_rows} == {5, 10, 15, 20, 25, 30}
-    assert all(pd.Timestamp(row["decision_timestamp"]).strftime("%H:%M") == "09:30" for row in live_rows)
+    assert all(pd.Timestamp(row["decision_timestamp"]).tz_convert(IST).strftime("%H:%M") == "09:30" for row in live_rows)
     assert all(pd.isna(row["target_timestamp"]) for row in live_rows)
     assert training_rows == []
 
