@@ -1,5 +1,6 @@
 name: Live intraday persistence status audit
 # Audits Drive persistence daily after the NSE cash session and on demand.
+# Current-session operational verification requested 2026-10-21; audit logic is unchanged.
 
 on:
   workflow_dispatch:
