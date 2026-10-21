@@ -463,6 +463,44 @@ def _stable_id(record: dict[str, Any]) -> str:
     return prediction_revision_fingerprint(record)[:24]
 
 
+
+def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
+    try:
+        from persistent_store import gdrive_config
+        cfg = gdrive_config()
+        if not cfg.get("configured"):
+            return None
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+        import io
+        credentials = service_account.Credentials.from_service_account_info(
+            cfg["service_account_info"], scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        parts = remote_relative_path.strip("/").split("/")
+        parent = cfg["root_folder_id"]
+        for part in parts[:-1]:
+            q = f"name = '{part.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
+            found = service.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute().get("files", [])
+            if not found:
+                return None
+            parent = found[0]["id"]
+        name = parts[-1]
+        q = f"name = '{name.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
+        found = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=10).execute().get("files", [])
+        if not found:
+            return None
+        request = service.files().get_media(fileId=found[0]["id"])
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
+    except Exception:
+        return None
+
 def _restore_remote_prediction_ledger() -> None:
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     if LOCAL_LEDGER.exists() and LOCAL_LEDGER.stat().st_size > 0:
