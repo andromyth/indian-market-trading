@@ -72,7 +72,32 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
     ref_close = float(close.loc[ref_rows.index[-1]])
     future = x.loc[x.index > ref_rows.index[-1]].copy()
     future["Close"] = pd.to_numeric(future["Close"], errors="coerce")
-    future = future.dropna(subset=["Close"]).head(max(cfg.rolling_days, 7))
+    future = future.dropna(subset=["Close"])
+
+    # A stored next-session forecast is tied to an explicit NSE session date.
+    # Never substitute the next available bar from a later date when the
+    # expected target session is missing from the official archive.
+    expected_target = record.get("prediction_for_date")
+    if expected_target not in (None, ""):
+        expected_day = pd.Timestamp(expected_target, errors="raise")
+        index_tz = getattr(future.index, "tz", None)
+        if expected_day.tzinfo is not None:
+            expected_day = expected_day.tz_convert(index_tz) if index_tz is not None else expected_day.tz_localize(None)
+        elif index_tz is not None:
+            expected_day = expected_day.tz_localize(index_tz)
+        expected_day = expected_day.normalize()
+        if not future.empty:
+            future = future.loc[future.index.normalize() == expected_day]
+        if future.empty:
+            return {
+                "prediction_id": record.get("prediction_id"),
+                "symbol": record.get("symbol"),
+                "validation_status": "WAITING",
+                "validation_reason": "Expected prediction_for_date is not present in official EOD history.",
+                "expected_d1_date": str(expected_day.date()),
+            }
+
+    future = future.head(max(cfg.rolling_days, 7))
     if future.empty:
         return {"prediction_id": record.get("prediction_id"), "validation_status": "WAITING"}
 
