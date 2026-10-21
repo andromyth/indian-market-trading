@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -256,8 +256,11 @@ def validate_one(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tolerance-seconds", type=int, default=60)
+    parser.add_argument("--lookback-calendar-days", type=int, default=14)
     parser.add_argument("--no-sync-drive", action="store_true")
     args = parser.parse_args()
+    if args.lookback_calendar_days < 0:
+        parser.error("--lookback-calendar-days cannot be negative")
 
     all_records = load_records()
     predictions = [
@@ -280,12 +283,30 @@ def main() -> int:
         and pd.notna(pd.to_numeric(row.get("actual_return_30m"), errors="coerce"))
         and str(row.get("actual_direction_30m", "")).upper() in {"UP", "DOWN"}
     }
-    pending = [row for row in predictions if str(row["prediction_id"]) not in completed_ids]
+    now = pd.Timestamp.now(tz=IST_TZ)
+    cutoff_date = now.date() - timedelta(days=args.lookback_calendar_days)
+    pending = []
+    for row in predictions:
+        if str(row["prediction_id"]) in completed_ids:
+            continue
+        decision = _timestamp(row.get("decision_timestamp"))
+        target = _timestamp(row.get("signal_horizon_end") or row.get("target_timestamp"))
+        if target is None and decision is not None:
+            target = decision + pd.Timedelta(minutes=30)
+        # Only query actuals for recently matured targets. Future predictions
+        # remain unscored, and older unresolved rows can be audited separately.
+        if target is not None and (target > now or target.date() < cutoff_date):
+            continue
+        if target is None and decision is not None and decision.date() < cutoff_date:
+            continue
+        pending.append(row)
     if not pending:
         print(json.dumps({
             "status": "NO_UNRESOLVED_30M_PREDICTIONS",
             "predictions_seen": len(predictions),
             "already_validated": len(completed_ids),
+            "lookback_start_date": cutoff_date.isoformat(),
+            "lookback_end_date": now.date().isoformat(),
             "saved": False,
         }, indent=2))
         return 0
@@ -329,6 +350,8 @@ def main() -> int:
     report = {
         "status": "PASS" if (args.no_sync_drive or saved.get("synced") is True) else "PERSISTENCE_ERROR",
         "predictions_seen": len(predictions),
+        "lookback_start_date": cutoff_date.isoformat(),
+        "lookback_end_date": now.date().isoformat(),
         "pending_scored": len(pending),
         "validation_status_counts": counts,
         "validated": len(validated),
