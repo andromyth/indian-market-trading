@@ -82,3 +82,30 @@ def test_audit_accepts_recovered_drive_write_when_artifacts_are_present():
     )
     assert report["quality_gate_pass"] is True
     assert recovered_key in report["recovered_persistence_issue_minutes"]
+
+
+def test_expected_minutes_cap_live_session_at_last_completed_minute():
+    from datetime import datetime
+
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    keys = expected_minutes(
+        date(2026, 10, 16),
+        as_of=datetime(2026, 10, 16, 9, 23, 30, tzinfo=ist),
+    )
+    assert len(keys) == 8
+    assert keys[0] == "20261016_0915"
+    assert keys[-1] == "20261016_0922"
+
+
+def test_expected_minutes_before_open_is_empty_for_same_day():
+    from datetime import datetime
+
+    from zoneinfo import ZoneInfo
+
+    keys = expected_minutes(
+        date(2026, 10, 16),
+        as_of=datetime(2026, 10, 16, 8, 59, tzinfo=ZoneInfo("Asia/Kolkata")),
+    )
+    assert keys == []
