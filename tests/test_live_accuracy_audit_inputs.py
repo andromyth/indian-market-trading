@@ -75,6 +75,7 @@ def test_intraday_coverage_accepts_a_matched_validated_actual(monkeypatch):
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
+        "decision_timestamp": "2026-10-20T10:00:00+05:30",
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-2",
