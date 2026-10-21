@@ -61,6 +61,7 @@ def test_seven_active_rows_are_not_enough_to_claim_target_accuracy():
 def test_future_active_targets_are_pending_not_missing_accuracy_data():
     active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
     active_preds, _ = _frames(12, active_version, True)
+    active_preds["prediction_id"] = "active-" + active_preds["prediction_id"].astype(str)
     active_preds["prediction_for_date"] = "2026-10-21"
 
     legacy_preds, legacy_vals = _frames(3, "2026.09-stage2", True)
