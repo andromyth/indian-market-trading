@@ -534,6 +534,13 @@ class AllNSEMinutePredictor:
                 "status": (
                     "OK" if manifest.get("missing_quote_count") == 0
                     and manifest.get("prediction_count") == manifest.get("expected_symbol_count")
+                    and manifest.get("data_limited_count", 0) == 0
+                    and manifest.get("untrained_symbol_count", 0) == 0
+                    and manifest.get("trained_symbol_manifest_available") is True
+                    and manifest.get("model_failure_count", 0) == 0
+                    and manifest.get("history_seed_coverage_symbols") == manifest.get("expected_symbol_count")
+                    and manifest.get("history_seed_failed_batches", 0) == 0
+                    and manifest.get("history_ready") is True
                     else "PARTIAL"
                 ),
                 "finished_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -560,11 +567,13 @@ class AllNSEMinutePredictor:
                 }, sort_keys=True),
                 encoding="utf-8",
             )
-            store.upload_or_update(
+            latest_result = store.upload_or_update(
                 manifest_path,
                 f"{REMOTE_ROOT}/latest_manifest.json",
                 mime_type="application/json",
             )
+            if str(latest_result.get("status") or "").upper() != "OK":
+                raise RuntimeError(f"Drive latest-manifest write not confirmed: {latest_result}")
         except Exception as exc:
             manifest["manifest_drive_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
             manifest["status"] = "PERSISTENCE_ERROR"
@@ -750,7 +759,7 @@ class AllNSEMinutePredictor:
                         self._pending_quote_rows.setdefault(symbol, []).append((minute, price_row))
                         # Bound bootstrap accumulation if an upstream seed call stalls.
                         self._pending_quote_rows[symbol] = self._pending_quote_rows[symbol][-180:]
-                elif quote_good and price_row is not None and history_ready and not model_error:
+                elif quote_good and price_row is not None and history_ready:
                     pending_additions[symbol] = (minute, price_row)
                     quote_actuals[symbol] = {
                         "day_volume": raw_day_volume,
@@ -769,11 +778,27 @@ class AllNSEMinutePredictor:
                     probability = float(probs[idx])
                     expected_return = float(expected_returns[idx]) if np.isfinite(expected_returns[idx]) else None
                     readiness = float(x.iloc[idx].notna().mean())
-                    raw_signal, signal = _signal(probability, readiness)
+                    raw_signal, proposed_signal = _signal(probability, readiness)
+                    trained_for_symbol = (
+                        symbol in self._trained_symbols
+                        if self._trained_symbols else None
+                    )
+                    signal = (
+                        proposed_signal
+                        if readiness >= MIN_SIGNAL_READINESS and trained_for_symbol is not False
+                        else "HOLD"
+                    )
+                    if readiness < MIN_SIGNAL_READINESS:
+                        prediction_status = "PASS_DATA_LIMITED"
+                    elif trained_for_symbol is False:
+                        prediction_status = "PASS_UNTRAINED_SYMBOL"
+                    else:
+                        prediction_status = "PASS"
                     row.update({
-                        "prediction_status": "PASS" if readiness >= MIN_SIGNAL_READINESS else "PASS_DATA_LIMITED",
+                        "prediction_status": prediction_status,
                         "raw_model_signal": raw_signal,
                         "signal": signal,
+                        "trained_for_symbol": trained_for_symbol,
                         "probability_up_30m": probability,
                         "expected_return_30m": expected_return,
                         "confidence": (
@@ -900,15 +925,26 @@ class AllNSEMinutePredictor:
         prediction_count = sum(
             1 for row in records
             if row.get("probability_up_30m") is not None
-            and row.get("prediction_status") in {"PASS", "PASS_DATA_LIMITED"}
+            and row.get("prediction_status") in {
+                "PASS", "PASS_DATA_LIMITED", "PASS_UNTRAINED_SYMBOL"
+            }
         )
         missing_quotes = sum(
-            1 for row in records if row.get("actual_market_value") is None
+            1 for row in records
+            if row.get("actual_market_value") is None
             or row.get("actual_quote_status") != "PASS"
+            or row.get("prediction_status") in {
+                "MISSING_CURRENT_QUOTE", "STALE_OR_INVALID_QUOTE"
+            }
         )
         data_limited_count = sum(
-            1 for row in records if row.get("prediction_status") == "PASS_DATA_LIMITED"
+            1 for row in records
+            if row.get("prediction_status") == "PASS_DATA_LIMITED"
         )
+        untrained_symbol_count = sum(
+            1 for row in records if row.get("trained_for_symbol") is False
+        )
+        trained_symbol_manifest_available = bool(self._trained_symbols)
         manifest = {
             "audit_name": "all-nse-minute-prediction-actual-capture",
             "schema_version": "all-nse-minute-prediction-v1",
@@ -920,6 +956,8 @@ class AllNSEMinutePredictor:
             "prediction_count": prediction_count,
             "data_limited_count": data_limited_count,
             "model_failure_count": model_failures,
+            "untrained_symbol_count": untrained_symbol_count,
+            "trained_symbol_manifest_available": trained_symbol_manifest_available,
             "model_target": "target_30m",
             "model_status": self._seed_status,
             "history_ready": history_ready,
@@ -934,8 +972,16 @@ class AllNSEMinutePredictor:
             "quote_snapshot_read_error": read_error,
             "current_minute_ohlc_complete": False,
             "quality_gate_pass": (
-                len(records) == len(symbols) and missing_quotes == 0
-                and prediction_count == len(symbols) and data_limited_count == 0
+                len(records) == len(symbols)
+                and missing_quotes == 0
+                and prediction_count == len(symbols)
+                and data_limited_count == 0
+                and untrained_symbol_count == 0
+                and trained_symbol_manifest_available
+                and model_failures == 0
+                and self._seed_coverage == len(symbols)
+                and self._seed_errors == 0
+                and history_ready
             ),
             "status": "PARTIAL",
         }
