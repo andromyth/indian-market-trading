@@ -832,6 +832,10 @@ class AutonomousIntradayWorker:
         upload_result = store.upload_or_update(
             local_path, remote, mime_type="application/x-ndjson"
         )
+        if upload_result.get("status") != "OK":
+            raise RuntimeError(
+                f"Drive minute snapshot upload was not confirmed: {upload_result}"
+            )
         prediction_count = sum(
             len(row.get("predictions") or []) for row in rows
         )
@@ -840,10 +844,10 @@ class AutonomousIntradayWorker:
             remote_path=remote,
             snapshot_rows=len(rows),
             prediction_rows=prediction_count,
-            status="OK",
+            status=upload_result.get("status"),
         )
         return {
-            "status": "OK",
+            "status": upload_result.get("status"),
             "remote_path": remote,
             "snapshot_rows": len(rows),
             "prediction_rows": prediction_count,
