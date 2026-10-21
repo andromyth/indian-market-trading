@@ -115,7 +115,46 @@ def _is_retryable_download_error(exc: Exception) -> bool:
     return any(token in name or token in message for token in (
         "timeout", "timed out", "connection reset", "connection aborted",
         "temporarily unavailable", "incompleteread", "server disconnected",
+        "internal error",
     ))
+
+
+def _retry_drive_operation(operation, *, context: str, retries: int = 4):
+    """Retry a Drive API request on transient server, rate-limit, or network errors."""
+    attempts = max(1, int(retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= attempts or not _is_retryable_download_error(exc):
+                raise
+            delay = min(2 ** (attempt - 1), 8)
+            response = getattr(exc, "resp", None)
+            status = getattr(response, "status", None) or getattr(exc, "status_code", None)
+            _stage(
+                f"DRIVE API RETRY: context={context}, "
+                f"status={status if status is not None else 'network'}, "
+                f"attempt={attempt}/{attempts}, "
+                f"error={type(exc).__name__}: {exc}, sleep_seconds={delay}"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"Drive retry loop ended unexpectedly: {context}")
+
+
+def _find_child_with_retry(
+    store,
+    parent_id: str,
+    name: str,
+    mime_type: str | None = None,
+    *,
+    retries: int = 4,
+):
+    """Find a Drive child; confirmed missing items are not retried."""
+    return _retry_drive_operation(
+        lambda: store._find_child(parent_id, name, mime_type),
+        context=f"find Drive child {name!r}",
+        retries=retries,
+    )
 
 
 def _download_file(store, remote: str, local: Path, retries: int = 4) -> bool:
@@ -179,7 +218,10 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
             "supportsAllDrives": True,
         }
         if token: kwargs["pageToken"] = token
-        resp = store.service.files().list(**kwargs).execute()
+        resp = _retry_drive_operation(
+            lambda: store.service.files().list(**kwargs).execute(),
+            context=f"list Drive folder {prefix or folder_id!r}",
+        )
         for item in resp.get("files", []):
             name = str(item.get("name",""))
             rel = f"{prefix}/{name}".strip("/")
@@ -193,7 +235,7 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
 def _download_recent_eod(store, lookback_days: int):
     p = store.root_id
     for part in ("production_data","nse_official","bulk_eod"):
-        hit = store._find_child(p, part, "application/vnd.google-apps.folder")
+        hit = _find_child_with_retry(store, p, part, "application/vnd.google-apps.folder")
         if not hit: raise RuntimeError(f"Drive folder missing: {part}")
         p = hit["id"]
     files=[]
@@ -217,7 +259,7 @@ def _download_recent_eod(store, lookback_days: int):
 def _download_recent_delivery(store, lookback_days:int):
     p=store.root_id
     for part in DELIVERY_REMOTE.split("/"):
-        hit=store._find_child(p,part,"application/vnd.google-apps.folder")
+        hit=_find_child_with_retry(store,p,part,"application/vnd.google-apps.folder")
         if not hit: return {"files_found":0,"files_downloaded":0}
         p=hit["id"]
     items=[]
@@ -232,7 +274,10 @@ def _download_recent_delivery(store, lookback_days:int):
             "supportsAllDrives": True,
         }
         if page_token: kwargs["pageToken"]=page_token
-        resp=store.service.files().list(**kwargs).execute()
+        resp=_retry_drive_operation(
+            lambda: store.service.files().list(**kwargs).execute(),
+            context=f"list Delivery folder {DELIVERY_REMOTE}",
+        )
         items.extend(resp.get("files",[]))
         page_token=resp.get("nextPageToken")
         if not page_token: break
@@ -246,17 +291,15 @@ def _download_recent_delivery(store, lookback_days:int):
         if d>=cutoff: chosen.append((d,item))
     chosen.sort()
     downloaded=0
-    from googleapiclient.http import MediaIoBaseDownload
     for d,item in chosen:
         local=DELIVERY_LOCAL/item["name"]
         if local.exists() and local.stat().st_size>0: continue
-        local.parent.mkdir(parents=True,exist_ok=True)
-        temp=local.with_suffix(".tmp")
-        with temp.open("wb") as fh:
-            dl=MediaIoBaseDownload(fh,store.service.files().get_media(fileId=item["id"]))
-            done=False
-            while not done: _,done=dl.next_chunk()
-        temp.replace(local); downloaded+=1
+        if _download_file(
+            store,
+            f"{DELIVERY_REMOTE}/{item['name']}",
+            local,
+        ):
+            downloaded+=1
     return {"files_found":len(chosen),"files_downloaded":downloaded,"first_date":str(chosen[0][0]) if chosen else None,"last_date":str(chosen[-1][0]) if chosen else None}
 
 def _load_eod(root:Path,start:date,end:date)->pd.DataFrame:

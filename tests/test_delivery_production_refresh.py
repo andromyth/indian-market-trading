@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from delivery_production_refresh import _download_file
+from delivery_production_refresh import _download_file, _walk
 
 
 class _FakeDriveFiles:
@@ -51,4 +52,54 @@ def test_drive_download_retries_transient_timeout_and_replaces_atomically(tmp_pa
     assert attempts["count"] == 2
     assert target.read_bytes() == b"downloaded-payload"
     assert not target.with_suffix(target.suffix + ".tmp").exists()
+    sleep.assert_called_once_with(1)
+
+
+def test_archive_walk_retries_transient_drive_list_http_500():
+    class _TransientDriveError(Exception):
+        def __init__(self):
+            super().__init__("Google Drive Internal Error")
+            self.resp = SimpleNamespace(status=500)
+
+    class _ListRequest:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def execute(self):
+            self.calls["count"] += 1
+            if self.calls["count"] == 1:
+                raise _TransientDriveError()
+            return {"files": []}
+
+    class _DriveFiles:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def list(self, **kwargs):
+            return _ListRequest(self.calls)
+
+    class _DriveService:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def files(self):
+            return _DriveFiles(self.calls)
+
+    class _Store:
+        def __init__(self, calls):
+            self.service = _DriveService(calls)
+
+    calls = {"count": 0}
+    out = []
+    with patch("delivery_production_refresh.time.sleep") as sleep:
+        _walk(
+            _Store(calls),
+            "bulk-eod-folder",
+            "production_data/nse_official/bulk_eod",
+            1,
+            out,
+        )
+
+    assert calls["count"] == 2
+    assert out == []
     sleep.assert_called_once_with(1)
