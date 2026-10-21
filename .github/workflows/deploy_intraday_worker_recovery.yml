@@ -124,23 +124,78 @@ jobs:
             gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(name,state,schedule,lastAttemptTime,status)' || exit 1
           done
 
-          # Wait for the new revision's first asynchronous Drive preflight.
-          for attempt in $(seq 1 12); do
-            LOGS="$(gcloud logging read \
-              "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.revision_name=\"$REVISION\" AND textPayload:\"google_drive_preflight\"" \
-              --project="$PROJECT_ID" --limit=20 --order=desc --format='value(textPayload)' 2>/dev/null || true)"
-            if [[ -n "$LOGS" ]]; then
-              printf '%s\n' "$LOGS"
-              if printf '%s\n' "$LOGS" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"OK"'; then
-                echo "DRIVE_PREFLIGHT=OK"
-                exit 0
-              fi
+          # Validate Drive preflight through the real authenticated private /tick path.
+          # /tick returns HTTP 503 when Drive read/write preflight is not ready. Invoke
+          # a Scheduler job whose normal schedule is outside the current market window,
+          # so this probe uses the already-authorized OIDC identity without requiring
+          # project-wide Cloud Logging access for the GitHub deploy identity.
+          PROBE_JOB=intraday-worker-0915-0959
+          BEFORE="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
+          echo "DRIVE_PREFLIGHT_PROBE_JOB=$PROBE_JOB"
+          PROBE_OK=false
+
+          for probe in 1 2 3; do
+            echo "Starting authenticated Drive-preflight probe attempt $probe/3"
+            if ! gcloud scheduler jobs run "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --quiet; then
+              echo "Scheduler rejected or could not enqueue the probe; retrying."
+              sleep 8
+              continue
             fi
-            sleep 5
+
+            for attempt in $(seq 1 18); do
+              JOB_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+              set +e
+              CHECK="$(printf '%s' "$JOB_JSON" | python -c '
+          import datetime, json, sys
+          job=json.load(sys.stdin)
+          def parse(v):
+              try:
+                  return datetime.datetime.fromisoformat(str(v).replace("Z","+00:00"))
+              except (TypeError, ValueError):
+                  return None
+          before=parse(sys.argv[1]) if sys.argv[1] else None
+          attempted=parse(job.get("lastAttemptTime"))
+          newer=attempted is not None and (before is None or attempted > before)
+          status=job.get("lastAttemptStatus") or {}
+          code=status.get("code")
+          message=str(status.get("message") or "")[:240]
+          print(json.dumps({
+              "lastAttemptTime": job.get("lastAttemptTime"),
+              "new_attempt": newer,
+              "last_attempt_code": code,
+              "last_attempt_message": message,
+          }, sort_keys=True))
+          if not newer or code is None:
+              sys.exit(2)
+          sys.exit(0 if int(code)==0 else 1)
+          ' "$BEFORE" 2>/dev/null)"
+              RC=$?
+              set -e
+              if [[ -n "$CHECK" ]]; then
+                echo "SCHEDULER_PROBE_RESULT=$CHECK"
+              fi
+              if [[ $RC -eq 0 ]]; then
+                echo "DRIVE_PREFLIGHT=OK via authenticated Cloud Scheduler /tick probe"
+                PROBE_OK=true
+                break
+              elif [[ $RC -eq 1 ]]; then
+                if printf '%s' "$CHECK" | grep -Eq '"last_attempt_message":.*(409|already running|in progress)'; then
+                  echo "Worker was busy during the probe; retrying after a short pause."
+                  break
+                fi
+                echo "ERROR: Authenticated /tick probe returned a failed Cloud Scheduler result."
+                exit 1
+              fi
+              sleep 5
+            done
+
+            if [[ "$PROBE_OK" == "true" ]]; then
+              break
+            fi
+            sleep 8
           done
 
-          echo "ERROR: No successful Drive preflight was confirmed for the new revision."
-          gcloud logging read \
-            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.revision_name=\"$REVISION\"" \
-            --project="$PROJECT_ID" --limit=40 --order=desc --format='table(timestamp,severity,textPayload)'
-          exit 1
+          if [[ "$PROBE_OK" != "true" ]]; then
+            echo "ERROR: Could not confirm successful authenticated /tick and Drive preflight."
+            exit 1
+          fi
