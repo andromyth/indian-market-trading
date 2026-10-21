@@ -156,9 +156,13 @@ jobs:
           before=parse(sys.argv[1]) if sys.argv[1] else None
           attempted=parse(job.get("lastAttemptTime"))
           newer=attempted is not None and (before is None or attempted > before)
-          status=job.get("lastAttemptStatus") or {}
+          status=job.get("status") or {}
           code=status.get("code")
           message=str(status.get("message") or "")[:240]
+          # Cloud Scheduler omits default-valued Status fields on success.
+          # A new attempt with an empty status object is therefore HTTP 2xx/OK.
+          if code is None and not message:
+              code=0
           print(json.dumps({
               "lastAttemptTime": job.get("lastAttemptTime"),
               "new_attempt": newer,
