@@ -70,115 +70,68 @@ jobs:
           done
           echo "ERROR: no ready Cloud Run revision created after the worker-code commit time."
           exit 1
-      - name: Probe full-universe quote and prediction capture through Scheduler identity
+      - name: Probe full-universe quote and prediction capture using read-only identity checks
         shell: bash
         run: |
           set -euo pipefail
-          PROBE_JOB=intraday-worker-finalize-1532
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          ORIGINAL_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
-          ORIGINAL_URI="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("uri",""))')"
-          ORIGINAL_METHOD="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("httpMethod","POST").upper())')"
-          JOB_STATE="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("state",""))')"
-          echo "PROBE_JOB_STATE=$JOB_STATE"
-          echo "ORIGINAL_TARGET_URI=$ORIGINAL_URI"
-          echo "ORIGINAL_TARGET_METHOD=$ORIGINAL_METHOD"
-          if [[ "$JOB_STATE" != "ENABLED" || "$ORIGINAL_URI" != "$SERVICE_URL/tick" || "$ORIGINAL_METHOD" != "POST" ]]; then
-            echo "ERROR: probe job is not in its expected enabled /tick POST configuration; refusing to modify it."
-            exit 1
-          fi
-          IST_HOUR="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Asia/Kolkata")).hour)')"
-          if (( IST_HOUR < 10 || IST_HOUR >= 15 )); then
-            echo "ERROR: safe probe window is 10:00–14:59 IST, outside this job's normal 15:32 schedule."
-            exit 1
-          fi
-
-          RESTORE_NEEDED=0
-          restore_target() {
-            if [[ "$RESTORE_NEEDED" == "1" ]]; then
-              echo "Restoring scheduler target to its original /tick POST URI."
-              if ! gcloud scheduler jobs update http "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --uri="$ORIGINAL_URI" --http-method="$ORIGINAL_METHOD" --quiet; then
-                echo "CRITICAL: failed to restore the original scheduler target."
-                return 1
-              fi
-              RESTORE_NEEDED=0
-              RESTORED_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
-              RESTORED_URI="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("uri",""))')"
-              RESTORED_METHOD="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("httpMethod","POST").upper())')"
-              RESTORED_STATE="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("state",""))')"
-              if [[ "$RESTORED_URI" != "$ORIGINAL_URI" || "$RESTORED_METHOD" != "$ORIGINAL_METHOD" || "$RESTORED_STATE" != "ENABLED" ]]; then
-                echo "CRITICAL: scheduler restoration verification did not match the original configuration."
-                return 1
-              fi
-              echo "SCHEDULER_TARGET_RESTORED=PASS"
-            fi
-          }
-          trap restore_target EXIT
-
-          probe_endpoint() {
-            local path="$1"
-            local label="$2"
-            local before check rc
-            before="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
-            RESTORE_NEEDED=1
-            gcloud scheduler jobs update http "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --uri="$SERVICE_URL$path" --http-method=GET --quiet
-            gcloud scheduler jobs run "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --quiet
-
-            for attempt in $(seq 1 20); do
-              JOB_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
-              set +e
-              check="$(JOB_JSON="$JOB_JSON" python - "$before" <<'PY'
-          import datetime, json, os, sys
-          job=json.loads(os.environ["JOB_JSON"])
-          try:
-              before=datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
-          except Exception:
-              before=None
-          try:
-              attempted=datetime.datetime.fromisoformat(str(job.get("lastAttemptTime","")).replace("Z","+00:00"))
-          except Exception:
-              attempted=None
-          newer=attempted is not None and (before is None or attempted > before)
-          status=job.get("status") or {}
-          code=status.get("code")
-          message=str(status.get("message") or "")[:240]
-          if code is None and not message:
-              code=0
-          print(json.dumps({"new_attempt":newer,"lastAttemptTime":job.get("lastAttemptTime"),"code":code,"message":message},sort_keys=True))
-          sys.exit(2 if not newer else (0 if code == 0 and not message else 1))
-          PY
-          )"
-              rc=$?
-              set -e
-              echo "${label}_SCHEDULER_RESULT=$check"
-              if [[ $rc -eq 0 ]]; then
-                echo "${label}=PASS (endpoint returned HTTP 2xx)"
-                return 0
-              elif [[ $rc -eq 1 ]]; then
-                echo "${label}=FAIL (endpoint returned non-2xx)"
-                return 1
-              fi
-              sleep 3
-            done
-            echo "${label}=UNKNOWN (no fresh Scheduler attempt was observed)"
-            return 2
-          }
-
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
           CAPTURE_OK=0
           PREDICTION_OK=0
-          if probe_endpoint "/capturez" "ALL_NSE_QUOTE_CAPTURE"; then CAPTURE_OK=1; fi
-          if probe_endpoint "/predictionz" "ALL_NSE_PREDICTION_ACTUAL_CAPTURE"; then PREDICTION_OK=1; fi
-          restore_target
-          trap - EXIT
-
+          AUTH_OK=0
+          for SA in "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            echo "TRYING_READ_ONLY_INVOKER=$SA"
+            if ! TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>&1)"; then
+              echo "IDENTITY_IMPERSONATION_UNAVAILABLE=$SA"
+              continue
+            fi
+            for item in "capturez:ALL_NSE_QUOTE_CAPTURE" "predictionz:ALL_NSE_PREDICTION_ACTUAL_CAPTURE"; do
+              PATH_PART="${item%%:*}"
+              LABEL="${item##*:}"
+              HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/$PATH_PART")" || HTTP_CODE=000
+              echo "${LABEL}_HTTP_STATUS=$HTTP_CODE"
+              if ! python - "$RESPONSE" "$HTTP_CODE" "$LABEL" <<'PY'
+          import json, sys
+          path, code, label = sys.argv[1:]
+          try:
+              payload=json.load(open(path,encoding="utf-8"))
+          except Exception:
+              print(f"{label}_DIAGNOSTIC_BODY_UNAVAILABLE")
+              sys.exit(2)
+          if payload.get("probe") not in {"all_nse_quote_capture", "all_nse_minute_prediction_actual"}:
+              print(f"{label}_IDENTITY_CANNOT_READ_PRIVATE_DIAGNOSTIC")
+              sys.exit(2)
+          print(f"{label}_STATUS={payload.get('status')}")
+          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons"):
+              if key in payload:
+                  print(f"{label}_{key.upper()}={payload.get(key)}")
+          sys.exit(0 if code == "200" and payload.get("status") == "ok" else 1)
+          PY
+              then
+                AUTH_OK=1
+                if [[ "$PATH_PART" == "capturez" ]]; then CAPTURE_OK=1; else PREDICTION_OK=1; fi
+              else
+                RC=$?
+                if [[ $RC -eq 2 ]]; then
+                  break
+                fi
+                AUTH_OK=1
+              fi
+            done
+            if [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]; then break; fi
+          done
           if [[ "$CAPTURE_OK" == "1" ]]; then
-            echo "QUOTE_CAPTURE_VERDICT=PASS: every expected NSE symbol had a fresh valid quote and the minute snapshot was confirmed in Drive."
+            echo "QUOTE_CAPTURE_VERDICT=PASS"
           else
-            echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_PARTIAL: latest quote file failed the full-coverage/freshness/Drive-write gate."
+            echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_UNVERIFIABLE"
           fi
           if [[ "$PREDICTION_OK" == "1" ]]; then
-            echo "PREDICTION_ACTUAL_VERDICT=PASS: one fresh model-prediction and actual-value row per expected NSE symbol passed its quality gate."
+            echo "PREDICTION_ACTUAL_VERDICT=PASS"
           else
-            echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_PARTIAL: latest prediction/actual file failed full-coverage/freshness/Drive-write checks."
+            echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_UNVERIFIABLE"
+          fi
+          if [[ "$AUTH_OK" != "1" ]]; then
+            echo "ACCESS_BLOCKER=deployment identity cannot impersonate either existing invoker service account; no Scheduler configuration was changed."
           fi
           [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]
