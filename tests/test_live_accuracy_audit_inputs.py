@@ -120,7 +120,8 @@ def test_drive_child_lookup_retries_transient_500_error(monkeypatch):
     file_id = audit._resolve_drive_id(store, "root-folder/example.jsonl")
 
     assert file_id == "folder-id"
-    assert store.calls == 2
+    # One transient retry, then a successful parent-folder lookup and file lookup.
+    assert store.calls == 3
 
 
 def test_drive_child_lookup_does_not_retry_confirmed_missing_file():
