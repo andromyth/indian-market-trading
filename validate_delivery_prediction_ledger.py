@@ -142,18 +142,23 @@ def main() -> int:
     rows = results.to_dict("records")
     saved = save_validation_results(rows, sync_drive=True)
     counts = results["validation_status"].astype(str).str.upper().value_counts().to_dict() if not results.empty else {}
+    error_count = int(counts.get("ERROR", 0))
     report = {
-        "status": "PASS" if saved.get("synced") is True else "PERSISTENCE_ERROR",
+        "status": (
+            "PERSISTENCE_ERROR" if saved.get("synced") is not True
+            else ("VALIDATION_ERRORS" if error_count else "PASS")
+        ),
         "latest_official_eod_date": latest_eod_date.isoformat(),
         "delivery_predictions_seen": len(records),
         "already_validated": len(already_validated),
         "due_predictions": len(due),
         "validation_status_counts": counts,
+        "validation_errors": error_count,
         "saved_validation_rows": saved.get("rows"),
         "drive_synced": saved.get("synced"),
     }
     print(json.dumps(report, indent=2, default=str))
-    return 0 if saved.get("synced") is True else 2
+    return 0 if saved.get("synced") is True and error_count == 0 else 2
 
 
 if __name__ == "__main__":
