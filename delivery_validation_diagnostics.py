@@ -81,6 +81,12 @@ def _iso_date(value):
     return parsed.date().isoformat()
 
 
+def _normalise_prediction_ids(values: pd.Series) -> pd.Series:
+    """Make ledger IDs comparable across JSON/Parquet type coercions."""
+    ids = values.astype("string").str.strip()
+    return ids.mask(ids.isna() | ids.eq("") | ids.str.lower().isin({"nan", "none", "<na>"}), pd.NA)
+
+
 def build_report(
     preds: pd.DataFrame,
     vals: pd.DataFrame,
@@ -92,6 +98,18 @@ def build_report(
     minimum = MIN_TARGET_VALIDATION_SAMPLES
     eod_day = _iso_date(latest_official_eod_date)
     report = {
+        "prediction_ledger_input_rows": int(len(preds)),
+        "validation_ledger_input_rows": int(len(vals)),
+        "delivery_prediction_rows": 0,
+        "delivery_prediction_unique_id_count": 0,
+        "validation_unique_id_count": 0,
+        "prediction_validation_id_intersection_count": 0,
+        "active_model_validation_id_intersection_count": 0,
+        "active_model_validated_id_intersection_count": 0,
+        "joined_validation_rows_before_status_filter": 0,
+        "joined_validated_rows_before_metrics": 0,
+        "joined_active_model_validated_rows": 0,
+        "duplicate_validation_rows_collapsed": 0,
         "diagnostics_schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "NO_DATA",
@@ -119,7 +137,10 @@ def build_report(
         report["diagnosis"] = "Prediction ledger has no mode field; refusing to score an ambiguous population."
         return report
 
-    p_all = preds[preds["mode"].astype(str).str.lower().eq("delivery")].copy()
+    p_all = preds[preds["mode"].astype(str).str.strip().str.lower().eq("delivery")].copy()
+    p_all["prediction_id"] = _normalise_prediction_ids(p_all["prediction_id"])
+    report["delivery_prediction_rows"] = int(len(p_all))
+    report["delivery_prediction_unique_id_count"] = int(p_all["prediction_id"].nunique(dropna=True))
     if "model_version" in p_all.columns:
         p_all["model_version"] = p_all["model_version"].astype(str)
         active_prediction_mask = p_all["model_version"].isin(ACTIVE_DELIVERY_MODEL_VERSIONS)
@@ -167,9 +188,39 @@ def build_report(
         v = vals[[col for col in vcols if col in vals.columns]].copy()
         if "prediction_id" not in v.columns:
             v["prediction_id"] = pd.Series(dtype="object")
+        v["prediction_id"] = _normalise_prediction_ids(v["prediction_id"])
+        v = v.loc[v["prediction_id"].notna()].copy()
+        report["validation_unique_id_count"] = int(v["prediction_id"].nunique(dropna=True))
+        if "validated_at" in vals.columns:
+            # Preserve the most recent state per prediction ID if a legacy ledger
+            # contains repeated validation rows. NaT sorts before real timestamps.
+            order = pd.to_datetime(vals.loc[v.index, "validated_at"], errors="coerce", utc=True)
+            v["_validation_sort_order"] = order
+            v = v.sort_values("_validation_sort_order", kind="mergesort", na_position="first")
+        before = int(len(v))
+        v = v.drop_duplicates("prediction_id", keep="last")
+        report["duplicate_validation_rows_collapsed"] = before - int(len(v))
+        v = v.drop(columns=["_validation_sort_order"], errors="ignore")
+    p["prediction_id"] = _normalise_prediction_ids(p["prediction_id"])
+    prediction_ids = set(p["prediction_id"].dropna().astype(str))
+    validation_ids = set(v["prediction_id"].dropna().astype(str))
+    active_ids = set(active_predictions["prediction_id"].dropna().astype(str))
+    validated_ids = (
+        set(v.loc[v["validation_status"].astype(str).str.strip().str.upper().eq("VALIDATED"), "prediction_id"].dropna().astype(str))
+        if "validation_status" in v.columns else set()
+    )
+    report["prediction_validation_id_intersection_count"] = int(len(prediction_ids & validation_ids))
+    report["active_model_validation_id_intersection_count"] = int(len(active_ids & validation_ids))
+    report["active_model_validated_id_intersection_count"] = int(len(active_ids & validated_ids))
     x = p.merge(v, on="prediction_id", how="inner")
+    report["joined_validation_rows_before_status_filter"] = int(len(x))
     if "validation_status" in x.columns:
-        x = x[x["validation_status"].astype(str).str.upper().eq("VALIDATED")].copy()
+        x = x[x["validation_status"].astype(str).str.strip().str.upper().eq("VALIDATED")].copy()
+    report["joined_validated_rows_before_metrics"] = int(len(x))
+    if "model_version" in x.columns:
+        report["joined_active_model_validated_rows"] = int(
+            x["model_version"].astype(str).isin(ACTIVE_DELIVERY_MODEL_VERSIONS).sum()
+        )
     if "decision_timestamp" not in x.columns:
         report["diagnosis"] = "Joined prediction ledger lacks decision_timestamp."
         return report

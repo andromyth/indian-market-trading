@@ -106,3 +106,22 @@ def test_large_monitoring_sample_still_does_not_claim_holdout_target():
     assert report["status"] == "OOS_HISTORY_AVAILABLE_TARGET_UNPROVEN"
     assert report["action_precision_target_met_on_monitoring_sample"] is True
     assert "later chronological holdout" in report["target_interpretation"]
+
+
+def test_join_normalizes_prediction_ids_after_numeric_to_string_coercion():
+    active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
+    preds, vals = _frames(80, active_version, True)
+    integer_ids = list(range(1000, 1080))
+    preds["prediction_id"] = integer_ids
+    vals["prediction_id"] = [str(value) for value in integer_ids]
+
+    report = build_report(preds, vals)
+
+    assert report["prediction_validation_id_intersection_count"] == 80
+    assert report["active_model_validation_id_intersection_count"] == 80
+    assert report["active_model_validated_id_intersection_count"] == 80
+    assert report["joined_validated_rows_before_metrics"] == 80
+    assert report["joined_active_model_validated_rows"] == 80
+    assert report["active_model_scored_samples"] == 80
+    assert report["quality_approved_active_samples"] == 80
+    assert report["status"] == "OOS_HISTORY_AVAILABLE_TARGET_UNPROVEN"
