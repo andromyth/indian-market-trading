@@ -500,3 +500,29 @@ def test_service_drive_preflight_failure_is_diagnostic_not_startup_exception(mon
     finally:
         STATE.clear()
         STATE.update(original)
+
+
+def test_live_inference_can_record_abstentions_after_opening_window_before_training_minimum():
+    prices = _bars("2026-10-13 09:15", 16)
+    prices["symbol"] = "HCLTECH"
+    market = _bars("2026-10-13 09:15", 16)
+
+    live_rows = _session_rows(
+        prices,
+        market,
+        (5, 10, 15, 20, 25, 30),
+        include_future=False,
+        decision_interval_minutes=1,
+    )
+    training_rows = _session_rows(
+        prices,
+        market,
+        (5, 10, 15, 20, 25, 30),
+        include_future=True,
+    )
+
+    assert live_rows
+    assert {row["horizon_min"] for row in live_rows} == {5, 10, 15, 20, 25, 30}
+    assert all(pd.Timestamp(row["decision_timestamp"]).strftime("%H:%M") == "09:30" for row in live_rows)
+    assert all(pd.isna(row["target_timestamp"]) for row in live_rows)
+    assert training_rows == []
