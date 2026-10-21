@@ -85,7 +85,7 @@ def test_30m_validation_uses_the_first_actual_bar_at_or_after_target():
 
     assert result["validation_status"] == "VALIDATED"
     assert result["actual_timestamp"] == "2026-10-08T10:30:00+05:30"
-    assert result["actual_return_30m"] == 0.02
+    assert abs(result["actual_return_30m"] - 0.02) < 1e-9
     assert result["actual_direction_30m"] == "UP"
     assert result["direction_match_30m"] is True
     assert result["signal_direction_match_30m"] is True
