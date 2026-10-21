@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 5
     env:
       PROJECT_ID: indian-market-trading
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -29,22 +31,22 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Read Drive credentials without printing them
+      - name: Prepare Drive audit credentials without printing them
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          if ! gcloud secrets versions access latest --secret=google-oauth-token-json --project="$PROJECT_ID" --out-file=/tmp/gdrive-oauth.json 2>/tmp/oauth-secret-error.txt; then
-            echo "DRIVE_OAUTH_SECRET_ACCESS=DENIED_OR_MISSING"
-            cat /tmp/oauth-secret-error.txt
+          if [[ -z "${GOOGLE_OAUTH_TOKEN_JSON:-}" ]]; then
+            echo "DRIVE_OAUTH_GITHUB_SECRET=EMPTY"
             exit 2
           fi
-          if ! gcloud secrets versions access latest --secret=google-drive-root-id --project="$PROJECT_ID" --out-file=/tmp/gdrive-root-id.txt 2>/tmp/root-secret-error.txt; then
-            echo "DRIVE_ROOT_ID_SECRET_ACCESS=DENIED_OR_MISSING"
-            cat /tmp/root-secret-error.txt
+          if [[ -z "${GOOGLE_DRIVE_ROOT_ID:-}" ]]; then
+            echo "DRIVE_ROOT_ID_GITHUB_SECRET=EMPTY"
             exit 2
           fi
-          echo "DRIVE_CREDENTIALS_RETRIEVED=YES (values withheld)"
+          printf '%s' "$GOOGLE_OAUTH_TOKEN_JSON" > /tmp/gdrive-oauth.json
+          printf '%s' "$GOOGLE_DRIVE_ROOT_ID" > /tmp/gdrive-root-id.txt
+          echo "DRIVE_CREDENTIALS_RETRIEVED=YES from existing GitHub Actions secrets (values withheld)"
           python -m pip install --quiet requests
 
       - name: Inspect latest Drive manifests and minute-shard gaps
@@ -219,32 +221,46 @@ jobs:
                       stamp=dt.datetime.strptime(m.group(1)+m.group(2),"%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Kolkata"))
                       stamps.append((stamp,file.get("name"),file.get("modifiedTime")))
                   stamps.sort()
-                  cutoff=dt.datetime.now(ZoneInfo("Asia/Kolkata"))-dt.timedelta(minutes=30)
-                  recent=[x for x in stamps if x[0]>=cutoff]
-                  print(f"{label}_MINUTE_FILES_LAST_30_MIN={len(recent)}")
-                  if recent:
-                      print(f"{label}_OLDEST_FILE_LAST_30_MIN={recent[0][1]}")
-                      print(f"{label}_LATEST_FILE={recent[-1][1]}")
-                      print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
-                      gaps=[]
-                      tset={x[0] for x in recent}
-                      start=(dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(second=0,microsecond=0)-dt.timedelta(minutes=29))
-                      for i in range(30):
-                          want=start+dt.timedelta(minutes=i)
-                          if want<=dt.datetime.now(ZoneInfo("Asia/Kolkata")) and want not in tset:
-                              gaps.append(want.strftime("%H:%M"))
-                      print(f"{label}_MISSING_MINUTES_LAST_30_MIN={','.join(gaps) if gaps else 'none'}")
-                  else:
-                      print(f"{label}_MINUTE_FILES_LAST_30_MIN=0")
+                  local_now=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+              session_open=local_now.replace(hour=9,minute=15,second=0,microsecond=0)
+              session_close=local_now.replace(hour=15,minute=30,second=0,microsecond=0)
+              window_end=min(local_now.replace(second=0,microsecond=0),session_close)
+              if window_end < session_open:
+                  window_start=None
+                  recent=[]
+              else:
+                  window_start=max(session_open,window_end-dt.timedelta(minutes=29))
+                  recent=[x for x in stamps if window_start<=x[0]<=window_end]
+              print(f"{label}_MARKET_WINDOW_START={window_start.strftime('%H:%M') if window_start else 'market-not-open'}")
+              print(f"{label}_MARKET_WINDOW_END={window_end.strftime('%H:%M') if window_start else 'market-not-open'}")
+              print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES={len(recent)}")
+              if recent:
+                  print(f"{label}_OLDEST_FILE_IN_WINDOW={recent[0][1]}")
+                  print(f"{label}_LATEST_FILE={recent[-1][1]}")
+                  print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
+                  gaps=[]
+                  tset={x[0] for x in recent}
+                  cursor=window_start
+                  while cursor<=window_end:
+                      if cursor not in tset:
+                          gaps.append(cursor.strftime("%H:%M"))
+                      cursor+=dt.timedelta(minutes=1)
+                  print(f"{label}_MISSING_MARKET_MINUTES={','.join(gaps) if gaps else 'none'}")
+              else:
+                  print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES=0")
               inspect_day("QUOTE",quotes,qts,"snapshot")
               inspect_day("PREDICTION",predictions,pts,"predictions")
 
               verdicts=[]
+              now_ist=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+              close_time=dt.time(15,30)
+              after_close=now_ist.time()>close_time
               for label,obj,ts in (("QUOTE",qm,qts),("PREDICTION",pm,pts)):
                   if not obj or not ts:
                       verdicts.append(False); print(f"{label}_VERDICT=FAIL: no readable latest manifest")
                       continue
-                  age=(dt.datetime.now(ZoneInfo("Asia/Kolkata"))-ts.astimezone(ZoneInfo("Asia/Kolkata"))).total_seconds()
+                  local_ts=ts.astimezone(ZoneInfo("Asia/Kolkata"))
+                  age=(now_ist-local_ts).total_seconds()
                   status=str(obj.get("status") or "").upper()
                   expected=obj.get("expected_symbol_count")
                   count=obj.get("quoted_symbol_count") if label=="QUOTE" else obj.get("prediction_count")
@@ -253,8 +269,15 @@ jobs:
                       full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0)
                   else:
                       full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0 and obj.get("quality_gate_pass") is True and obj.get("history_ready") is True and int(obj.get("data_limited_count") or 0)==0)
-                  ok=(status=="OK" and full and age>=0 and age<=180)
+                  if after_close:
+                      fresh=(local_ts.date()==now_ist.date() and dt.time(15,28)<=local_ts.time().replace(tzinfo=None)<=close_time)
+                      print(f"{label}_FRESHNESS_BASIS=last market minutes through 15:30 IST")
+                  else:
+                      fresh=(age>=0 and age<=180)
+                      print(f"{label}_FRESHNESS_BASIS=within 180 seconds during the session")
+                  ok=(status=="OK" and full and fresh)
                   verdicts.append(ok)
+                  print(f"{label}_LATEST_AGE_MINUTES={max(0.0,age)/60:.1f}")
                   print(f"{label}_VERDICT={'PASS' if ok else 'FAIL'}")
               print(f"OVERALL_VERDICT={'PASS' if all(verdicts) else 'FAIL'}")
               sys.exit(0 if all(verdicts) else 1)
