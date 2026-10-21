@@ -379,6 +379,8 @@ def load_validation_records() -> list[dict[str, Any]]:
 
 def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
     """Persist the latest validation result per prediction ID, optionally syncing Drive."""
+    # Hydrate first; otherwise a fresh runner could overwrite historical Drive rows.
+    load_validation_records()
     local_validation = Path(__file__).resolve().parent / "data" / "prediction_ledger" / "prediction_validation.jsonl"
     remote_validation = "production_data/predictions/prediction_validation.jsonl"
     local_validation.parent.mkdir(parents=True, exist_ok=True)
@@ -465,41 +467,79 @@ def _stable_id(record: dict[str, Any]) -> str:
 
 
 def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
+    """Read a Drive file without conflating transport errors with a missing file.
+
+    Returning None is reserved for an unconfigured Drive store or a path that
+    does not exist. API/auth/download errors raise so a caller cannot mistake
+    a transient read failure for an empty ledger and overwrite persisted history.
+    """
+    from persistent_store import gdrive_config
+
+    cfg = gdrive_config()
+    if not cfg.get("configured"):
+        return None
+    if not cfg.get("service_account_info") or not cfg.get("root_folder_id"):
+        raise RuntimeError("Google Drive is marked configured but credentials/root folder are incomplete.")
+
     try:
-        from persistent_store import gdrive_config
-        cfg = gdrive_config()
-        if not cfg.get("configured"):
-            return None
+        import io
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseDownload
-        import io
+
         credentials = service_account.Credentials.from_service_account_info(
-            cfg["service_account_info"], scopes=["https://www.googleapis.com/auth/drive"]
+            cfg["service_account_info"],
+            scopes=["https://www.googleapis.com/auth/drive"],
         )
         service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         parts = remote_relative_path.strip("/").split("/")
+        if not parts or any(not part for part in parts):
+            raise ValueError(f"Invalid Drive-relative path: {remote_relative_path!r}")
         parent = cfg["root_folder_id"]
+
         for part in parts[:-1]:
-            q = f"name = '{part.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
-            found = service.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute().get("files", [])
+            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
+            query = f"name = '{escaped}' and '{parent}' in parents and trashed = false"
+            response = service.files().list(
+                q=query,
+                spaces="drive",
+                fields="files(id,name,mimeType)",
+                pageSize=10,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+            found = response.get("files", [])
             if not found:
                 return None
             parent = found[0]["id"]
+
         name = parts[-1]
-        q = f"name = '{name.replace(chr(39), chr(39)+chr(39))}' and '{parent}' in parents and trashed = false"
-        found = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=10).execute().get("files", [])
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"name = '{escaped}' and '{parent}' in parents and trashed = false"
+        response = service.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name,mimeType)",
+            pageSize=10,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        found = response.get("files", [])
         if not found:
             return None
-        request = service.files().get_media(fileId=found[0]["id"])
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
+
+        request = service.files().get_media(fileId=found[0]["id"], supportsAllDrives=True)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
         done = False
         while not done:
             _, done = downloader.next_chunk()
-        return buf.getvalue()
-    except Exception:
-        return None
+        return buffer.getvalue()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read persisted Google Drive file {remote_relative_path!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 def _restore_remote_prediction_ledger() -> None:
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
