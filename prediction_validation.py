@@ -94,9 +94,7 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
         elif index_tz is not None:
             expected_day = expected_day.tz_localize(index_tz)
         expected_day = expected_day.normalize()
-        if not future.empty:
-            future = future.loc[future.index.normalize() == expected_day]
-        if future.empty:
+        if future.empty or not bool((future.index.normalize() == expected_day).any()):
             return {
                 "prediction_id": record.get("prediction_id"),
                 "symbol": record.get("symbol"),
@@ -104,6 +102,9 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
                 "validation_reason": "Expected prediction_for_date is not present in official EOD history.",
                 "expected_d1_date": str(expected_day.date()),
             }
+        # Keep the exact target date first for D+1 accuracy while retaining
+        # subsequent sessions for the separate D+2..D+7 monitoring path.
+        future = future.loc[future.index.normalize() >= expected_day]
 
     future = future.head(max(cfg.rolling_days, 7))
     if future.empty:
