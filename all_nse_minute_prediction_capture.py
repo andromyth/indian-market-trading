@@ -809,6 +809,31 @@ class AllNSEMinutePredictor:
                 if item["day_volume"] is not None:
                     self._last_day_volume[symbol] = (item["date"], float(item["day_volume"]))
 
+            # Preserve each minute's NIFTY context for subsequent returns/RSI,
+            # and buffer it during the initial historical warm-up.
+            if nifty_price is not None:
+                nifty_row = {
+                    "Open": np.nan,
+                    "High": np.nan,
+                    "Low": np.nan,
+                    "Close": float(nifty_price),
+                    "Volume": np.nan,
+                }
+                if self._seed_ready:
+                    current_market = pd.DataFrame(
+                        [nifty_row], index=pd.DatetimeIndex([minute], name="Datetime")
+                    )
+                    market = pd.concat([self._market_history, current_market]).sort_index()
+                    market = market.loc[~market.index.duplicated(keep="last")]
+                    self._market_history = market.tail(HISTORY_LOOKBACK_BARS)
+                else:
+                    self._pending_quote_rows.setdefault("__NIFTY50__", []).append(
+                        (minute, nifty_row)
+                    )
+                    self._pending_quote_rows["__NIFTY50__"] = (
+                        self._pending_quote_rows["__NIFTY50__"][-180:]
+                    )
+
         # Ensure exactly one row per universe symbol even when data or inference failed.
         current_rows_by_symbol = {str(row["symbol"]): row for row in current_rows}
         records = []
