@@ -499,6 +499,7 @@ def append_predictions(
 ) -> dict[str, Any]:
     """Append idempotent Delivery prediction revisions and optionally sync the ledger."""
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_LEDGER.touch(exist_ok=True)
     existing = _load_delivery_prediction_records()
     existing_ids = {str(row.get("prediction_id")) for row in existing if row.get("prediction_id")}
     existing_fingerprints = {
@@ -556,7 +557,7 @@ def append_predictions(
     if rows_to_append:
         with LOCAL_LEDGER.open("a", encoding="utf-8") as handle:
             for row in rows_to_append:
-                handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\\n")
+                handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
 
     synced = False
     sync_error = None
@@ -576,7 +577,7 @@ def append_predictions(
     result = {
         "status": status,
         "rows_added": len(rows_to_append),
-        "rows_total": len(existing),
+        "rows_total": len(existing) + len(rows_to_append),
         "synced": synced,
     }
     if sync_error:
