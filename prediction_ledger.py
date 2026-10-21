@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import time
 from pathlib import Path
@@ -28,6 +29,13 @@ SCHEMA_VERSION = "2.2"
 MARKET_OPEN_TIME = time(9, 15, 0)
 MARKET_LAST_VALID_TARGET_TIME = time(15, 29, 0)
 MIN_FEATURE_COVERAGE = 0.70
+
+# Daily Delivery prediction ledger. The optional-path overload of load_records()
+# preserves this legacy API while an explicit path selects the minute-level ledger.
+LOCAL_DIR = Path(__file__).resolve().parent / "data" / "prediction_ledger"
+LOCAL_LEDGER = LOCAL_DIR / "prediction_ledger.jsonl"
+REMOTE_LEDGER = "production_data/predictions/prediction_ledger.jsonl"
+
 
 
 def normalize_ist_timestamp(ts: Any) -> pd.Timestamp:
@@ -255,15 +263,17 @@ def append_record(
 
 
 def load_records(
-    ledger_path: str | Path,
+    ledger_path: str | Path | None = None,
     *,
     include_out_of_session: bool = False,
     min_feature_coverage: float = 0.0,
-) -> pd.DataFrame:
+) -> pd.DataFrame | list[dict[str, Any]]:
     """
-    Load historical prediction records, normalize timestamps to Asia/Kolkata,
-    restore microstructure state columns, and filter out-of-session horizons.
+    Load minute-level records when a path is supplied, or the shared daily
+    Delivery/legacy prediction JSONL ledger when called with no arguments.
     """
+    if ledger_path is None:
+        return _load_delivery_prediction_records()
     path = Path(ledger_path)
     if not path.exists():
         return pd.DataFrame()
@@ -370,6 +380,8 @@ def load_validation_records() -> list[dict[str, Any]]:
 
 def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
     """Persist the latest validation result per prediction ID, optionally syncing Drive."""
+    # Hydrate first; otherwise a fresh runner could overwrite historical Drive rows.
+    load_validation_records()
     local_validation = Path(__file__).resolve().parent / "data" / "prediction_ledger" / "prediction_validation.jsonl"
     remote_validation = "production_data/predictions/prediction_validation.jsonl"
     local_validation.parent.mkdir(parents=True, exist_ok=True)
@@ -424,3 +436,234 @@ def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = Tr
 def _utc_timestamp() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+
+def _prediction_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Return deterministic prediction content without volatile persistence metadata."""
+    ignored = {
+        "created_at", "created_timestamp", "prediction_id",
+        "prediction_revision", "revision_fingerprint", "validated_at",
+        "last_synced_at", "sync_status", "sync_error",
+    }
+    return {str(k): v for k, v in record.items() if str(k) not in ignored}
+
+
+def prediction_revision_fingerprint(record: dict[str, Any]) -> str:
+    """Hash model output and decision metadata, excluding creation-time noise."""
+    payload = json.dumps(
+        _prediction_payload(dict(record)),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    )
+    return __import__("hashlib").sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stable_id(record: dict[str, Any]) -> str:
+    """Stable ID for an immutable prediction revision."""
+    return prediction_revision_fingerprint(record)[:24]
+
+
+
+def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
+    """Read a Drive file without conflating transport errors with a missing file.
+
+    Returning None is reserved for an unconfigured Drive store or a path that
+    does not exist. API/auth/download errors raise so a caller cannot mistake
+    a transient read failure for an empty ledger and overwrite persisted history.
+    """
+    from persistent_store import gdrive_config
+
+    cfg = gdrive_config()
+    if not cfg.get("configured"):
+        return None
+    if not cfg.get("service_account_info") or not cfg.get("root_folder_id"):
+        raise RuntimeError("Google Drive is marked configured but credentials/root folder are incomplete.")
+
+    try:
+        import io
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+
+        credentials = service_account.Credentials.from_service_account_info(
+            cfg["service_account_info"],
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        parts = remote_relative_path.strip("/").split("/")
+        if not parts or any(not part for part in parts):
+            raise ValueError(f"Invalid Drive-relative path: {remote_relative_path!r}")
+        parent = cfg["root_folder_id"]
+
+        for part in parts[:-1]:
+            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
+            query = f"name = '{escaped}' and '{parent}' in parents and trashed = false"
+            response = service.files().list(
+                q=query,
+                spaces="drive",
+                fields="files(id,name,mimeType)",
+                pageSize=10,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+            found = response.get("files", [])
+            if not found:
+                return None
+            parent = found[0]["id"]
+
+        name = parts[-1]
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"name = '{escaped}' and '{parent}' in parents and trashed = false"
+        response = service.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name,mimeType)",
+            pageSize=10,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        found = response.get("files", [])
+        if not found:
+            return None
+
+        request = service.files().get_media(fileId=found[0]["id"], supportsAllDrives=True)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buffer.getvalue()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read persisted Google Drive file {remote_relative_path!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+def _restore_remote_prediction_ledger() -> None:
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCAL_LEDGER.exists() and LOCAL_LEDGER.stat().st_size > 0:
+        return
+    payload = _drive_file_bytes(REMOTE_LEDGER)
+    if payload:
+        LOCAL_LEDGER.write_bytes(payload)
+
+
+def _load_delivery_prediction_records() -> list[dict[str, Any]]:
+    """Load durable daily predictions, restoring the remote ledger when needed."""
+    _restore_remote_prediction_ledger()
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOCAL_LEDGER.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with LOCAL_LEDGER.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def append_predictions(
+    records: list[dict[str, Any]],
+    sync_drive: bool = True,
+) -> dict[str, Any]:
+    """Append idempotent Delivery prediction revisions and optionally sync the ledger."""
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_LEDGER.touch(exist_ok=True)
+    existing = _load_delivery_prediction_records()
+    existing_ids = {str(row.get("prediction_id")) for row in existing if row.get("prediction_id")}
+    existing_fingerprints = {
+        str(row.get("revision_fingerprint") or prediction_revision_fingerprint(row))
+        for row in existing
+    }
+
+    rows_to_append: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        row = dict(record)
+        row.setdefault("created_at", _utc_timestamp())
+        fingerprint = prediction_revision_fingerprint(row)
+        row["revision_fingerprint"] = fingerprint
+
+        supplied_id = str(row.get("prediction_id") or "").strip()
+        if fingerprint in existing_fingerprints:
+            continue
+        prediction_id = supplied_id
+        if not prediction_id or prediction_id in existing_ids:
+            prediction_id = _stable_id(row)
+        if prediction_id in existing_ids:
+            # Deterministic IDs must never silently overwrite a different version.
+            prediction_id = __import__("hashlib").sha256(
+                f"{prediction_id}|{fingerprint}".encode("utf-8")
+            ).hexdigest()[:24]
+        if prediction_id in existing_ids:
+            continue
+
+        row["prediction_id"] = prediction_id
+        identity = (
+            str(row.get("symbol", "")).strip().upper(),
+            str(row.get("mode", "")).strip().lower(),
+            str(row.get("prediction_horizon", "")),
+            str(row.get("prediction_for_date", ""))[:10],
+            str(row.get("model_version", "")),
+        )
+        prior_revisions = [
+            max(1, int(prev.get("prediction_revision", 1) or 1))
+            for prev in existing + rows_to_append
+            if (
+                str(prev.get("symbol", "")).strip().upper(),
+                str(prev.get("mode", "")).strip().lower(),
+                str(prev.get("prediction_horizon", "")),
+                str(prev.get("prediction_for_date", ""))[:10],
+                str(prev.get("model_version", "")),
+            ) == identity
+        ]
+        row["prediction_revision"] = max(prior_revisions, default=0) + 1
+        rows_to_append.append(row)
+        existing_ids.add(prediction_id)
+        existing_fingerprints.add(fingerprint)
+
+    if rows_to_append:
+        with LOCAL_LEDGER.open("a", encoding="utf-8") as handle:
+            for row in rows_to_append:
+                handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+
+    synced = False
+    sync_error = None
+    if sync_drive:
+        try:
+            from persistent_store import GoogleDriveStore
+            result = GoogleDriveStore().upload_or_update(
+                LOCAL_LEDGER, REMOTE_LEDGER, mime_type="application/x-ndjson"
+            )
+            synced = result.get("status") == "OK"
+            if not synced:
+                sync_error = str(result)
+        except Exception as exc:
+            sync_error = f"{type(exc).__name__}: {exc}"
+
+    status = "SYNCED" if synced else ("APPENDED_LOCAL_ONLY" if rows_to_append else "NO_NEW_ROWS")
+    result = {
+        "status": status,
+        "rows_added": len(rows_to_append),
+        "rows_total": len(existing) + len(rows_to_append),
+        "synced": synced,
+    }
+    if sync_error:
+        result["sync_error"] = sync_error
+    return result
+
+
+def append_prediction(record: dict[str, Any], sync_drive: bool = True) -> dict[str, Any]:
+    """Compatibility wrapper for callers that append a single daily prediction."""
+    return append_predictions([record], sync_drive=sync_drive)

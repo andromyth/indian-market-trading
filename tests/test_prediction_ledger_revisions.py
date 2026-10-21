@@ -131,3 +131,49 @@ def test_save_validation_results_deduplicates_by_prediction_id(tmp_path, monkeyp
     latest = {row["prediction_id"]: row for row in loaded}
     assert latest["p-1"]["validation_status"] == "VALIDATED"
     assert latest["p-2"]["actual_direction_d1"] == "DOWN"
+
+
+
+def test_append_predictions_is_idempotent_and_tracks_revisions(tmp_path, monkeypatch):
+    import prediction_ledger as ledger
+
+    local_dir = tmp_path / "data" / "prediction_ledger"
+    monkeypatch.setattr(ledger, "LOCAL_DIR", local_dir)
+    monkeypatch.setattr(ledger, "LOCAL_LEDGER", local_dir / "prediction_ledger.jsonl")
+    monkeypatch.setattr(ledger, "_drive_file_bytes", lambda _remote: None)
+
+    first = _record(created_at="2026-10-16T03:00:00+00:00")
+    one = ledger.append_predictions([first], sync_drive=False)
+    assert one["rows_added"] == 1
+    assert one["synced"] is False
+
+    repeated = _record(created_at="2026-10-16T04:00:00+00:00")
+    same = ledger.append_predictions([repeated], sync_drive=False)
+    assert same["rows_added"] == 0
+
+    changed = _record(predicted_price_next_session=103.4)
+    revised = ledger.append_predictions([changed], sync_drive=False)
+    assert revised["rows_added"] == 1
+    records = ledger.load_records()
+    assert len(records) == 2
+    assert len({row["prediction_id"] for row in records}) == 2
+    assert sorted(row["prediction_revision"] for row in records) == [1, 2]
+
+
+def test_explicit_path_keeps_minute_level_dataframe_loader(tmp_path):
+    import json
+    from prediction_ledger import load_records
+
+    path = tmp_path / "minute.jsonl"
+    path.write_text(json.dumps({
+        "symbol": "SBIN",
+        "decision_timestamp": "2026-10-21T09:30:00+05:30",
+        "horizon_min": 5,
+        "signal": "HOLD",
+        "probability_up": 0.51,
+        "reference_close": 100.0,
+        "predicted_price": 100.1,
+    }) + "\n", encoding="utf-8")
+    loaded = load_records(path)
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["symbol"] == "SBIN"
