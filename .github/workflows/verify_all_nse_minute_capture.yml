@@ -1,0 +1,141 @@
+name: Verify all-NSE minute capture
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/verify_all_nse_minute_capture.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Read authenticated worker health and capture coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          if [[ -z "$SERVICE_URL" ]]; then
+            echo "ERROR: Cloud Run service URL is missing."
+            exit 1
+          fi
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
+          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            --output "$RESPONSE" --write-out "%{http_code}" \
+            "$SERVICE_URL/healthz")" || {
+              echo "ERROR: Could not contact the authenticated worker health endpoint."
+              exit 1
+            }
+          echo "HEALTH_HTTP_STATUS=$HTTP_CODE"
+          python - "$RESPONSE" "$HTTP_CODE" <<'PY'
+          import datetime as dt
+          import json
+          import sys
+
+          path, http_code = sys.argv[1], int(sys.argv[2])
+          try:
+              payload = json.load(open(path, encoding="utf-8"))
+          except Exception as exc:
+              print(f"ERROR: health endpoint returned invalid JSON: {exc}")
+              sys.exit(1)
+
+          capture = payload.get("all_universe_capture") or {}
+          prediction = payload.get("all_nse_minute_prediction") or {}
+
+          def show(prefix, obj, keys):
+              for key in keys:
+                  if key in obj:
+                      print(f"{prefix}_{key.upper()}={obj.get(key)}")
+
+          print(f"WORKER_HEALTH={payload.get('status')}")
+          print(f"DRIVE_PREFLIGHT={payload.get('drive_preflight_status')}")
+          print(f"LAST_TICK_AT_UTC={payload.get('last_tick_at_utc')}")
+          print(f"NSE_TIME_IST={payload.get('nse_time_ist')}")
+          show("QUOTE_CAPTURE", capture, [
+              "status", "cycle_minute_ist", "expected_symbol_count",
+              "quoted_symbol_count", "missing_quote_count",
+              "unmapped_symbol_count", "snapshot_drive_path",
+              "remote_snapshot_path", "error",
+          ])
+          show("PREDICTION_CAPTURE", prediction, [
+              "status", "cycle_minute_ist", "expected_symbol_count",
+              "prediction_count", "missing_quote_count", "data_limited_count",
+              "history_ready", "history_status", "history_seed_coverage_symbols",
+              "history_seed_failed_batches", "quality_gate_pass",
+              "remote_path", "manifest_drive_path", "error",
+          ])
+          if payload.get("all_nse_minute_prediction_error"):
+              print("PREDICTION_ERROR=" + str(payload["all_nse_minute_prediction_error"]))
+          if payload.get("last_error"):
+              print("WORKER_LAST_ERROR=" + str(payload["last_error"]))
+
+          # Health returns 503 when degraded but still supplies useful diagnostics.
+          if http_code not in (200, 503):
+              print(f"ERROR: unexpected health HTTP status {http_code}")
+              sys.exit(1)
+          if payload.get("drive_preflight_status") != "OK":
+              print("VERDICT=FAIL: Drive read/write preflight is not ready.")
+              sys.exit(1)
+
+          expected = capture.get("expected_symbol_count")
+          quoted = capture.get("quoted_symbol_count")
+          missing = capture.get("missing_quote_count")
+          status = str(capture.get("status") or "").upper()
+          drive_path = capture.get("snapshot_drive_path") or capture.get("remote_snapshot_path")
+          minute = capture.get("cycle_minute_ist")
+          if not minute or not drive_path or expected is None or quoted is None or missing is None:
+              print("VERDICT=FAIL: no complete latest full-universe capture diagnostics are available.")
+              sys.exit(1)
+
+          try:
+              parsed = dt.datetime.fromisoformat(str(minute).replace("Z", "+00:00"))
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=dt.timezone.utc)
+              age = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
+          except Exception:
+              age = 999999
+          print(f"QUOTE_CAPTURE_AGE_SECONDS={max(0, int(age))}")
+          if int(expected) <= 0 or int(quoted) + int(missing) != int(expected):
+              print("VERDICT=FAIL: quote coverage counts do not reconcile to the NSE universe.")
+              sys.exit(1)
+          if age > 180:
+              print("VERDICT=FAIL: latest capture is older than 3 minutes.")
+              sys.exit(1)
+          if status != "OK" or int(missing) != 0 or int(quoted) != int(expected):
+              print("VERDICT=PARTIAL: latest file is recent and coverage counts reconcile, but not every NSE symbol has a valid quote.")
+              sys.exit(1)
+
+          pred_status = str(prediction.get("status") or "NOT_REPORTED").upper()
+          pred_expected = prediction.get("expected_symbol_count")
+          pred_count = prediction.get("prediction_count")
+          print(f"VERDICT=PASS: latest one-minute NSE quote snapshot has {quoted}/{expected} valid quotes and a confirmed Drive path.")
+          if pred_status != "OK" or pred_expected is None or pred_count != pred_expected:
+              print("PREDICTION_VERDICT=PARTIAL: one-row-per-symbol prediction file is not fully passing its quality gate.")
+          else:
+              print(f"PREDICTION_VERDICT=PASS: {pred_count}/{pred_expected} symbol predictions are present.")
+          PY
