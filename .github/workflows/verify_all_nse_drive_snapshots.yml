@@ -1,0 +1,265 @@
+name: Verify all-NSE Drive minute snapshots
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/verify_all_nse_drive_snapshots.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-drive-snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_ID: indian-market-trading
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Read Drive credentials without printing them
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! gcloud secrets versions access latest --secret=google-oauth-token-json --project="$PROJECT_ID" --out-file=/tmp/gdrive-oauth.json 2>/tmp/oauth-secret-error.txt; then
+            echo "DRIVE_OAUTH_SECRET_ACCESS=DENIED_OR_MISSING"
+            cat /tmp/oauth-secret-error.txt
+            exit 2
+          fi
+          if ! gcloud secrets versions access latest --secret=google-drive-root-id --project="$PROJECT_ID" --out-file=/tmp/gdrive-root-id.txt 2>/tmp/root-secret-error.txt; then
+            echo "DRIVE_ROOT_ID_SECRET_ACCESS=DENIED_OR_MISSING"
+            cat /tmp/root-secret-error.txt
+            exit 2
+          fi
+          echo "DRIVE_CREDENTIALS_RETRIEVED=YES (values withheld)"
+          python -m pip install --quiet requests
+
+      - name: Inspect latest Drive manifests and minute-shard gaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+          import requests
+
+          PROJECT = "indian-market-trading"
+          ROOT_ID = Path("/tmp/gdrive-root-id.txt").read_text(encoding="utf-8").strip()
+          token_info = json.loads(Path("/tmp/gdrive-oauth.json").read_text(encoding="utf-8"))
+          now = dt.datetime.now(dt.timezone.utc)
+          access = token_info.get("token") or token_info.get("access_token")
+          expires = token_info.get("expiry") or token_info.get("expires_at")
+          stale = True
+          if expires:
+              try:
+                  exp = dt.datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+                  stale = exp <= now + dt.timedelta(minutes=2)
+              except Exception:
+                  stale = True
+          if not access or stale:
+              refresh_token = token_info.get("refresh_token")
+              if not refresh_token:
+                  print("DRIVE_AUTH=FAIL: OAuth token is missing or expired and has no refresh token")
+                  sys.exit(2)
+              token_uri = token_info.get("token_uri") or "https://oauth2.googleapis.com/token"
+              resp = requests.post(token_uri, data={
+                  "client_id": token_info.get("client_id"),
+                  "client_secret": token_info.get("client_secret"),
+                  "refresh_token": refresh_token,
+                  "grant_type": "refresh_token",
+              }, timeout=20)
+              if resp.status_code != 200:
+                  print(f"DRIVE_AUTH=FAIL: OAuth refresh returned HTTP {resp.status_code}")
+                  sys.exit(2)
+              access = resp.json().get("access_token")
+          if not access:
+              print("DRIVE_AUTH=FAIL: no access token available")
+              sys.exit(2)
+
+          def drive_get(path, params=None, media=False):
+              suffix = "?" + urlencode(params or {}) if params else ""
+              url = "https://www.googleapis.com/drive/v3/" + path + suffix
+              if media:
+                  url += ("&" if suffix else "?") + "alt=media"
+              r = requests.get(url, headers={"Authorization": "Bearer " + access}, timeout=25)
+              if r.status_code != 200:
+                  raise RuntimeError(f"Drive API HTTP {r.status_code} for read-only query {path}")
+              return r.json() if not media else r.content
+
+          def list_children(parent_id, name=None, mime_type=None):
+              q = f"'{parent_id}' in parents and trashed = false"
+              if name:
+                  escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+                  q += f" and name = '{escaped}'"
+              if mime_type:
+                  q += f" and mimeType = '{mime_type}'"
+              params = {
+                  "q": q,
+                  "pageSize": 1000,
+                  "orderBy": "modifiedTime desc",
+                  "fields": "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken",
+                  "supportsAllDrives": "true",
+                  "includeItemsFromAllDrives": "true",
+              }
+              all_files=[]
+              while True:
+                  body=drive_get("files",params)
+                  all_files.extend(body.get("files",[]))
+                  page=body.get("nextPageToken")
+                  if not page: break
+                  params["pageToken"]=page
+              return all_files
+
+          def child_folder(parent_id, name):
+              files=list_children(parent_id,name,"application/vnd.google-apps.folder")
+              return files[0] if files else None
+
+          def child_file(parent_id, name):
+              files=list_children(parent_id,name)
+              candidates=[f for f in files if f["name"]==name and f.get("mimeType")!="application/vnd.google-apps.folder"]
+              return candidates[0] if candidates else None
+
+          def read_json_file(file):
+              if not file: return None
+              return json.loads(drive_get(f"files/{file['id']}",media=True).decode("utf-8"))
+
+          def safe_get(obj, *keys):
+              for key in keys:
+                  if not isinstance(obj,dict): return None
+                  obj=obj.get(key)
+              return obj
+
+          def print_manifest(label, folder, remote_root):
+              latest=child_file(folder["id"],"latest_manifest.json")
+              if not latest:
+                  print(f"{label}_LATEST_MANIFEST=NOT_FOUND")
+                  return None
+              payload=read_json_file(latest)
+              print(f"{label}_MANIFEST_MODIFIED_UTC={latest.get('modifiedTime')}")
+              keys = (
+                  "status","cycle_minute_ist","expected_symbol_count","row_count",
+                  "quoted_symbol_count","actual_quote_count","missing_quote_count",
+                  "unmapped_symbol_count","prediction_count","data_limited_count",
+                  "quality_gate_pass","history_ready","remote_snapshot_path",
+                  "snapshot_drive_path","remote_path","manifest_drive_path",
+                  "prediction_drive_error","manifest_drive_error","error",
+              )
+              for key in keys:
+                  if key in payload:
+                      print(f"{label}_{key.upper()}={payload.get(key)}")
+              if remote_root:
+                  print(f"{label}_REMOTE_ROOT={remote_root}")
+              return payload
+
+          try:
+              root_meta=drive_get(f"files/{ROOT_ID}",{
+                  "fields":"id,name,mimeType,trashed"
+              })
+              if root_meta.get("mimeType")!="application/vnd.google-apps.folder" or root_meta.get("trashed"):
+                  raise RuntimeError("configured root ID is not an accessible, active folder")
+              print("DRIVE_AUTH=PASS")
+              print("DRIVE_ROOT_ACCESS=PASS")
+              prod=child_folder(ROOT_ID,"production_data")
+              if not prod: raise RuntimeError("production_data folder not found under configured root")
+              quotes=child_folder(prod["id"],"all_universe_minute_snapshots")
+              predictions=child_folder(prod["id"],"all_nse_minute_predictions")
+              if not quotes: raise RuntimeError("all_universe_minute_snapshots folder not found")
+              if not predictions: raise RuntimeError("all_nse_minute_predictions folder not found")
+              qm=print_manifest("QUOTE",quotes,"production_data/all_universe_minute_snapshots")
+              pm=print_manifest("PREDICTION",predictions,"production_data/all_nse_minute_predictions")
+
+              def get_minute(obj):
+                  if not obj or not obj.get("cycle_minute_ist"): return None
+                  ts=dt.datetime.fromisoformat(str(obj["cycle_minute_ist"]).replace("Z","+00:00"))
+                  return ts.replace(tzinfo=ZoneInfo("Asia/Kolkata")) if ts.tzinfo is None else ts
+
+              qts=get_minute(qm); pts=get_minute(pm)
+              for label, ts in (("QUOTE",qts),("PREDICTION",pts)):
+                  if ts:
+                      age=(dt.datetime.now(ZoneInfo("Asia/Kolkata"))-ts.astimezone(ZoneInfo("Asia/Kolkata"))).total_seconds()/60
+                      print(f"{label}_AGE_MINUTES={age:.1f}")
+
+              def inspect_day(label, parent_folder, ts, prefix):
+                  if not ts:
+                      print(f"{label}_MINUTE_FILES=UNAVAILABLE_NO_TIMESTAMP")
+                      return
+                  local=ts.astimezone(ZoneInfo("Asia/Kolkata"))
+                  cur=parent_folder
+                  for component in (f"{local:%Y}",f"{local:%m}",f"{local:%d}"):
+                      cur_obj=child_folder(cur["id"],component)
+                      if not cur_obj:
+                          print(f"{label}_DAY_FOLDER_MISSING={component}")
+                          return
+                      cur=cur_obj
+                  files=list_children(cur["id"])
+                  pattern=re.compile(rf"^{re.escape(prefix)}_(\d{{8}})_(\d{{4}})\.parquet$")
+                  stamps=[]
+                  for file in files:
+                      m=pattern.match(file.get("name",""))
+                      if not m: continue
+                      stamp=dt.datetime.strptime(m.group(1)+m.group(2),"%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+                      stamps.append((stamp,file.get("name"),file.get("modifiedTime")))
+                  stamps.sort()
+                  cutoff=dt.datetime.now(ZoneInfo("Asia/Kolkata"))-dt.timedelta(minutes=30)
+                  recent=[x for x in stamps if x[0]>=cutoff]
+                  print(f"{label}_MINUTE_FILES_LAST_30_MIN={len(recent)}")
+                  if recent:
+                      print(f"{label}_OLDEST_FILE_LAST_30_MIN={recent[0][1]}")
+                      print(f"{label}_LATEST_FILE={recent[-1][1]}")
+                      print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
+                      gaps=[]
+                      tset={x[0] for x in recent}
+                      start=(dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(second=0,microsecond=0)-dt.timedelta(minutes=29))
+                      for i in range(30):
+                          want=start+dt.timedelta(minutes=i)
+                          if want<=dt.datetime.now(ZoneInfo("Asia/Kolkata")) and want not in tset:
+                              gaps.append(want.strftime("%H:%M"))
+                      print(f"{label}_MISSING_MINUTES_LAST_30_MIN={','.join(gaps) if gaps else 'none'}")
+                  else:
+                      print(f"{label}_MINUTE_FILES_LAST_30_MIN=0")
+              inspect_day("QUOTE",quotes,qts,"snapshot")
+              inspect_day("PREDICTION",predictions,pts,"predictions")
+
+              verdicts=[]
+              for label,obj,ts in (("QUOTE",qm,qts),("PREDICTION",pm,pts)):
+                  if not obj or not ts:
+                      verdicts.append(False); print(f"{label}_VERDICT=FAIL: no readable latest manifest")
+                      continue
+                  age=(dt.datetime.now(ZoneInfo("Asia/Kolkata"))-ts.astimezone(ZoneInfo("Asia/Kolkata"))).total_seconds()
+                  status=str(obj.get("status") or "").upper()
+                  expected=obj.get("expected_symbol_count")
+                  count=obj.get("quoted_symbol_count") if label=="QUOTE" else obj.get("prediction_count")
+                  miss=obj.get("missing_quote_count")
+                  if label=="QUOTE":
+                      full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0)
+                  else:
+                      full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0 and obj.get("quality_gate_pass") is True and obj.get("history_ready") is True and int(obj.get("data_limited_count") or 0)==0)
+                  ok=(status=="OK" and full and age>=0 and age<=180)
+                  verdicts.append(ok)
+                  print(f"{label}_VERDICT={'PASS' if ok else 'FAIL'}")
+              print(f"OVERALL_VERDICT={'PASS' if all(verdicts) else 'FAIL'}")
+              sys.exit(0 if all(verdicts) else 1)
+          except Exception as exc:
+              print(f"DRIVE_INSPECTION_ERROR={type(exc).__name__}: {exc}")
+              sys.exit(2)
+          PY
+          rm -f /tmp/gdrive-oauth.json /tmp/gdrive-root-id.txt /tmp/oauth-secret-error.txt /tmp/root-secret-error.txt
