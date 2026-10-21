@@ -594,8 +594,13 @@ class AllNSEMinutePredictor:
         worker_root: str | Path | None = None,
     ) -> dict[str, Any]:
         """Predict for the captured NSE universe and write one row per symbol to Drive."""
-        self.start()
         capture_manifest = capture_manifest or {}
+        if not capture_manifest.get("cycle_minute_ist"):
+            return {
+                "status": "NOT_RUN",
+                "reason": "This worker tick did not produce a live full-universe quote capture.",
+            }
+        self.start()
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
             fallback=pd.Timestamp.now(tz=IST).floor("min"),
@@ -778,6 +783,10 @@ class AllNSEMinutePredictor:
                     probability = float(probs[idx])
                     expected_return = float(expected_returns[idx]) if np.isfinite(expected_returns[idx]) else None
                     readiness = float(x.iloc[idx].notna().mean())
+                    decision_ts = _as_ist_timestamp(
+                        row.get("actual_observed_at_ist"),
+                        fallback=minute,
+                    )
                     raw_signal, proposed_signal = _signal(probability, readiness)
                     trained_for_symbol = (
                         symbol in self._trained_symbols
@@ -812,16 +821,15 @@ class AllNSEMinutePredictor:
                             self._model_status.get("training_symbol_count")
                             or len(self._trained_symbols)
                         ),
-                        "trained_for_symbol": symbol in self._trained_symbols,
                         "feature_count": len(self._model_api.FEATURES),
                         "non_missing_feature_count": int(x.iloc[idx].notna().sum()),
                         "data_readiness_score": readiness,
                         "data_limited": readiness < MIN_SIGNAL_READINESS,
                         "forecast_target_timestamp_utc": (
-                            (actual_ts + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat()
+                            (decision_ts + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat()
                         ),
                         "forecast_key": (
-                            f"{symbol}|{actual_ts.tz_convert('UTC').isoformat()}|30|"
+                            f"{symbol}|{decision_ts.tz_convert('UTC').isoformat()}|30|"
                             f"{self._model_status.get('trained_until') or 'all-nse-pooled'}"
                         ),
                         "error": None,
