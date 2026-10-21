@@ -343,9 +343,26 @@ def main() -> int:
     counts = pd.Series([row.get("validation_status", "UNKNOWN") for row in results]).value_counts().to_dict()
     validated = [row for row in results if row.get("validation_status") == "VALIDATED"]
     saved = save_validation_results(results, sync_drive=not args.no_sync_drive)
+    latest_by_id = dict(existing)
+    for row in results:
+        if row.get("prediction_id"):
+            latest_by_id[str(row["prediction_id"])] = row
+    validated_in_window = []
+    for row in latest_by_id.values():
+        if str(row.get("validation_status", "")).upper() != "VALIDATED":
+            continue
+        if str(row.get("mode", "")).strip().lower() != "intraday":
+            continue
+        if str(row.get("prediction_horizon", "")).strip().lower().replace(" ", "") not in {"30m", "30min", "30minutes"}:
+            continue
+        target_ts = _timestamp(row.get("target_timestamp") or row.get("signal_horizon_end"))
+        if target_ts is None or target_ts > now or target_ts.date() < cutoff_date:
+            continue
+        validated_in_window.append(row)
     action_matches = [
         bool(row["signal_direction_match_30m"])
-        for row in validated if row.get("signal") in {"BUY", "SELL"} and row.get("signal_direction_match_30m") is not None
+        for row in validated_in_window
+        if row.get("signal") in {"BUY", "SELL"} and row.get("signal_direction_match_30m") is not None
     ]
     report = {
         "status": "PASS" if (args.no_sync_drive or saved.get("synced") is True) else "PERSISTENCE_ERROR",
@@ -354,7 +371,8 @@ def main() -> int:
         "lookback_end_date": now.date().isoformat(),
         "pending_scored": len(pending),
         "validation_status_counts": counts,
-        "validated": len(validated),
+        "newly_validated": len(validated),
+        "validated_outcomes_in_lookback": len(validated_in_window),
         "action_direction_accuracy_descriptive": float(np.mean(action_matches)) if action_matches else None,
         "action_predictions_scored": len(action_matches),
         "saved_validation_rows": saved.get("rows"),
