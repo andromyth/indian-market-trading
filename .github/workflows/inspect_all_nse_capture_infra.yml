@@ -39,6 +39,49 @@ jobs:
           gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --sort-by='~metadata.creationTimestamp' --format='table(metadata.name,metadata.creationTimestamp,status.conditions[0].status,status.conditions[0].reason)' || true
           echo "=== Recent Cloud Builds ==="
           gcloud builds list --project="$PROJECT_ID" --limit=8 --sort-by='~createTime' --format='table(id,status,createTime,finishTime,logUrl)' || true
+          echo "=== Cloud Run HTTP request metrics for last 20 minutes ==="
+          END_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          START_TIME="$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "METRICS_WINDOW_START=$START_TIME"
+          echo "METRICS_WINDOW_END=$END_TIME"
+          set +e
+          gcloud monitoring time-series list --project="$PROJECT_ID" \
+            --filter='metric.type="run.googleapis.com/request_count" AND resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker"' \
+            --interval="start=$START_TIME,end=$END_TIME" \
+            --format=json > /tmp/run_request_metrics.json
+          METRICS_RC=$?
+          set -e
+          if [[ "$METRICS_RC" -eq 0 ]]; then
+            python - /tmp/run_request_metrics.json <<'PY'
+          import json,sys
+          try:
+              items=json.load(open(sys.argv[1],encoding="utf-8"))
+          except Exception as exc:
+              print(f"METRICS_PARSE_ERROR={exc}")
+              sys.exit(0)
+          print(f"REQUEST_METRIC_SERIES_COUNT={len(items)}")
+          for item in items:
+              metric=item.get("metric",{})
+              resource=item.get("resource",{})
+              labels=metric.get("labels",{})
+              rlabels=resource.get("labels",{})
+              values=item.get("points",[])
+              for point in values[-8:]:
+                  value=point.get("value",{})
+                  num=value.get("int64Value",value.get("doubleValue",value.get("distributionValue")))
+                  interval=point.get("interval",{})
+                  print("REQUEST_METRIC="+json.dumps({
+                      "revision":rlabels.get("revision_name"),
+                      "response_code":labels.get("response_code"),
+                      "response_code_class":labels.get("response_code_class"),
+                      "method":labels.get("method"),
+                      "value":num,
+                      "end":interval.get("endTime")
+                  },sort_keys=True))
+          PY
+          else
+            echo "REQUEST_METRICS_UNAVAILABLE_RC=$METRICS_RC"
+          fi
           echo "=== Scheduler state and last attempt ==="
           for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
             echo "--- $job ---"
