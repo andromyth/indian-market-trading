@@ -474,24 +474,20 @@ def _drive_file_bytes(remote_relative_path: str) -> bytes | None:
     does not exist. API/auth/download errors raise so a caller cannot mistake
     a transient read failure for an empty ledger and overwrite persisted history.
     """
-    from persistent_store import gdrive_config
+    from persistent_store import gdrive_config, _drive_credentials
 
     cfg = gdrive_config()
     if not cfg.get("configured"):
         return None
-    if not cfg.get("service_account_info") or not cfg.get("root_folder_id"):
-        raise RuntimeError("Google Drive is marked configured but credentials/root folder are incomplete.")
+    if not cfg.get("root_folder_id"):
+        raise RuntimeError("Google Drive is marked configured but the root folder ID is missing.")
 
     try:
         import io
-        from google.oauth2 import service_account
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseDownload
 
-        credentials = service_account.Credentials.from_service_account_info(
-            cfg["service_account_info"],
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
+        credentials = _drive_credentials(cfg)
         service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         parts = remote_relative_path.strip("/").split("/")
         if not parts or any(not part for part in parts):
