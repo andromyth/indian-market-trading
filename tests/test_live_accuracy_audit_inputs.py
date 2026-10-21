@@ -140,3 +140,34 @@ def test_drive_child_lookup_does_not_retry_confirmed_missing_file():
     store = Store()
     assert audit._resolve_drive_id(store, "missing/folder/file.parquet") is None
     assert store.calls == 1
+
+
+def test_intraday_audit_retries_transient_drive_report_upload(tmp_path, monkeypatch):
+    import audit_autonomous_intraday_outcomes as audit
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def upload_or_update(self, local_path, remote_path, mime_type=None):
+            self.calls.append((str(local_path), remote_path, mime_type))
+            if len(self.calls) == 1:
+                raise TimeoutError("The read operation timed out")
+            return {"status": "OK", "remote_path": remote_path}
+
+    store = Store()
+    local = tmp_path / "outcomes.csv"
+    local.write_text("prediction_id,actual_return\nid-1,0.01\n", encoding="utf-8")
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr("random.random", lambda: 0.0)
+
+    result = audit._upload_drive_with_retry(
+        store,
+        local,
+        "production_data/intraday_predictions/outcomes_audit/outcomes.csv",
+        mime_type="text/csv",
+    )
+
+    assert result["status"] == "OK"
+    assert len(store.calls) == 2
+    assert store.calls[0] == store.calls[1]
