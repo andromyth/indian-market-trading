@@ -2,9 +2,26 @@ name: Deploy intraday worker recovery revision
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy_intraday_worker_recovery.yml"
+      - "autonomous_intraday_worker.py"
+      - "autonomous_intraday_worker_service.py"
+      - "all_universe_minute_capture.py"
+      - "persistent_store.py"
+      - "indstocks_client.py"
+      - "market_session_guard.py"
+      - "data_fetcher.py"
+      - "nse_data_layer.py"
+      - "selfdriving/**"
+      - "requirements.txt"
+      - "Dockerfile"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: intraday-worker-recovery-deploy
@@ -18,10 +35,38 @@ jobs:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
     steps:
-      - name: Checkout current main
+      - name: Checkout the commit being verified
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
+
+      - name: Require successful Multi-factor candidate CI for this exact commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/multifactor_candidate_ci.yml/runs?branch=main&head_sha=${GITHUB_SHA}&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json, os, sys; sha=os.environ["GITHUB_SHA"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs", []) if r.get("head_sha")==sha]; print(json.dumps(max(runs, key=lambda r:r.get("created_at", "")) if runs else {}))')"
+            RUN_ID="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion", ""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              echo "CI_RUN_ID=$RUN_ID STATUS=$STATUS CONCLUSION=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                [[ "$CONCLUSION" == "success" ]] || {
+                  echo "Deployment blocked: CI for this exact commit did not pass."
+                  exit 1
+                }
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Deployment blocked: timed out waiting for CI for this exact commit."
+          exit 1
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -54,8 +99,8 @@ jobs:
             --concurrency 1 \
             --timeout 300 \
             --no-allow-unauthenticated \
-            --set-env-vars "AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=60,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
-            --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
+            --update-env-vars "AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=60,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+            --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 
       - name: Verify ready revision, traffic, scheduler states and startup diagnostics
         shell: bash
@@ -72,7 +117,7 @@ jobs:
           gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(status.latestReadyRevisionName,status.latestCreatedRevisionName,status.traffic)'
 
           echo "=== Scheduler job states ==="
-          for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530; do
+          for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
             gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(name,state,schedule,lastAttemptTime,status)' || exit 1
           done
 
