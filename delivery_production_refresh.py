@@ -291,17 +291,15 @@ def _download_recent_delivery(store, lookback_days:int):
         if d>=cutoff: chosen.append((d,item))
     chosen.sort()
     downloaded=0
-    from googleapiclient.http import MediaIoBaseDownload
     for d,item in chosen:
         local=DELIVERY_LOCAL/item["name"]
         if local.exists() and local.stat().st_size>0: continue
-        local.parent.mkdir(parents=True,exist_ok=True)
-        temp=local.with_suffix(".tmp")
-        with temp.open("wb") as fh:
-            dl=MediaIoBaseDownload(fh,store.service.files().get_media(fileId=item["id"]))
-            done=False
-            while not done: _,done=dl.next_chunk()
-        temp.replace(local); downloaded+=1
+        if _download_file(
+            store,
+            f"{DELIVERY_REMOTE}/{item['name']}",
+            local,
+        ):
+            downloaded+=1
     return {"files_found":len(chosen),"files_downloaded":downloaded,"first_date":str(chosen[0][0]) if chosen else None,"last_date":str(chosen[-1][0]) if chosen else None}
 
 def _load_eod(root:Path,start:date,end:date)->pd.DataFrame:
