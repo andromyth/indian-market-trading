@@ -408,10 +408,12 @@ class AllNSEMinutePredictor:
                         ]
                         market_base = pd.concat([market_base, *add]).sort_index()
                         market_base = market_base.loc[~market_base.index.duplicated(keep="last")]
+                    # Keep the index's context history separate from stock histories;
+                    # an available NIFTY series alone must not mark all-stock history ready.
                     self._history = {
                         symbol: frame.tail(HISTORY_LOOKBACK_BARS)
                         for symbol, frame in histories.items()
-                        if not frame.empty
+                        if symbol != "__NIFTY50__" and not frame.empty
                     }
                     self._market_history = market_base.tail(HISTORY_LOOKBACK_BARS)
                     self._seed_coverage = sum(
@@ -422,9 +424,10 @@ class AllNSEMinutePredictor:
                     self._seed_error = None if batch_errors == 0 else (
                         f"{batch_errors} historical batches did not return a success payload"
                     )
-                    self._seed_ready = bool(self._history)
+                    self._seed_ready = self._seed_coverage > 0
                     self._seed_status = (
-                        "READY" if self._seed_ready and batch_errors == 0
+                        "READY"
+                        if self._seed_ready and batch_errors == 0 and self._seed_coverage == len(symbols)
                         else "READY_PARTIAL" if self._seed_ready
                         else "HISTORY_SEED_EMPTY"
                     )
