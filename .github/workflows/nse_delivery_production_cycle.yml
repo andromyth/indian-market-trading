@@ -28,6 +28,9 @@ on:
       - "delivery_prediction_csv_ledger.py"
       - "delivery_validation_diagnostics.py"
       - "delivery_policy_update.py"
+      - "validate_delivery_prediction_ledger.py"
+      - "validate_intraday_30m_predictions.py"
+      - "prediction_validation.py"
 
   workflow_dispatch:
     inputs:
@@ -233,9 +236,13 @@ jobs:
           }, indent=2))
           PY
 
-      - name: Validate prior trading-day Delivery predictions against today's actual
+      - name: Validate matured Delivery predictions against their target NSE session
         if: steps.target.outputs.target_date != ''
-        run: python -u validate_prediction_ledger.py
+        run: python -u validate_delivery_prediction_ledger.py
+
+      - name: Validate matured 30-minute Intraday predictions against target bars
+        if: steps.target.outputs.target_date != ''
+        run: python -u validate_intraday_30m_predictions.py --lookback-calendar-days 14
 
       - name: Update daywise Delivery prediction-vs-actual CSV ledger with actuals
         if: steps.target.outputs.target_date != ''
