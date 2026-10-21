@@ -99,6 +99,42 @@ def test_matured_active_targets_without_validations_remain_a_hard_gap():
     assert report["active_model_scored_samples"] == 0
 
 
+def test_missing_decision_timestamp_uses_target_date_fallback_for_scoring():
+    active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
+    preds, vals = _frames(80, active_version, True)
+    preds["decision_timestamp"] = None
+    preds["prediction_for_date"] = pd.date_range(
+        "2026-06-01", periods=80, freq="B"
+    ).strftime("%Y-%m-%d")
+
+    report = build_report(
+        preds,
+        vals,
+        latest_official_eod_date="2026-10-21",
+    )
+
+    assert report["status"] == "OOS_HISTORY_AVAILABLE_TARGET_UNPROVEN"
+    assert report["joined_active_missing_decision_timestamp_count"] == 80
+    assert report["joined_active_rows_scored_using_target_date_fallback"] == 80
+    assert report["joined_active_rows_without_usable_ordering_date"] == 0
+    assert report["joined_active_model_validated_rows_after_time_resolution"] == 80
+    assert report["active_model_scored_samples"] == 80
+    assert report["quality_approved_active_samples"] == 80
+
+
+def test_missing_decision_and_target_dates_are_reported_as_timestamp_gap():
+    active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
+    preds, vals = _frames(4, active_version, True)
+    preds["decision_timestamp"] = None
+
+    report = build_report(preds, vals, latest_official_eod_date="2026-10-21")
+
+    assert report["status"] == "ACTIVE_MODEL_TIMESTAMP_GAP"
+    assert report["joined_active_model_validated_rows"] == 4
+    assert report["joined_active_model_validated_rows_after_time_resolution"] == 0
+    assert report["active_model_scored_samples"] == 0
+    assert "both a parseable decision_timestamp and a usable prediction_for_date" in report["diagnosis"]
+
 def test_large_monitoring_sample_still_does_not_claim_holdout_target():
     active_version = sorted(ACTIVE_DELIVERY_MODEL_VERSIONS)[0]
     preds, vals = _frames(80, active_version, True)

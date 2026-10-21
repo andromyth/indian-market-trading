@@ -57,6 +57,42 @@ def _evaluate(x):
     }
     return out
 
+def _score_input_coverage(frame: pd.DataFrame) -> dict:
+    """Explain why joined outcomes may or may not be scorable."""
+    rows = int(len(frame))
+    p = pd.to_numeric(
+        frame.get("probability_up_next_session", pd.Series(np.nan, index=frame.index)),
+        errors="coerce",
+    )
+    r = pd.to_numeric(
+        frame.get("predicted_return_next_session", pd.Series(np.nan, index=frame.index)),
+        errors="coerce",
+    )
+    actual = (
+        frame.get("actual_direction_d1", pd.Series(pd.NA, index=frame.index))
+        .astype("string").str.strip().str.upper()
+    )
+    valid_direction = actual.isin(["UP", "DOWN"])
+    complete = p.notna() & r.notna() & valid_direction
+    coverage = {
+        "rows": rows,
+        "probability_non_null": int(p.notna().sum()),
+        "predicted_return_non_null": int(r.notna().sum()),
+        "actual_direction_up_or_down": int(valid_direction.sum()),
+        "complete_score_input_rows": int(complete.sum()),
+        "actual_direction_counts": {
+            str(k): int(v) for k, v in actual.fillna("<MISSING>").value_counts(dropna=False).items()
+        },
+    }
+    if "production_data_quality_gate" in frame.columns:
+        coverage["quality_gate_approved_rows"] = int(
+            frame["production_data_quality_gate"].map(_gate_pass).sum()
+        )
+    else:
+        coverage["quality_gate_approved_rows"] = 0
+    return coverage
+
+
 def _gate_pass(value) -> bool:
     """Treat unknown data-quality state as unapproved."""
     if value is None or pd.isna(value):
@@ -109,6 +145,12 @@ def build_report(
         "joined_validation_rows_before_status_filter": 0,
         "joined_validated_rows_before_metrics": 0,
         "joined_active_model_validated_rows": 0,
+        "joined_active_model_validated_rows_after_time_resolution": 0,
+        "joined_active_missing_decision_timestamp_count": 0,
+        "joined_active_rows_scored_using_target_date_fallback": 0,
+        "joined_active_rows_without_usable_ordering_date": 0,
+        "active_model_score_input_coverage_before_time_filter": {},
+        "quality_approved_active_score_input_coverage_before_time_filter": {},
         "duplicate_validation_rows_collapsed": 0,
         "diagnostics_schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -221,12 +263,56 @@ def build_report(
         report["joined_active_model_validated_rows"] = int(
             x["model_version"].astype(str).isin(ACTIVE_DELIVERY_MODEL_VERSIONS).sum()
         )
-    if "decision_timestamp" not in x.columns:
-        report["diagnosis"] = "Joined prediction ledger lacks decision_timestamp."
-        return report
-    x["decision_timestamp"] = pd.to_datetime(x["decision_timestamp"], errors="coerce", utc=True)
-    x = x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").drop_duplicates("prediction_id", keep="last")
+    # Historical ledger revisions can have valid, ID-aligned actual outcomes but
+    # lack a parseable decision_timestamp. Use the explicit target-session date
+    # only as a diagnostic ordering fallback; never rewrite the stored decision
+    # timestamp or infer an outcome from a later/non-target bar.
+    if "model_version" in x.columns:
+        active_before_time_resolution = x["model_version"].astype(str).isin(ACTIVE_DELIVERY_MODEL_VERSIONS)
+    else:
+        active_before_time_resolution = pd.Series(False, index=x.index)
+    active_joined_raw = x.loc[active_before_time_resolution].copy()
+    if "production_data_quality_gate" in active_joined_raw.columns:
+        quality_active_joined_raw = active_joined_raw.loc[
+            active_joined_raw["production_data_quality_gate"].map(_gate_pass)
+        ].copy()
+    else:
+        quality_active_joined_raw = active_joined_raw.iloc[0:0].copy()
+    report["active_model_score_input_coverage_before_time_filter"] = _score_input_coverage(
+        active_joined_raw
+    )
+    report["quality_approved_active_score_input_coverage_before_time_filter"] = _score_input_coverage(
+        quality_active_joined_raw
+    )
 
+    if "decision_timestamp" in x.columns:
+        decision_ts = pd.to_datetime(x["decision_timestamp"], errors="coerce", utc=True)
+    else:
+        decision_ts = pd.Series(pd.NaT, index=x.index, dtype="datetime64[ns, UTC]")
+    if "prediction_for_date" in x.columns:
+        target_order_ts = pd.to_datetime(x["prediction_for_date"], errors="coerce", utc=True)
+    else:
+        target_order_ts = pd.Series(pd.NaT, index=x.index, dtype="datetime64[ns, UTC]")
+    fallback_mask = decision_ts.isna() & target_order_ts.notna()
+    metric_order_ts = decision_ts.where(decision_ts.notna(), target_order_ts)
+
+    report["joined_active_missing_decision_timestamp_count"] = int(
+        (active_before_time_resolution & decision_ts.isna()).sum()
+    )
+    report["joined_active_rows_scored_using_target_date_fallback"] = int(
+        (active_before_time_resolution & fallback_mask).sum()
+    )
+    report["joined_active_rows_without_usable_ordering_date"] = int(
+        (active_before_time_resolution & metric_order_ts.isna()).sum()
+    )
+
+    x["_metrics_order_timestamp"] = metric_order_ts
+    x = x.loc[x["_metrics_order_timestamp"].notna()].copy()
+    report["joined_active_model_validated_rows_after_time_resolution"] = int(
+        x["model_version"].astype(str).isin(ACTIVE_DELIVERY_MODEL_VERSIONS).sum()
+        if "model_version" in x.columns else 0
+    )
+    x = x.sort_values("_metrics_order_timestamp").drop_duplicates("prediction_id", keep="last")
     if "model_version" in x.columns:
         x["model_version"] = x["model_version"].astype(str)
         active_mask = x["model_version"].isin(ACTIVE_DELIVERY_MODEL_VERSIONS)
@@ -247,36 +333,57 @@ def build_report(
     quality_count = int(quality_metrics.get("samples", 0))
 
     if active_count == 0:
-        matured_count = report["active_model_matured_prediction_count"]
-        waiting_count = report["active_model_waiting_for_target_count"]
-        known_count = report["active_model_targets_with_known_date"]
-        active_prediction_count = report["active_model_prediction_count"]
-        if (
-            active_prediction_count > 0
-            and eod_day is not None
-            and known_count == active_prediction_count
-            and matured_count == 0
-            and waiting_count == active_prediction_count
-        ):
-            status = "ACTIVE_MODEL_AWAITING_MATURITY"
+        joined_active_before_order = int(report.get("joined_active_model_validated_rows", 0))
+        joined_active_after_order = int(
+            report.get("joined_active_model_validated_rows_after_time_resolution", 0)
+        )
+        if joined_active_before_order > 0 and joined_active_after_order == 0:
+            status = "ACTIVE_MODEL_TIMESTAMP_GAP"
             diagnosis = (
-                "Active-model forecasts are present, but every known target session is later "
-                "than the latest official EOD date. No active-model accuracy score is available "
-                "yet; these forecasts remain unscored until their official target bars arrive."
+                "Validated active-model prediction/outcome IDs joined, but every joined row lacked "
+                "both a parseable decision_timestamp and a usable prediction_for_date for chronological "
+                "ordering. Restore those timestamps/target dates before claiming accuracy."
             )
-        elif active_prediction_count > 0 and eod_day is not None and (matured_count or 0) > 0:
-            status = "ACTIVE_MODEL_OUTCOME_GAP"
+        elif joined_active_after_order > 0:
+            status = "ACTIVE_MODEL_SCORE_INPUT_GAP"
+            coverage = report.get("active_model_score_input_coverage_before_time_filter", {})
             diagnosis = (
-                "Active-model forecasts have target sessions at or before the latest official "
-                "EOD date, but no validated outcomes were joined for the active model. Repair "
-                "the prediction-ID/validation persistence or target-bar coverage before claiming accuracy."
+                "Validated active-model prediction/outcome rows joined and were chronologically ordered, "
+                "but none had all required scoring inputs (probability_up_next_session, "
+                "predicted_return_next_session, and actual_direction_d1=UP/DOWN). "
+                f"Score-input coverage: {json.dumps(coverage, sort_keys=True, default=str)}"
             )
         else:
-            status = "NO_ACTIVE_MODEL_DATA"
-            diagnosis = (
-                "No completed outcomes from the active ALL-NSE 59-feature Delivery model were found, "
-                "and the available target-date evidence is insufficient to classify this as a normal maturity wait."
-            )
+            matured_count = report["active_model_matured_prediction_count"]
+            waiting_count = report["active_model_waiting_for_target_count"]
+            known_count = report["active_model_targets_with_known_date"]
+            active_prediction_count = report["active_model_prediction_count"]
+            if (
+                active_prediction_count > 0
+                and eod_day is not None
+                and known_count == active_prediction_count
+                and matured_count == 0
+                and waiting_count == active_prediction_count
+            ):
+                status = "ACTIVE_MODEL_AWAITING_MATURITY"
+                diagnosis = (
+                    "Active-model forecasts are present, but every known target session is later "
+                    "than the latest official EOD date. No active-model accuracy score is available "
+                    "yet; these forecasts remain unscored until their official target bars arrive."
+                )
+            elif active_prediction_count > 0 and eod_day is not None and (matured_count or 0) > 0:
+                status = "ACTIVE_MODEL_OUTCOME_GAP"
+                diagnosis = (
+                    "Active-model forecasts have target sessions at or before the latest official "
+                    "EOD date, but no validated outcomes were joined for the active model. Repair "
+                    "the prediction-ID/validation persistence or target-bar coverage before claiming accuracy."
+                )
+            else:
+                status = "NO_ACTIVE_MODEL_DATA"
+                diagnosis = (
+                    "No completed outcomes from the active ALL-NSE 59-feature Delivery model were found, "
+                    "and the available target-date evidence is insufficient to classify this as a normal maturity wait."
+                )
     elif quality_count == 0:
         status = "NO_QUALITY_APPROVED_DATA"
         diagnosis = "Active-model outcomes exist, but none passed the production data-quality gate. Do not claim accuracy; repair PIT/data-readiness gates first."

@@ -595,6 +595,7 @@ def main() -> int:
         issues.append("No Delivery PIT readiness report could be found.")
     if delivery_outcomes.get("status") in {
         "NO_ACTIVE_MODEL_DATA", "ACTIVE_MODEL_OUTCOME_GAP",
+        "ACTIVE_MODEL_TIMESTAMP_GAP", "ACTIVE_MODEL_SCORE_INPUT_GAP",
         "NO_QUALITY_APPROVED_DATA", "INSUFFICIENT_HISTORY",
         "INSUFFICIENT_SESSION_HISTORY", "AUDIT_FAILED", "NO_DATA",
     }:
