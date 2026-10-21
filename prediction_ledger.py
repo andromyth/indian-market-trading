@@ -332,3 +332,95 @@ def load_records(
         df = df[df["feature_coverage"] >= min_feature_coverage].copy()
 
     return df.sort_values(["decision_timestamp", "symbol", "horizon_min"]).reset_index(drop=True)
+
+
+def load_validation_records() -> list[dict[str, Any]]:
+    """Load persisted Delivery validation rows, restoring the Drive copy when needed.
+
+    This compatibility API is shared by Delivery diagnostics, policy updates,
+    and the CSV prediction-vs-actual view. It deliberately remains separate
+    from the minute-level prediction-record loader above.
+    """
+    local_validation = Path(__file__).resolve().parent / "data" / "prediction_ledger" / "prediction_validation.jsonl"
+    remote_validation = "production_data/predictions/prediction_validation.jsonl"
+
+    if not local_validation.exists() or local_validation.stat().st_size == 0:
+        payload = _drive_file_bytes(remote_validation)
+        if payload:
+            local_validation.parent.mkdir(parents=True, exist_ok=True)
+            local_validation.write_bytes(payload)
+
+    if not local_validation.exists():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    with local_validation.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = True) -> dict[str, Any]:
+    """Persist the latest validation result per prediction ID, optionally syncing Drive."""
+    local_validation = Path(__file__).resolve().parent / "data" / "prediction_ledger" / "prediction_validation.jsonl"
+    remote_validation = "production_data/predictions/prediction_validation.jsonl"
+    local_validation.parent.mkdir(parents=True, exist_ok=True)
+
+    latest: dict[str, dict[str, Any]] = {}
+    if local_validation.exists():
+        with local_validation.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("prediction_id"):
+                    latest[str(row["prediction_id"])] = row
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        prediction_id = result.get("prediction_id")
+        if not prediction_id:
+            continue
+        row = dict(result)
+        row["validated_at"] = _utc_timestamp()
+        latest[str(prediction_id)] = row
+
+    tmp = local_validation.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for row in latest.values():
+            handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+    os.replace(tmp, local_validation)
+
+    synced = False
+    sync_error = None
+    if sync_drive:
+        try:
+            from persistent_store import GoogleDriveStore
+            result = GoogleDriveStore().upload_or_update(
+                local_validation, remote_validation, mime_type="application/x-ndjson"
+            )
+            synced = result.get("status") == "OK"
+            if not synced:
+                sync_error = str(result)
+        except Exception as exc:
+            sync_error = f"{type(exc).__name__}: {exc}"
+
+    result = {"status": "SAVED", "rows": len(latest), "synced": synced}
+    if sync_error:
+        result["sync_error"] = sync_error
+    return result
+
+
+def _utc_timestamp() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
