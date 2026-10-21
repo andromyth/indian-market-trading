@@ -93,6 +93,21 @@ jobs:
             head -c 1200 /tmp/run_request_metrics.json 2>/dev/null || true
             echo
           fi
+          echo "=== Parsed active minute-job status ==="
+          if gcloud scheduler jobs describe intraday-worker-1000-1459 --project="$PROJECT_ID" --location="$REGION" --format=json > /tmp/active_scheduler_job.json; then
+            python - /tmp/active_scheduler_job.json <<'PY'
+          import json,sys
+          job=json.load(open(sys.argv[1],encoding="utf-8"))
+          status=job.get("status") or {}
+          print("ACTIVE_JOB_STATE="+str(job.get("state")))
+          print("ACTIVE_JOB_SCHEDULE="+str(job.get("schedule")))
+          print("ACTIVE_JOB_LAST_ATTEMPT_UTC="+str(job.get("lastAttemptTime")))
+          print("ACTIVE_JOB_NEXT_SCHEDULE_UTC="+str(job.get("scheduleTime")))
+          print("ACTIVE_JOB_ATTEMPT_DEADLINE="+str(job.get("attemptDeadline")))
+          print("ACTIVE_JOB_STATUS_CODE="+str(status.get("code","OK_OR_OMITTED")))
+          print("ACTIVE_JOB_STATUS_MESSAGE="+str(status.get("message",""))[:300])
+          PY
+          fi
           echo "=== Scheduler state and last attempt ==="
           for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
             echo "--- $job ---"
