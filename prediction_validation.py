@@ -79,7 +79,15 @@ def validate_delivery_prediction(record: dict[str, Any], history_df: pd.DataFram
     # expected target session is missing from the official archive.
     expected_target = record.get("prediction_for_date")
     if expected_target not in (None, ""):
-        expected_day = pd.Timestamp(expected_target, errors="raise")
+        expected_day = pd.to_datetime(expected_target, errors="coerce")
+        if pd.isna(expected_day):
+            return {
+                "prediction_id": record.get("prediction_id"),
+                "symbol": record.get("symbol"),
+                "validation_status": "ERROR",
+                "validation_reason": "Invalid prediction_for_date; target session cannot be aligned.",
+                "expected_d1_date": str(expected_target),
+            }
         index_tz = getattr(future.index, "tz", None)
         if expected_day.tzinfo is not None:
             expected_day = expected_day.tz_convert(index_tz) if index_tz is not None else expected_day.tz_localize(None)
