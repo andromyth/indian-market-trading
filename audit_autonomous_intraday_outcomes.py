@@ -62,6 +62,40 @@ def _retryable_drive_error(exc: Exception) -> bool:
     ))
 
 
+def _upload_drive_with_retry(
+    store: Any,
+    local_path: Path,
+    remote_path: str,
+    *,
+    mime_type: str,
+    attempts: int = 5,
+) -> dict[str, Any]:
+    """Retry transient Drive uploads without treating timeouts as missing reports."""
+    import random
+    import time as time_module
+
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            return store.upload_or_update(
+                local_path, remote_path, mime_type=mime_type
+            )
+        except Exception as exc:
+            if not _retryable_drive_error(exc) or attempt + 1 >= attempts:
+                raise
+            delay = min(8.0, 0.4 * (2 ** attempt) + random.random() * 0.25)
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            print(
+                "DRIVE_UPLOAD_RETRY: "
+                f"path={remote_path}, status={status if status is not None else 'network'}, "
+                f"attempt={attempt + 1}/{attempts}, "
+                f"error={type(exc).__name__}: {exc}, sleep_seconds={delay:.2f}",
+                flush=True,
+            )
+            time_module.sleep(delay)
+    raise RuntimeError(f"Drive upload retry loop ended unexpectedly: {remote_path}")
+
+
 def _find_child_retry(store: Any, parent: str, name: str, mime_type: str | None = None,
                       attempts: int = 5) -> dict[str, Any] | None:
     """Retry only transient Drive listing failures; a confirmed miss remains a miss."""
@@ -471,8 +505,8 @@ def main() -> int:
         )
         remote_csv = f"{remote_root}/{csv_path.name}"
         remote_json = f"{remote_root}/{json_path.name}"
-        csv_upload = store.upload_or_update(
-            csv_path, remote_csv, mime_type="text/csv"
+        csv_upload = _upload_drive_with_retry(
+            store, csv_path, remote_csv, mime_type="text/csv"
         )
         report["google_drive_sync"] = {
             "status": "CSV_UPLOADED_JSON_PENDING",
@@ -483,8 +517,8 @@ def main() -> int:
         json_path.write_text(
             json.dumps(report, indent=2, default=str), encoding="utf-8"
         )
-        json_upload = store.upload_or_update(
-            json_path, remote_json, mime_type="application/json"
+        json_upload = _upload_drive_with_retry(
+            store, json_path, remote_json, mime_type="application/json"
         )
         report["google_drive_sync"]["status"] = "OK"
         report["google_drive_sync"]["json_upload_result"] = str(json_upload)
