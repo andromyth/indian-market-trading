@@ -235,7 +235,7 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
 def _download_recent_eod(store, lookback_days: int):
     p = store.root_id
     for part in ("production_data","nse_official","bulk_eod"):
-        hit = _find_child_with_retry(p and store or store, p, part, "application/vnd.google-apps.folder")
+        hit = _find_child_with_retry(store, p, part, "application/vnd.google-apps.folder")
         if not hit: raise RuntimeError(f"Drive folder missing: {part}")
         p = hit["id"]
     files=[]
