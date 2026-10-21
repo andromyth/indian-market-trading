@@ -398,7 +398,7 @@ def save_validation_results(results: list[dict[str, Any]], sync_drive: bool = Tr
     tmp = local_validation.with_suffix(".jsonl.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         for row in latest.values():
-            handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\\n")
+            handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
     os.replace(tmp, local_validation)
 
     synced = False
