@@ -46,6 +46,7 @@ def test_intraday_coverage_requires_populated_target_aligned_outcome(monkeypatch
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
+        "decision_timestamp": "2026-10-20T10:00:00+05:30",
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-1",
@@ -74,6 +75,7 @@ def test_intraday_coverage_accepts_a_matched_validated_actual(monkeypatch):
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
+        "decision_timestamp": "2026-10-20T10:00:00+05:30",
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-2",
@@ -171,3 +173,76 @@ def test_intraday_audit_retries_transient_drive_report_upload(tmp_path, monkeypa
     assert result["status"] == "OK"
     assert len(store.calls) == 2
     assert store.calls[0] == store.calls[1]
+
+
+def test_intraday_coverage_ignores_other_horizons(monkeypatch):
+    import prediction_ledger
+    import audit_live_prediction_health as audit
+
+    monkeypatch.setattr(prediction_ledger, "load_records", lambda: [
+        {
+            "prediction_id": "intraday-5m",
+            "symbol": "SBIN",
+            "mode": "Intraday",
+            "prediction_horizon": "5m",
+            "decision_timestamp": "2026-10-20T10:00:00+05:30",
+        },
+        {
+            "prediction_id": "delivery-30m",
+            "symbol": "SBIN",
+            "mode": "Delivery",
+            "prediction_horizon": "30m",
+            "decision_timestamp": "2026-10-20T10:00:00+05:30",
+        },
+    ])
+    monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [])
+
+    result = audit._intraday_outcome_coverage()
+
+    assert result["status"] == "NO_30M_INTRADAY_PREDICTIONS"
+    assert result["intraday_prediction_count"] == 0
+    assert result["other_intraday_rows_excluded"] == 1
+    assert result["accuracy_claim_allowed"] is False
+
+
+def test_intraday_coverage_does_not_block_on_stale_targets_outside_lookback(monkeypatch):
+    import prediction_ledger
+    import audit_live_prediction_health as audit
+
+    monkeypatch.setattr(prediction_ledger, "load_records", lambda: [{
+        "prediction_id": "intraday-old-30m",
+        "symbol": "SBIN",
+        "mode": "Intraday",
+        "prediction_horizon": "30m",
+        "decision_timestamp": "2026-09-01T10:00:00+05:30",
+    }])
+    monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [])
+
+    result = audit._intraday_outcome_coverage()
+
+    assert result["status"] == "NO_RECENT_MATURED_30M_PREDICTIONS"
+    assert result["recent_matured_target_count"] == 0
+    assert result["historical_outside_lookback_count"] == 1
+    assert result["accuracy_claim_allowed"] is False
+
+
+def test_intraday_coverage_does_not_block_on_future_targets(monkeypatch):
+    import prediction_ledger
+    import audit_live_prediction_health as audit
+
+    monkeypatch.setattr(prediction_ledger, "load_records", lambda: [{
+        "prediction_id": "intraday-future-30m",
+        "symbol": "SBIN",
+        "mode": "Intraday",
+        "prediction_horizon": "30m",
+        "decision_timestamp": "2026-10-22T10:00:00+05:30",
+        "signal_horizon_end": "2026-10-22T10:30:00+05:30",
+    }])
+    monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [])
+
+    result = audit._intraday_outcome_coverage()
+
+    assert result["status"] == "NO_RECENT_MATURED_30M_PREDICTIONS"
+    assert result["recent_matured_target_count"] == 0
+    assert result["future_target_count"] == 1
+    assert result["accuracy_claim_allowed"] is False
