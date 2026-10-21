@@ -443,13 +443,14 @@ def capture_all_universe_minute_snapshot(
 
     rows: list[dict[str, Any]] = []
     request_errors = 0
+    batch_diagnostics: list[dict[str, Any]] = []
     all_codes = [
         (symbol, instruments[symbol])
         for symbol in universe
         if symbol in instruments
     ]
 
-    for offset in range(0, len(all_codes), BATCH_SIZE):
+    for batch_index, offset in enumerate(range(0, len(all_codes), BATCH_SIZE), start=1):
         batch = all_codes[offset:offset + BATCH_SIZE]
         codes = [code for _, code in batch]
         try:
@@ -470,6 +471,17 @@ def capture_all_universe_minute_snapshot(
                 raise RuntimeError(
                     str(body.get("message") or body.get("error") or "quote request not successful")
                 )
+            matched_code_count = sum(
+                1 for _, code in batch if isinstance(data.get(code), dict)
+            )
+            batch_diagnostics.append({
+                "batch_index": batch_index,
+                "requested_code_count": len(codes),
+                "response_data_key_count": len(data),
+                "matched_response_code_count": matched_code_count,
+                "response_key_samples": [str(key) for key in list(data.keys())[:5]],
+                "status": "OK",
+            })
             observed_at = pd.Timestamp.now(tz=IST)
             for symbol, code in batch:
                 quote = data.get(code)
@@ -480,7 +492,13 @@ def capture_all_universe_minute_snapshot(
         except Exception as exc:
             request_errors += 1
             observed_at = pd.Timestamp.now(tz=IST)
-            error = f"{type(exc).__name__}: {exc}"
+            error = f"{type(exc).__name__}: {exc}"[:300]
+            batch_diagnostics.append({
+                "batch_index": batch_index,
+                "requested_code_count": len(codes),
+                "status": "ERROR",
+                "error": error,
+            })
             for symbol, code in batch:
                 rows.append(_quote_row(
                     symbol, code, None, observed_at, cycle_minute,
@@ -494,6 +512,9 @@ def capture_all_universe_minute_snapshot(
                 prediction_map, forecast_rows,
                 provider_error="Symbol missing from INDstocks instrument master",
             ))
+
+    manifest["quote_request_error_count"] = request_errors
+    manifest["quote_batch_diagnostics"] = batch_diagnostics
 
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -544,10 +565,12 @@ def capture_all_universe_minute_snapshot(
         "BLOCKED_PROVIDER_CREDENTIALS", "NO_ROWS", "PERSISTENCE_ERROR"
     }:
         manifest["status"] = "PERSISTENCE_ERROR"
-        manifest["error"] = (
+        manifest["recovery_error"] = (
             "One or more previous minute snapshots or manifests still failed Drive "
             "recovery; inspect pending_snapshot_recovery and pending_manifest_recovery."
         )
+        if not manifest.get("error"):
+            manifest["error"] = manifest["recovery_error"]
 
     try:
         manifest["manifest_drive_sync"] = _write_manifest(store, local_dir, manifest)
