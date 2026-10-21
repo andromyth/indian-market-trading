@@ -73,7 +73,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         STATE["all_nse_minute_prediction_last_result"] = _clean_json({
             key: all_nse.get(key)
             for key in (
-                "cycle_minute_ist", "expected_symbol_count", "prediction_count",
+                "cycle_minute_ist", "expected_symbol_count", "row_count", "prediction_count",
                 "missing_quote_count", "data_limited_count", "history_ready",
                 "history_status", "remote_path", "manifest_drive_path",
                 "quality_gate_pass", "status", "error",
@@ -89,7 +89,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         STATE["all_universe_capture_last_result"] = _clean_json({
             key: capture.get(key)
             for key in (
-                "cycle_minute_ist", "expected_symbol_count", "quoted_symbol_count",
+                "cycle_minute_ist", "expected_symbol_count", "row_count", "quoted_symbol_count",
                 "missing_quote_count", "unmapped_symbol_count", "forecast_symbol_count",
                 "matched_outcome_count", "snapshot_drive_path", "remote_snapshot_path",
                 "status", "error",
@@ -159,6 +159,120 @@ def _public_status() -> dict[str, Any]:
         "tick_interval_seconds": POLL_SECONDS,
         "max_stocks": MAX_STOCKS,
     })
+
+
+def _diagnostic_age_seconds(value: Any) -> float | None:
+    try:
+        stamp = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(stamp):
+            return None
+        return float((pd.Timestamp.now(tz="UTC") - stamp).total_seconds())
+    except Exception:
+        return None
+
+
+def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
+    """Return a strict, machine-readable all-NSE capture readiness result."""
+    state = _public_status()
+    now_utc = datetime.now(timezone.utc).isoformat()
+    if path == "/capturez":
+        item = state.get("all_universe_capture_last_result") or {}
+        prefix = "all_nse_quote_capture"
+        expected = item.get("expected_symbol_count")
+        row_count = item.get("row_count")
+        valid = item.get("quoted_symbol_count")
+        missing = item.get("missing_quote_count")
+        drive_path = item.get("snapshot_drive_path") or item.get("remote_snapshot_path")
+        minute = item.get("cycle_minute_ist")
+        item_status = str(item.get("status") or "NOT_RUN").upper()
+        age = _diagnostic_age_seconds(minute)
+        reasons = []
+        if state.get("drive_preflight_status") != "OK":
+            reasons.append("Google Drive read/write preflight is not ready")
+        if item_status != "OK":
+            reasons.append(f"latest full-universe quote snapshot status is {item_status}")
+        if age is None or age < 0 or age > 180:
+            reasons.append("latest full-universe quote snapshot is missing or older than 180 seconds")
+        if expected is None or int(expected or 0) <= 0:
+            reasons.append("official NSE universe count is missing or zero")
+        elif row_count is None or int(row_count) != int(expected):
+            reasons.append("snapshot row count does not equal the expected NSE universe")
+        if expected is not None and (valid is None or missing is None
+                                     or int(valid) != int(expected) or int(missing) != 0):
+            reasons.append("one or more NSE symbols lack a valid current quote")
+        if not drive_path:
+            reasons.append("confirmed Drive snapshot path is missing")
+        payload = {
+            "status": "ok" if not reasons else "degraded",
+            "probe": prefix,
+            "checked_at_utc": now_utc,
+            "cycle_minute_ist": minute,
+            "capture_status": item_status,
+            "age_seconds": None if age is None else round(age, 1),
+            "expected_symbol_count": expected,
+            "row_count": row_count,
+            "quoted_symbol_count": valid,
+            "missing_quote_count": missing,
+            "drive_path": drive_path,
+            "reasons": reasons,
+        }
+    elif path == "/predictionz":
+        item = state.get("all_nse_minute_prediction_last_result") or {}
+        prefix = "all_nse_minute_prediction_actual"
+        expected = item.get("expected_symbol_count")
+        row_count = item.get("row_count")
+        predicted = item.get("prediction_count")
+        missing = item.get("missing_quote_count")
+        limited = item.get("data_limited_count")
+        minute = item.get("cycle_minute_ist")
+        item_status = str(item.get("status") or state.get("all_nse_minute_prediction_status") or "NOT_RUN").upper()
+        age = _diagnostic_age_seconds(minute)
+        drive_path = item.get("remote_path")
+        manifest_path = item.get("manifest_drive_path")
+        reasons = []
+        if state.get("drive_preflight_status") != "OK":
+            reasons.append("Google Drive read/write preflight is not ready")
+        if item_status != "OK":
+            reasons.append(f"latest all-NSE prediction snapshot status is {item_status}")
+        if age is None or age < 0 or age > 180:
+            reasons.append("latest prediction snapshot is missing or older than 180 seconds")
+        if expected is None or int(expected or 0) <= 0:
+            reasons.append("expected NSE universe count is missing or zero")
+        elif row_count is None or int(row_count) != int(expected):
+            reasons.append("prediction row count does not equal the expected NSE universe")
+        if expected is not None and (predicted is None or int(predicted) != int(expected)):
+            reasons.append("not every expected NSE symbol has a model prediction")
+        if missing is None or int(missing or 0) != 0:
+            reasons.append("one or more symbols lack a valid current quote")
+        if limited is None or int(limited or 0) != 0:
+            reasons.append("one or more symbols are data-limited")
+        if item.get("quality_gate_pass") is not True:
+            reasons.append("prediction quality gate is not passing")
+        if item.get("history_ready") is not True:
+            reasons.append("historical feature data is not ready")
+        if not drive_path or not manifest_path:
+            reasons.append("confirmed Drive prediction or manifest path is missing")
+        payload = {
+            "status": "ok" if not reasons else "degraded",
+            "probe": prefix,
+            "checked_at_utc": now_utc,
+            "cycle_minute_ist": minute,
+            "capture_status": item_status,
+            "age_seconds": None if age is None else round(age, 1),
+            "expected_symbol_count": expected,
+            "row_count": row_count,
+            "prediction_count": predicted,
+            "missing_quote_count": missing,
+            "data_limited_count": limited,
+            "quality_gate_pass": item.get("quality_gate_pass"),
+            "history_ready": item.get("history_ready"),
+            "drive_path": drive_path,
+            "manifest_drive_path": manifest_path,
+            "reasons": reasons,
+        }
+    else:
+        return 404, {"status": "not_found"}
+    return (200 if not reasons else 503), payload
 
 
 def _preflight() -> dict[str, Any]:
@@ -233,6 +347,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/capturez", "/predictionz"}:
+            code, payload = _capture_diagnostic(self.path)
+            self._send_json(code, payload)
+            return
         if self.path not in {"/", "/healthz", "/readyz"}:
             self.send_error(404)
             return

@@ -7,19 +7,24 @@ on:
       - main
     paths:
       - ".github/workflows/verify_all_nse_minute_capture.yml"
+      - "autonomous_intraday_worker_service.py"
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   verify-live-capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
     steps:
+      - name: Checkout the commit being verified
+        uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -31,121 +36,139 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Read authenticated worker health and capture coverage
+      - name: Wait for the exact commit's deployment to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          for attempt in $(seq 1 90); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${GITHUB_SHA}&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["GITHUB_SHA"]; rows=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(rows,key=lambda r:r.get("created_at","")) if rows else {}))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
+            if [[ "$STATUS" == "completed" ]]; then
+              [[ "$CONCLUSION" == "success" ]] || {
+                echo "ERROR: deployment workflow for this exact commit did not pass."
+                exit 1
+              }
+              echo "DEPLOYMENT_FOR_EXACT_COMMIT=PASS"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: timed out waiting for deployment of this exact commit."
+          exit 1
+
+      - name: Probe full-universe quote and prediction capture through Scheduler identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROBE_JOB=intraday-worker-0915-0959
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          if [[ -z "$SERVICE_URL" ]]; then
-            echo "ERROR: Cloud Run service URL is missing."
+          ORIGINAL_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+          ORIGINAL_URI="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("uri",""))')"
+          ORIGINAL_METHOD="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("httpMethod","POST").upper())')"
+          JOB_STATE="$(printf '%s' "$ORIGINAL_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("state",""))')"
+          echo "PROBE_JOB_STATE=$JOB_STATE"
+          echo "ORIGINAL_TARGET_URI=$ORIGINAL_URI"
+          echo "ORIGINAL_TARGET_METHOD=$ORIGINAL_METHOD"
+          if [[ "$JOB_STATE" != "ENABLED" || "$ORIGINAL_URI" != "$SERVICE_URL/tick" || "$ORIGINAL_METHOD" != "POST" ]]; then
+            echo "ERROR: probe job is not in its expected enabled /tick POST configuration; refusing to modify it."
             exit 1
           fi
-          echo "SERVICE_URL=$SERVICE_URL"
-          TARGET_URI="$(gcloud scheduler jobs describe intraday-worker-0915-0959 --project="$PROJECT_ID" --location="$REGION" --format="value(httpTarget.uri)")"
-          echo "SCHEDULER_TARGET_URI=$TARGET_URI"
-          gcloud run services get-iam-policy "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="yaml(bindings)" || true
-          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
-          RESPONSE="$(mktemp)"
-          trap 'rm -f "$RESPONSE"' EXIT
-          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/json" \
-            --output "$RESPONSE" --write-out "%{http_code}" \
-            "$SERVICE_URL/healthz")" || {
-              echo "ERROR: Could not contact the authenticated worker health endpoint."
-              exit 1
-            }
-          echo "HEALTH_HTTP_STATUS=$HTTP_CODE"
-          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "503" ]]; then
-            echo "HEALTH_RESPONSE_BODY_BEGIN"
-            head -c 1200 "$RESPONSE" || true
-            echo
-            echo "HEALTH_RESPONSE_BODY_END"
+          IST_HOUR="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Asia/Kolkata")).hour)')"
+          if (( IST_HOUR < 10 || IST_HOUR >= 15 )); then
+            echo "ERROR: safe probe window is 10:00–14:59 IST, outside this job's normal 09:15–09:59 schedule."
+            exit 1
           fi
-          python - "$RESPONSE" "$HTTP_CODE" <<'PY'
-          import datetime as dt
-          import json
-          import sys
 
-          path, http_code = sys.argv[1], int(sys.argv[2])
+          RESTORE_NEEDED=0
+          restore_target() {
+            if [[ "$RESTORE_NEEDED" == "1" ]]; then
+              echo "Restoring scheduler target to its original /tick POST URI."
+              if ! gcloud scheduler jobs update http "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --uri="$ORIGINAL_URI" --http-method="$ORIGINAL_METHOD" --quiet; then
+                echo "CRITICAL: failed to restore the original scheduler target."
+                return 1
+              fi
+              RESTORE_NEEDED=0
+              RESTORED_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+              RESTORED_URI="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("uri",""))')"
+              RESTORED_METHOD="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("httpTarget",{}).get("httpMethod","POST").upper())')"
+              RESTORED_STATE="$(printf '%s' "$RESTORED_JSON" | python -c 'import json,sys; print(json.load(sys.stdin).get("state",""))')"
+              if [[ "$RESTORED_URI" != "$ORIGINAL_URI" || "$RESTORED_METHOD" != "$ORIGINAL_METHOD" || "$RESTORED_STATE" != "ENABLED" ]]; then
+                echo "CRITICAL: scheduler restoration verification did not match the original configuration."
+                return 1
+              fi
+              echo "SCHEDULER_TARGET_RESTORED=PASS"
+            fi
+          }
+          trap restore_target EXIT
+
+          probe_endpoint() {
+            local path="$1"
+            local label="$2"
+            local before check rc
+            before="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
+            RESTORE_NEEDED=1
+            gcloud scheduler jobs update http "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --uri="$SERVICE_URL$path" --http-method=GET --quiet
+            gcloud scheduler jobs run "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --quiet
+
+            for attempt in $(seq 1 20); do
+              JOB_JSON="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+              set +e
+              check="$(printf '%s' "$JOB_JSON" | python - "$before" <<'PY'
+          import datetime, json, sys
+          job=json.load(sys.stdin)
           try:
-              payload = json.load(open(path, encoding="utf-8"))
-          except Exception as exc:
-              print(f"ERROR: health endpoint returned invalid JSON: {exc}")
-              sys.exit(1)
-
-          capture = payload.get("all_universe_capture") or {}
-          prediction = payload.get("all_nse_minute_prediction") or {}
-
-          def show(prefix, obj, keys):
-              for key in keys:
-                  if key in obj:
-                      print(f"{prefix}_{key.upper()}={obj.get(key)}")
-
-          print(f"WORKER_HEALTH={payload.get('status')}")
-          print(f"DRIVE_PREFLIGHT={payload.get('drive_preflight_status')}")
-          print(f"LAST_TICK_AT_UTC={payload.get('last_tick_at_utc')}")
-          print(f"NSE_TIME_IST={payload.get('nse_time_ist')}")
-          show("QUOTE_CAPTURE", capture, [
-              "status", "cycle_minute_ist", "expected_symbol_count",
-              "quoted_symbol_count", "missing_quote_count",
-              "unmapped_symbol_count", "snapshot_drive_path",
-              "remote_snapshot_path", "error",
-          ])
-          show("PREDICTION_CAPTURE", prediction, [
-              "status", "cycle_minute_ist", "expected_symbol_count",
-              "prediction_count", "missing_quote_count", "data_limited_count",
-              "history_ready", "history_status", "history_seed_coverage_symbols",
-              "history_seed_failed_batches", "quality_gate_pass",
-              "remote_path", "manifest_drive_path", "error",
-          ])
-          if payload.get("all_nse_minute_prediction_error"):
-              print("PREDICTION_ERROR=" + str(payload["all_nse_minute_prediction_error"]))
-          if payload.get("last_error"):
-              print("WORKER_LAST_ERROR=" + str(payload["last_error"]))
-
-          # Health returns 503 when degraded but still supplies useful diagnostics.
-          if http_code not in (200, 503):
-              print(f"ERROR: unexpected health HTTP status {http_code}")
-              sys.exit(1)
-          if payload.get("drive_preflight_status") != "OK":
-              print("VERDICT=FAIL: Drive read/write preflight is not ready.")
-              sys.exit(1)
-
-          expected = capture.get("expected_symbol_count")
-          quoted = capture.get("quoted_symbol_count")
-          missing = capture.get("missing_quote_count")
-          status = str(capture.get("status") or "").upper()
-          drive_path = capture.get("snapshot_drive_path") or capture.get("remote_snapshot_path")
-          minute = capture.get("cycle_minute_ist")
-          if not minute or not drive_path or expected is None or quoted is None or missing is None:
-              print("VERDICT=FAIL: no complete latest full-universe capture diagnostics are available.")
-              sys.exit(1)
-
-          try:
-              parsed = dt.datetime.fromisoformat(str(minute).replace("Z", "+00:00"))
-              if parsed.tzinfo is None:
-                  parsed = parsed.replace(tzinfo=dt.timezone.utc)
-              age = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
+              before=datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
           except Exception:
-              age = 999999
-          print(f"QUOTE_CAPTURE_AGE_SECONDS={max(0, int(age))}")
-          if int(expected) <= 0 or int(quoted) + int(missing) != int(expected):
-              print("VERDICT=FAIL: quote coverage counts do not reconcile to the NSE universe.")
-              sys.exit(1)
-          if age > 180:
-              print("VERDICT=FAIL: latest capture is older than 3 minutes.")
-              sys.exit(1)
-          if status != "OK" or int(missing) != 0 or int(quoted) != int(expected):
-              print("VERDICT=PARTIAL: latest file is recent and coverage counts reconcile, but not every NSE symbol has a valid quote.")
-              sys.exit(1)
-
-          pred_status = str(prediction.get("status") or "NOT_REPORTED").upper()
-          pred_expected = prediction.get("expected_symbol_count")
-          pred_count = prediction.get("prediction_count")
-          print(f"VERDICT=PASS: latest one-minute NSE quote snapshot has {quoted}/{expected} valid quotes and a confirmed Drive path.")
-          if pred_status != "OK" or pred_expected is None or pred_count != pred_expected:
-              print("PREDICTION_VERDICT=PARTIAL: one-row-per-symbol prediction file is not fully passing its quality gate.")
-          else:
-              print(f"PREDICTION_VERDICT=PASS: {pred_count}/{pred_expected} symbol predictions are present.")
+              before=None
+          try:
+              attempted=datetime.datetime.fromisoformat(str(job.get("lastAttemptTime","")).replace("Z","+00:00"))
+          except Exception:
+              attempted=None
+          newer=attempted is not None and (before is None or attempted > before)
+          status=job.get("status") or {}
+          code=status.get("code")
+          message=str(status.get("message") or "")[:240]
+          if code is None and not message:
+              code=0
+          print(json.dumps({"new_attempt":newer,"lastAttemptTime":job.get("lastAttemptTime"),"code":code,"message":message},sort_keys=True))
+          sys.exit(2 if not newer else (0 if code == 0 and not message else 1))
           PY
+          )"
+              rc=$?
+              set -e
+              echo "${label}_SCHEDULER_RESULT=$check"
+              if [[ $rc -eq 0 ]]; then
+                echo "${label}=PASS (endpoint returned HTTP 2xx)"
+                return 0
+              elif [[ $rc -eq 1 ]]; then
+                echo "${label}=FAIL (endpoint returned non-2xx)"
+                return 1
+              fi
+              sleep 3
+            done
+            echo "${label}=UNKNOWN (no fresh Scheduler attempt was observed)"
+            return 2
+          }
+
+          CAPTURE_OK=0
+          PREDICTION_OK=0
+          if probe_endpoint "/capturez" "ALL_NSE_QUOTE_CAPTURE"; then CAPTURE_OK=1; fi
+          if probe_endpoint "/predictionz" "ALL_NSE_PREDICTION_ACTUAL_CAPTURE"; then PREDICTION_OK=1; fi
+          restore_target
+          trap - EXIT
+
+          if [[ "$CAPTURE_OK" == "1" ]]; then
+            echo "QUOTE_CAPTURE_VERDICT=PASS: every expected NSE symbol had a fresh valid quote and the minute snapshot was confirmed in Drive."
+          else
+            echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_PARTIAL: latest quote file failed the full-coverage/freshness/Drive-write gate."
+          fi
+          if [[ "$PREDICTION_OK" == "1" ]]; then
+            echo "PREDICTION_ACTUAL_VERDICT=PASS: one fresh model-prediction and actual-value row per expected NSE symbol passed its quality gate."
+          else
+            echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_PARTIAL: latest prediction/actual file failed full-coverage/freshness/Drive-write checks."
+          fi
+          [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]
