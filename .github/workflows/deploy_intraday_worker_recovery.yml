@@ -130,11 +130,11 @@ jobs:
           # so this probe uses the already-authorized OIDC identity without requiring
           # project-wide Cloud Logging access for the GitHub deploy identity.
           PROBE_JOB=intraday-worker-0915-0959
-          BEFORE="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
           echo "DRIVE_PREFLIGHT_PROBE_JOB=$PROBE_JOB"
           PROBE_OK=false
 
           for probe in 1 2 3; do
+            BEFORE="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
             echo "Starting authenticated Drive-preflight probe attempt $probe/3"
             if ! gcloud scheduler jobs run "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --quiet; then
               echo "Scheduler rejected or could not enqueue the probe; retrying."
