@@ -168,3 +168,29 @@ def test_intraday_duplicate_column_normalization_works_with_pandas_index():
     assert list(normalized.columns) == ["close", "open"]
     assert normalized.columns.is_unique
     assert np.allclose(normalized["close"].to_numpy(), [100.0, 101.0])
+
+
+def test_live_inference_minimum_does_not_relax_training_minimum():
+    from datetime import date
+
+    idx = pd.date_range(
+        "2026-10-13 09:15",
+        periods=16,
+        freq="1min",
+        tz="Asia/Kolkata",
+    )
+    px = 100.0 + np.arange(len(idx)) * 0.02
+    bars = pd.DataFrame({
+        "symbol": "A",
+        "ts": idx.tz_convert("UTC"),
+        "open": px,
+        "high": px + 0.05,
+        "low": px - 0.05,
+        "close": px,
+    })
+    live = _session_rows(
+        bars, None, (5, 30), include_future=False, decision_interval_minutes=1
+    )
+    train = _session_rows(bars, None, (5, 30), include_future=True)
+    assert live
+    assert train == []
