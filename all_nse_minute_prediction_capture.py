@@ -388,6 +388,12 @@ class AllNSEMinutePredictor:
                     if offset + HISTORY_BATCH_SIZE < len(entries):
                         time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
 
+                # Count only actual historical API results, not live quote rows
+                # buffered while the potentially long bootstrap is in progress.
+                historical_coverage = sum(
+                    1 for symbol in symbols
+                    if symbol in histories and not histories[symbol].empty
+                )
                 with self._lock:
                     # Merge point-in-time quotes observed while seed requests ran.
                     for symbol, pending in self._pending_quote_rows.items():
@@ -416,10 +422,7 @@ class AllNSEMinutePredictor:
                         if symbol != "__NIFTY50__" and not frame.empty
                     }
                     self._market_history = market_base.tail(HISTORY_LOOKBACK_BARS)
-                    self._seed_coverage = sum(
-                        1 for symbol in symbols
-                        if symbol in self._history and not self._history[symbol].empty
-                    )
+                    self._seed_coverage = historical_coverage
                     self._seed_errors = batch_errors
                     self._seed_error = None if batch_errors == 0 else (
                         f"{batch_errors} historical batches did not return a success payload"
