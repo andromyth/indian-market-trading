@@ -71,9 +71,26 @@ def _gate_pass(value) -> bool:
         return False
 
 
-def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
+def _iso_date(value):
+    """Parse a date-like field without assuming a missing value is current."""
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def build_report(
+    preds: pd.DataFrame,
+    vals: pd.DataFrame,
+    *,
+    latest_official_eod_date: str | date | None = None,
+) -> dict:
+    """Score completed outcomes, distinguishing un-matured forecasts from data gaps."""
     rolling_health_minimum = int(ValidationConfig().minimum_health_samples)
     minimum = MIN_TARGET_VALIDATION_SAMPLES
+    eod_day = _iso_date(latest_official_eod_date)
     report = {
         "diagnostics_schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -84,27 +101,72 @@ def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
         "target_action_precision": TARGET_ACTION_PRECISION,
         "minimum_target_actions": MIN_TARGET_ACTIONS,
         "active_model_versions_expected": sorted(ACTIVE_DELIVERY_MODEL_VERSIONS),
-        "history_sufficient": False,
+        "latest_official_eod_date": eod_day,
+        "active_model_prediction_count": 0,
+        "active_model_target_date_min": None,
+        "active_model_target_date_max": None,
+        "active_model_targets_with_known_date": 0,
+        "active_model_matured_prediction_count": None,
+        "active_model_waiting_for_target_count": None,
         "active_model_scored_samples": 0,
         "quality_approved_active_samples": 0,
+        "history_sufficient": False,
     }
-    if preds.empty or vals.empty or "prediction_id" not in preds or "prediction_id" not in vals:
-        report["diagnosis"] = "No prediction/validation ledger rows could be joined."
+    if preds.empty or "prediction_id" not in preds.columns:
+        report["diagnosis"] = "No prediction rows with stable IDs are available."
         return report
-    if "mode" not in preds:
+    if "mode" not in preds.columns:
         report["diagnosis"] = "Prediction ledger has no mode field; refusing to score an ambiguous population."
         return report
 
-    p = preds[preds["mode"].astype(str).str.lower().eq("delivery")].copy()
+    p_all = preds[preds["mode"].astype(str).str.lower().eq("delivery")].copy()
+    if "model_version" in p_all.columns:
+        p_all["model_version"] = p_all["model_version"].astype(str)
+        active_prediction_mask = p_all["model_version"].isin(ACTIVE_DELIVERY_MODEL_VERSIONS)
+    else:
+        active_prediction_mask = pd.Series(False, index=p_all.index)
+    active_predictions = p_all.loc[active_prediction_mask].copy()
+    report["active_model_prediction_count"] = int(len(active_predictions))
+    report["active_models_seen"] = (
+        sorted(set(active_predictions["model_version"].dropna().astype(str)))
+        if "model_version" in active_predictions.columns else []
+    )
+
+    target_dates = pd.Series(index=active_predictions.index, dtype="object")
+    if "prediction_for_date" in active_predictions.columns:
+        target_dates = active_predictions["prediction_for_date"].map(_iso_date)
+    known_targets = target_dates.notna()
+    report["active_model_targets_with_known_date"] = int(known_targets.sum())
+    if bool(known_targets.any()):
+        parsed_known = sorted(target_dates.loc[known_targets].tolist())
+        report["active_model_target_date_min"] = parsed_known[0]
+        report["active_model_target_date_max"] = parsed_known[-1]
+    if eod_day is not None:
+        report["active_model_matured_prediction_count"] = int(
+            (target_dates.notna() & target_dates.le(eod_day)).sum()
+        )
+        report["active_model_waiting_for_target_count"] = int(
+            (target_dates.notna() & target_dates.gt(eod_day)).sum()
+        )
+
+    if p_all.empty:
+        report["diagnosis"] = "No Delivery prediction rows are available to score."
+        return report
+
     cols = [
-        "prediction_id", "symbol", "decision_timestamp",
+        "prediction_id", "symbol", "decision_timestamp", "prediction_for_date",
         "probability_up_next_session", "predicted_return_next_session",
         "production_data_quality_gate", "production_data_quality_score",
         "model_version", "engine_version", "decision_engine_version",
     ]
-    p = p[[col for col in cols if col in p.columns]]
+    p = p_all[[col for col in cols if col in p_all.columns]].copy()
     vcols = ["prediction_id", "actual_direction_d1", "actual_d1_return", "validation_status"]
-    v = vals[[col for col in vcols if col in vals.columns]]
+    if vals.empty or "prediction_id" not in vals.columns:
+        v = pd.DataFrame(columns=vcols)
+    else:
+        v = vals[[col for col in vcols if col in vals.columns]].copy()
+        if "prediction_id" not in v.columns:
+            v["prediction_id"] = pd.Series(dtype="object")
     x = p.merge(v, on="prediction_id", how="inner")
     if "validation_status" in x.columns:
         x = x[x["validation_status"].astype(str).str.upper().eq("VALIDATED")].copy()
@@ -132,9 +194,38 @@ def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
     legacy_metrics = _evaluate(legacy)
     active_count = int(active_metrics.get("samples", 0))
     quality_count = int(quality_metrics.get("samples", 0))
+
     if active_count == 0:
-        status = "NO_ACTIVE_MODEL_DATA"
-        diagnosis = "No completed outcomes from the active ALL-NSE 59-feature Delivery model were found. Legacy-model metrics are not a score for the active model."
+        matured_count = report["active_model_matured_prediction_count"]
+        waiting_count = report["active_model_waiting_for_target_count"]
+        known_count = report["active_model_targets_with_known_date"]
+        active_prediction_count = report["active_model_prediction_count"]
+        if (
+            active_prediction_count > 0
+            and eod_day is not None
+            and known_count == active_prediction_count
+            and matured_count == 0
+            and waiting_count == active_prediction_count
+        ):
+            status = "ACTIVE_MODEL_AWAITING_MATURITY"
+            diagnosis = (
+                "Active-model forecasts are present, but every known target session is later "
+                "than the latest official EOD date. No active-model accuracy score is available "
+                "yet; these forecasts remain unscored until their official target bars arrive."
+            )
+        elif active_prediction_count > 0 and eod_day is not None and (matured_count or 0) > 0:
+            status = "ACTIVE_MODEL_OUTCOME_GAP"
+            diagnosis = (
+                "Active-model forecasts have target sessions at or before the latest official "
+                "EOD date, but no validated outcomes were joined for the active model. Repair "
+                "the prediction-ID/validation persistence or target-bar coverage before claiming accuracy."
+            )
+        else:
+            status = "NO_ACTIVE_MODEL_DATA"
+            diagnosis = (
+                "No completed outcomes from the active ALL-NSE 59-feature Delivery model were found, "
+                "and the available target-date evidence is insufficient to classify this as a normal maturity wait."
+            )
     elif quality_count == 0:
         status = "NO_QUALITY_APPROVED_DATA"
         diagnosis = "Active-model outcomes exist, but none passed the production data-quality gate. Do not claim accuracy; repair PIT/data-readiness gates first."
@@ -166,14 +257,13 @@ def build_report(preds: pd.DataFrame, vals: pd.DataFrame) -> dict:
             and quality_metrics["action_precision"] >= TARGET_ACTION_PRECISION
         ),
         "target_interpretation": "Monitoring precision is descriptive only; target success must be demonstrated by a later chronological holdout with enough BUY/SELL actions.",
+        "active_model_outcome_versions_seen": sorted(set(active["model_version"].dropna().astype(str))) if "model_version" in active.columns else [],
         "legacy_models_seen": sorted(set(legacy["model_version"].dropna().astype(str))) if "model_version" in legacy.columns else [],
-        "active_models_seen": sorted(set(active["model_version"].dropna().astype(str))) if "model_version" in active.columns else [],
         "decision_engines": sorted(set(x["decision_engine_version"].dropna().astype(str))) if "decision_engine_version" in x.columns else [],
         "symbols": int(active["symbol"].nunique()) if "symbol" in active.columns else 0,
         "diagnosis": diagnosis,
     })
     return report
-
 
 def main():
     preds = pd.DataFrame(load_records())
