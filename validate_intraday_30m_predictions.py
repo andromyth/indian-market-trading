@@ -41,7 +41,7 @@ def _normalise_bars(frame: pd.DataFrame | None) -> pd.DataFrame:
     x = frame.copy()
     lower_to_original = {str(c).strip().lower(): c for c in x.columns}
     timestamp_col = next(
-        (lower_to_original[k] for k in ("timestamp", "datetime", "date", "_time") if k in lower_to_original),
+        (lower_to_original[k] for k in ("timestamp", "timestamp_utc", "timestamp_ist", "datetime", "date", "_time", "time") if k in lower_to_original),
         None,
     )
     raw_index = x.pop(timestamp_col) if timestamp_col is not None else x.index
