@@ -44,29 +44,38 @@ jobs:
           START_TIME="$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
           echo "METRICS_WINDOW_START=$START_TIME"
           echo "METRICS_WINDOW_END=$END_TIME"
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
           set +e
-          gcloud monitoring time-series list --project="$PROJECT_ID" \
-            --filter='metric.type="run.googleapis.com/request_count" AND resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker"' \
-            --interval="start=$START_TIME,end=$END_TIME" \
-            --format=json > /tmp/run_request_metrics.json
+          METRICS_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 30 -G \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            --data-urlencode 'filter=metric.type="run.googleapis.com/request_count" AND resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker"' \
+            --data-urlencode "interval.startTime=$START_TIME" \
+            --data-urlencode "interval.endTime=$END_TIME" \
+            --data-urlencode "view=FULL" \
+            --output /tmp/run_request_metrics.json --write-out "%{http_code}" \
+            "https://monitoring.googleapis.com/v3/projects/$PROJECT_ID/timeSeries")"
           METRICS_RC=$?
           set -e
-          if [[ "$METRICS_RC" -eq 0 ]]; then
+          echo "METRICS_HTTP_STATUS=$METRICS_CODE"
+          if [[ "$METRICS_RC" -eq 0 && "$METRICS_CODE" == "200" ]]; then
             python - /tmp/run_request_metrics.json <<'PY'
           import json,sys
           try:
-              items=json.load(open(sys.argv[1],encoding="utf-8"))
+              response=json.load(open(sys.argv[1],encoding="utf-8"))
           except Exception as exc:
               print(f"METRICS_PARSE_ERROR={exc}")
               sys.exit(0)
+          items=response.get("timeSeries",[])
           print(f"REQUEST_METRIC_SERIES_COUNT={len(items)}")
+          if response.get("nextPageToken"):
+              print("REQUEST_METRICS_PAGE_TRUNCATED=true")
           for item in items:
               metric=item.get("metric",{})
               resource=item.get("resource",{})
               labels=metric.get("labels",{})
               rlabels=resource.get("labels",{})
               values=item.get("points",[])
-              for point in values[-8:]:
+              for point in values[:8]:
                   value=point.get("value",{})
                   num=value.get("int64Value",value.get("doubleValue",value.get("distributionValue")))
                   interval=point.get("interval",{})
@@ -80,7 +89,9 @@ jobs:
                   },sort_keys=True))
           PY
           else
-            echo "REQUEST_METRICS_UNAVAILABLE_RC=$METRICS_RC"
+            echo "REQUEST_METRICS_UNAVAILABLE=true"
+            head -c 1200 /tmp/run_request_metrics.json 2>/dev/null || true
+            echo
           fi
           echo "=== Scheduler state and last attempt ==="
           for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
