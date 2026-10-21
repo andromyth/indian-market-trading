@@ -358,6 +358,9 @@ def _manifest_summary(store: GoogleDriveStore, path: str, now_utc: datetime) -> 
         "unmapped_symbol_count": payload.get("unmapped_symbol_count"),
         "forecast_record_count": payload.get("forecast_record_count"),
         "matched_outcome_count": payload.get("matched_outcome_count"),
+        "quote_request_error_count": payload.get("quote_request_error_count"),
+        "quote_batch_diagnostics": (payload.get("quote_batch_diagnostics") or [])[:8],
+        "recovery_error": str(payload.get("recovery_error") or "")[:240] or None,
         "row_count": payload.get("row_count"),
         "snapshot_drive_path": payload.get("snapshot_drive_path"),
         "error": str(payload.get("error") or payload.get("manifest_sync_error") or "")[:240] or None,
@@ -495,6 +498,7 @@ def main() -> int:
     worker_status, worker_meta = _read_json(store, "production_data/intraday_predictions/worker_status_latest.json")
     worker = {"exists": worker_status is not None}
     if worker_status is not None:
+        last_cycle = worker_status.get("last_cycle_summary") or {}
         worker.update({
             "modified_time_utc": worker_meta.get("modifiedTime") if worker_meta else None,
             "modified_age_minutes": _age_minutes(worker_meta.get("modifiedTime"), now_utc) if worker_meta else None,
@@ -502,10 +506,18 @@ def main() -> int:
             "run_status": worker_status.get("run_status"),
             "cycle_count": worker_status.get("cycle_count"),
             "watchlist_symbol_count": len(worker_status.get("watchlist_symbols") or []),
-            "last_cycle_observed_at_ist": (worker_status.get("last_cycle_summary") or {}).get("observed_at_ist"),
-            "last_cycle_predictions_written": (worker_status.get("last_cycle_summary") or {}).get("predictions_written"),
-            "last_cycle_stock_fetch_errors": (worker_status.get("last_cycle_summary") or {}).get("stock_fetch_errors"),
-            "last_cycle_error_count": len((worker_status.get("last_cycle_summary") or {}).get("errors") or []),
+            "last_cycle_observed_at_ist": last_cycle.get("observed_at_ist"),
+            "last_cycle_stock_fetch_ok": last_cycle.get("stock_fetch_ok"),
+            "last_cycle_stock_fetch_errors": last_cycle.get("stock_fetch_errors"),
+            "last_cycle_fresh_benchmark_count": last_cycle.get("fresh_benchmark_count"),
+            "last_cycle_predictions_written": last_cycle.get("predictions_written"),
+            "last_cycle_prediction_rows_valid": last_cycle.get("prediction_rows_valid"),
+            "last_cycle_prediction_errors": last_cycle.get("prediction_errors"),
+            "last_cycle_prediction_abstains": last_cycle.get("prediction_abstains"),
+            "last_cycle_warmup_symbols": (last_cycle.get("warmup_symbols") or [])[:5],
+            "last_cycle_stale_symbols": (last_cycle.get("stale_symbols") or [])[:5],
+            "last_cycle_errors": (last_cycle.get("errors") or [])[:8],
+            "last_cycle_error_count": len(last_cycle.get("errors") or []),
         })
 
     global_manifest = _manifest_summary(
