@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -13,6 +13,7 @@ from autonomous_intraday_worker import (
     segment_should_stop,
 )
 from selfdriving.sd_intraday_v2 import _session_rows
+from verify_minute_prediction_persistence import _required_prediction_snapshot_keys
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -526,3 +527,26 @@ def test_live_inference_can_record_abstentions_after_opening_window_before_train
     assert all(pd.Timestamp(row["decision_timestamp"]).strftime("%H:%M") == "09:30" for row in live_rows)
     assert all(pd.isna(row["target_timestamp"]) for row in live_rows)
     assert training_rows == []
+
+
+def test_prediction_audit_starts_after_opening_warmup_and_caps_live_minutes():
+    day = date(2026, 10, 21)
+    full_session_keys = [
+        (pd.Timestamp(day, tz=IST) + pd.Timedelta(minutes=9 * 60 + 15 + offset)).strftime("%Y%m%d_%H%M")
+        for offset in range(375)
+    ]
+
+    required, first_key = _required_prediction_snapshot_keys(full_session_keys, day)
+
+    assert first_key == "20261021_0931"
+    assert len(required) == 359
+    assert required[0] == "20261021_0931"
+    assert required[-1] == "20261021_1529"
+
+    live_through_0930 = [key for key in full_session_keys if key <= "20261021_0930"]
+    required_live, _ = _required_prediction_snapshot_keys(live_through_0930, day)
+    assert required_live == []
+
+    live_through_0931 = [key for key in full_session_keys if key <= "20261021_0931"]
+    required_live, _ = _required_prediction_snapshot_keys(live_through_0931, day)
+    assert required_live == ["20261021_0931"]

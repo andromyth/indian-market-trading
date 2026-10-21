@@ -164,13 +164,26 @@ def _read_jsonl(store: GoogleDriveStore, file_meta: dict, max_bytes: int = 30_00
     }
 
 
+def _required_prediction_snapshot_keys(
+    expected_keys: list[str], session_date: date
+) -> tuple[list[str], str]:
+    """Forecast snapshots start at 09:31: the 09:30 candle completes at 09:31."""
+    from market_session_guard import OPEN
+
+    first_forecast_minute = (
+        datetime.combine(session_date, OPEN, tzinfo=IST) + timedelta(minutes=16)
+    )
+    first_forecast_key = first_forecast_minute.strftime("%Y%m%d_%H%M")
+    return [key for key in expected_keys if key >= first_forecast_key], first_forecast_key
+
+
 def _snapshot_summary(
     store: GoogleDriveStore,
     files: list[dict],
     now_utc: datetime,
     session_date: date,
 ) -> dict:
-    """Audit each expected one-minute snapshot and its actual/prediction content."""
+    """Audit every actual snapshot; require model forecasts only after opening warmup."""
     from market_session_guard import CLOSE, OPEN, is_nse_trading_day
 
     snapshots = sorted(
@@ -202,7 +215,10 @@ def _snapshot_summary(
     missing = [key for key in expected_keys if not by_minute.get(key)]
     duplicates = [key for key in expected_keys if len(by_minute.get(key, [])) > 1]
     opening_key = datetime.combine(session_date, OPEN, tzinfo=IST).strftime("%Y%m%d_%H%M")
-    required_forecast_keys = [key for key in expected_keys if key != opening_key]
+    required_forecast_keys, first_forecast_key = _required_prediction_snapshot_keys(
+        expected_keys, session_date
+    )
+    warmup_exempt_keys = [key for key in expected_keys if key < first_forecast_key]
 
     summary = {
         "file_count_today": len(snapshots),
@@ -220,6 +236,8 @@ def _snapshot_summary(
         "actual_symbol_observation_rows_all_expected_minutes": 0,
         "symbol_observation_rows_all_expected_minutes": 0,
         "opening_minute_prediction_exempt": opening_key in expected_keys,
+        "first_forecast_snapshot_key": first_forecast_key,
+        "prediction_warmup_exempt_minutes": warmup_exempt_keys,
         "latest_snapshot_rows": 0,
         "latest_rows_with_actual_observed_close": 0,
         "latest_rows_with_predictions": 0,
