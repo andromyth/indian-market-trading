@@ -473,7 +473,6 @@ class SelfEvolvingIntelligence:
         if len(reconciled_df) < 15:
             return discovered
 
-        # Pattern 1: Climax Volume Exhaustion Fakeout
         exhaustion_mask = (
             (reconciled_df["volume_zscore_20m"] > 2.0)
             & (reconciled_df["vwap_distance_bps"].abs() > 45.0)
@@ -499,7 +498,6 @@ class SelfEvolvingIntelligence:
                     )
                 )
 
-        # Pattern 2: Horizon Overextension Dampener (e.g. +20m early MFE reversal)
         if "outcome_archetype" in reconciled_df.columns:
             for h_val, grp in reconciled_df.groupby("horizon_min"):
                 overext = grp[grp["outcome_archetype"] == "HORIZON_OVEREXTENSION_REVERSAL"]
@@ -518,7 +516,6 @@ class SelfEvolvingIntelligence:
                         )
                     )
 
-        # Pattern 3: Institutional Volume Ignition Expansion (De-shrinks L1 return magnitude)
         ignition_mask = (
             (reconciled_df["volume_zscore_20m"] > 1.8)
             & (reconciled_df["candle_body_to_wick"] > 0.65)

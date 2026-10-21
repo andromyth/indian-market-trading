@@ -1,7 +1,8 @@
 """
 validate_prediction_ledger.py
 Unified point-in-time reconciliation of minute-level predictions against live 1-minute NSE bars,
-plus realized volume-shock detection and root-cause failure attribution for autonomous learning.
+realized volume-shock detection, root-cause failure attribution, and automatic triggering of
+SelfEvolvingIntelligence to upgrade `generated_alpha_policy.py`.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from calibration_autopilot import SelfEvolvingIntelligence
 from prediction_ledger import IST_TZ, is_within_nse_session
 
 
@@ -140,11 +142,13 @@ def compare_with_live_market(
     max_tolerance: str = "2min",
     high_conf_delta: float = 0.06,
     compute_excursions: bool = True,
+    auto_evolve_intelligence: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Align minute-level predictions with realized 1-minute NSE bars using a strict
-    backward merge_asof, backfill missing reference_close values, and compute
-    horizon-adaptive accuracy, error metrics, and causal failure archetypes.
+    backward merge_asof, backfill missing reference_close values, compute
+    horizon-adaptive accuracy and causal failure archetypes, and automatically
+    trigger SelfEvolvingIntelligence to upgrade `generated_alpha_policy.py`.
     """
     if ledger_df.empty:
         return ledger_df.copy(), {"matched_count": 0, "match_rate": 0.0}
@@ -259,14 +263,24 @@ def compare_with_live_market(
         matched["path_mae_bps"] = 0.0
         matched["realized_vol_shock_ratio"] = 1.0
 
-    for col, d_val in [("volume_zscore_20m", 0.0), ("vwap_distance_bps", 0.0), ("volatility_ratio_15m", 1.0), ("candle_body_to_wick", 0.5), ("order_flow_imbalance", 0.0)]:
+    for col, d_val in [
+        ("volume_zscore_20m", 0.0),
+        ("vwap_distance_bps", 0.0),
+        ("volatility_ratio_15m", 1.0),
+        ("candle_body_to_wick", 0.5),
+        ("order_flow_imbalance", 0.0),
+    ]:
         if col not in matched.columns:
             matched[col] = d_val
 
     matched["outcome_archetype"] = _classify_outcome_archetypes(matched)
 
     # 4. Build summary diagnostics dictionary
-    active_mask = matched["signal"].astype(str).str.upper().isin(["BUY", "SELL", "LONG", "SHORT"]) if "signal" in matched.columns else pd.Series(True, index=matched.index)
+    active_mask = (
+        matched["signal"].astype(str).str.upper().isin(["BUY", "SELL", "LONG", "SHORT"])
+        if "signal" in matched.columns
+        else pd.Series(True, index=matched.index)
+    )
     active_df = matched[active_mask]
     high_conf_df = active_df[active_df["is_high_confidence"]]
 
@@ -284,7 +298,7 @@ def compare_with_live_market(
 
     archetype_counts = matched["outcome_archetype"].value_counts().to_dict()
 
-    summary = {
+    summary: dict[str, Any] = {
         "total_in_session": int(total_in_session),
         "matched_count": int(len(matched)),
         "match_rate": float(len(matched) / max(1, total_in_session)),
@@ -297,5 +311,16 @@ def compare_with_live_market(
         "outcome_archetypes": {str(k): int(v) for k, v in archetype_counts.items()},
         "horizons": horizon_breakdown,
     }
+
+    # 5. Zero-edit autonomous upgrade: learn from reconciled outcomes & rewrite generated_alpha_policy.py
+    if auto_evolve_intelligence:
+        try:
+            brain = SelfEvolvingIntelligence(
+                state_path="intelligence_brain_state.json",
+                generated_code_path="generated_alpha_policy.py",
+            )
+            summary["intelligence_evolution"] = brain.evolve_from_outcomes(matched)
+        except Exception as exc:
+            summary["intelligence_evolution"] = {"status": "SKIPPED", "error": str(exc)}
 
     return matched, summary

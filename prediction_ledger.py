@@ -2,11 +2,12 @@
 prediction_ledger.py
 Unified minute-level prediction ledger and live microstructure feature capture
 (volume z-score, VWAP distance, order-flow imbalance, volatility ratios, and event flags)
-with strict Asia/Kolkata session boundary guards.
+with strict Asia/Kolkata session boundary guards and zero-edit policy hot-reloading.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+try:
+    import generated_alpha_policy
+except ImportError:
+    generated_alpha_policy = None
 
 IST_TZ = "Asia/Kolkata"
 SCHEMA_VERSION = "2.2"
@@ -57,7 +63,7 @@ def is_within_nse_session(decision_ts: pd.Timestamp, horizon_min: int) -> bool:
     return True
 
 
-def extract_live_microstructure_features(bars_1m: pd.DataFrame) -> dict[str, Any]:
+def extract_live_microstructure_features(bars_1m: pd.DataFrame | None) -> dict[str, Any]:
     """
     Extract real-time price, volume, and event features from trailing 1-minute NSE
     OHLCV bars to feed both inference and state capture.
@@ -140,7 +146,6 @@ class PredictionRecord:
     calibration_profile_id: str = "RAW"
     atr_15m: float | None = None
     target_timestamp: str | None = None
-    # Live microstructure context for self-evolving online learning
     volume_zscore_20m: float = 0.0
     vwap_distance_bps: float = 0.0
     price_momentum_5m_bps: float = 0.0
@@ -180,12 +185,59 @@ class PredictionRecord:
         return asdict(self)
 
 
-def append_record(ledger_path: str | Path, record: PredictionRecord | dict[str, Any]) -> PredictionRecord:
-    """Validate and append a single prediction record (with microstructure state) to JSONL or CSV."""
+def append_record(
+    ledger_path: str | Path,
+    record: PredictionRecord | dict[str, Any],
+    *,
+    bars_1m: pd.DataFrame | None = None,
+    auto_apply_intelligence: bool = True,
+) -> PredictionRecord:
+    """
+    Zero-edit hook: automatically extracts live 1m microstructure features (if bars_1m is passed),
+    hot-reloads generated_alpha_policy.py, upgrades the raw forecast, and appends to the ledger.
+    """
     path = Path(ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    validated = record if isinstance(record, PredictionRecord) else PredictionRecord(**record)
+    raw_dict = record.to_dict() if isinstance(record, PredictionRecord) else dict(record)
+
+    if bars_1m is not None and not bars_1m.empty:
+        micro_state = extract_live_microstructure_features(bars_1m)
+        raw_dict.update(micro_state)
+    else:
+        micro_state = {
+            "volume_zscore_20m": float(raw_dict.get("volume_zscore_20m", 0.0)),
+            "vwap_distance_bps": float(raw_dict.get("vwap_distance_bps", 0.0)),
+            "price_momentum_5m_bps": float(raw_dict.get("price_momentum_5m_bps", 0.0)),
+            "order_flow_imbalance": float(raw_dict.get("order_flow_imbalance", 0.0)),
+            "volatility_ratio_15m": float(raw_dict.get("volatility_ratio_15m", 1.0)),
+            "candle_body_to_wick": float(raw_dict.get("candle_body_to_wick", 0.5)),
+            "event_flags": list(raw_dict.get("event_flags", [])),
+        }
+
+    if (
+        auto_apply_intelligence
+        and generated_alpha_policy is not None
+        and float(raw_dict.get("reference_close", 0.0)) > 0
+    ):
+        try:
+            importlib.reload(generated_alpha_policy)
+            evolved = generated_alpha_policy.apply_evolved_intelligence(
+                reference_close=float(raw_dict["reference_close"]),
+                raw_predicted_price=float(raw_dict["predicted_price"]),
+                raw_probability_up=float(raw_dict.get("probability_up", 0.5)),
+                horizon_min=int(raw_dict.get("horizon_min", 5)),
+                state=micro_state,
+            )
+            raw_dict["predicted_price"] = evolved["predicted_price"]
+            raw_dict["probability_up"] = evolved["probability_up"]
+            raw_dict["expert_votes"] = evolved["expert_votes"]
+            raw_dict["active_policy_version"] = evolved["active_policy_version"]
+            raw_dict["calibration_profile_id"] = evolved["active_policy_version"]
+        except Exception:
+            pass
+
+    validated = PredictionRecord(**raw_dict)
     row_dict = validated.to_dict()
 
     if path.suffix.lower() == ".jsonl":
@@ -252,7 +304,6 @@ def load_records(
     if "price_forecast_status" not in df.columns:
         df["price_forecast_status"] = "OK"
 
-    # Ensure microstructure columns exist with safe defaults for legacy ledgers
     defaults = {
         "volume_zscore_20m": 0.0,
         "vwap_distance_bps": 0.0,
