@@ -76,7 +76,7 @@ def _find_child_retry(store: Any, parent: str, name: str, mime_type: str | None 
             last_error = exc
             if not _retryable_drive_error(exc) or attempt + 1 >= attempts:
                 raise
-            time_module.sleep(min(8.0, (0.4 * (2 ** attempt)) + random.random() * 0.25)
+            time_module.sleep(min(8.0, (0.4 * (2 ** attempt)) + random.random() * 0.25))
     if last_error:
         raise last_error
     return None
@@ -119,7 +119,7 @@ def _download_drive_bytes(store: Any, remote_path: str) -> bytes | None:
             last_error = exc
             if not _retryable_drive_error(exc) or attempt >= 4:
                 raise
-            time_module.sleep(min(8.0, 0.4 * (2 ** attempt) + random.random() * 0.25)
+            time_module.sleep(min(8.0, 0.4 * (2 ** attempt) + random.random() * 0.25))
     if last_error:
         raise last_error
     return None
