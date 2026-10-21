@@ -92,12 +92,32 @@ def _parsed_dates(items: Iterable[dict[str, Any]], pattern: re.Pattern[str], fmt
     return found
 
 
+def _is_retryable_drive_error(exc: Exception) -> bool:
+    """Identify transient Drive API and transport errors safe to retry."""
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    detail = str(exc).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "internal error",
+        )
+    )
+
+
 def load_drive_inventory(store: GoogleDriveStore, *, max_attempts: int = 4) -> dict[str, set[date]]:
-    """Read the three Drive inventories, retrying transient rate/server errors."""
+    """Read the three Drive inventories, retrying transient API and network errors."""
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
 
-    retryable_statuses = {429, 500, 502, 503, 504}
     for attempt in range(1, max_attempts + 1):
         try:
             eod_folder = _resolve_folder(store, "production_data/nse_official/bulk_eod")
@@ -121,13 +141,14 @@ def load_drive_inventory(store: GoogleDriveStore, *, max_attempts: int = 4) -> d
             )
             return inventory
         except Exception as exc:
-            status = getattr(getattr(exc, "resp", None), "status", None)
-            if status not in retryable_statuses or attempt >= max_attempts:
+            if not _is_retryable_drive_error(exc) or attempt >= max_attempts:
                 raise
             delay = min(2 ** (attempt - 1), 8)
+            status = getattr(getattr(exc, "resp", None), "status", None)
             print(
                 "DRIVE_TRANSIENT_READ_RETRY: "
-                f"http_status={status} attempt={attempt}/{max_attempts} "
+                f"status={status if status is not None else 'network'} "
+                f"attempt={attempt}/{max_attempts} "
                 f"retry_in_seconds={delay} error={type(exc).__name__}",
                 flush=True,
             )
@@ -183,12 +204,36 @@ def plan_snapshot_backfill(
     }
 
 
-def _write_report(store: GoogleDriveStore, report: dict[str, Any]) -> None:
+def _write_report(store: GoogleDriveStore, report: dict[str, Any], *, max_attempts: int = 4) -> None:
+    """Persist the local report and retry transient Drive writes.
+
+    Repeating upload_or_update is safe here: each attempt re-resolves the same
+    remote path, so a create that succeeded remotely but timed out locally is
+    observed as an existing file on the next attempt rather than duplicated.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    store.upload_or_update(
-        REPORT_PATH, REMOTE_REPORT, mime_type="application/json"
-    )
+    for attempt in range(1, max_attempts + 1):
+        try:
+            store.upload_or_update(
+                REPORT_PATH, REMOTE_REPORT, mime_type="application/json"
+            )
+            return
+        except Exception as exc:
+            if not _is_retryable_drive_error(exc) or attempt >= max_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 8)
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            print(
+                "DRIVE_TRANSIENT_WRITE_RETRY: "
+                f"status={status if status is not None else 'network'} "
+                f"attempt={attempt}/{max_attempts} "
+                f"retry_in_seconds={delay} error={type(exc).__name__}",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def _run_refresh(day: date) -> dict[str, Any]:
