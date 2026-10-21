@@ -118,7 +118,10 @@ def test_join_normalizes_prediction_ids_after_numeric_to_string_coercion():
     report = build_report(preds, vals)
 
     assert report["prediction_validation_id_intersection_count"] == 80
+    assert report["active_model_validation_id_intersection_count"] == 80
+    assert report["active_model_validated_id_intersection_count"] == 80
     assert report["joined_validated_rows_before_metrics"] == 80
+    assert report["joined_active_model_validated_rows"] == 80
     assert report["active_model_scored_samples"] == 80
     assert report["quality_approved_active_samples"] == 80
     assert report["status"] == "OOS_HISTORY_AVAILABLE_TARGET_UNPROVEN"
