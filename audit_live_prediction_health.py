@@ -201,56 +201,144 @@ def _realised_delivery_diagnostics(
         }
 
 
+def _intraday_target_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
+    """Resolve the same 30-minute endpoint used by the target-bar validator."""
+    raw = row.get("signal_horizon_end") or row.get("target_timestamp")
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(row.get("decision_timestamp"), errors="coerce")
+        if pd.isna(parsed):
+            return None
+        parsed = parsed + pd.Timedelta(minutes=30)
+    stamp = pd.Timestamp(parsed)
+    if stamp.tzinfo is None:
+        return stamp.tz_localize(ZoneInfo("Asia/Kolkata"))
+    return stamp.tz_convert(ZoneInfo("Asia/Kolkata"))
+
+
+def _normalise_outcome_prediction_ids(values: pd.Series) -> pd.Series:
+    ids = values.astype("string").str.strip()
+    return ids.mask(ids.isna() | ids.eq("") | ids.str.lower().isin({"nan", "none", "<na>"}), pd.NA)
+
+
 def _intraday_outcome_coverage() -> dict[str, Any]:
-    """Distinguish intraday prediction logs from true 30-minute realised outcomes."""
+    """Audit recent matured 30-minute predictions, not every intraday horizon."""
     try:
         from prediction_ledger import load_records, load_validation_records
         preds = pd.DataFrame(load_records())
         vals = pd.DataFrame(load_validation_records())
         if preds.empty:
-            return {"status": "NO_INTRADAY_PREDICTIONS", "prediction_count": 0}
-        mode = preds.get("mode", pd.Series("", index=preds.index)).astype(str).str.lower()
-        horizon = preds.get("prediction_horizon", pd.Series("", index=preds.index)).astype(str).str.lower()
-        intraday = preds.loc[mode.eq("intraday") | horizon.isin({"30m", "30min", "30_minutes"})].copy()
+            return {
+                "status": "NO_30M_INTRADAY_PREDICTIONS",
+                "intraday_prediction_count": 0,
+                "accuracy_claim_allowed": False,
+            }
+
+        mode = preds.get("mode", pd.Series("", index=preds.index)).astype(str).str.strip().str.lower()
+        horizon = (
+            preds.get("prediction_horizon", pd.Series("", index=preds.index))
+            .astype(str).str.strip().str.lower().str.replace(r"\s+", "", regex=True)
+        )
+        is_30m = mode.eq("intraday") & horizon.isin({"30m", "30min", "30minutes"})
+        intraday = preds.loc[is_30m].copy()
         if intraday.empty:
-            return {"status": "NO_INTRADAY_PREDICTIONS", "prediction_count": 0}
+            return {
+                "status": "NO_30M_INTRADAY_PREDICTIONS",
+                "intraday_prediction_count": 0,
+                "other_intraday_rows_excluded": int((mode.eq("intraday")).sum()),
+                "accuracy_claim_allowed": False,
+                "note": "Only mode=Intraday records with a 30-minute horizon are eligible for this coverage check.",
+            }
+
+        now_ist = pd.Timestamp.now(tz=ZoneInfo("Asia/Kolkata"))
+        cutoff_date = now_ist.date() - timedelta(days=14)
+        targets = {idx: _intraday_target_timestamp(row) for idx, row in intraday.iterrows()}
+        known = {idx: target for idx, target in targets.items() if target is not None}
+        recent_matured = {
+            idx: target for idx, target in known.items()
+            if target <= now_ist and target.date() >= cutoff_date
+        }
+        future = {
+            idx: target for idx, target in known.items()
+            if target > now_ist
+        }
+        historical_outside_window = {
+            idx: target for idx, target in known.items()
+            if target.date() < cutoff_date
+        }
+        missing_target = set(targets) - set(known)
+
+        summary = {
+            "intraday_prediction_count": int(len(intraday)),
+            "prediction_ids_available": int(
+                _normalise_outcome_prediction_ids(intraday["prediction_id"]).nunique(dropna=True)
+                if "prediction_id" in intraday.columns else 0
+            ),
+            "lookback_start_date": cutoff_date.isoformat(),
+            "lookback_end_date": now_ist.date().isoformat(),
+            "target_timestamps_known": int(len(known)),
+            "recent_matured_target_count": int(len(recent_matured)),
+            "future_target_count": int(len(future)),
+            "historical_outside_lookback_count": int(len(historical_outside_window)),
+            "missing_target_timestamp_count": int(len(missing_target)),
+            "accuracy_claim_allowed": False,
+        }
+        if not recent_matured:
+            return {
+                **summary,
+                "status": "NO_RECENT_MATURED_30M_PREDICTIONS",
+                "validation_rows_matched_by_prediction_id": 0,
+                "matched_validated_rows": 0,
+                "validation_rows_with_target_aligned_outcomes": 0,
+                "realised_30m_fields_found_in_validation_ledger": [],
+                "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
+                "note": (
+                    "No 30-minute target in the current 14-calendar-day validation window has both "
+                    "matured and become eligible for outcome scoring. Future targets are waiting, "
+                    "and older targets are outside this live-coverage check; no accuracy score is inferred."
+                ),
+            }
+
         fields = {
             "realised_return": ["actual_return_30m", "actual_30m_return", "realized_return_30m", "realised_return_30m"],
             "realised_direction": ["actual_direction_30m", "actual_30m_direction", "realized_direction_30m", "realised_direction_30m"],
-            "validation_status": ["validation_status"],
         }
         available = {kind: [name for name in names if name in vals.columns] for kind, names in fields.items()}
-        ids = set(intraday.get("prediction_id", pd.Series(dtype=str)).dropna().astype(str))
-        matched = vals.loc[vals.get("prediction_id", pd.Series(index=vals.index, dtype=str)).astype(str).isin(ids)].copy() if not vals.empty and "prediction_id" in vals.columns else pd.DataFrame()
+        if "prediction_id" not in intraday.columns:
+            ids = set()
+        else:
+            scope_ids = _normalise_outcome_prediction_ids(intraday.loc[list(recent_matured), "prediction_id"])
+            ids = set(scope_ids.dropna().astype(str))
+        if not vals.empty and "prediction_id" in vals.columns:
+            val_ids = _normalise_outcome_prediction_ids(vals["prediction_id"])
+            matched = vals.loc[val_ids.isin(ids)].copy()
+        else:
+            matched = pd.DataFrame()
         validated = matched.iloc[0:0].copy()
         if not matched.empty and "validation_status" in matched.columns:
             validated = matched.loc[
-                matched["validation_status"].astype(str).str.upper().eq("VALIDATED")
+                matched["validation_status"].astype(str).str.strip().str.upper().eq("VALIDATED")
             ].copy()
 
-        # Schema presence alone is not proof that a target-aligned outcome has
-        # been recorded. Require at least one matched VALIDATED row with an
-        # actual return or direction value populated.
         outcome_mask = pd.Series(False, index=validated.index)
         for column in available["realised_return"]:
             outcome_mask |= pd.to_numeric(validated[column], errors="coerce").notna()
         for column in available["realised_direction"]:
-            outcome_mask |= validated[column].astype(str).str.upper().isin({"UP", "DOWN", "FLAT"})
+            outcome_mask |= validated[column].astype(str).str.strip().str.upper().isin({"UP", "DOWN", "FLAT"})
         matured = validated.loc[outcome_mask].copy()
         target_outcome_available = not matured.empty
         return {
+            **summary,
             "status": "TARGET_ALIGNED_OUTCOMES_AVAILABLE" if target_outcome_available else "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR",
-            "intraday_prediction_count": int(len(intraday)),
-            "prediction_ids_available": int(len(ids)),
             "validation_rows_matched_by_prediction_id": int(len(matched)),
             "matched_validated_rows": int(len(validated)),
             "validation_rows_with_target_aligned_outcomes": int(len(matured)),
             "realised_30m_fields_found_in_validation_ledger": available["realised_return"] + available["realised_direction"],
             "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
-            "accuracy_claim_allowed": False,
             "note": (
-                "A 30-minute intraday score requires future 30-minute realised price outcomes matched to the exact prediction timestamp. "
-                "Delivery D+1 validation rows are not valid substitutes."
+                "Only recent matured 30-minute predictions are checked. A scored outcome requires "
+                "a matching prediction ID, VALIDATED status, and a populated 30-minute realised return "
+                "or direction. This coverage check does not itself prove predictive accuracy."
             ),
         }
     except Exception as exc:
@@ -511,8 +599,11 @@ def main() -> int:
         issues.append("The live Delivery accuracy diagnostic has no adequate quality-approved active-model outcome history.")
     if intraday.get("status") == "AUDIT_FAILED":
         issues.append("The certified intraday model manifest/target contract could not be verified.")
-    if intraday_outcomes.get("intraday_prediction_count", 0) and intraday_outcomes.get("status") == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR":
-        issues.append("Intraday predictions exist, but no target-aligned 30-minute realised-outcome validator was found in the validation ledger.")
+    if (
+        intraday_outcomes.get("recent_matured_target_count", 0) > 0
+        and intraday_outcomes.get("status") == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR"
+    ):
+        issues.append("Recent matured 30-minute Intraday predictions exist, but no target-aligned realised outcomes were found in the validation ledger.")
 
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
