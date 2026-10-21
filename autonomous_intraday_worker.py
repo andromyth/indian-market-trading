@@ -832,7 +832,10 @@ class AutonomousIntradayWorker:
         upload_result = store.upload_or_update(
             local_path, remote, mime_type="application/x-ndjson"
         )
-        if upload_result.get("status") != "OK":
+        upload_status = str(upload_result.get("status") or "").strip().lower()
+        # GoogleDriveStore's production contract returns "OK"; accept the
+        # explicit create/update success statuses used by compatible adapters.
+        if upload_status not in {"ok", "created", "updated"}:
             raise RuntimeError(
                 f"Drive minute snapshot upload was not confirmed: {upload_result}"
             )
@@ -844,10 +847,11 @@ class AutonomousIntradayWorker:
             remote_path=remote,
             snapshot_rows=len(rows),
             prediction_rows=prediction_count,
-            status=upload_result.get("status"),
+            status="OK",
+            upload_status=upload_status,
         )
         return {
-            "status": upload_result.get("status"),
+            "status": "OK",
             "remote_path": remote,
             "snapshot_rows": len(rows),
             "prediction_rows": prediction_count,
