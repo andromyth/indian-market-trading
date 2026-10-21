@@ -90,3 +90,44 @@ def test_daily_csv_view_selects_latest_revision_for_same_symbol_and_date() -> No
     sbin = latest.loc[latest["symbol"].eq("SBIN")].iloc[0]
     assert sbin["prediction_id"] == "new-revision"
     assert sbin["signal"] == "BUY"
+
+
+
+def test_validation_loader_exists_and_reads_jsonl(tmp_path, monkeypatch):
+    import json
+    import prediction_ledger as ledger
+    from pathlib import Path
+
+    monkeypatch.setattr(ledger, "__file__", str(tmp_path / "prediction_ledger.py"))
+    path = tmp_path / "data" / "prediction_ledger" / "prediction_validation.jsonl"
+    path.parent.mkdir(parents=True)
+    rows = [
+        {"prediction_id": "p-1", "validation_status": "VALIDATED"},
+        {"prediction_id": "p-2", "validation_status": "WAITING"},
+    ]
+    path.write_text("".join(json.dumps(row) + "\\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(ledger, "_drive_file_bytes", lambda _remote: None)
+
+    assert ledger.load_validation_records() == rows
+
+
+def test_save_validation_results_deduplicates_by_prediction_id(tmp_path, monkeypatch):
+    import json
+    import prediction_ledger as ledger
+
+    monkeypatch.setattr(ledger, "__file__", str(tmp_path / "prediction_ledger.py"))
+    monkeypatch.setattr(ledger, "_utc_timestamp", lambda: "2026-10-21T00:00:00+00:00")
+    monkeypatch.setattr(ledger, "_drive_file_bytes", lambda _remote: None)
+    rows = [
+        {"prediction_id": "p-1", "validation_status": "WAITING"},
+        {"prediction_id": "p-1", "validation_status": "VALIDATED", "actual_direction_d1": "UP"},
+        {"prediction_id": "p-2", "validation_status": "VALIDATED", "actual_direction_d1": "DOWN"},
+    ]
+
+    result = ledger.save_validation_results(rows, sync_drive=False)
+    assert result["status"] == "SAVED"
+    assert result["rows"] == 2
+    loaded = ledger.load_validation_records()
+    latest = {row["prediction_id"]: row for row in loaded}
+    assert latest["p-1"]["validation_status"] == "VALIDATED"
+    assert latest["p-2"]["actual_direction_d1"] == "DOWN"
