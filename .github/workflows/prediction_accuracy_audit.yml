@@ -140,3 +140,33 @@ jobs:
           path: accuracy-audit/**
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Fail if either audit component reported an error
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          reports = [
+              ("Delivery live health", Path("accuracy-audit/delivery_audit_exit.json")),
+              ("Autonomous Intraday outcomes", Path("accuracy-audit/intraday_audit_exit.json")),
+          ]
+          failures = []
+          for label, path in reports:
+              if not path.exists():
+                  failures.append(f"{label}: exit report missing ({path})")
+                  continue
+              try:
+                  report = json.loads(path.read_text(encoding="utf-8"))
+                  exit_code = int(report.get("exit_code", 1))
+              except Exception as exc:
+                  failures.append(f"{label}: invalid exit report ({type(exc).__name__}: {exc})")
+                  continue
+              if exit_code != 0:
+                  failures.append(f"{label}: exit code {exit_code}")
+
+          if failures:
+              raise SystemExit("Accuracy audit failure after artifact upload: " + "; ".join(failures))
+          print("All accuracy audit components passed.")
+          PY
