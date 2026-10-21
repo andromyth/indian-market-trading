@@ -339,22 +339,42 @@ class AllNSEMinutePredictor:
                 for offset in range(0, len(entries), HISTORY_BATCH_SIZE):
                     batch = entries[offset:offset + HISTORY_BATCH_SIZE]
                     code_list = [code for _, code in batch]
-                    body = _request(
-                        "GET",
-                        "/market/historical/1minute",
-                        params={
-                            "scrip-codes": ",".join(code_list),
-                            "start_time": start_ms,
-                            "end_time": end_ms,
-                        },
-                    ).json()
-                    requests_made += 1
-                    success = isinstance(body, dict) and (
-                        body.get("success") is True
-                        or str(body.get("status") or "").strip().lower() == "success"
-                    )
-                    if not success:
+                    body = None
+                    batch_error = None
+                    for attempt in range(3):
+                        try:
+                            body = _request(
+                                "GET",
+                                "/market/historical/1minute",
+                                params={
+                                    "scrip-codes": ",".join(code_list),
+                                    "start_time": start_ms,
+                                    "end_time": end_ms,
+                                },
+                            ).json()
+                            requests_made += 1
+                            success = isinstance(body, dict) and (
+                                body.get("success") is True
+                                or str(body.get("status") or "").strip().lower() == "success"
+                            )
+                            if not success:
+                                raise RuntimeError("historical API response did not report success")
+                            batch_error = None
+                            break
+                        except Exception as exc:
+                            batch_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                            if attempt < 2:
+                                # Honor the provider's five-request/second limit and
+                                # back off if a transient 429/5xx occurs.
+                                time.sleep(0.6 * (attempt + 1))
+                    if batch_error:
                         batch_errors += 1
+                        self._log(
+                            "all_nse_history_batch_failed",
+                            batch_index=offset // HISTORY_BATCH_SIZE + 1,
+                            batch_size=len(batch),
+                            error=batch_error,
+                        )
                     else:
                         data = body.get("data") or {}
                         for symbol, code in batch:
