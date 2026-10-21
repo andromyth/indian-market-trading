@@ -20,6 +20,7 @@ from typing import Any
 import pandas as pd
 
 from autonomous_intraday_worker import AutonomousIntradayWorker, _clean_json, _log
+from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 from market_session_guard import IST
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -48,12 +49,18 @@ WORKER = AutonomousIntradayWorker(
     root=WORKER_ROOT,
 )
 
+# Separate pooled ALL-NSE inference path; the existing news watchlist remains unchanged.
+ALL_NSE_MINUTE_PREDICTOR = AllNSEMinutePredictor(WORKER_ROOT)
+
 
 def _record_tick_result(result: dict[str, Any]) -> None:
     status = str(result.get("status", "")).upper()
     capture = result.get("all_universe_capture") or {}
     capture_status = str(capture.get("status") or "NOT_RUN").upper()
     capture_error = capture.get("error")
+    all_nse = result.get("all_nse_minute_predictions") or {}
+    all_nse_status = str(all_nse.get("status") or "NOT_RUN").upper()
+    all_nse_error = all_nse.get("error")
     with STATE_LOCK:
         previous_capture_issues = {
             STATE.get("all_universe_capture_error"),
@@ -62,6 +69,23 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         STATE["last_tick_at_utc"] = datetime.now(timezone.utc).isoformat()
         STATE["last_tick_result"] = _clean_json(result)
         STATE["all_universe_capture_status"] = capture_status
+        STATE["all_nse_minute_prediction_status"] = all_nse_status
+        STATE["all_nse_minute_prediction_last_result"] = _clean_json({
+            key: all_nse.get(key)
+            for key in (
+                "cycle_minute_ist", "expected_symbol_count", "prediction_count",
+                "missing_quote_count", "data_limited_count", "history_ready",
+                "history_status", "remote_path", "manifest_drive_path",
+                "quality_gate_pass", "status", "error",
+            )
+            if key in all_nse
+        })
+        if all_nse_status not in {"OK", "NOT_RUN"}:
+            STATE["all_nse_minute_prediction_error"] = str(
+                all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
+            )
+        else:
+            STATE["all_nse_minute_prediction_error"] = None
         STATE["all_universe_capture_last_result"] = _clean_json({
             key: capture.get(key)
             for key in (
@@ -223,6 +247,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 or capture_status not in {"OK", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "NOT_RUN"}
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
@@ -232,6 +257,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
             "all_universe_capture_status": capture_status,
             "all_universe_capture": status.get("all_universe_capture_last_result"),
             "all_universe_capture_warning": capture_warning,
+            "all_nse_minute_prediction_status": status.get("all_nse_minute_prediction_status", "NOT_RUN"),
+            "all_nse_minute_prediction": status.get("all_nse_minute_prediction_last_result"),
+            "all_nse_minute_prediction_error": status.get("all_nse_minute_prediction_error"),
             "nse_time_ist": status.get("nse_time_ist"),
             "tick_interval_seconds": status.get("tick_interval_seconds"),
         }
@@ -283,6 +311,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self.rfile.read(min(length, 4096))
 
             result = WORKER.tick_once()
+            # Reuse this minute's all-universe real-time quote snapshot for a
+            # separate pooled-model prediction for every official NSE symbol.
+            try:
+                prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
+                    result.get("all_universe_capture") or {},
+                    WORKER.root,
+                )
+                result["all_nse_minute_predictions"] = prediction_capture
+            except Exception as prediction_exc:
+                prediction_error = f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
+                result["all_nse_minute_predictions"] = {
+                    "status": "ERROR",
+                    "error": prediction_error,
+                }
+                _log("all_nse_minute_prediction_capture_failed", error=prediction_error)
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result)
             # A tick completed even if one symbol/source failed; errors are
