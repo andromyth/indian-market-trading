@@ -40,6 +40,10 @@ jobs:
             echo "ERROR: Cloud Run service URL is missing."
             exit 1
           fi
+          echo "SERVICE_URL=$SERVICE_URL"
+          TARGET_URI="$(gcloud scheduler jobs describe intraday-worker-0915-0959 --project="$PROJECT_ID" --location="$REGION" --format="value(httpTarget.uri)")"
+          echo "SCHEDULER_TARGET_URI=$TARGET_URI"
+          gcloud run services get-iam-policy "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="yaml(bindings)" || true
           TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
@@ -52,6 +56,12 @@ jobs:
               exit 1
             }
           echo "HEALTH_HTTP_STATUS=$HTTP_CODE"
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "503" ]]; then
+            echo "HEALTH_RESPONSE_BODY_BEGIN"
+            head -c 1200 "$RESPONSE" || true
+            echo
+            echo "HEALTH_RESPONSE_BODY_END"
+          fi
           python - "$RESPONSE" "$HTTP_CODE" <<'PY'
           import datetime as dt
           import json
