@@ -113,19 +113,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Preserve private invoker settings and service accounts; alter only cadence/deadline.
-          gcloud scheduler jobs update http intraday-worker-0915-0959 \
-            --project="$PROJECT_ID" --location="$REGION" \
-            --schedule="15-55/5 9 * * 1-5" --time-zone="Asia/Kolkata" \
-            --attempt-deadline=300s --max-retry-attempts=0
-          gcloud scheduler jobs update http intraday-worker-1000-1459 \
-            --project="$PROJECT_ID" --location="$REGION" \
-            --schedule="*/5 10-14 * * 1-5" --time-zone="Asia/Kolkata" \
-            --attempt-deadline=300s --max-retry-attempts=0
-          gcloud scheduler jobs update http intraday-worker-1500-1530 \
-            --project="$PROJECT_ID" --location="$REGION" \
-            --schedule="0-25/5 15 * * 1-5" --time-zone="Asia/Kolkata" \
-            --attempt-deadline=300s --max-retry-attempts=0
+          # Patch only schedule metadata. Do not send httpTarget/oidcToken back
+          # to the API: that would require iam.serviceAccounts.actAs for the
+          # existing Scheduler identity, which this deploy identity must not alter.
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          patch_schedule() {
+            local job="$1"
+            local schedule="$2"
+            local name="projects/$PROJECT_ID/locations/$REGION/jobs/$job"
+            local payload
+            payload="$(python - "$name" "$schedule" <<'PY'
+          import json, sys
+          name, schedule = sys.argv[1:]
+          print(json.dumps({
+              "name": name,
+              "schedule": schedule,
+              "timeZone": "Asia/Kolkata",
+              "attemptDeadline": "300s",
+          }))
+          PY
+          )"
+            curl --fail-with-body --silent --show-error --request PATCH \
+              --header "Authorization: Bearer $ACCESS_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$payload" \
+              "https://cloudscheduler.googleapis.com/v1/$name?updateMask=schedule,timeZone,attemptDeadline" \
+              >/dev/null
+          }
+          patch_schedule "intraday-worker-0915-0959" "15-55/5 9 * * 1-5"
+          patch_schedule "intraday-worker-1000-1459" "*/5 10-14 * * 1-5"
+          patch_schedule "intraday-worker-1500-1530" "0-25/5 15 * * 1-5"
 
           verify_schedule() {
             job="$1"; expected="$2"
