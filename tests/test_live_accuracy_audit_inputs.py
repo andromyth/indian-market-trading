@@ -235,8 +235,8 @@ def test_intraday_coverage_does_not_block_on_future_targets(monkeypatch):
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
-        "decision_timestamp": "2026-10-22T10:00:00+05:30",
-        "signal_horizon_end": "2026-10-22T10:30:00+05:30",
+        "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(hours=1)).isoformat(),
+        "signal_horizon_end": (pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(hours=1, minutes=30)).isoformat(),
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [])
 

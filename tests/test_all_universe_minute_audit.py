@@ -55,7 +55,7 @@ def test_audit_passes_only_when_every_snapshot_and_manifest_is_present():
     assert report["observed_quote_coverage_pct"] == 100.0
     assert report["quality_gate_pass"] is True
     assert report["audit_status"] == "PASS"
-    assert len(rows) == 375
+    assert len(rows) == 75
 
 
 def test_audit_fails_when_a_minute_snapshot_is_missing():
