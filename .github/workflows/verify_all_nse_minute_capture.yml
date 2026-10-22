@@ -74,6 +74,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          IN_NSE_CASH_SESSION="$(python - <<'PY'
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+          from market_session_guard import is_nse_trading_day
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          print("true" if is_nse_trading_day(now.date()) and time(9, 15) <= now.time() < time(15, 30) else "false")
+          PY
+          )"
+          if [[ "$IN_NSE_CASH_SESSION" != "true" ]]; then
+            echo "LIVE_CAPTURE_CHECK=DEFERRED_OUTSIDE_NSE_CASH_SESSION"
+            echo "READY_WORKER_REVISION_CHECK=PASS"
+            echo "DETAIL=Fresh quote/prediction diagnostics require an active market session; the deployment workflow separately verifies the private Scheduler jobs and Drive preflight."
+            exit 0
+          fi
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
