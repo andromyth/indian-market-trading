@@ -17,6 +17,7 @@ on:
       - ".github/workflows/verify_minute_prediction_persistence.yml"
       - "autonomous_intraday_worker.py"
       - "all_universe_minute_capture.py"
+      - "all_nse_minute_prediction_capture.py"
       - "audit_all_universe_minute_snapshots.py"
       - "verify_minute_prediction_persistence.py"
       - "tests/test_all_universe_minute_audit.py"
@@ -127,8 +128,8 @@ jobs:
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           day = now.date()
           # Before today's open, audit the last completed session. During the
-          # session, audit only completed minute slots from today. After close,
-          # today's full 375-minute session is eligible for strict validation.
+          # session, audit only completed five-minute capture slots from today.
+          # After close, all 75 scheduled slots are eligible for strict validation.
           if is_nse_trading_day(day) and now.time() < time(9, 15):
               day -= timedelta(days=1)
           while not is_nse_trading_day(day):
@@ -169,12 +170,17 @@ jobs:
           output = Path("/tmp/all-universe-minute-audit.log").read_text(encoding="utf-8")
           report = json.loads(output)
           keys = (
-              "session_date", "nse_trading_day", "expected_minutes",
-              "snapshot_files_present", "missing_snapshot_minutes",
+              "session_date", "nse_trading_day", "capture_interval_minutes",
+              "expected_minutes", "snapshot_files_present", "missing_snapshot_minutes",
               "minute_manifests_present", "missing_manifest_minutes",
               "capture_status_counts", "total_expected_symbol_minutes",
               "total_quoted_symbol_minutes", "total_missing_quote_rows",
               "observed_quote_coverage_pct", "matched_outcomes",
+              "prediction_expected_slots", "prediction_files_present",
+              "missing_prediction_minutes", "prediction_manifests_present",
+              "missing_prediction_manifest_minutes", "prediction_row_count_failures",
+              "prediction_model_quality_failures", "total_persisted_prediction_rows",
+              "total_model_prediction_count", "prediction_quality_gate_pass",
               "quality_gate_pass", "audit_status",
               "drive_json_write", "drive_csv_write",
           )

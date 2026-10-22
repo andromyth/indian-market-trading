@@ -979,9 +979,11 @@ class AllNSEMinutePredictor:
         manifest = {
             "audit_name": "all-nse-minute-prediction-actual-capture",
             "schema_version": "all-nse-minute-prediction-v1",
+            "capture_interval_minutes": 5,
             "cycle_minute_ist": minute.isoformat(),
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "expected_symbol_count": len(symbols),
+            "row_count": len(records),
             "actual_quote_count": len(records) - missing_quotes,
             "missing_quote_count": missing_quotes,
             "prediction_count": prediction_count,

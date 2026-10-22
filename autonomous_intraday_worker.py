@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Unattended NSE intraday watchlist collector and prediction worker.
 
-The worker runs independently of Streamlit, polls during the NSE cash session,
-persists 1-minute watchlist bars to a dedicated Drive namespace, runs the saved
-Beta V2 horizon models, and appends prediction/health records to a Drive ledger.
+The worker runs independently of Streamlit and is invoked by Cloud Scheduler
+during the NSE cash session. It persists intraday bars and prediction snapshots
+to Drive. Full-universe actual-price and pooled-prediction snapshots are captured
+on five-minute session anchors, separately from the dynamic news watchlist.
 
-It scores the dynamic news-derived watchlist (top 5 by default), not thousands
-of securities every minute. The existing nse_intraday_sync.yml job retains
-ownership of the separate hourly full-universe archive.
+The worker does not place orders and never fabricates missing market values.
 """
 from __future__ import annotations
 
@@ -34,12 +33,29 @@ DEFAULT_ROOT = Path("data/autonomous_intraday")
 FLUSH_EVERY_DEFAULT = 5
 WATCHLIST_REFRESH_SECONDS_DEFAULT = 15 * 60
 MAX_DATA_AGE_SECONDS = 5 * 60
+ALL_NSE_CAPTURE_INTERVAL_MINUTES = 5
 SEGMENT_STOP = {
     "morning": time(12, 15),
     "afternoon": time(15, 30),
     "once": time(15, 30),
     "service": time(15, 30),
 }
+
+
+def is_all_nse_capture_slot(value: datetime | pd.Timestamp) -> bool:
+    """Return True only for five-minute NSE cash-session anchors.
+
+    Slots are 09:15, 09:20, ..., 15:25 Asia/Kolkata. An off-schedule/manual
+    /tick probe may still refresh the small watchlist, but must not trigger a
+    costly full-universe quote plus prediction capture.
+    """
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+    local = stamp.to_pydatetime()
+    if not is_nse_trading_day(local.date()) or not (OPEN <= local.time() < CLOSE):
+        return False
+    elapsed_minutes = local.hour * 60 + local.minute - (OPEN.hour * 60 + OPEN.minute)
+    return elapsed_minutes >= 0 and elapsed_minutes % ALL_NSE_CAPTURE_INTERVAL_MINUTES == 0
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -1347,8 +1363,8 @@ class AutonomousIntradayWorker:
             _log("minute_tick_failed", minute=minute_key, error=error)
 
         # Save the compact prediction + contemporaneous actual-price snapshot on
-        # every minute tick. The larger bars and append-only daily ledger remain
-        # batched to control Drive writes.
+        # every scheduled worker tick. The larger bars and append-only daily
+        # ledger remain batched to control Drive writes.
         if self.last_minute_snapshot_rows:
             try:
                 snapshot_result = self._persist_minute_snapshot(now, result)
@@ -1363,45 +1379,50 @@ class AutonomousIntradayWorker:
                 self.run_status = "PERSISTENCE_ERROR"
                 _log("minute_snapshot_persist_failed", minute=minute_key, error=error)
 
-        # Capture current market quotes for the full official NSE equity
-        # universe independently of the smaller news-selected prediction watchlist.
-        # The separate manifest reports coverage gaps and Drive persistence errors.
-        try:
-            from all_universe_minute_capture import capture_all_universe_minute_snapshot
+        # Capture current market quotes and pooled-model predictions for the
+        # official NSE equity universe only on five-minute session anchors.
+        # All quote-observation timestamps remain the actual collection times.
+        if is_all_nse_capture_slot(now):
+            try:
+                from all_universe_minute_capture import capture_all_universe_minute_snapshot
 
-            # Use the actual capture start time, not the tick-start time:
-            # the model/watchlist cycle can cross a minute boundary.
-            capture_now = pd.Timestamp.now(tz=IST)
-            all_universe_capture = capture_all_universe_minute_snapshot(
-                now=capture_now,
-                worker_root=self.root,
-                daily_ledger=self.daily_ledger,
-                prediction_snapshots=self.last_minute_snapshot_rows,
-            )
-            result["all_universe_capture"] = all_universe_capture
-            if all_universe_capture.get("status") != "OK":
-                _log(
-                    "all_universe_minute_capture_degraded",
-                    minute=minute_key,
-                    capture_status=all_universe_capture.get("status"),
-                    expected_symbol_count=all_universe_capture.get("expected_symbol_count"),
-                    quoted_symbol_count=all_universe_capture.get("quoted_symbol_count"),
-                    missing_quote_count=all_universe_capture.get("missing_quote_count"),
-                    snapshot_drive_path=all_universe_capture.get("snapshot_drive_path"),
-                    error=all_universe_capture.get("error"),
+                all_universe_capture = capture_all_universe_minute_snapshot(
+                    now=now.floor("min"),
+                    worker_root=self.root,
+                    daily_ledger=self.daily_ledger,
+                    prediction_snapshots=self.last_minute_snapshot_rows,
                 )
-        except Exception as exc:
-            capture_error = f"{type(exc).__name__}: {exc}"
+                result["all_universe_capture"] = all_universe_capture
+                if all_universe_capture.get("status") != "OK":
+                    _log(
+                        "all_universe_minute_capture_degraded",
+                        minute=minute_key,
+                        capture_status=all_universe_capture.get("status"),
+                        expected_symbol_count=all_universe_capture.get("expected_symbol_count"),
+                        quoted_symbol_count=all_universe_capture.get("quoted_symbol_count"),
+                        missing_quote_count=all_universe_capture.get("missing_quote_count"),
+                        snapshot_drive_path=all_universe_capture.get("snapshot_drive_path"),
+                        error=all_universe_capture.get("error"),
+                    )
+            except Exception as exc:
+                capture_error = f"{type(exc).__name__}: {exc}"
+                result["all_universe_capture"] = {
+                    "status": "ERROR",
+                    "error": capture_error,
+                    "cycle_minute_ist": minute_key,
+                }
+                _log(
+                    "all_universe_minute_capture_failed",
+                    minute=minute_key,
+                    error=capture_error,
+                )
+        else:
             result["all_universe_capture"] = {
-                "status": "ERROR",
-                "error": capture_error,
+                "status": "NOT_SCHEDULED",
                 "cycle_minute_ist": minute_key,
+                "capture_interval_minutes": ALL_NSE_CAPTURE_INTERVAL_MINUTES,
+                "reason": "Full-NSE capture runs only on five-minute session anchors.",
             }
-            _log(
-                "all_universe_minute_capture_failed",
-                minute=minute_key,
-                error=capture_error,
-            )
 
         # Persist immediately on any degraded tick so failed inference rows and
         # their health status survive even when the scheduler runs a one-off tick.

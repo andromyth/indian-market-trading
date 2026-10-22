@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from persistent_store import GoogleDriveStore, drive_status
 
 IST = ZoneInfo("Asia/Kolkata")
+WORKER_SNAPSHOT_INTERVAL_MINUTES = 5
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
@@ -167,11 +168,17 @@ def _read_jsonl(store: GoogleDriveStore, file_meta: dict, max_bytes: int = 30_00
 def _required_prediction_snapshot_keys(
     expected_keys: list[str], session_date: date
 ) -> tuple[list[str], str]:
-    """Forecast snapshots start at 09:31: the 09:30 candle completes at 09:31."""
+    """Require pooled forecasts after warm-up, aligned to five-minute snapshot slots."""
     from market_session_guard import OPEN
 
+    warmup_minutes = 16
+    aligned_warmup_minutes = (
+        (warmup_minutes + WORKER_SNAPSHOT_INTERVAL_MINUTES - 1)
+        // WORKER_SNAPSHOT_INTERVAL_MINUTES
+    ) * WORKER_SNAPSHOT_INTERVAL_MINUTES
     first_forecast_minute = (
-        datetime.combine(session_date, OPEN, tzinfo=IST) + timedelta(minutes=16)
+        datetime.combine(session_date, OPEN, tzinfo=IST)
+        + timedelta(minutes=aligned_warmup_minutes)
     )
     first_forecast_key = first_forecast_minute.strftime("%Y%m%d_%H%M")
     return [key for key in expected_keys if key >= first_forecast_key], first_forecast_key
@@ -203,14 +210,18 @@ def _snapshot_summary(
     expected_keys: list[str] = []
     if is_nse_trading_day(session_date):
         start = datetime.combine(session_date, OPEN, tzinfo=IST)
-        end = datetime.combine(session_date, time(CLOSE.hour, CLOSE.minute - 1), tzinfo=IST)
+        end = datetime.combine(
+            session_date,
+            time(CLOSE.hour, CLOSE.minute - WORKER_SNAPSHOT_INTERVAL_MINUTES),
+            tzinfo=IST,
+        )
         if session_date == now_ist.date():
             last_completed_minute = now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)
             end = min(end, last_completed_minute)
         cursor = start
         while cursor <= end:
             expected_keys.append(cursor.strftime("%Y%m%d_%H%M"))
-            cursor += timedelta(minutes=1)
+            cursor += timedelta(minutes=WORKER_SNAPSHOT_INTERVAL_MINUTES)
 
     missing = [key for key in expected_keys if not by_minute.get(key)]
     duplicates = [key for key in expected_keys if len(by_minute.get(key, [])) > 1]
@@ -551,7 +562,7 @@ def main() -> int:
     watch_fresh = (
         today_watch.get("file_count_today", 0) > 0
         and (today_watch.get("latest_file_timestamp_age_minutes") is not None)
-        and today_watch.get("latest_file_timestamp_age_minutes") <= 5
+        and today_watch.get("latest_file_timestamp_age_minutes") <= 7
     )
     watch_actual = today_watch.get("recent_5_snapshot_files_actual_rows", 0) > 0
     watch_predictions = today_watch.get("recent_5_snapshot_files_prediction_rows", 0) > 0
@@ -561,7 +572,7 @@ def main() -> int:
         and today_universe.get("latest_manifest") is not None
         and today_universe["latest_manifest"].get("status") == "OK"
         and _age_minutes(today_universe["latest_manifest"].get("cycle_minute_ist"), now_utc) is not None
-        and _age_minutes(today_universe["latest_manifest"].get("cycle_minute_ist"), now_utc) <= 5
+        and _age_minutes(today_universe["latest_manifest"].get("cycle_minute_ist"), now_utc) <= 7
     )
     current_actual_matched = int(global_manifest.get("matched_outcome_count") or 0) if global_manifest.get("exists") else 0
     historic_validated = max(

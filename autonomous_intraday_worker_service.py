@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Private Cloud Run endpoint for scheduled, unattended NSE intraday ticks.
 
-Cloud Scheduler sends one authenticated POST to /tick per minute during NSE
-cash hours. The in-process worker object and model cache are reused while the
-Cloud Run instance is warm; duplicate requests in the same minute are ignored.
+Cloud Scheduler sends one authenticated POST to /tick every five minutes during
+NSE cash hours. The in-process worker and pooled-model cache are reused while
+the Cloud Run instance is warm; duplicate requests in the same minute are ignored.
 No browser, Streamlit process, order placement, or background CPU loop is used.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from market_session_guard import IST
 PORT = int(os.getenv("PORT", "8080"))
 WORKER_ROOT = Path(os.getenv("AUTONOMOUS_INTRADAY_ROOT", "/tmp/autonomous_intraday"))
 MAX_STOCKS = int(os.getenv("AUTONOMOUS_INTRADAY_MAX_STOCKS", "5"))
-POLL_SECONDS = max(10, int(os.getenv("AUTONOMOUS_INTRADAY_INTERVAL_SECONDS", "60")))
+POLL_SECONDS = max(10, int(os.getenv("AUTONOMOUS_INTRADAY_INTERVAL_SECONDS", "300")))
 
 TICK_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
@@ -62,6 +62,20 @@ def _record_tick_result(result: dict[str, Any]) -> None:
     all_nse_status = str(all_nse.get("status") or "NOT_RUN").upper()
     all_nse_error = all_nse.get("error")
     with STATE_LOCK:
+        # Off-cadence/manual /tick requests still update the watchlist, but must
+        # not erase the latest scheduled full-universe capture result.
+        if capture_status == "NOT_SCHEDULED":
+            capture = STATE.get("all_universe_capture_last_result") or {}
+            capture_status = str(
+                STATE.get("all_universe_capture_status") or capture.get("status") or "NOT_RUN"
+            ).upper()
+            capture_error = STATE.get("all_universe_capture_error")
+        if all_nse_status == "NOT_SCHEDULED":
+            all_nse = STATE.get("all_nse_minute_prediction_last_result") or {}
+            all_nse_status = str(
+                STATE.get("all_nse_minute_prediction_status") or all_nse.get("status") or "NOT_RUN"
+            ).upper()
+            all_nse_error = STATE.get("all_nse_minute_prediction_error")
         previous_capture_issues = {
             STATE.get("all_universe_capture_error"),
             STATE.get("all_universe_capture_warning"),
@@ -191,8 +205,8 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             reasons.append("Google Drive read/write preflight is not ready")
         if item_status != "OK":
             reasons.append(f"latest full-universe quote snapshot status is {item_status}")
-        if age is None or age < 0 or age > 180:
-            reasons.append("latest full-universe quote snapshot is missing or older than 180 seconds")
+        if age is None or age < 0 or age > 420:
+            reasons.append("latest full-universe quote snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
         if expected is None or int(expected or 0) <= 0:
             reasons.append("official NSE universe count is missing or zero")
         elif row_count is None or int(row_count) != int(expected):
@@ -234,8 +248,8 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             reasons.append("Google Drive read/write preflight is not ready")
         if item_status != "OK":
             reasons.append(f"latest all-NSE prediction snapshot status is {item_status}")
-        if age is None or age < 0 or age > 180:
-            reasons.append("latest prediction snapshot is missing or older than 180 seconds")
+        if age is None or age < 0 or age > 420:
+            reasons.append("latest prediction snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
         if expected is None or int(expected or 0) <= 0:
             reasons.append("expected NSE universe count is missing or zero")
         elif row_count is None or int(row_count) != int(expected):
@@ -429,21 +443,28 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self.rfile.read(min(length, 4096))
 
             result = WORKER.tick_once()
-            # Reuse this minute's all-universe real-time quote snapshot for a
-            # separate pooled-model prediction for every official NSE symbol.
-            try:
-                prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
-                    result.get("all_universe_capture") or {},
-                    WORKER.root,
-                )
-                result["all_nse_minute_predictions"] = prediction_capture
-            except Exception as prediction_exc:
-                prediction_error = f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
+            # Run pooled all-NSE inference only when the full-universe quote
+            # capture actually ran on a scheduled five-minute slot.
+            capture_result = result.get("all_universe_capture") or {}
+            if capture_result.get("status") == "NOT_SCHEDULED":
                 result["all_nse_minute_predictions"] = {
-                    "status": "ERROR",
-                    "error": prediction_error,
+                    "status": "NOT_SCHEDULED",
+                    "reason": "Full-NSE prediction snapshots are written on five-minute capture slots only.",
                 }
-                _log("all_nse_minute_prediction_capture_failed", error=prediction_error)
+            else:
+                try:
+                    prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
+                        capture_result,
+                        WORKER.root,
+                    )
+                    result["all_nse_minute_predictions"] = prediction_capture
+                except Exception as prediction_exc:
+                    prediction_error = f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
+                    result["all_nse_minute_predictions"] = {
+                        "status": "ERROR",
+                        "error": prediction_error,
+                    }
+                    _log("all_nse_minute_prediction_capture_failed", error=prediction_error)
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result)
             # A tick completed even if one symbol/source failed; errors are

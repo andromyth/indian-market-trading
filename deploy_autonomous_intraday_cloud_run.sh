@@ -137,12 +137,13 @@ gcloud run deploy "$SERVICE_NAME" \
   --port 8080 \
   --cpu 1 \
   --memory 2Gi \
-  --min 0 \
+  --min 1 \
   --max 1 \
+  --no-cpu-throttling \
   --concurrency 1 \
   --timeout 300 \
   --no-allow-unauthenticated \
-  --set-env-vars "AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=60,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+  --set-env-vars "AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
   --set-secrets "$secrets_arg"
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" \
@@ -189,7 +190,7 @@ upsert_scheduler_job() {
     --http-method POST
     --oidc-service-account-email "$SCHEDULER_SA"
     --oidc-token-audience "$SERVICE_URL"
-    --attempt-deadline 180s
+    --attempt-deadline 300s
     --max-retry-attempts 0
   )
 
@@ -204,21 +205,21 @@ upsert_scheduler_job() {
 
 upsert_scheduler_job \
   "intraday-worker-0915-0959" \
-  "15-59 9 * * 1-5" \
-  "Indian Market intraday worker, 09:15-09:59 Asia/Kolkata"
+  "15-55/5 9 * * 1-5" \
+  "Indian Market intraday worker, every 5 minutes from 09:15 to 09:55 Asia/Kolkata"
 upsert_scheduler_job \
   "intraday-worker-1000-1459" \
-  "* 10-14 * * 1-5" \
-  "Indian Market intraday worker, 10:00-14:59 Asia/Kolkata"
+  "*/5 10-14 * * 1-5" \
+  "Indian Market intraday worker, every 5 minutes from 10:00 to 14:55 Asia/Kolkata"
 upsert_scheduler_job \
   "intraday-worker-1500-1530" \
-  "0-30 15 * * 1-5" \
-  "Indian Market intraday worker, 15:00-15:30 Asia/Kolkata"
+  "0-25/5 15 * * 1-5" \
+  "Indian Market intraday worker, every 5 minutes from 15:00 to 15:25 Asia/Kolkata"
 
 echo
 echo "Cloud Run service deployed: $SERVICE_URL"
 echo "Cloud Scheduler jobs configured in timezone Asia/Kolkata:"
-echo "  09:15-09:59, 10:00-14:59, 15:00-15:30 on weekdays."
+echo "  Every 5 minutes from 09:15 through 15:25 on weekdays (75 slots/session)."
 echo "NSE holiday/session guards run inside the worker; weekends and holidays do not fetch/predict."
 echo "Check Cloud Run logs for google_drive_preflight, cloud_run_worker_api_started,"
 echo "minute_tick_started, intraday_prediction_completed, and drive_flush_completed."

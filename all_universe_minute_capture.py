@@ -407,6 +407,7 @@ def capture_all_universe_minute_snapshot(
     )
     manifest: dict[str, Any] = {
         "schema_version": "all-universe-minute-snapshot-v1",
+        "capture_interval_minutes": 5,
         "cycle_minute_ist": cycle_minute.isoformat(),
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "INDSTOCKS_BATCH_QUOTE",

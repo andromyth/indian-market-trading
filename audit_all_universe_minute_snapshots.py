@@ -19,20 +19,22 @@ REMOTE_ROOT = "production_data/all_universe_minute_snapshots"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SNAPSHOT_PREFIX = "snapshot_"
 MANIFEST_PREFIX = "manifest_"
+CAPTURE_INTERVAL_MINUTES = 5
+PREDICTION_ROOT = "production_data/all_nse_minute_predictions"
 
 
 def expected_minutes(
     session_date: date, *, as_of: datetime | pd.Timestamp | None = None
 ) -> list[str]:
-    """Return expected session minutes through the latest completed minute.
+    """Return expected five-minute capture slots through the latest completed slot.
 
-    Historical sessions (or a session after its close) require all 375 minutes.
-    For a live session, do not mark future minutes as missing: evaluate only
-    minutes completed before the current minute. Before the open, return no
-    expected minutes so the caller can select the latest completed session.
+    A regular session has 75 scheduled slots: 09:15 through 15:25 IST.
+    For a live session, do not mark future slots as missing; evaluate only slots
+    whose scheduled minute has completed. Before the open, return no slots so the
+    caller can select the latest completed session.
     """
     start = datetime.combine(session_date, time(9, 15), tzinfo=IST)
-    end = datetime.combine(session_date, time(15, 29), tzinfo=IST)
+    end = datetime.combine(session_date, time(15, 25), tzinfo=IST)
     if as_of is not None:
         stamp = pd.Timestamp(as_of)
         stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
@@ -45,9 +47,9 @@ def expected_minutes(
             end = min(end, last_completed.to_pydatetime())
     if end < start:
         return []
-    count = int((end - start).total_seconds() // 60) + 1
+    count = int((end - start).total_seconds() // (60 * CAPTURE_INTERVAL_MINUTES)) + 1
     return [
-        (start + timedelta(minutes=offset)).strftime("%Y%m%d_%H%M")
+        (start + timedelta(minutes=offset * CAPTURE_INTERVAL_MINUTES)).strftime("%Y%m%d_%H%M")
         for offset in range(count)
     ]
 
@@ -268,6 +270,112 @@ def build_audit_report(
     return report, frame
 
 
+def build_prediction_audit(
+    expected: list[str],
+    files: list[dict[str, Any]],
+    manifest_loader,
+    *,
+    session_date: date,
+) -> dict[str, Any]:
+    """Validate each scheduled all-NSE prediction Parquet and its manifest."""
+    groups = _group_by_name(files)
+    first_prediction_key = (
+        datetime.combine(session_date, time(9, 15), tzinfo=IST) + timedelta(minutes=20)
+    ).strftime("%Y%m%d_%H%M")
+    missing_files: list[str] = []
+    missing_manifests: list[str] = []
+    corrupt_manifests: list[str] = []
+    duplicate_files = 0
+    duplicate_manifests = 0
+    row_count_failures: list[str] = []
+    model_quality_failures: list[str] = []
+    total_expected_rows = 0
+    total_persisted_rows = 0
+    total_predictions = 0
+    status_counts: dict[str, int] = {}
+
+    for key in expected:
+        snapshots = groups.get(f"predictions_{key}.parquet", [])
+        manifests = groups.get(f"manifest_{key}.json", [])
+        if not snapshots:
+            missing_files.append(key)
+        if not manifests:
+            missing_manifests.append(key)
+        duplicate_files += max(0, len(snapshots) - 1)
+        duplicate_manifests += max(0, len(manifests) - 1)
+        manifest: dict[str, Any] = {}
+        if manifests:
+            try:
+                manifest = manifest_loader(manifests[0]["id"])
+            except Exception:
+                corrupt_manifests.append(key)
+                continue
+        status = str(manifest.get("status") or ("MISSING_MANIFEST" if not manifests else "CORRUPT_MANIFEST"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        expected_symbols = manifest.get("expected_symbol_count")
+        row_count = manifest.get("row_count")
+        prediction_count = manifest.get("prediction_count")
+        try:
+            expected_int = int(expected_symbols)
+            row_count_int = int(row_count)
+        except (TypeError, ValueError):
+            expected_int = row_count_int = 0
+        total_expected_rows += expected_int
+        total_persisted_rows += row_count_int
+        try:
+            total_predictions += int(prediction_count or 0)
+        except (TypeError, ValueError):
+            pass
+        if expected_int <= 0 or row_count_int != expected_int:
+            row_count_failures.append(key)
+        if key < first_prediction_key:
+            continue  # Model history warm-up; the all-symbol rows must still be persisted.
+        quality_ok = (
+            status == "OK"
+            and manifest.get("quality_gate_pass") is True
+            and prediction_count is not None
+            and int(prediction_count or 0) == expected_int
+            and int(manifest.get("missing_quote_count") or 0) == 0
+            and int(manifest.get("data_limited_count") or 0) == 0
+            and int(manifest.get("untrained_symbol_count") or 0) == 0
+            and int(manifest.get("model_failure_count") or 0) == 0
+            and manifest.get("history_ready") is True
+            and int(manifest.get("history_seed_coverage_symbols") or 0) == expected_int
+            and int(manifest.get("history_seed_failed_batches") or 0) == 0
+        )
+        if not quality_ok:
+            model_quality_failures.append(key)
+
+    quality_gate_pass = bool(
+        len(expected) > 0
+        and len(missing_files) == 0
+        and len(missing_manifests) == 0
+        and duplicate_files == 0
+        and duplicate_manifests == 0
+        and len(corrupt_manifests) == 0
+        and len(row_count_failures) == 0
+        and len(model_quality_failures) == 0
+    )
+    return {
+        "prediction_expected_slots": len(expected),
+        "prediction_files_present": len(expected) - len(missing_files),
+        "missing_prediction_minutes": missing_files,
+        "prediction_manifests_present": len(expected) - len(missing_manifests),
+        "missing_prediction_manifest_minutes": missing_manifests,
+        "corrupt_prediction_manifest_minutes": corrupt_manifests,
+        "duplicate_prediction_files": duplicate_files,
+        "duplicate_prediction_manifests": duplicate_manifests,
+        "prediction_row_count_failures": row_count_failures,
+        "prediction_model_quality_failures": model_quality_failures,
+        "prediction_status_counts": status_counts,
+        "total_expected_prediction_symbol_rows": total_expected_rows,
+        "total_persisted_prediction_rows": total_persisted_rows,
+        "total_model_prediction_count": total_predictions,
+        "prediction_warmup_until": first_prediction_key,
+        "prediction_quality_gate_pass": quality_gate_pass,
+    }
+
+
 def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str, Any], pd.DataFrame]:
     from persistent_store import GoogleDriveStore
 
@@ -281,12 +389,34 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
     ]
     day_folder_id = _find_folder(store, day_parts)
     files = _list_children(store, day_folder_id) if day_folder_id else []
+    load_manifest = lambda file_id: _download_json(store, file_id)
+    as_of = datetime.now(IST)
     report, rows = build_audit_report(
         session_date,
         files,
-        lambda file_id: _download_json(store, file_id),
-        as_of=datetime.now(IST),
+        load_manifest,
+        as_of=as_of,
     )
+    prediction_day_parts = [
+        "production_data",
+        "all_nse_minute_predictions",
+        f"{session_date:%Y}",
+        f"{session_date:%m}",
+        f"{session_date:%d}",
+    ]
+    prediction_folder_id = _find_folder(store, prediction_day_parts)
+    prediction_files = _list_children(store, prediction_folder_id) if prediction_folder_id else []
+    prediction_report = build_prediction_audit(
+        expected_minutes(session_date, as_of=as_of),
+        prediction_files,
+        load_manifest,
+        session_date=session_date,
+    )
+    report.update(prediction_report)
+    report["quality_gate_pass"] = bool(
+        report.get("quality_gate_pass") and prediction_report["prediction_quality_gate_pass"]
+    )
+    report["audit_status"] = "PASS" if report["quality_gate_pass"] else "NEEDS_ATTENTION"
 
     output_dir = (
         Path("data")
@@ -340,7 +470,7 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Audit all-NSE-equity per-minute quote snapshots and Drive persistence."
+        description="Audit all-NSE-equity five-minute quote and prediction snapshots plus Drive persistence."
     )
     parser.add_argument("--date", default="", help="NSE session date YYYY-MM-DD (default: today in IST)")
     parser.add_argument("--sync-drive", action="store_true", help="Upload audit JSON and CSV to Google Drive")

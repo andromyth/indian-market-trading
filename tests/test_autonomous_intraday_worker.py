@@ -11,6 +11,7 @@ from autonomous_intraday_worker import (
     is_fresh_current_session,
     normalize_bars,
     segment_should_stop,
+    is_all_nse_capture_slot,
 )
 from selfdriving.sd_intraday_v2 import _session_rows
 from verify_minute_prediction_persistence import _required_prediction_snapshot_keys
@@ -39,6 +40,15 @@ def test_segment_worker_stops_at_expected_nse_market_bounds():
     assert not segment_should_stop(datetime(2026, 10, 13, 15, 29, tzinfo=IST), "afternoon")
     assert segment_should_stop(datetime(2026, 10, 13, 15, 30, tzinfo=IST), "afternoon")
     assert segment_should_stop(datetime(2026, 10, 17, 10, 0, tzinfo=IST), "once")
+
+
+def test_all_nse_capture_uses_five_minute_session_anchors():
+    assert is_all_nse_capture_slot(datetime(2026, 10, 21, 9, 15, 20, tzinfo=IST))
+    assert is_all_nse_capture_slot(datetime(2026, 10, 21, 9, 20, tzinfo=IST))
+    assert is_all_nse_capture_slot(datetime(2026, 10, 21, 15, 25, tzinfo=IST))
+    assert not is_all_nse_capture_slot(datetime(2026, 10, 21, 9, 17, tzinfo=IST))
+    assert not is_all_nse_capture_slot(datetime(2026, 10, 21, 15, 30, tzinfo=IST))
+    assert not is_all_nse_capture_slot(datetime(2026, 10, 24, 10, 0, tzinfo=IST))
 
 
 def test_normalize_and_freshness_use_current_completed_candles():
@@ -533,15 +543,15 @@ def test_prediction_audit_starts_after_opening_warmup_and_caps_live_minutes():
     day = date(2026, 10, 21)
     full_session_keys = [
         (pd.Timestamp(day, tz=IST) + pd.Timedelta(minutes=9 * 60 + 15 + offset)).strftime("%Y%m%d_%H%M")
-        for offset in range(375)
+        for offset in range(0, 375, 5)
     ]
 
     required, first_key = _required_prediction_snapshot_keys(full_session_keys, day)
 
-    assert first_key == "20261021_0931"
-    assert len(required) == 359
-    assert required[0] == "20261021_0931"
-    assert required[-1] == "20261021_1529"
+    assert first_key == "20261021_0935"
+    assert len(required) == 71
+    assert required[0] == "20261021_0935"
+    assert required[-1] == "20261021_1525"
 
     live_through_0930 = [key for key in full_session_keys if key <= "20261021_0930"]
     required_live, _ = _required_prediction_snapshot_keys(live_through_0930, day)
@@ -549,4 +559,4 @@ def test_prediction_audit_starts_after_opening_warmup_and_caps_live_minutes():
 
     live_through_0931 = [key for key in full_session_keys if key <= "20261021_0931"]
     required_live, _ = _required_prediction_snapshot_keys(live_through_0931, day)
-    assert required_live == ["20261021_0931"]
+    assert required_live == []
