@@ -1,0 +1,101 @@
+name: Configure private intraday Scheduler five-minute cadence
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/configure_intraday_five_minute_schedule.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: configure-intraday-five-minute-schedule
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Patch only scheduler cadence and verify the existing private target
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPLOYER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          echo "DEPLOYER_PRINCIPAL=$DEPLOYER"
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          patch_schedule() {
+            local job="$1"
+            local schedule="$2"
+            local name="projects/$PROJECT_ID/locations/$REGION/jobs/$job"
+            local payload response http_code
+            payload="$(python - "$name" "$schedule" <<'PY'
+          import json, sys
+          name, schedule = sys.argv[1:]
+          print(json.dumps({
+              "name": name,
+              "schedule": schedule,
+              "timeZone": "Asia/Kolkata",
+              "attemptDeadline": "300s",
+          }))
+          PY
+          )"
+            response="$(mktemp)"
+            http_code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+              --request PATCH \
+              --header "Authorization: Bearer $ACCESS_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$payload" \
+              "https://cloudscheduler.googleapis.com/v1/$name?updateMask=schedule,timeZone,attemptDeadline")" || {
+                cat "$response"
+                rm -f "$response"
+                return 1
+              }
+            if [[ "$http_code" != "200" ]]; then
+              echo "SCHEDULER_PATCH_HTTP_STATUS=$http_code"
+              cat "$response"
+              rm -f "$response"
+              return 1
+            fi
+            rm -f "$response"
+            echo "PATCHED_SCHEDULE job=$job schedule=$schedule"
+          }
+          patch_schedule "intraday-worker-0915-0959" "15-55/5 9 * * 1-5"
+          patch_schedule "intraday-worker-1000-1459" "*/5 10-14 * * 1-5"
+          patch_schedule "intraday-worker-1500-1530" "0-25/5 15 * * 1-5"
+
+          verify_schedule() {
+            local job="$1"
+            local expected="$2"
+            local actual
+            actual="$(gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='value(schedule)')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "SCHEDULE_VERIFICATION_FAILED job=$job expected=$expected actual=$actual"
+              exit 1
+            fi
+            echo "FIVE_MINUTE_SCHEDULE_VERIFIED job=$job schedule=$actual"
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" \
+              --format='yaml(state,timeZone,httpTarget.uri,httpTarget.oidcToken.serviceAccountEmail,attemptDeadline)'
+          }
+          verify_schedule "intraday-worker-0915-0959" "15-55/5 9 * * 1-5"
+          verify_schedule "intraday-worker-1000-1459" "*/5 10-14 * * 1-5"
+          verify_schedule "intraday-worker-1500-1530" "0-25/5 15 * * 1-5"
