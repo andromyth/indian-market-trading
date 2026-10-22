@@ -217,9 +217,10 @@ def build_audit_report(
     )
     report = {
         "audit_name": "all-universe-minute-capture-audit",
-        "schema_version": "all-universe-minute-audit-v1",
+        "schema_version": "all-universe-minute-audit-v2",
         "session_date": session_date.isoformat(),
         "timezone": "Asia/Kolkata",
+        "capture_interval_minutes": CAPTURE_INTERVAL_MINUTES,
         "nse_trading_day": is_nse_trading_day(session_date),
         "expected_minutes": expected_count,
         "snapshot_files_present": snapshots_present,
