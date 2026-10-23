@@ -816,6 +816,70 @@ def load_clean_session_data(
     return predictions, quotes, report
 
 
+def select_versioned_fit_rows(outcomes: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Select only matured outcomes tied to a genuinely explicit model identity."""
+    diagnostics: dict[str, Any] = {
+        "outcome_rows": int(len(outcomes)),
+        "validated_outcome_rows": 0,
+        "validated_rows_with_explicit_model_version": 0,
+        "validated_rows_with_unknown_model_version": 0,
+        "validated_rows_with_valid_probability": 0,
+        "validated_rows_with_actual_return": 0,
+        "fit_eligible_rows": 0,
+        "model_version_counts_top20": {},
+        "base_model_version_counts_top20": {},
+        "readiness_segment_counts": {},
+    }
+    if outcomes.empty:
+        return pd.DataFrame(), diagnostics
+
+    status = outcomes.get(
+        "validation_status", pd.Series("", index=outcomes.index)
+    ).astype(str).str.upper()
+    version = outcomes.get(
+        "model_version", pd.Series("LEGACY_UNKNOWN", index=outcomes.index)
+    ).fillna("LEGACY_UNKNOWN").astype(str).str.strip()
+    explicit_version = (
+        version.ne("")
+        & ~version.str.lower().isin({"legacy_unknown", "none", "nan", "<na>"})
+        & ~version.str.upper().str.startswith("LEGACY_UNKNOWN")
+    )
+    probability = pd.to_numeric(
+        outcomes.get("probability_up", pd.Series(np.nan, index=outcomes.index)),
+        errors="coerce",
+    )
+    actual_return = pd.to_numeric(
+        outcomes.get("actual_return", pd.Series(np.nan, index=outcomes.index)),
+        errors="coerce",
+    )
+    validated = status.eq("VALIDATED")
+    probability_valid = probability.between(0, 1)
+    actual_return_valid = actual_return.notna()
+    fit_mask = validated & explicit_version & probability_valid & actual_return_valid
+    diagnostics.update({
+        "validated_outcome_rows": int(validated.sum()),
+        "validated_rows_with_explicit_model_version": int((validated & explicit_version).sum()),
+        "validated_rows_with_unknown_model_version": int((validated & ~explicit_version).sum()),
+        "validated_rows_with_valid_probability": int((validated & probability_valid).sum()),
+        "validated_rows_with_actual_return": int((validated & actual_return_valid).sum()),
+        "fit_eligible_rows": int(fit_mask.sum()),
+    })
+
+    def top_counts(column: str) -> dict[str, int]:
+        if column not in outcomes:
+            return {}
+        values = outcomes.loc[validated, column].fillna("<NULL>").astype(str).str.strip()
+        return {
+            str(key): int(value)
+            for key, value in values.replace("", "<EMPTY>").value_counts().head(20).items()
+        }
+
+    diagnostics["model_version_counts_top20"] = top_counts("model_version")
+    diagnostics["base_model_version_counts_top20"] = top_counts("base_model_version")
+    diagnostics["readiness_segment_counts"] = top_counts("readiness_segment")
+    return outcomes.loc[fit_mask].copy(), diagnostics
+
+
 def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "diagnostics/all_nse_prediction_learning") -> dict[str, Any]:
     store = GoogleDriveStore()
     predictions, quotes, ingest = load_clean_session_data(store, start_date, end_date)
@@ -824,17 +888,9 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
     prediction_rows_for_outcome_summary = int(len(predictions))
     outcomes = match_matured_outcomes(predictions, quotes)
     del predictions, quotes
-    if outcomes.empty:
-        fit_frame = pd.DataFrame()
-    else:
-        # Old snapshots predate explicit model-version logging. Keep their scored
-        # outcomes in the audit, but never mix them into a version-specific fit.
-        fit_frame = outcomes.loc[
-            outcomes["validation_status"].eq("VALIDATED")
-            & ~outcomes["model_version"].astype(str).isin(["", "LEGACY_UNKNOWN", "None", "nan"])
-            & pd.to_numeric(outcomes["probability_up"], errors="coerce").between(0, 1)
-            & pd.to_numeric(outcomes["actual_return"], errors="coerce").notna()
-        ].copy()
+    # Keep legacy model versions in the outcomes audit, but never fit or deploy
+    # calibration under a profile whose producing estimator cannot be identified.
+    fit_frame, fit_diagnostics = select_versioned_fit_rows(outcomes)
     fit_frame["target_timestamp_utc"] = fit_frame.get("target_timestamp_utc", pd.Series(dtype=object))
     report: dict[str, Any] = {
         "audit_name": "all-nse-production-outcome-learning",
@@ -853,6 +909,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine rows with missing/stale/unmatched quotes, invalid probability/target, explicitly untrained membership, or near-empty readiness below 0.35. PASS and PASS_DATA_LIMITED rows are evaluated in readiness-scoped model versions; low-readiness calibration may update probability/return fields but the primary action remains HOLD. Pooled-model rows with unknown membership remain labelled UNKNOWN. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
+        "fit_eligibility_diagnostics": fit_diagnostics,
         "outcome_summary": {
             "prediction_rows_in_clean_slots": prediction_rows_for_outcome_summary,
             "matched_validated_outcomes": int(outcomes["validation_status"].eq("VALIDATED").sum()) if not outcomes.empty else 0,
@@ -879,6 +936,16 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "profiles_live": 0,
         "reason": "No validated outcomes were available for an explicitly versioned full-NSE model, or the versioned clean sample was empty.",
     }
+    if outcomes.empty:
+        report["recommendation_update"]["status"] = "WAITING_FOR_CLEAN_MATURED_OUTCOMES"
+    elif int(fit_diagnostics.get("validated_rows_with_explicit_model_version", 0)) == 0:
+        calibration_result["status"] = "WAITING_FOR_VERSIONED_PRODUCTION_OUTCOMES"
+        calibration_result["reason"] = (
+            "Matured outcomes exist, but their stored prediction rows/manifests do not identify "
+            "the producing classifier/regressor artifacts. They remain available for evaluation "
+            "but are excluded from calibration to prevent applying a profile to the wrong model."
+        )
+        report["recommendation_update"]["status"] = "WAITING_FOR_VERSIONED_PRODUCTION_OUTCOMES"
     if not fit_frame.empty:
         # Run through the same persisted registry used by the runtime calibration
         # overlay. Version-specific entries keep this model separate from the
