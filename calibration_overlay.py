@@ -113,8 +113,11 @@ class CalibrationOverlay:
                 if er_cal is not None:
                     out["expected_return"] = er_cal
                 out["predicted_price"] = out["predicted_price_calibrated"]
-                if profile.get("thresholds") and not profile["thresholds"].get("abstain_all", True):
-                    out["signal"] = signal
+                thresholds = profile.get("thresholds") or {"abstain_all": True}
+                # An active profile that cannot safely emit BUY/SELL must force
+                # the production-facing signal to HOLD rather than preserve the
+                # raw pre-calibration action by accident.
+                out["signal"] = signal if not thresholds.get("abstain_all", True) else "HOLD"
                 out["calibration_applied"] = True
             else:
                 # Record raw columns for scoring lineage even in shadow mode, but
