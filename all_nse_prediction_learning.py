@@ -315,6 +315,7 @@ def match_matured_outcomes(
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
         "calibration_profile_id", "model_version", "model_family", "horizon_min",
         "input_age_seconds", "feature_coverage", "validation_status", "source", "quote_basis",
+        "prediction_slot_status", "quote_slot_status", "slot_quality_gate_pass",
     ]
     if predictions.empty:
         return pd.DataFrame(columns=output_columns)
@@ -412,6 +413,16 @@ def match_matured_outcomes(
     merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
     merged["source"] = "all_nse_intraday_production"
     merged["quote_basis"] = "nearest clean provider quote observation within target tolerance; not exchange-stamped 1m OHLCV"
+    for column, default in (
+        ("prediction_slot_status", "UNKNOWN"),
+        ("quote_slot_status", "UNKNOWN"),
+        ("slot_quality_gate_pass", False),
+    ):
+        if column not in merged:
+            merged[column] = default
+    merged["prediction_slot_status"] = merged["prediction_slot_status"].fillna("UNKNOWN").astype(str)
+    merged["quote_slot_status"] = merged["quote_slot_status"].fillna("UNKNOWN").astype(str)
+    merged["slot_quality_gate_pass"] = merged["slot_quality_gate_pass"].map(_true)
     return merged[output_columns].reset_index(drop=True)
 
 def _day_folder_files(store: Any, root: str, day: date) -> list[dict[str, Any]]:
@@ -452,17 +463,24 @@ def load_clean_session_data(
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
         "signal_calibrated", "calibration_profile_id", "model_version", "model_family",
-        "data_readiness_score",
+        "data_readiness_score", "prediction_slot_status", "quote_slot_status",
+        "slot_quality_gate_pass",
     ]
     report = {
         "calendar_days_scanned": (end_date - start_date).days + 1,
         "prediction_slots_seen": 0,
         "prediction_slots_eligible": 0,
+        "prediction_slots_partial_evaluated": 0,
         "prediction_slots_quarantined": 0,
+        "prediction_slots_row_quality_empty": 0,
         "quote_slots_seen": 0,
         "quote_slots_eligible": 0,
+        "quote_slots_partial_evaluated": 0,
         "quote_slots_quarantined": 0,
         "prediction_rows_retained_for_diagnostics": 0,
+        "prediction_rows_from_partial_slots": 0,
+        "clean_prediction_rows_from_partial_slots": 0,
+        "row_level_quality_rejections": 0,
         "clean_prediction_rows": 0,
         "quote_rows_retained": 0,
         "manifest_errors": [],
@@ -479,6 +497,9 @@ def load_clean_session_data(
         quote_manifests = _file_map(quote_files, "manifest_", ".json")
         quote_parquets = _file_map(quote_files, "snapshot_", ".parquet")
         clean_quote_keys: set[str] = set()
+        loaded_quote_keys: set[str] = set()
+        quote_slot_frames: dict[str, pd.DataFrame] = {}
+        quote_slot_manifests: dict[str, dict[str, Any]] = {}
 
         for key, mf in quote_manifests.items():
             report["quote_slots_seen"] += 1
@@ -489,20 +510,45 @@ def load_clean_session_data(
                 report["quote_slots_quarantined"] += 1
                 report["excluded_reasons"]["quote_manifest_unreadable"] = report["excluded_reasons"].get("quote_manifest_unreadable", 0) + 1
                 continue
-            if not quote_manifest_is_clean(manifest) or key not in quote_parquets:
+
+            slot_status = str(manifest.get("status") or "").upper()
+            if key not in quote_parquets or slot_status not in {"OK", "PARTIAL"}:
                 report["quote_slots_quarantined"] += 1
-                reason = "quote_incomplete_or_snapshot_missing"
+                reason = "quote_snapshot_missing_or_manifest_not_persisted"
                 report["excluded_reasons"][reason] = report["excluded_reasons"].get(reason, 0) + 1
                 continue
             try:
                 raw = _download_bytes(store, quote_parquets[key]["id"])
                 frame = pd.read_parquet(io.BytesIO(raw))
                 expected = int(manifest.get("expected_symbol_count") or 0)
-                if len(frame) != expected or frame["symbol"].astype(str).str.upper().nunique() != expected:
-                    raise ValueError(f"quote row/universe mismatch: rows={len(frame)} unique={frame['symbol'].nunique()} expected={expected}")
-                quote_frames.append(frame[["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"]].copy())
-                clean_quote_keys.add(key)
-                report["quote_slots_eligible"] += 1
+                declared_rows = int(manifest.get("row_count") if manifest.get("row_count") is not None else len(frame))
+                symbols = frame["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+                if (
+                    expected <= 0
+                    or len(frame) > expected
+                    or declared_rows != len(frame)
+                    or symbols.eq("").any()
+                    or symbols.duplicated().any()
+                    or (slot_status == "OK" and len(frame) != expected)
+                ):
+                    raise ValueError(
+                        f"quote rows are structurally inconsistent: rows={len(frame)} "
+                        f"manifest_rows={declared_rows} unique_symbols={symbols.nunique()} expected={expected}"
+                    )
+                quote_frame = frame[[
+                    "symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"
+                ]].copy()
+                quote_frame["symbol"] = symbols
+                quote_frames.append(quote_frame)
+                quote_slot_frames[key] = quote_frame
+                quote_slot_manifests[key] = manifest
+                loaded_quote_keys.add(key)
+                slot_clean = quote_manifest_is_clean(manifest) and len(frame) == expected
+                if slot_clean:
+                    clean_quote_keys.add(key)
+                    report["quote_slots_eligible"] += 1
+                else:
+                    report["quote_slots_partial_evaluated"] += 1
             except Exception as exc:
                 report["parquet_errors"].append(f"quote/{current}/{key}: {type(exc).__name__}: {exc}")
                 report["quote_slots_quarantined"] += 1
@@ -517,54 +563,78 @@ def load_clean_session_data(
                 report["prediction_slots_quarantined"] += 1
                 report["excluded_reasons"]["prediction_manifest_unreadable"] = report["excluded_reasons"].get("prediction_manifest_unreadable", 0) + 1
                 continue
-            # Prediction rows are eligible only if both the prediction model and
-            # the contemporaneous all-universe quote capture passed their full gates.
-            if not prediction_manifest_is_clean(manifest) or key not in pred_parquets or key not in clean_quote_keys:
+
+            slot_status = str(manifest.get("status") or "").upper()
+            if (
+                key not in pred_parquets
+                or key not in loaded_quote_keys
+                or slot_status not in {"OK", "PARTIAL"}
+            ):
                 report["prediction_slots_quarantined"] += 1
-                reason = "prediction_incomplete_or_quote_slot_not_clean"
+                reason = "prediction_or_contemporaneous_quote_snapshot_missing_or_not_persisted"
                 report["excluded_reasons"][reason] = report["excluded_reasons"].get(reason, 0) + 1
                 continue
+
             try:
                 raw = _download_bytes(store, pred_parquets[key]["id"])
                 frame = pd.read_parquet(io.BytesIO(raw))
                 expected = int(manifest.get("expected_symbol_count") or 0)
-                if len(frame) != expected or frame["symbol"].astype(str).str.upper().nunique() != expected:
-                    raise ValueError(f"prediction row/universe mismatch: rows={len(frame)} unique={frame['symbol'].nunique()} expected={expected}")
+                declared_rows = int(manifest.get("row_count") if manifest.get("row_count") is not None else len(frame))
+                symbols = frame["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+                if (
+                    expected <= 0
+                    or len(frame) > expected
+                    or declared_rows != len(frame)
+                    or symbols.eq("").any()
+                    or symbols.duplicated().any()
+                    or (slot_status == "OK" and len(frame) != expected)
+                ):
+                    raise ValueError(
+                        f"prediction rows are structurally inconsistent: rows={len(frame)} "
+                        f"manifest_rows={declared_rows} unique_symbols={symbols.nunique()} expected={expected}"
+                    )
                 report["prediction_rows_retained_for_diagnostics"] += len(frame)
-                symbol = frame["symbol"].astype(str).str.upper().str.replace(".NS", "", regex=False)
-                probability = pd.to_numeric(frame.get("probability_up_30m"), errors="coerce")
-                quote_age = pd.to_numeric(frame.get("actual_quote_age_seconds"), errors="coerce")
-                valid_row = (
-                    frame.get("prediction_status", pd.Series("", index=frame.index)).astype(str).eq("PASS")
-                    & frame.get("actual_quote_status", pd.Series("", index=frame.index)).astype(str).str.upper().eq("PASS")
-                    & frame.get("trained_for_symbol", pd.Series(False, index=frame.index)).map(_true)
-                    & ~frame.get("data_limited", pd.Series(True, index=frame.index)).map(_true)
-                    & probability.between(0, 1)
-                    & quote_age.le(120)
-                    & pd.to_numeric(frame.get("actual_market_value"), errors="coerce").gt(0)
-                    & frame.get("forecast_target_timestamp_utc", pd.Series(None, index=frame.index)).notna()
+                clean, row_gate = select_row_level_clean_predictions(
+                    frame,
+                    quote_slot_frames[key],
+                    manifest,
                 )
-                clean = frame.loc[valid_row].copy()
-                clean["symbol"] = symbol.loc[valid_row]
-                if "model_version" not in clean:
-                    clean["model_version"] = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
-                else:
-                    clean["model_version"] = clean["model_version"].fillna(
-                        str(manifest.get("model_version") or "LEGACY_UNKNOWN")
-                    ).astype(str)
+                model_version = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                clean["model_version"] = clean.get("model_version", pd.Series(dtype=object)).fillna(model_version).astype(str) if "model_version" in clean else model_version
+                clean["prediction_slot_status"] = slot_status
+                quote_slot_status = str(quote_slot_manifests[key].get("status") or "UNKNOWN").upper()
+                clean["quote_slot_status"] = quote_slot_status
+                clean["slot_quality_gate_pass"] = bool(
+                    prediction_manifest_is_clean(manifest)
+                    and key in clean_quote_keys
+                )
                 for column in prediction_columns:
                     if column not in clean:
                         clean[column] = None
-                clean["model_version"] = clean["model_version"].fillna(
-                    str(manifest.get("model_version") or "LEGACY_UNKNOWN")
-                ).astype(str)
+                clean["model_version"] = clean["model_version"].fillna(model_version).astype(str)
                 prediction_frames.append(clean[prediction_columns].copy())
                 report["clean_prediction_rows"] += len(clean)
-                report["prediction_slots_eligible"] += 1
-                if len(clean) != expected:
-                    # The whole slot remains auditable; only individually clean
-                    # rows become candidates, and an unexpected shortfall is flagged.
-                    report["excluded_reasons"]["row_level_quality_failures_in_manifest_ok_slot"] = report["excluded_reasons"].get("row_level_quality_failures_in_manifest_ok_slot", 0) + (expected - len(clean))
+                report["row_level_quality_rejections"] += int(row_gate.get("quarantined_rows", 0))
+                slot_clean = bool(
+                    prediction_manifest_is_clean(manifest)
+                    and key in clean_quote_keys
+                    and row_gate.get("quarantined_rows", 0) == 0
+                    and len(clean) == expected
+                )
+                if slot_clean:
+                    report["prediction_slots_eligible"] += 1
+                else:
+                    report["prediction_slots_partial_evaluated"] += 1
+                    report["prediction_rows_from_partial_slots"] += int(len(frame))
+                    report["clean_prediction_rows_from_partial_slots"] += int(len(clean))
+                if len(clean) == 0:
+                    report["prediction_slots_row_quality_empty"] += 1
+                if row_gate.get("quote_matched_rows", 0) < len(frame):
+                    failed_quote_rows = len(frame) - int(row_gate.get("quote_matched_rows", 0))
+                    report["excluded_reasons"]["prediction_rows_without_matching_same_slot_quote"] = (
+                        report["excluded_reasons"].get("prediction_rows_without_matching_same_slot_quote", 0)
+                        + failed_quote_rows
+                    )
             except Exception as exc:
                 report["parquet_errors"].append(f"prediction/{current}/{key}: {type(exc).__name__}: {exc}")
                 report["prediction_slots_quarantined"] += 1
