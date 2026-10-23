@@ -38,7 +38,34 @@ MIME_FOLDER = "application/vnd.google-apps.folder"
 MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
 MAX_INPUT_AGE_SECONDS = 120
 MIN_DATA_READINESS = 0.70
+# Data-limited probabilities can be assessed in their own segment; almost-empty rows remain excluded.
+MIN_LEARNING_READINESS = 0.35
+READINESS_LOW_SUFFIX = "__READINESS_LOW"
+READINESS_READY_SUFFIX = "__READINESS_READY"
+READINESS_UNKNOWN_SUFFIX = "__READINESS_UNKNOWN"
 MODEL_VERSION_PREFIX = "all_nse_intraday__"
+
+
+def readiness_segment(value: Any) -> str:
+    score = _number(value)
+    if not np.isfinite(score) or score < 0 or score > 1:
+        return "READINESS_UNKNOWN"
+    return "READINESS_LOW" if score < MIN_DATA_READINESS else "READINESS_READY"
+
+
+def calibration_model_version(base_version: Any, readiness: Any) -> str:
+    """Scope calibration to a deployed model artifact and its readiness band."""
+    base = str(base_version or "LEGACY_UNKNOWN").strip()
+    for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    suffix = {
+        "READINESS_LOW": READINESS_LOW_SUFFIX,
+        "READINESS_READY": READINESS_READY_SUFFIX,
+        "READINESS_UNKNOWN": READINESS_UNKNOWN_SUFFIX,
+    }[readiness_segment(readiness)]
+    return f"{base}{suffix}"
 
 
 def _number(value: Any) -> float:
@@ -176,11 +203,14 @@ def select_row_level_clean_predictions(
         "quarantined_rows": int(len(frame)),
         "condition_counts": {
             "prediction_status_pass": 0,
+            "prediction_status_pass_data_limited": 0,
+            "prediction_status_eligible": 0,
             "actual_quote_status_pass": 0,
             "trained_true": 0,
             "trained_false": 0,
             "trained_unknown": 0,
             "data_limited_false": 0,
+            "data_limited_true": 0,
             "probability_valid": 0,
             "quote_age_valid": 0,
             "readiness_valid": 0,
@@ -297,10 +327,10 @@ def select_row_level_clean_predictions(
         & price_match
     )
 
-    prediction_status_pass = (
-        merged.get("prediction_status", pd.Series("", index=merged.index))
-        .astype(str).str.upper().eq("PASS")
-    )
+    prediction_status = merged.get("prediction_status", pd.Series("", index=merged.index)).astype(str).str.upper()
+    prediction_status_pass = prediction_status.eq("PASS")
+    prediction_status_pass_data_limited = prediction_status.eq("PASS_DATA_LIMITED")
+    prediction_status_eligible = prediction_status_pass | prediction_status_pass_data_limited
     actual_quote_status_pass = (
         merged.get("actual_quote_status", pd.Series("", index=merged.index))
         .astype(str).str.upper().eq("PASS")
@@ -315,10 +345,11 @@ def select_row_level_clean_predictions(
         )
     )
     trained_unknown = ~(trained_true | trained_false)
-    data_limited_false = ~merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+    data_limited_flags = merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+    data_limited_false = ~data_limited_flags
     probability_valid = merged_probability.between(0, 1)
     quote_age_valid = merged_quote_age.between(0, MAX_INPUT_AGE_SECONDS)
-    readiness_valid = merged_readiness.ge(MIN_DATA_READINESS)
+    readiness_valid = merged_readiness.ge(MIN_LEARNING_READINESS) & merged_readiness.le(1.0)
     target_timestamp_valid = (
         pd.to_datetime(
             merged.get("forecast_target_timestamp_utc", pd.Series(pd.NaT, index=merged.index)),
@@ -328,10 +359,9 @@ def select_row_level_clean_predictions(
     symbol_valid = merged["_symbol_norm_internal"].astype(str).str.strip().ne("")
 
     non_quote_valid = (
-        prediction_status_pass
+        prediction_status_eligible
         & actual_quote_status_pass
         & ~trained_false
-        & data_limited_false
         & probability_valid
         & quote_age_valid
         & readiness_valid
@@ -342,11 +372,14 @@ def select_row_level_clean_predictions(
 
     base_report["condition_counts"] = {
         "prediction_status_pass": int(prediction_status_pass.sum()),
+        "prediction_status_pass_data_limited": int(prediction_status_pass_data_limited.sum()),
+        "prediction_status_eligible": int(prediction_status_eligible.sum()),
         "actual_quote_status_pass": int(actual_quote_status_pass.sum()),
         "trained_true": int(trained_true.sum()),
         "trained_false": int(trained_false.sum()),
         "trained_unknown": int(trained_unknown.sum()),
         "data_limited_false": int(data_limited_false.sum()),
+        "data_limited_true": int(data_limited_flags.sum()),
         "probability_valid": int(probability_valid.sum()),
         "quote_age_valid": int(quote_age_valid.sum()),
         "readiness_valid": int(readiness_valid.sum()),
@@ -383,9 +416,11 @@ def match_matured_outcomes(
         "actual_quote_timestamp_utc", "target_quote_distance_seconds", "reference_price",
         "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
-        "calibration_profile_id", "model_version", "model_family", "horizon_min",
-        "input_age_seconds", "feature_coverage", "validation_status", "source", "quote_basis",
-        "prediction_status", "trained_for_symbol", "trained_membership_status", "data_limited",
+        "calibrated_signal_advisory",
+        "calibration_profile_id", "model_version", "base_model_version", "readiness_segment",
+        "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
+        "validation_status", "source", "quote_basis", "prediction_status",
+        "trained_for_symbol", "trained_membership_status", "data_limited",
         "prediction_slot_status", "quote_slot_status", "slot_quality_gate_pass",
     ]
     if predictions.empty:
@@ -405,12 +440,20 @@ def match_matured_outcomes(
     if "model_version" not in pred:
         pred["model_version"] = "LEGACY_UNKNOWN"
     pred["model_version"] = pred["model_version"].fillna("LEGACY_UNKNOWN").astype(str)
+    if "base_model_version" not in pred:
+        pred["base_model_version"] = pred["model_version"]
+    pred["base_model_version"] = pred["base_model_version"].fillna(pred["model_version"]).astype(str)
+    if "readiness_segment" not in pred:
+        pred["readiness_segment"] = pd.to_numeric(
+            pred.get("data_readiness_score", pd.Series(np.nan, index=pred.index)), errors="coerce"
+        ).map(readiness_segment)
     for col in ("probability_up_30m_calibrated", "expected_return_30m_calibrated",
                 "actual_quote_age_seconds", "data_readiness_score"):
         if col not in pred:
             pred[col] = np.nan
-    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
-                "model_family", "forecast_key", "prediction_status", "trained_for_symbol", "data_limited"):
+    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibrated_signal_advisory",
+                "calibration_profile_id", "model_family", "forecast_key", "prediction_status",
+                "trained_for_symbol", "data_limited"):
         if col not in pred:
             pred[col] = None
 
@@ -479,11 +522,14 @@ def match_matured_outcomes(
     signal = signal.mask(signal.eq(""), fallback)
     signal = signal.mask(signal.eq(""), merged["signal"].fillna("").astype(str).str.strip())
     merged["signal"] = signal.mask(signal.eq(""), "HOLD").str.upper()
+    merged["calibrated_signal_advisory"] = merged["calibrated_signal_advisory"].fillna("").astype(str).str.upper()
     merged["horizon_min"] = 30
     merged["input_age_seconds"] = pd.to_numeric(merged["actual_quote_age_seconds"], errors="coerce")
     merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
     merged["source"] = "all_nse_intraday_production"
     merged["quote_basis"] = "nearest clean provider quote observation within target tolerance; not exchange-stamped 1m OHLCV"
+    merged["base_model_version"] = merged["base_model_version"].fillna(merged["model_version"]).astype(str)
+    merged["readiness_segment"] = merged["readiness_segment"].fillna("READINESS_UNKNOWN").astype(str)
     merged["trained_membership_status"] = merged["trained_for_symbol"].map(
         lambda value: "TRAINED" if _true(value) else (
             "UNTRAINED" if (
@@ -539,11 +585,12 @@ def load_clean_session_data(
     prediction_columns = [
         "symbol", "actual_observed_at_utc", "actual_market_value", "actual_quote_status",
         "actual_quote_age_seconds", "forecast_target_timestamp_utc", "forecast_key",
-        "prediction_status", "trained_for_symbol", "data_limited",
-        "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
+        "prediction_status", "trained_for_symbol", "data_limited", "base_model_version",
+        "readiness_segment", "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
-        "signal_calibrated", "calibration_profile_id", "model_version", "model_family",
+        "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
+        "model_version", "model_family",
         "data_readiness_score", "prediction_slot_status", "quote_slot_status",
         "slot_quality_gate_pass",
     ]
@@ -681,8 +728,30 @@ def load_clean_session_data(
                     quote_slot_frames[key],
                     manifest,
                 )
-                model_version = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
-                clean["model_version"] = clean.get("model_version", pd.Series(dtype=object)).fillna(model_version).astype(str) if "model_version" in clean else model_version
+                manifest_model_version = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                for column in prediction_columns:
+                    if column not in clean:
+                        clean[column] = None
+                if clean.empty:
+                    clean["base_model_version"] = pd.Series(dtype=str)
+                    clean["readiness_segment"] = pd.Series(dtype=str)
+                    clean["model_version"] = pd.Series(dtype=str)
+                else:
+                    row_version = clean["model_version"].fillna("").astype(str)
+                    if "base_model_version" in clean:
+                        raw_base_version = clean["base_model_version"].fillna("").astype(str)
+                        base_version = raw_base_version.where(raw_base_version.str.strip().ne(""), row_version)
+                    else:
+                        base_version = row_version
+                    base_version = base_version.where(base_version.str.strip().ne(""), manifest_model_version)
+                    clean["base_model_version"] = base_version
+                    clean["readiness_segment"] = pd.to_numeric(
+                        clean["data_readiness_score"], errors="coerce"
+                    ).map(readiness_segment)
+                    clean["model_version"] = [
+                        calibration_model_version(base, score)
+                        for base, score in zip(clean["base_model_version"], clean["data_readiness_score"])
+                    ]
                 clean["prediction_slot_status"] = slot_status
                 quote_slot_status = str(quote_slot_manifests[key].get("status") or "UNKNOWN").upper()
                 clean["quote_slot_status"] = quote_slot_status
@@ -690,10 +759,6 @@ def load_clean_session_data(
                     prediction_manifest_is_clean(manifest)
                     and key in clean_quote_keys
                 )
-                for column in prediction_columns:
-                    if column not in clean:
-                        clean[column] = None
-                clean["model_version"] = clean["model_version"].fillna(model_version).astype(str)
                 prediction_frames.append(clean[prediction_columns].copy())
                 report["clean_prediction_rows"] += len(clean)
                 report["row_level_quality_rejections"] += int(row_gate.get("quarantined_rows", 0))
@@ -778,7 +843,14 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
         "scope": "ALL-NSE pooled production 30-minute classifier/regressor",
         "capture_interval_minutes": 5,
-        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine every row that fails PASS prediction status, readiness, same-slot quote price/status, or timestamp validation. Explicitly untrained rows are excluded; pooled-model rows with unknown membership can be evaluated only when the production predictor marked them PASS, with membership remaining labelled UNKNOWN. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
+        "readiness_calibration_policy": {
+            "segment_threshold": MIN_DATA_READINESS,
+            "minimum_learning_readiness": MIN_LEARNING_READINESS,
+            "segments": ["READINESS_LOW", "READINESS_READY", "READINESS_UNKNOWN"],
+            "required_matured_sessions_for_activation": 15,
+            "low_readiness_primary_signal_policy": "HOLD",
+        },
+        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine rows with missing/stale/unmatched quotes, invalid probability/target, explicitly untrained membership, or near-empty readiness below 0.35. PASS and PASS_DATA_LIMITED rows are evaluated in readiness-scoped model versions; low-readiness calibration may update probability/return fields but the primary action remains HOLD. Pooled-model rows with unknown membership remain labelled UNKNOWN. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
@@ -796,7 +868,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
             "calibration_profile_auto_applied": False,
             "minimum_autopilot_rows": 600,
             "minimum_autopilot_sessions": 15,
-            "activation_policy": "Eligible profiles enter SHADOW, and only profiles that subsequently improve live log loss without worsening Brier score can progress to ACTIVE. Active calibration changes live probability/return/signal outputs; base joblib weights remain unchanged.",
+            "activation_policy": "Readiness-scoped profiles enter SHADOW and must pass the existing minimum sample/session and holdout gates. Only profiles that improve live log loss without worsening Brier score can progress to ACTIVE. READINESS_LOW profiles may recalibrate probability/return outputs but the primary action remains HOLD. Base joblib weights remain unchanged.",
         },
         "production_model_changed": False,
         "orders_placed": False,

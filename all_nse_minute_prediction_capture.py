@@ -177,6 +177,20 @@ def _signal(probability_up: float, readiness: float) -> tuple[str, str]:
     return raw, raw if readiness >= MIN_SIGNAL_READINESS else "HOLD"
 
 
+def _primary_signal_with_readiness_guard(
+    prediction_status: Any,
+    data_limited: Any,
+    candidate_signal: Any,
+) -> str:
+    """Never expose BUY/SELL as the primary action for a limited/unknown row."""
+    status = str(prediction_status or "").strip().upper()
+    ready_flag = isinstance(data_limited, (bool, np.bool_)) and not bool(data_limited)
+    if status != "PASS" or not ready_flag:
+        return "HOLD"
+    signal = str(candidate_signal or "HOLD").strip().upper()
+    return signal if signal in {"BUY", "SELL", "HOLD"} else "HOLD"
+
+
 class AllNSEMinutePredictor:
     """Rate-limited history cache and one-row-per-symbol minute inference engine."""
 
@@ -875,12 +889,13 @@ class AllNSEMinutePredictor:
                         symbol in self._trained_symbols
                         if self._trained_symbols else None
                     )
+                    data_limited = not np.isfinite(readiness) or readiness < MIN_SIGNAL_READINESS
                     signal = (
                         proposed_signal
-                        if readiness >= MIN_SIGNAL_READINESS and trained_for_symbol is not False
+                        if not data_limited and trained_for_symbol is not False
                         else "HOLD"
                     )
-                    if readiness < MIN_SIGNAL_READINESS:
+                    if data_limited:
                         prediction_status = "PASS_DATA_LIMITED"
                     elif trained_for_symbol is False:
                         prediction_status = "PASS_UNTRAINED_SYMBOL"
@@ -906,8 +921,8 @@ class AllNSEMinutePredictor:
                         ),
                         "feature_count": len(self._model_api.FEATURES),
                         "non_missing_feature_count": int(x.iloc[idx].notna().sum()),
-                        "data_readiness_score": readiness,
-                        "data_limited": readiness < MIN_SIGNAL_READINESS,
+                        "data_readiness_score": readiness if np.isfinite(readiness) else None,
+                        "data_limited": data_limited,
                         "forecast_target_timestamp_utc": (
                             (decision_ts + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat()
                         ),
@@ -918,7 +933,15 @@ class AllNSEMinutePredictor:
                         "error": None,
                     })
 
-                    model_version = self._production_model_version()
+                    base_model_version = self._production_model_version()
+                    readiness_segment = (
+                        "READINESS_UNKNOWN" if not np.isfinite(readiness)
+                        else "READINESS_LOW" if data_limited
+                        else "READINESS_READY"
+                    )
+                    model_version = f"{base_model_version}__{readiness_segment}"
+                    row["base_model_version"] = base_model_version
+                    row["readiness_segment"] = readiness_segment
                     row["model_version"] = model_version
                     row["probability_up_30m_raw"] = probability
                     row["expected_return_30m_raw"] = expected_return
@@ -941,14 +964,25 @@ class AllNSEMinutePredictor:
                     row["probability_up_30m_calibrated"] = overlay.get("probability_up_calibrated")
                     row["expected_return_30m_calibrated"] = overlay.get("expected_return_calibrated")
                     row["predicted_price_30m_calibrated"] = overlay.get("predicted_price_calibrated")
-                    row["signal_calibrated"] = overlay.get("signal_calibrated")
+                    row["calibrated_signal_advisory"] = overlay.get("signal_calibrated")
+                    # A data-limited inference must remain HOLD even if an
+                    # active probability calibrator would otherwise suggest BUY/SELL.
+                    row["signal_calibrated"] = _primary_signal_with_readiness_guard(
+                        row.get("prediction_status"),
+                        row.get("data_limited"),
+                        overlay.get("signal_calibrated"),
+                    )
                     row["calibration_profile_id"] = overlay.get("calibration_profile_id")
                     row["calibration_stage"] = overlay.get("calibration_stage")
                     row["calibration_applied"] = bool(overlay.get("calibration_applied", False))
                     if row["calibration_applied"]:
                         row["probability_up_30m"] = overlay.get("probability_up", probability)
                         row["expected_return_30m"] = overlay.get("expected_return", expected_return)
-                        row["signal"] = overlay.get("signal", signal)
+                        row["signal"] = _primary_signal_with_readiness_guard(
+                            row.get("prediction_status"),
+                            row.get("data_limited"),
+                            overlay.get("signal", signal),
+                        )
                         calibrated_probability = _safe_float(row.get("probability_up_30m"))
                         if calibrated_probability is not None:
                             row["confidence"] = (
@@ -1081,6 +1115,7 @@ class AllNSEMinutePredictor:
             "capture_interval_minutes": 5,
             "cycle_minute_ist": minute.isoformat(),
             "model_version": self._production_model_version(),
+            "calibration_versioning": "per-row readiness segment; READINESS_LOW primary action remains HOLD",
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "expected_symbol_count": len(symbols),
             "row_count": len(records),
