@@ -121,3 +121,12 @@ jobs:
             echo "--- $job ---"
             gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(state,schedule,timeZone,lastAttemptTime,scheduleTime,status,attemptDeadline,retryConfig,httpTarget.uri,httpTarget.httpMethod,httpTarget.oidcToken.serviceAccountEmail)' || true
           done
+          echo "=== Recent Cloud Run worker tick/capture logs (last 6 hours) ==="
+          LOG_START="$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "WORKER_LOG_WINDOW_START=$LOG_START"
+          gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND timestamp >= \"$LOG_START\"" \
+            --project="$PROJECT_ID" \
+            --limit=120 \
+            --order=desc \
+            --format='table(timestamp,severity,jsonPayload.event,jsonPayload.status,jsonPayload.error,jsonPayload.reason,jsonPayload.capture_status,jsonPayload.all_universe_capture.status,jsonPayload.all_universe_capture.expected_symbol_count,jsonPayload.all_universe_capture.quoted_symbol_count,jsonPayload.all_universe_capture.missing_quote_count,jsonPayload.all_nse_minute_predictions.status,jsonPayload.all_nse_minute_predictions.prediction_count,jsonPayload.all_nse_minute_predictions.error,textPayload)' || true
