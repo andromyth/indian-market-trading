@@ -79,6 +79,12 @@ def is_usable_model_version(value: Any) -> bool:
         return False
     candidate = str(value).strip()
     lowered = candidate.lower()
+    # Readiness suffixes do not make a sentinel such as LEGACY_UNKNOWN into
+    # a trustworthy model identity.
+    for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+        if lowered.endswith(suffix):
+            lowered = lowered[:-len(suffix)]
+            break
     if lowered in _INVALID_MODEL_VERSION_VALUES:
         return False
     if lowered.endswith("__unversioned") or "__unversioned__" in lowered:
