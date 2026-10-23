@@ -68,6 +68,53 @@ def calibration_model_version(base_version: Any, readiness: Any) -> str:
     return f"{base}{suffix}"
 
 
+_INVALID_MODEL_VERSION_VALUES = {
+    "", "legacy_unknown", "unknown", "unversioned", "none", "null", "nan", "n/a", "<na>",
+}
+
+
+def is_usable_model_version(value: Any) -> bool:
+    """Reject blank/sentinel versions that cannot safely scope calibration."""
+    if value is None or pd.isna(value):
+        return False
+    candidate = str(value).strip()
+    lowered = candidate.lower()
+    for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+        if lowered.endswith(suffix.lower()):
+            lowered = lowered[:-len(suffix)]
+            break
+    if lowered in _INVALID_MODEL_VERSION_VALUES:
+        return False
+    if lowered.endswith("__unversioned") or "__unversioned__" in lowered:
+        return False
+    return True
+
+
+def resolve_base_model_version(
+    row_base_version: Any,
+    row_model_version: Any,
+    manifest_model_version: Any,
+) -> tuple[str, str]:
+    """Prefer trustworthy row version, then row model version, then slot manifest.
+
+    A legacy/sentinel row value must never shadow a trustworthy manifest version.
+    """
+    for source, value in (
+        ("row_base_model_version", row_base_version),
+        ("row_model_version", row_model_version),
+        ("manifest_model_version", manifest_model_version),
+    ):
+        if is_usable_model_version(value):
+            resolved = str(value).strip()
+            for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+                if resolved.upper().endswith(suffix.upper()):
+                    resolved = resolved[:-len(suffix)]
+                    break
+            if is_usable_model_version(resolved):
+                return resolved, source
+    return "LEGACY_UNKNOWN", "legacy_unknown_fallback"
+
+
 def _number(value: Any) -> float:
     try:
         result = float(value)
@@ -417,7 +464,8 @@ def match_matured_outcomes(
         "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
         "calibrated_signal_advisory",
-        "calibration_profile_id", "model_version", "base_model_version", "readiness_segment",
+        "calibration_profile_id", "model_version", "base_model_version", "model_version_source",
+        "readiness_segment",
         "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
         "validation_status", "source", "quote_basis", "prediction_status",
         "trained_for_symbol", "trained_membership_status", "data_limited",
@@ -431,12 +479,20 @@ def match_matured_outcomes(
     pred["_target_ts"] = pd.to_datetime(pred.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
     pred["_decision_ts"] = pd.to_datetime(pred.get("actual_observed_at_utc"), errors="coerce", utc=True)
     pred["_reference"] = pd.to_numeric(pred.get("actual_market_value"), errors="coerce")
-    pred["_probability"] = pd.to_numeric(
-        pred.get("probability_up_30m_raw", pred.get("probability_up_30m")), errors="coerce"
+    probability_raw = pd.to_numeric(
+        pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
     )
-    pred["_expected_return"] = pd.to_numeric(
-        pred.get("expected_return_30m_raw", pred.get("expected_return_30m")), errors="coerce"
+    probability_legacy = pd.to_numeric(
+        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
     )
+    pred["_probability"] = probability_raw.where(probability_raw.notna(), probability_legacy)
+    return_raw = pd.to_numeric(
+        pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
+    )
+    return_legacy = pd.to_numeric(
+        pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
+    )
+    pred["_expected_return"] = return_raw.where(return_raw.notna(), return_legacy)
     if "model_version" not in pred:
         pred["model_version"] = "LEGACY_UNKNOWN"
     pred["model_version"] = pred["model_version"].fillna("LEGACY_UNKNOWN").astype(str)
@@ -453,7 +509,7 @@ def match_matured_outcomes(
             pred[col] = np.nan
     for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibrated_signal_advisory",
                 "calibration_profile_id", "model_family", "forecast_key", "prediction_status",
-                "trained_for_symbol", "data_limited"):
+                "trained_for_symbol", "data_limited", "model_version_source"):
         if col not in pred:
             pred[col] = None
 
@@ -590,7 +646,7 @@ def load_clean_session_data(
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
         "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
-        "model_version", "model_family",
+        "model_version", "model_version_source", "model_family",
         "data_readiness_score", "prediction_slot_status", "quote_slot_status",
         "slot_quality_gate_pass",
     ]
@@ -610,6 +666,7 @@ def load_clean_session_data(
         "clean_prediction_rows_from_partial_slots": 0,
         "row_level_quality_rejections": 0,
         "row_gate_condition_counts": {},
+        "model_version_resolution_counts": {},
         "clean_prediction_rows": 0,
         "quote_rows_retained": 0,
         "manifest_errors": [],
@@ -736,20 +793,27 @@ def load_clean_session_data(
                     clean["base_model_version"] = pd.Series(dtype=str)
                     clean["readiness_segment"] = pd.Series(dtype=str)
                     clean["model_version"] = pd.Series(dtype=str)
+                    clean["model_version_source"] = pd.Series(dtype=str)
                 else:
-                    row_version = clean["model_version"].fillna("").astype(str)
-                    if "base_model_version" in clean:
-                        raw_base_version = clean["base_model_version"].fillna("").astype(str)
-                        base_version = raw_base_version.where(raw_base_version.str.strip().ne(""), row_version)
-                    else:
-                        base_version = row_version
-                    base_version = base_version.where(base_version.str.strip().ne(""), manifest_model_version)
-                    clean["base_model_version"] = base_version
+                    raw_base_versions = clean["base_model_version"].tolist()
+                    raw_row_versions = clean["model_version"].tolist()
+                    resolved_versions = [
+                        resolve_base_model_version(row_base, row_version, manifest_model_version)
+                        for row_base, row_version in zip(raw_base_versions, raw_row_versions)
+                    ]
+                    base_versions = [item[0] for item in resolved_versions]
+                    version_sources = [item[1] for item in resolved_versions]
+                    clean["base_model_version"] = base_versions
+                    clean["model_version_source"] = version_sources
+                    for source, count in pd.Series(version_sources).value_counts().items():
+                        resolution_counts = report["model_version_resolution_counts"]
+                        resolution_counts[str(source)] = int(resolution_counts.get(str(source), 0)) + int(count)
                     clean["readiness_segment"] = pd.to_numeric(
                         clean["data_readiness_score"], errors="coerce"
                     ).map(readiness_segment)
                     clean["model_version"] = [
                         calibration_model_version(base, score)
+                        if is_usable_model_version(base) else "LEGACY_UNKNOWN"
                         for base, score in zip(clean["base_model_version"], clean["data_readiness_score"])
                     ]
                 clean["prediction_slot_status"] = slot_status
@@ -828,6 +892,7 @@ def select_versioned_fit_rows(outcomes: pd.DataFrame) -> tuple[pd.DataFrame, dic
         "fit_eligible_rows": 0,
         "model_version_counts_top20": {},
         "base_model_version_counts_top20": {},
+        "model_version_source_counts_top20": {},
         "readiness_segment_counts": {},
     }
     if outcomes.empty:
@@ -876,6 +941,7 @@ def select_versioned_fit_rows(outcomes: pd.DataFrame) -> tuple[pd.DataFrame, dic
 
     diagnostics["model_version_counts_top20"] = top_counts("model_version")
     diagnostics["base_model_version_counts_top20"] = top_counts("base_model_version")
+    diagnostics["model_version_source_counts_top20"] = top_counts("model_version_source")
     diagnostics["readiness_segment_counts"] = top_counts("readiness_segment")
     return outcomes.loc[fit_mask].copy(), diagnostics
 
