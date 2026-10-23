@@ -1,0 +1,89 @@
+name: Diagnose ALL-NSE row-gate eligibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_date:
+        description: "NSE session date YYYY-MM-DD; blank selects the latest weekday session"
+        required: false
+        default: ""
+  push:
+    branches:
+      - main
+    paths:
+      - "all_nse_prediction_learning.py"
+      - "all_nse_minute_prediction_capture.py"
+      - "all_universe_minute_capture.py"
+      - ".github/workflows/diagnose_all_nse_learning_gate.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: all-nse-row-gate-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Read one session from Google Drive and report row-gate counters
+        env:
+          SESSION_DATE: ${{ inputs.session_date }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          from all_nse_prediction_learning import load_clean_session_data
+          from persistent_store import GoogleDriveStore
+          from market_session_guard import is_nse_trading_day
+
+          ist = ZoneInfo("Asia/Kolkata")
+          configured = os.environ.get("SESSION_DATE", "").strip()
+          if configured:
+              session = date.fromisoformat(configured)
+          else:
+              today = datetime.now(ist).date()
+              session = next(
+                  (today - timedelta(days=offset)
+                   for offset in range(8)
+                   if is_nse_trading_day(today - timedelta(days=offset))),
+                  today,
+              )
+
+          store = GoogleDriveStore()
+          predictions, quotes, ingestion = load_clean_session_data(store, session, session)
+          payload = {
+              "diagnostic": "ALL_NSE_ROW_GATE",
+              "session_date": session.isoformat(),
+              "mode": "READ_ONLY",
+              "prediction_rows_returned_for_outcome_matching": int(len(predictions)),
+              "quote_rows_loaded": int(len(quotes)),
+              "ingestion": ingestion,
+              "production_model_changed": False,
+              "calibration_registry_changed": False,
+              "orders_placed": False,
+          }
+          print("ALL_NSE_ROW_GATE_DIAGNOSTIC_BEGIN")
+          print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+          print("ALL_NSE_ROW_GATE_DIAGNOSTIC_END")
+          PY
