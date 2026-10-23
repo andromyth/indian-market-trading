@@ -104,86 +104,110 @@ def match_matured_outcomes(
     *,
     max_target_distance_seconds: int = MAX_TARGET_QUOTE_DISTANCE_SECONDS,
 ) -> pd.DataFrame:
-    """Join forecasts to nearest clean quote close near the 30-minute target.
+    """Vector-match matured forecasts to the nearest clean target-window quote.
 
-    Quote timestamps are provider observation times, not exchange-timestamped
-    candles. The nearest same-symbol quote must be within three minutes of the
-    target; otherwise the outcome remains unvalidated and is not used for fit.
+    Source timestamps are provider observation times, not exchange-stamped
+    one-minute candle closes. Unmatched targets remain pending, never scored.
     """
+    output_columns = [
+        "forecast_key", "symbol", "decision_timestamp_utc", "target_timestamp_utc",
+        "actual_quote_timestamp_utc", "target_quote_distance_seconds", "reference_price",
+        "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
+        "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
+        "calibration_profile_id", "model_version", "model_family", "horizon_min",
+        "input_age_seconds", "feature_coverage", "validation_status", "source", "quote_basis",
+    ]
     if predictions.empty:
-        return pd.DataFrame()
-    quote_frame = quotes.copy()
-    if not quote_frame.empty:
-        quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.upper().str.replace(".NS", "", regex=False)
-        quote_frame["_quote_ts"] = pd.to_datetime(quote_frame["quote_observed_at_utc"], errors="coerce", utc=True)
-        quote_frame["_quote_price"] = pd.to_numeric(quote_frame["actual_observed_price"], errors="coerce")
-        quote_frame = quote_frame.loc[
-            quote_frame["_quote_ts"].notna()
-            & quote_frame["_quote_price"].gt(0)
-            & quote_frame["quote_status"].astype(str).str.upper().eq("PASS")
-        ].copy()
-        quote_frame = quote_frame.sort_values("_quote_ts")
-    lookup: dict[str, pd.DataFrame] = {
-        symbol: group for symbol, group in quote_frame.groupby("symbol", sort=False)
-    } if not quote_frame.empty else {}
+        return pd.DataFrame(columns=output_columns)
 
-    out: list[dict[str, Any]] = []
-    for row in predictions.to_dict(orient="records"):
-        symbol = str(row.get("symbol") or "").strip().upper().replace(".NS", "")
-        target = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
-        decision_ts = pd.to_datetime(row.get("actual_observed_at_utc"), errors="coerce", utc=True)
-        ref_price = _number(row.get("actual_market_value"))
-        raw_probability = _number(row.get("probability_up_30m_raw", row.get("probability_up_30m")))
-        raw_return = _number(row.get("expected_return_30m_raw", row.get("expected_return_30m")))
-        version = str(row.get("model_version") or "LEGACY_UNKNOWN")
-        status = "PENDING_TARGET_QUOTE"
-        actual_price = float("nan")
-        actual_quote_ts = pd.NaT
-        actual_return = float("nan")
-        quote_group = lookup.get(symbol)
-        if (
-            quote_group is not None and not pd.isna(target) and not pd.isna(decision_ts)
-            and np.isfinite(ref_price) and ref_price > 0
-        ):
-            distances = (quote_group["_quote_ts"] - target).abs().dt.total_seconds()
-            idx = distances.idxmin()
-            distance = float(distances.loc[idx])
-            if distance <= max_target_distance_seconds:
-                actual_quote_ts = quote_group.loc[idx, "_quote_ts"]
-                actual_price = float(quote_group.loc[idx, "_quote_price"])
-                actual_return = actual_price / ref_price - 1.0
-                status = "VALIDATED"
-        out.append({
-            "forecast_key": str(row.get("forecast_key") or ""),
-            "symbol": symbol,
-            "decision_timestamp_utc": decision_ts.isoformat() if not pd.isna(decision_ts) else None,
-            "target_timestamp_utc": target.isoformat() if not pd.isna(target) else None,
-            "actual_quote_timestamp_utc": actual_quote_ts.isoformat() if not pd.isna(actual_quote_ts) else None,
-            "target_quote_distance_seconds": (
-                abs((actual_quote_ts - target).total_seconds())
-                if not pd.isna(actual_quote_ts) and not pd.isna(target) else None
-            ),
-            "reference_price": ref_price if np.isfinite(ref_price) else None,
-            "actual_target_price": actual_price if np.isfinite(actual_price) else None,
-            "actual_return": actual_return if np.isfinite(actual_return) else None,
-            "probability_up": raw_probability if np.isfinite(raw_probability) else None,
-            "probability_up_calibrated": _number(row.get("probability_up_30m_calibrated")),
-            "expected_return": raw_return if np.isfinite(raw_return) else None,
-            "expected_return_calibrated": _number(row.get("expected_return_30m_calibrated")),
-            "signal": str(row.get("signal_raw") or row.get("raw_model_signal") or row.get("signal") or "HOLD").upper(),
-            "signal_calibrated": row.get("signal_calibrated"),
-            "calibration_profile_id": row.get("calibration_profile_id"),
-            "model_version": version,
-            "model_family": str(row.get("model_family") or "UNKNOWN"),
-            "horizon_min": 30,
-            "input_age_seconds": _number(row.get("actual_quote_age_seconds")),
-            "feature_coverage": _number(row.get("data_readiness_score")),
-            "validation_status": status,
-            "source": "all_nse_intraday_production",
-            "quote_basis": "nearest provider quote observation within 180s of nominal target; not exchange-stamped 1m OHLCV",
-        })
-    return pd.DataFrame(out)
+    pred = predictions.copy()
+    pred["symbol"] = pred["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+    pred["_target_ts"] = pd.to_datetime(pred.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
+    pred["_decision_ts"] = pd.to_datetime(pred.get("actual_observed_at_utc"), errors="coerce", utc=True)
+    pred["_reference"] = pd.to_numeric(pred.get("actual_market_value"), errors="coerce")
+    pred["_probability"] = pd.to_numeric(
+        pred.get("probability_up_30m_raw", pred.get("probability_up_30m")), errors="coerce"
+    )
+    pred["_expected_return"] = pd.to_numeric(
+        pred.get("expected_return_30m_raw", pred.get("expected_return_30m")), errors="coerce"
+    )
+    if "model_version" not in pred:
+        pred["model_version"] = "LEGACY_UNKNOWN"
+    pred["model_version"] = pred["model_version"].fillna("LEGACY_UNKNOWN").astype(str)
+    for col in ("probability_up_30m_calibrated", "expected_return_30m_calibrated",
+                "actual_quote_age_seconds", "data_readiness_score"):
+        if col not in pred:
+            pred[col] = np.nan
+    for col in ("signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
+                "model_family", "forecast_key"):
+        if col not in pred:
+            pred[col] = None
 
+    quote_cols = ["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"]
+    if quotes.empty:
+        q = pd.DataFrame(columns=["symbol", "_quote_ts", "_quote_price"])
+    else:
+        q = quotes[quote_cols].copy()
+        q["symbol"] = q["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+        q["_quote_ts"] = pd.to_datetime(q["quote_observed_at_utc"], errors="coerce", utc=True)
+        q["_quote_price"] = pd.to_numeric(q["actual_observed_price"], errors="coerce")
+        q = q.loc[
+            q["_quote_ts"].notna()
+            & q["_quote_price"].gt(0)
+            & q["quote_status"].astype(str).str.upper().eq("PASS")
+        ].sort_values(["_quote_ts", "symbol"]).drop_duplicates(["symbol", "_quote_ts"], keep="last")
+        q = q[["symbol", "_quote_ts", "_quote_price"]]
+
+    valid_left_mask = pred["_target_ts"].notna() & pred["symbol"].ne("")
+    left_valid = pred.loc[valid_left_mask].sort_values(["_target_ts", "symbol"])
+    left_invalid = pred.loc[~valid_left_mask].copy()
+    if not left_valid.empty and not q.empty:
+        matched = pd.merge_asof(
+            left_valid,
+            q.sort_values(["_quote_ts", "symbol"]),
+            left_on="_target_ts",
+            right_on="_quote_ts",
+            by="symbol",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=max_target_distance_seconds),
+        )
+    else:
+        matched = left_valid.copy()
+        matched["_quote_ts"] = pd.NaT
+        matched["_quote_price"] = np.nan
+    if not left_invalid.empty:
+        left_invalid["_quote_ts"] = pd.NaT
+        left_invalid["_quote_price"] = np.nan
+        merged = pd.concat([matched, left_invalid], ignore_index=True, sort=False)
+    else:
+        merged = matched
+
+    reference = pd.to_numeric(merged["_reference"], errors="coerce")
+    target_price = pd.to_numeric(merged["_quote_price"], errors="coerce")
+    quote_ok = merged["_quote_ts"].notna() & reference.gt(0) & target_price.gt(0)
+    merged["validation_status"] = np.where(quote_ok, "VALIDATED", "PENDING_TARGET_QUOTE")
+    merged["actual_return"] = np.where(quote_ok, target_price / reference - 1.0, np.nan)
+    merged["target_quote_distance_seconds"] = (merged["_quote_ts"] - merged["_target_ts"]).dt.total_seconds().abs()
+    merged["decision_timestamp_utc"] = merged["_decision_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["target_timestamp_utc"] = merged["_target_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["actual_quote_timestamp_utc"] = merged["_quote_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["reference_price"] = reference
+    merged["actual_target_price"] = target_price
+    merged["probability_up"] = merged["_probability"]
+    merged["probability_up_calibrated"] = pd.to_numeric(merged["probability_up_30m_calibrated"], errors="coerce")
+    merged["expected_return"] = merged["_expected_return"]
+    merged["expected_return_calibrated"] = pd.to_numeric(merged["expected_return_30m_calibrated"], errors="coerce")
+    signal = merged["signal_raw"].fillna("").astype(str).str.strip()
+    fallback = merged["raw_model_signal"].fillna("").astype(str).str.strip()
+    signal = signal.mask(signal.eq(""), fallback)
+    signal = signal.mask(signal.eq(""), merged["signal"].fillna("").astype(str).str.strip())
+    merged["signal"] = signal.mask(signal.eq(""), "HOLD").str.upper()
+    merged["horizon_min"] = 30
+    merged["input_age_seconds"] = pd.to_numeric(merged["actual_quote_age_seconds"], errors="coerce")
+    merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
+    merged["source"] = "all_nse_intraday_production"
+    merged["quote_basis"] = "nearest clean provider quote observation within target tolerance; not exchange-stamped 1m OHLCV"
+    return merged[output_columns].reset_index(drop=True)
 
 def _day_folder_files(store: Any, root: str, day: date) -> list[dict[str, Any]]:
     folder_id = _find_folder(store, root.split("/") + [f"{day:%Y}", f"{day:%m}", f"{day:%d}"])
@@ -214,8 +238,17 @@ def _file_map(files: list[dict[str, Any]], prefix: str, suffix: str) -> dict[str
 def load_clean_session_data(
     store: Any, start_date: date, end_date: date
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    prediction_rows: list[dict[str, Any]] = []
-    quote_rows: list[dict[str, Any]] = []
+    prediction_frames: list[pd.DataFrame] = []
+    quote_frames: list[pd.DataFrame] = []
+    prediction_columns = [
+        "symbol", "actual_observed_at_utc", "actual_market_value", "actual_quote_status",
+        "actual_quote_age_seconds", "forecast_target_timestamp_utc", "forecast_key",
+        "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
+        "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
+        "probability_up_30m_calibrated", "expected_return_30m_calibrated",
+        "signal_calibrated", "calibration_profile_id", "model_version", "model_family",
+        "data_readiness_score",
+    ]
     report = {
         "calendar_days_scanned": (end_date - start_date).days + 1,
         "prediction_slots_seen": 0,
@@ -262,8 +295,7 @@ def load_clean_session_data(
                 expected = int(manifest.get("expected_symbol_count") or 0)
                 if len(frame) != expected or frame["symbol"].astype(str).str.upper().nunique() != expected:
                     raise ValueError(f"quote row/universe mismatch: rows={len(frame)} unique={frame['symbol'].nunique()} expected={expected}")
-                frame["slot_key_ist"] = key
-                quote_rows.extend(frame.to_dict(orient="records"))
+                quote_frames.append(frame[["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"]].copy())
                 clean_quote_keys.add(key)
                 report["quote_slots_eligible"] += 1
             except Exception as exc:
@@ -315,8 +347,13 @@ def load_clean_session_data(
                     clean["model_version"] = clean["model_version"].fillna(
                         str(manifest.get("model_version") or "LEGACY_UNKNOWN")
                     ).astype(str)
-                clean["slot_key_ist"] = key
-                prediction_rows.extend(clean.to_dict(orient="records"))
+                for column in prediction_columns:
+                    if column not in clean:
+                        clean[column] = None
+                clean["model_version"] = clean["model_version"].fillna(
+                    str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                ).astype(str)
+                prediction_frames.append(clean[prediction_columns].copy())
                 report["clean_prediction_rows"] += len(clean)
                 report["prediction_slots_eligible"] += 1
                 if len(clean) != expected:
@@ -329,8 +366,14 @@ def load_clean_session_data(
                 report["excluded_reasons"]["prediction_parquet_invalid"] = report["excluded_reasons"].get("prediction_parquet_invalid", 0) + 1
         current += timedelta(days=1)
 
-    predictions = pd.DataFrame(prediction_rows)
-    quotes = pd.DataFrame(quote_rows)
+    predictions = (
+        pd.concat(prediction_frames, ignore_index=True, copy=False)
+        if prediction_frames else pd.DataFrame(columns=prediction_columns)
+    )
+    quotes = (
+        pd.concat(quote_frames, ignore_index=True, copy=False)
+        if quote_frames else pd.DataFrame(columns=["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"])
+    )
     report["quote_rows_retained"] = len(quotes)
     if not predictions.empty:
         decision_ts = pd.to_datetime(predictions.get("actual_observed_at_utc"), errors="coerce", utc=True)
