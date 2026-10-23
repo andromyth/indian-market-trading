@@ -53,7 +53,17 @@ jobs:
           from datetime import date, datetime, timedelta
           from zoneinfo import ZoneInfo
 
-          from all_nse_prediction_learning import load_clean_session_data
+          import io
+          import pandas as pd
+
+          from all_nse_prediction_learning import (
+              PREDICTION_ROOT,
+              _day_folder_files,
+              _download_bytes,
+              _download_json,
+              _file_map,
+              load_clean_session_data,
+          )
           from persistent_store import GoogleDriveStore
           from market_session_guard import is_nse_trading_day
 
@@ -72,10 +82,92 @@ jobs:
 
           store = GoogleDriveStore()
           predictions, quotes, ingestion = load_clean_session_data(store, session, session)
+
+          # Inspect the newest persisted raw prediction shard as well as the
+          # strict loader result. This is read-only and helps explain which
+          # readiness/status fields block individually valid-looking forecasts.
+          pred_files = _day_folder_files(store, PREDICTION_ROOT, session)
+          manifests = _file_map(pred_files, "manifest_", ".json")
+          shards = _file_map(pred_files, "predictions_", ".parquet")
+          available_keys = sorted(set(manifests) & set(shards))
+          latest_slot = available_keys[-1] if available_keys else None
+          latest_manifest = {}
+          latest_stats = {"status": "NO_COMPLETE_MANIFEST_AND_SHARD"}
+          if latest_slot:
+              latest_manifest = _download_json(store, manifests[latest_slot]["id"])
+              raw = _download_bytes(store, shards[latest_slot]["id"])
+              frame = pd.read_parquet(io.BytesIO(raw))
+              def counts(column):
+                  if column not in frame.columns:
+                      return {}
+                  return {
+                      str(key): int(value)
+                      for key, value in frame[column].astype("string").fillna("<NULL>").value_counts(dropna=False).items()
+                  }
+              def numeric_summary(column):
+                  if column not in frame.columns:
+                      return {"available": False}
+                  series = pd.to_numeric(frame[column], errors="coerce").dropna()
+                  if series.empty:
+                      return {"available": True, "non_null": 0}
+                  return {
+                      "available": True,
+                      "non_null": int(series.size),
+                      "min": float(series.min()),
+                      "p10": float(series.quantile(0.10)),
+                      "p25": float(series.quantile(0.25)),
+                      "median": float(series.median()),
+                      "p75": float(series.quantile(0.75)),
+                      "max": float(series.max()),
+                  }
+              latest_stats = {
+                  "status": "RAW_SHARD_LOADED",
+                  "slot_key_ist": latest_slot,
+                  "row_count": int(len(frame)),
+                  "columns_present": [
+                      name for name in (
+                          "symbol", "prediction_status", "actual_quote_status",
+                          "trained_for_symbol", "data_limited",
+                          "data_readiness_score", "feature_count",
+                          "non_missing_feature_count", "actual_quote_age_seconds",
+                          "actual_market_value", "probability_up_30m",
+                          "forecast_target_timestamp_utc",
+                      ) if name in frame.columns
+                  ],
+                  "prediction_status_counts": counts("prediction_status"),
+                  "actual_quote_status_counts": counts("actual_quote_status"),
+                  "trained_for_symbol_counts": counts("trained_for_symbol"),
+                  "data_limited_counts": counts("data_limited"),
+                  "data_readiness_score": numeric_summary("data_readiness_score"),
+                  "non_missing_feature_count": numeric_summary("non_missing_feature_count"),
+                  "feature_count": numeric_summary("feature_count"),
+                  "actual_quote_age_seconds": numeric_summary("actual_quote_age_seconds"),
+                  "probability_up_30m": numeric_summary("probability_up_30m"),
+                  "target_timestamp_non_null": (
+                      int(pd.to_datetime(frame["forecast_target_timestamp_utc"], errors="coerce", utc=True).notna().sum())
+                      if "forecast_target_timestamp_utc" in frame.columns else 0
+                  ),
+              }
+          manifest_fields = {
+              key: latest_manifest.get(key)
+              for key in (
+                  "status", "quality_gate_pass", "expected_symbol_count", "row_count",
+                  "prediction_count", "missing_quote_count", "data_limited_count",
+                  "untrained_symbol_count", "model_failure_count", "history_ready",
+                  "history_seed_coverage_symbols", "history_seed_failed_batches",
+                  "model_coverage_symbols", "model_status", "nifty_context_status",
+                  "nifty_context_error", "trained_symbol_manifest_available",
+                  "model_version", "quote_snapshot_read_error",
+              )
+              if key in latest_manifest
+          }
           payload = {
               "diagnostic": "ALL_NSE_ROW_GATE",
               "session_date": session.isoformat(),
               "mode": "READ_ONLY",
+              "latest_raw_slot": latest_slot,
+              "latest_prediction_manifest": manifest_fields,
+              "latest_raw_prediction_stats": latest_stats,
               "prediction_rows_returned_for_outcome_matching": int(len(predictions)),
               "quote_rows_loaded": int(len(quotes)),
               "ingestion": ingestion,
