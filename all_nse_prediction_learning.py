@@ -590,7 +590,7 @@ def load_clean_session_data(
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
         "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
-        "model_version", "base_model_version", "readiness_segment", "model_family",
+        "model_version", "model_family",
         "data_readiness_score", "prediction_slot_status", "quote_slot_status",
         "slot_quality_gate_pass",
     ]
