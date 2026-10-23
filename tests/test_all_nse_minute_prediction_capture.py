@@ -98,6 +98,17 @@ def test_actionable_signal_abstains_when_feature_readiness_is_low():
     assert capture._signal(0.5, 0.90) == ("HOLD", "HOLD")
 
 
+def test_active_calibration_never_overrides_data_readiness_hold():
+    guard = capture._primary_signal_with_readiness_guard
+    assert guard("PASS", False, "BUY") == "BUY"
+    assert guard("PASS", False, "SELL") == "SELL"
+    assert guard("PASS_DATA_LIMITED", True, "BUY") == "HOLD"
+    assert guard("PASS", True, "BUY") == "HOLD"
+    assert guard("PASS_UNTRAINED_SYMBOL", False, "SELL") == "HOLD"
+    assert guard("PASS", None, "BUY") == "HOLD"
+    assert guard("PASS", False, "ABSTAIN") == "HOLD"
+
+
 def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
     ts = int(pd.Timestamp("2026-10-21 10:00:00", tz=IST).timestamp())
     frame = capture.AllNSEMinutePredictor._parse_candles([
