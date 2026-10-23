@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import all_nse_prediction_learning as learning
 from all_nse_prediction_learning import (
     bounded_calibration_sample,
     match_matured_outcomes,
@@ -292,3 +293,44 @@ def test_row_level_gate_excludes_stale_same_symbol_quote_and_low_readiness():
     assert clean.empty
     assert gate["clean_rows"] == 0
     assert gate["quarantined_rows"] == 1
+
+
+def test_run_learning_reports_prediction_count_after_releasing_source_frames(tmp_path, monkeypatch):
+    class FakeDriveStore:
+        def upload_or_update(self, local_path, remote_relative_path, mime_type="application/octet-stream"):
+            assert local_path.exists()
+            return {
+                "status": "OK",
+                "action": "updated",
+                "remote_path": remote_relative_path,
+                "file_id": "fake-drive-id",
+            }
+
+    source_predictions = pd.DataFrame([
+        {"symbol": "AAA", "probability_up_30m": 0.6}
+    ])
+    monkeypatch.setattr(learning, "GoogleDriveStore", FakeDriveStore)
+    monkeypatch.setattr(
+        learning,
+        "load_clean_session_data",
+        lambda store, start, end: (
+            source_predictions.copy(),
+            pd.DataFrame(),
+            {"clean_prediction_rows": 1, "prediction_slots_seen": 1},
+        ),
+    )
+    monkeypatch.setattr(
+        learning,
+        "match_matured_outcomes",
+        lambda predictions, quotes: pd.DataFrame(),
+    )
+
+    report = learning.run_learning(
+        pd.Timestamp("2026-10-01").date(),
+        pd.Timestamp("2026-10-01").date(),
+        output_dir=tmp_path,
+    )
+    assert report["outcome_summary"]["prediction_rows_in_clean_slots"] == 1
+    assert report["outcome_summary"]["matched_validated_outcomes"] == 0
+    assert report["recommendation_update"]["status"] == "WAITING_FOR_CLEAN_MATURED_OUTCOMES"
+    assert report["production_model_changed"] is False
