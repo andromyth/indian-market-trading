@@ -362,6 +362,18 @@ def test_overlay_never_applies_shadow_stage_even_in_active_mode_and_respects_abs
     assert abstain["signal"] == "HOLD" and abstain["probability_up"] < 0.9 and abstain["signal_calibrated"] == "ABSTAIN"
 
 
+
+def test_active_abstention_suppresses_raw_buy_and_sell_signals():
+    for raw_signal in ("BUY", "SELL"):
+        row = {**_row(), "signal": raw_signal}
+        out = co.CalibrationOverlay(
+            lambda: _doc(thresholds={"abstain_all": True}),
+            mode="active",
+            now_fn=lambda: NOW,
+        ).annotate(row)
+        assert out["calibration_applied"] is True
+        assert out["signal_calibrated"] == "ABSTAIN"
+        assert out["signal"] == "HOLD"
 def test_overlay_fails_open_for_every_kind_of_problem():
     row = _row()
     assert co.CalibrationOverlay(lambda: _doc(), mode="off").annotate(row) is row
