@@ -423,6 +423,10 @@ def load_clean_session_data(
         pd.concat(quote_frames, ignore_index=True, copy=False)
         if quote_frames else pd.DataFrame(columns=["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"])
     )
+    # Drop references to individual Parquet fragments after concatenation so the
+    # multi-week full-universe run does not retain both fragmented and combined data.
+    prediction_frames.clear()
+    quote_frames.clear()
     report["quote_rows_retained"] = len(quotes)
     if not predictions.empty:
         decision_ts = pd.to_datetime(predictions.get("actual_observed_at_utc"), errors="coerce", utc=True)
@@ -440,6 +444,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
     store = GoogleDriveStore()
     predictions, quotes, ingest = load_clean_session_data(store, start_date, end_date)
     outcomes = match_matured_outcomes(predictions, quotes)
+    del predictions, quotes
     if outcomes.empty:
         fit_frame = pd.DataFrame()
     else:
@@ -525,14 +530,14 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}"
-    outcomes_path = out_dir / f"all_nse_outcomes_{stamp}.csv"
+    outcomes_path = out_dir / f"all_nse_outcomes_{stamp}.csv.gz"
     report_path = out_dir / f"all_nse_prediction_learning_report_{stamp}.json"
-    outcomes.to_csv(outcomes_path, index=False)
+    outcomes.to_csv(outcomes_path, index=False, compression="gzip")
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     remote_dir = f"{LEARNING_ROOT}/{end_date:%Y/%m/%d}"
     upload_results = {}
     for key, path, mime_type in [
-        ("outcomes", outcomes_path, "text/csv"),
+        ("outcomes", outcomes_path, "application/gzip"),
         ("report", report_path, "application/json"),
     ]:
         result = store.upload_or_update(path, f"{remote_dir}/{path.name}", mime_type=mime_type)
