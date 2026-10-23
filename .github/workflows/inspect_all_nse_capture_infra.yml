@@ -8,6 +8,13 @@ on:
       - main
     paths:
       - ".github/workflows/inspect_all_nse_capture_infra.yml"
+      - ".github/workflows/verify_all_nse_minute_capture.yml"
+      - ".github/workflows/configure_intraday_five_minute_schedule.yml"
+      - "autonomous_intraday_worker_service.py"
+      - "autonomous_intraday_worker.py"
+      - "all_universe_minute_capture.py"
+      - "all_nse_minute_prediction_capture.py"
+      - "audit_all_universe_minute_snapshots.py"
 
 permissions:
   contents: read
