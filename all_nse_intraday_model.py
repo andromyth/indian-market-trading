@@ -219,16 +219,27 @@ def model_status() -> dict[str,Any]:
         m=_manifest()
     except Exception as exc:
         return {"status":"MODEL_ARTIFACT_UNAVAILABLE","error_type":type(exc).__name__,"error":str(exc)}
+    classifier_sha = str(m.get("classifier_sha256") or "")
+    regressor_sha = str(m.get("regressor_sha256") or "")
+    # Profile identity must change when either deployed estimator changes, even
+    # when two builds share the same training cutoff timestamp.
+    artifact_version = (
+        f"{m.get('trained_until') or 'unknown'}__{classifier_sha[:12]}_{regressor_sha[:12]}"
+        if classifier_sha and regressor_sha else None
+    )
     return {
         "status":m.get("status","REPLACEMENT"),
         "model_family":m.get("model_family"),
         "target":m.get("target"),
+        "model_version":str(m.get("model_version") or artifact_version or m.get("trained_until") or "unversioned"),
         "feature_count":len(FEATURES),
         "training_symbols":m.get("training_symbols",[]),
         "training_symbol_count":m.get("training_symbol_count"),
         "universe_size":m.get("universe_size"),
         "coverage_pct":m.get("coverage_pct"),
         "trained_until":m.get("trained_until"),
+        "classifier_sha256":classifier_sha or None,
+        "regressor_sha256":regressor_sha or None,
         "manifest_sha256_match": all([
             LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
             LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
