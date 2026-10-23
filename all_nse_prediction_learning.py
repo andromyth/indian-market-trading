@@ -38,7 +38,34 @@ MIME_FOLDER = "application/vnd.google-apps.folder"
 MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
 MAX_INPUT_AGE_SECONDS = 120
 MIN_DATA_READINESS = 0.70
+# Data-limited probabilities can be assessed in their own segment; almost-empty rows remain excluded.
+MIN_LEARNING_READINESS = 0.35
+READINESS_LOW_SUFFIX = "__READINESS_LOW"
+READINESS_READY_SUFFIX = "__READINESS_READY"
+READINESS_UNKNOWN_SUFFIX = "__READINESS_UNKNOWN"
 MODEL_VERSION_PREFIX = "all_nse_intraday__"
+
+
+def readiness_segment(value: Any) -> str:
+    score = _number(value)
+    if not np.isfinite(score) or score < 0 or score > 1:
+        return "READINESS_UNKNOWN"
+    return "READINESS_LOW" if score < MIN_DATA_READINESS else "READINESS_READY"
+
+
+def calibration_model_version(base_version: Any, readiness: Any) -> str:
+    """Scope calibration to a deployed model artifact and its readiness band."""
+    base = str(base_version or "LEGACY_UNKNOWN").strip()
+    for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    suffix = {
+        "READINESS_LOW": READINESS_LOW_SUFFIX,
+        "READINESS_READY": READINESS_READY_SUFFIX,
+        "READINESS_UNKNOWN": READINESS_UNKNOWN_SUFFIX,
+    }[readiness_segment(readiness)]
+    return f"{base}{suffix}"
 
 
 def _number(value: Any) -> float:
@@ -176,11 +203,14 @@ def select_row_level_clean_predictions(
         "quarantined_rows": int(len(frame)),
         "condition_counts": {
             "prediction_status_pass": 0,
+            "prediction_status_pass_data_limited": 0,
+            "prediction_status_eligible": 0,
             "actual_quote_status_pass": 0,
             "trained_true": 0,
             "trained_false": 0,
             "trained_unknown": 0,
             "data_limited_false": 0,
+            "data_limited_true": 0,
             "probability_valid": 0,
             "quote_age_valid": 0,
             "readiness_valid": 0,
@@ -297,10 +327,10 @@ def select_row_level_clean_predictions(
         & price_match
     )
 
-    prediction_status_pass = (
-        merged.get("prediction_status", pd.Series("", index=merged.index))
-        .astype(str).str.upper().eq("PASS")
-    )
+    prediction_status = merged.get("prediction_status", pd.Series("", index=merged.index)).astype(str).str.upper()
+    prediction_status_pass = prediction_status.eq("PASS")
+    prediction_status_pass_data_limited = prediction_status.eq("PASS_DATA_LIMITED")
+    prediction_status_eligible = prediction_status_pass | prediction_status_pass_data_limited
     actual_quote_status_pass = (
         merged.get("actual_quote_status", pd.Series("", index=merged.index))
         .astype(str).str.upper().eq("PASS")
@@ -315,10 +345,11 @@ def select_row_level_clean_predictions(
         )
     )
     trained_unknown = ~(trained_true | trained_false)
-    data_limited_false = ~merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+    data_limited_flags = merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+    data_limited_false = ~data_limited_flags
     probability_valid = merged_probability.between(0, 1)
     quote_age_valid = merged_quote_age.between(0, MAX_INPUT_AGE_SECONDS)
-    readiness_valid = merged_readiness.ge(MIN_DATA_READINESS)
+    readiness_valid = merged_readiness.ge(MIN_LEARNING_READINESS) & merged_readiness.le(1.0)
     target_timestamp_valid = (
         pd.to_datetime(
             merged.get("forecast_target_timestamp_utc", pd.Series(pd.NaT, index=merged.index)),
@@ -328,10 +359,9 @@ def select_row_level_clean_predictions(
     symbol_valid = merged["_symbol_norm_internal"].astype(str).str.strip().ne("")
 
     non_quote_valid = (
-        prediction_status_pass
+        prediction_status_eligible
         & actual_quote_status_pass
         & ~trained_false
-        & data_limited_false
         & probability_valid
         & quote_age_valid
         & readiness_valid
@@ -342,11 +372,14 @@ def select_row_level_clean_predictions(
 
     base_report["condition_counts"] = {
         "prediction_status_pass": int(prediction_status_pass.sum()),
+        "prediction_status_pass_data_limited": int(prediction_status_pass_data_limited.sum()),
+        "prediction_status_eligible": int(prediction_status_eligible.sum()),
         "actual_quote_status_pass": int(actual_quote_status_pass.sum()),
         "trained_true": int(trained_true.sum()),
         "trained_false": int(trained_false.sum()),
         "trained_unknown": int(trained_unknown.sum()),
         "data_limited_false": int(data_limited_false.sum()),
+        "data_limited_true": int(data_limited_flags.sum()),
         "probability_valid": int(probability_valid.sum()),
         "quote_age_valid": int(quote_age_valid.sum()),
         "readiness_valid": int(readiness_valid.sum()),
