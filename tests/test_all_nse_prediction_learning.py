@@ -10,6 +10,7 @@ from all_nse_prediction_learning import (
     prediction_manifest_is_clean,
     quote_manifest_is_clean,
     select_row_level_clean_predictions,
+    calibration_model_version,
 )
 
 
@@ -391,3 +392,67 @@ def test_run_learning_reports_prediction_count_after_releasing_source_frames(tmp
     assert report["outcome_summary"]["matched_validated_outcomes"] == 0
     assert report["recommendation_update"]["status"] == "WAITING_FOR_CLEAN_MATURED_OUTCOMES"
     assert report["production_model_changed"] is False
+
+
+def test_data_limited_predictions_are_eligible_only_for_low_readiness_calibration():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    pred.update({
+        "symbol": "AAA",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_age_seconds": 5.0,
+        "actual_quote_status": "PASS",
+        "prediction_status": "PASS_DATA_LIMITED",
+        "trained_for_symbol": True,
+        "data_limited": True,
+        "data_readiness_score": 0.5294,
+        "base_model_version": "all_nse_intraday__artifact123",
+    })
+    quote = pd.DataFrame([{
+        "symbol": "AAA",
+        "quote_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_observed_price": 100.0,
+        "quote_status": "PASS",
+    }])
+    clean, gate = select_row_level_clean_predictions(
+        pd.DataFrame([pred]), quote, prediction_manifest(status="PARTIAL")
+    )
+    assert clean["symbol"].tolist() == ["AAA"]
+    assert gate["condition_counts"]["prediction_status_pass_data_limited"] == 1
+    assert gate["condition_counts"]["data_limited_true"] == 1
+    assert gate["condition_counts"]["readiness_valid"] == 1
+    assert gate["condition_counts"]["all_conditions"] == 1
+    assert calibration_model_version("all_nse_intraday__artifact123", 0.5294) == (
+        "all_nse_intraday__artifact123__READINESS_LOW"
+    )
+    assert calibration_model_version("all_nse_intraday__artifact123", 0.95) == (
+        "all_nse_intraday__artifact123__READINESS_READY"
+    )
+
+
+def test_near_empty_readiness_and_explicitly_untrained_rows_remain_ineligible():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    pred.update({
+        "symbol": "AAA",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_age_seconds": 5.0,
+        "actual_quote_status": "PASS",
+        "prediction_status": "PASS_DATA_LIMITED",
+        "trained_for_symbol": False,
+        "data_limited": True,
+        "data_readiness_score": 0.20,
+    })
+    quote = pd.DataFrame([{
+        "symbol": "AAA",
+        "quote_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_observed_price": 100.0,
+        "quote_status": "PASS",
+    }])
+    clean, gate = select_row_level_clean_predictions(
+        pd.DataFrame([pred]), quote, prediction_manifest(status="PARTIAL")
+    )
+    assert clean.empty
+    assert gate["condition_counts"]["trained_false"] == 1
+    assert gate["condition_counts"]["readiness_valid"] == 0
+    assert gate["condition_counts"]["all_conditions"] == 0
