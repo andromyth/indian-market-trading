@@ -51,6 +51,55 @@ def _true(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def bounded_calibration_sample(
+    frame: pd.DataFrame,
+    *,
+    max_rows_per_session: int = 12000,
+    expected_slots_per_session: int = 75,
+) -> pd.DataFrame:
+    """Deterministically sample calibration rows across each session's time slots.
+
+    The complete clean outcome ledger remains available for audit/metrics. This
+    bounded, stratified view prevents a multi-million-row month from making the
+    bootstrap/calibrator step unbounded while retaining cross-sectional coverage.
+    """
+    if frame.empty or max_rows_per_session < 1:
+        return frame.copy()
+    required = {"symbol", "target_timestamp_utc"}
+    if not required.issubset(frame.columns):
+        return frame.copy()
+
+    working = frame.copy()
+    target = pd.to_datetime(working["target_timestamp_utc"], errors="coerce", utc=True)
+    valid = target.notna()
+    working = working.loc[valid].copy()
+    if working.empty:
+        return frame.iloc[0:0].copy()
+    target = target.loc[valid].dt.tz_convert(IST)
+    working["_learning_session"] = target.dt.strftime("%Y-%m-%d")
+    working["_learning_slot"] = target.dt.floor("5min").astype(str)
+    working["_learning_rank"] = pd.util.hash_pandas_object(
+        working["symbol"].astype(str) + "|" + working["_learning_session"] + "|" + working["_learning_slot"],
+        index=False,
+    ).astype("uint64").to_numpy()
+    per_slot = max(1, (max_rows_per_session + expected_slots_per_session - 1) // expected_slots_per_session)
+
+    selected = []
+    for _, slot_group in working.groupby(["_learning_session", "_learning_slot"], sort=True):
+        if len(slot_group) > per_slot:
+            slot_group = slot_group.nsmallest(per_slot, "_learning_rank")
+        selected.append(slot_group)
+
+    sampled = pd.concat(selected, ignore_index=False) if selected else working.iloc[0:0].copy()
+    sampled_sessions = []
+    for _, session_group in sampled.groupby("_learning_session", sort=True):
+        if len(session_group) > max_rows_per_session:
+            session_group = session_group.nsmallest(max_rows_per_session, "_learning_rank")
+        sampled_sessions.append(session_group)
+    result = pd.concat(sampled_sessions, ignore_index=False) if sampled_sessions else sampled.iloc[0:0].copy()
+    return result.drop(columns=["_learning_session", "_learning_slot", "_learning_rank"]).reset_index(drop=True)
+
+
 def prediction_manifest_is_clean(manifest: dict[str, Any]) -> bool:
     """Require the full-NSE inference slot to be complete and model-ready."""
     try:
@@ -443,7 +492,8 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         # Run through the same persisted registry used by the runtime calibration
         # overlay. Version-specific entries keep this model separate from the
         # watchlist model even though both use the same lifecycle state file.
-        runtime_frame = fit_frame.copy()
+        full_fit_rows = int(len(fit_frame))
+        runtime_frame = bounded_calibration_sample(fit_frame)
         runtime_frame["validation_status"] = "VALIDATED"
         runtime_frame["horizon_min"] = 30
         runtime_frame["probability_up"] = pd.to_numeric(runtime_frame["probability_up"], errors="coerce")
@@ -458,6 +508,10 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         }
         active_keys = sorted(set(calibration_result.get("active_profile_keys", [])) & full_nse_keys)
         shadow_keys = sorted(set(calibration_result.get("shadow_profile_keys", [])) & full_nse_keys)
+        report["recommendation_update"]["autopilot_rows_full_clean_sample"] = full_fit_rows
+        report["recommendation_update"]["autopilot_rows_used"] = int(len(runtime_frame))
+        report["recommendation_update"]["autopilot_max_rows_per_session"] = 12000
+        report["recommendation_update"]["autopilot_sampling"] = "deterministic hash sample stratified by 5-minute target slot; all complete clean outcomes remain in audit CSV"
         report["recommendation_update"]["status"] = calibration_result.get("status", "UNKNOWN")
         report["recommendation_update"]["calibration_profiles_live"] = len(active_keys) + len(shadow_keys)
         report["recommendation_update"]["calibration_profiles_active_for_full_nse"] = len(active_keys)
