@@ -49,63 +49,6 @@ def quote_manifest(**overrides):
     return {**base, **overrides}
 
 
-@pytest.mark.parametrize(
-    ("row_base", "row_version", "manifest_version", "expected", "source"),
-    [
-        (
-            "LEGACY_UNKNOWN",
-            "LEGACY_UNKNOWN__READINESS_READY",
-            "all_nse_intraday__2026-10-22__classifier123_regressor456",
-            "all_nse_intraday__2026-10-22__classifier123_regressor456",
-            "manifest_model_version",
-        ),
-        (
-            "all_nse_intraday__row-hash-abc",
-            "all_nse_intraday__row-hash-abc__READINESS_READY",
-            "all_nse_intraday__manifest-hash-xyz",
-            "all_nse_intraday__row-hash-abc",
-            "row_base_model_version",
-        ),
-        (
-            "",
-            "all_nse_intraday__row-hash-abc__READINESS_LOW",
-            "all_nse_intraday__manifest-hash-xyz",
-            "all_nse_intraday__row-hash-abc",
-            "row_model_version",
-        ),
-        (
-            "unversioned",
-            "all_nse_intraday__unversioned__READINESS_READY",
-            "all_nse_intraday__unversioned",
-            "LEGACY_UNKNOWN",
-            "legacy_unknown_fallback",
-        ),
-    ],
-)
-def test_model_version_resolution_skips_sentinels_and_uses_manifest_fallback(
-    row_base, row_version, manifest_version, expected, source
-):
-    assert resolve_base_model_version(row_base, row_version, manifest_version) == (expected, source)
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        None, "", "LEGACY_UNKNOWN", "UNKNOWN", "unversioned",
-        "all_nse_intraday__unversioned",
-        "LEGACY_UNKNOWN__READINESS_LOW",
-        "LEGACY_UNKNOWN__READINESS_READY",
-        "LEGACY_UNKNOWN__READINESS_UNKNOWN",
-    ],
-)
-def test_unusable_model_version_sentinels_are_not_fit_eligible(value):
-    assert not is_usable_model_version(value)
-
-
-def test_versioned_artifact_with_readiness_suffix_is_fit_eligible():
-    assert is_usable_model_version("all_nse_intraday__2026-10-22__abc__READINESS_READY")
-
-
 def test_complete_full_nse_prediction_manifest_is_eligible():
     assert prediction_manifest_is_clean(prediction_manifest())
 
@@ -201,23 +144,6 @@ def test_matured_outcome_uses_nearest_clean_target_quote_within_tolerance():
     assert result.loc[0, "actual_return"] == pytest.approx(0.02)
     assert result.loc[0, "target_quote_distance_seconds"] == pytest.approx(15.0)
     assert result.loc[0, "model_version"] == "all_nse_intraday__2026-09-30"
-
-
-def test_matured_outcome_falls_back_to_legacy_probability_when_raw_column_is_null():
-    pred = _prediction()
-    pred["probability_up_30m_raw"] = None
-    pred["expected_return_30m_raw"] = None
-    predictions = pd.DataFrame([pred])
-    quotes = pd.DataFrame([{
-        "symbol": "ABC",
-        "quote_observed_at_utc": "2026-10-01T04:30:10Z",
-        "actual_observed_price": 102.0,
-        "quote_status": "PASS",
-    }])
-    result = match_matured_outcomes(predictions, quotes)
-    assert result.loc[0, "validation_status"] == "VALIDATED"
-    assert result.loc[0, "probability_up"] == pytest.approx(0.62)
-    assert result.loc[0, "expected_return"] == pytest.approx(0.01)
 
 
 def test_unmatched_or_too_distant_target_quote_is_not_scored():
@@ -532,3 +458,84 @@ def test_near_empty_readiness_and_explicitly_untrained_rows_remain_ineligible():
     assert gate["condition_counts"]["trained_false"] == 1
     assert gate["condition_counts"]["readiness_valid"] == 0
     assert gate["condition_counts"]["all_conditions"] == 0
+
+
+def test_matcher_falls_back_to_model_values_when_raw_columns_exist_but_are_null():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    # This is what older Drive Parquets look like after the loader has
+    # materialized newer schema columns with null values.
+    pred["probability_up_30m_raw"] = None
+    pred["expected_return_30m_raw"] = None
+    pred["probability_up_30m"] = 0.62
+    pred["expected_return_30m"] = 0.01
+    predictions = pd.DataFrame([pred])
+    quotes = pd.DataFrame([
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:30:15Z",
+            "actual_observed_price": 102.0,
+            "quote_status": "PASS",
+        }
+    ])
+    result = match_matured_outcomes(predictions, quotes)
+    assert result.loc[0, "validation_status"] == "VALIDATED"
+    assert result.loc[0, "probability_up"] == pytest.approx(0.62)
+    assert result.loc[0, "expected_return"] == pytest.approx(0.01)
+    assert result.loc[0, "actual_return"] == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    ("row_base", "row_version", "manifest_version", "expected", "source"),
+    [
+        (
+            "LEGACY_UNKNOWN",
+            "LEGACY_UNKNOWN__READINESS_READY",
+            "all_nse_intraday__2026-10-22__classifier123_regressor456",
+            "all_nse_intraday__2026-10-22__classifier123_regressor456",
+            "manifest_model_version",
+        ),
+        (
+            "all_nse_intraday__row-hash-abc",
+            "all_nse_intraday__row-hash-abc__READINESS_READY",
+            "all_nse_intraday__manifest-hash-xyz",
+            "all_nse_intraday__row-hash-abc",
+            "row_base_model_version",
+        ),
+        (
+            "",
+            "all_nse_intraday__row-hash-abc__READINESS_LOW",
+            "all_nse_intraday__manifest-hash-xyz",
+            "all_nse_intraday__row-hash-abc",
+            "row_model_version",
+        ),
+        (
+            "unversioned",
+            "all_nse_intraday__unversioned__READINESS_READY",
+            "all_nse_intraday__unversioned",
+            "LEGACY_UNKNOWN",
+            "legacy_unknown_fallback",
+        ),
+    ],
+)
+def test_model_version_resolution_skips_sentinels_and_uses_manifest_fallback(
+    row_base, row_version, manifest_version, expected, source
+):
+    assert resolve_base_model_version(row_base, row_version, manifest_version) == (expected, source)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None, "", "LEGACY_UNKNOWN", "UNKNOWN", "unversioned",
+        "all_nse_intraday__unversioned",
+        "LEGACY_UNKNOWN__READINESS_LOW",
+        "LEGACY_UNKNOWN__READINESS_READY",
+        "LEGACY_UNKNOWN__READINESS_UNKNOWN",
+    ],
+)
+def test_unusable_model_version_sentinels_are_not_fit_eligible(value):
+    assert not is_usable_model_version(value)
+
+
+def test_versioned_artifact_with_readiness_suffix_is_fit_eligible():
+    assert is_usable_model_version("all_nse_intraday__2026-10-22__abc__READINESS_READY")
