@@ -177,6 +177,20 @@ def _signal(probability_up: float, readiness: float) -> tuple[str, str]:
     return raw, raw if readiness >= MIN_SIGNAL_READINESS else "HOLD"
 
 
+def _primary_signal_with_readiness_guard(
+    prediction_status: Any,
+    data_limited: Any,
+    candidate_signal: Any,
+) -> str:
+    """Never expose BUY/SELL as the primary action for a limited/unknown row."""
+    status = str(prediction_status or "").strip().upper()
+    ready_flag = isinstance(data_limited, (bool, np.bool_)) and not bool(data_limited)
+    if status != "PASS" or not ready_flag:
+        return "HOLD"
+    signal = str(candidate_signal or "HOLD").strip().upper()
+    return signal if signal in {"BUY", "SELL", "HOLD"} else "HOLD"
+
+
 class AllNSEMinutePredictor:
     """Rate-limited history cache and one-row-per-symbol minute inference engine."""
 
@@ -953,10 +967,10 @@ class AllNSEMinutePredictor:
                     row["calibrated_signal_advisory"] = overlay.get("signal_calibrated")
                     # A data-limited inference must remain HOLD even if an
                     # active probability calibrator would otherwise suggest BUY/SELL.
-                    row["signal_calibrated"] = (
-                        overlay.get("signal_calibrated")
-                        if row.get("prediction_status") == "PASS" and not row.get("data_limited")
-                        else "HOLD"
+                    row["signal_calibrated"] = _primary_signal_with_readiness_guard(
+                        row.get("prediction_status"),
+                        row.get("data_limited"),
+                        overlay.get("signal_calibrated"),
                     )
                     row["calibration_profile_id"] = overlay.get("calibration_profile_id")
                     row["calibration_stage"] = overlay.get("calibration_stage")
@@ -964,10 +978,10 @@ class AllNSEMinutePredictor:
                     if row["calibration_applied"]:
                         row["probability_up_30m"] = overlay.get("probability_up", probability)
                         row["expected_return_30m"] = overlay.get("expected_return", expected_return)
-                        row["signal"] = (
-                            overlay.get("signal", signal)
-                            if row.get("prediction_status") == "PASS" and not row.get("data_limited")
-                            else "HOLD"
+                        row["signal"] = _primary_signal_with_readiness_guard(
+                            row.get("prediction_status"),
+                            row.get("data_limited"),
+                            overlay.get("signal", signal),
                         )
                         calibrated_probability = _safe_float(row.get("probability_up_30m"))
                         if calibrated_probability is not None:
