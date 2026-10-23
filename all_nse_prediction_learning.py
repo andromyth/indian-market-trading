@@ -480,12 +480,22 @@ def match_matured_outcomes(
     pred["_target_ts"] = pd.to_datetime(pred.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
     pred["_decision_ts"] = pd.to_datetime(pred.get("actual_observed_at_utc"), errors="coerce", utc=True)
     pred["_reference"] = pd.to_numeric(pred.get("actual_market_value"), errors="coerce")
-    pred["_probability"] = pd.to_numeric(
-        pred.get("probability_up_30m_raw", pred.get("probability_up_30m")), errors="coerce"
+    # Prefer the explicit base-model outputs where present, but fall back
+    # per row to legacy output columns when newer schema columns exist but are null.
+    probability_raw = pd.to_numeric(
+        pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
     )
-    pred["_expected_return"] = pd.to_numeric(
-        pred.get("expected_return_30m_raw", pred.get("expected_return_30m")), errors="coerce"
+    probability_legacy = pd.to_numeric(
+        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
     )
+    pred["_probability"] = probability_raw.where(probability_raw.notna(), probability_legacy)
+    return_raw = pd.to_numeric(
+        pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
+    )
+    return_legacy = pd.to_numeric(
+        pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
+    )
+    pred["_expected_return"] = return_raw.where(return_raw.notna(), return_legacy)
     if "model_version" not in pred:
         pred["model_version"] = "LEGACY_UNKNOWN"
     pred["model_version"] = pred["model_version"].fillna("LEGACY_UNKNOWN").astype(str)
