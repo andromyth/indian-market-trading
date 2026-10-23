@@ -170,6 +170,22 @@ def select_row_level_clean_predictions(
         "quote_matched_rows": 0,
         "clean_rows": 0,
         "quarantined_rows": int(len(frame)),
+        "condition_counts": {
+            "prediction_status_pass": 0,
+            "actual_quote_status_pass": 0,
+            "trained_true": 0,
+            "trained_false": 0,
+            "trained_unknown": 0,
+            "data_limited_false": 0,
+            "probability_valid": 0,
+            "quote_age_valid": 0,
+            "readiness_valid": 0,
+            "target_timestamp_valid": 0,
+            "symbol_valid": 0,
+            "quote_matched": 0,
+            "all_non_quote_conditions": 0,
+            "all_conditions": 0,
+        },
     }
     if frame.empty or str(manifest.get("status") or "").upper() not in {"OK", "PARTIAL"}:
         return empty, base_report
@@ -259,36 +275,72 @@ def select_row_level_clean_predictions(
         merged["_quote_status_internal"].eq("PASS")
         & merged_quote_price.gt(0)
         & merged_quote_ts.notna()
-        & merged_pred_ts.notna()
+        & pred_ts.notna()
         & timestamp_delta.le(MAX_INPUT_AGE_SECONDS)
         & merged_pred_price.gt(0)
         & price_match
     )
+
+    prediction_status_pass = (
+        merged.get("prediction_status", pd.Series("", index=merged.index))
+        .astype(str).str.upper().eq("PASS")
+    )
+    actual_quote_status_pass = (
+        merged.get("actual_quote_status", pd.Series("", index=merged.index))
+        .astype(str).str.upper().eq("PASS")
+    )
+    trained_raw = merged.get("trained_for_symbol", pd.Series(None, index=merged.index))
+    trained_true = trained_raw.map(_true)
+    trained_text = trained_raw.map(lambda value: str(value).strip().lower())
+    trained_false = trained_raw.map(
+        lambda value: (
+            (isinstance(value, (bool, np.bool_)) and not bool(value))
+            or str(value).strip().lower() in {"false", "0", "no"}
+        )
+    )
+    trained_unknown = ~(trained_true | trained_false)
+    data_limited_false = ~merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+    probability_valid = merged_probability.between(0, 1)
+    quote_age_valid = merged_quote_age.between(0, MAX_INPUT_AGE_SECONDS)
+    readiness_valid = merged_readiness.ge(MIN_DATA_READINESS)
+    target_timestamp_valid = (
+        pd.to_datetime(
+            merged.get("forecast_target_timestamp_utc", pd.Series(pd.NaT, index=merged.index)),
+            errors="coerce", utc=True
+        ).notna()
+    )
+    symbol_valid = merged["_symbol_norm_internal"].astype(str).str.strip().ne("")
+
+    non_quote_valid = (
+        prediction_status_pass
+        & actual_quote_status_pass
+        & trained_true
+        & data_limited_false
+        & probability_valid
+        & quote_age_valid
+        & readiness_valid
+        & target_timestamp_valid
+        & symbol_valid
+    )
+    valid = quote_matched & non_quote_valid
+
+    base_report["condition_counts"] = {
+        "prediction_status_pass": int(prediction_status_pass.sum()),
+        "actual_quote_status_pass": int(actual_quote_status_pass.sum()),
+        "trained_true": int(trained_true.sum()),
+        "trained_false": int(trained_false.sum()),
+        "trained_unknown": int(trained_unknown.sum()),
+        "data_limited_false": int(data_limited_false.sum()),
+        "probability_valid": int(probability_valid.sum()),
+        "quote_age_valid": int(quote_age_valid.sum()),
+        "readiness_valid": int(readiness_valid.sum()),
+        "target_timestamp_valid": int(target_timestamp_valid.sum()),
+        "symbol_valid": int(symbol_valid.sum()),
+        "quote_matched": int(quote_matched.sum()),
+        "all_non_quote_conditions": int(non_quote_valid.sum()),
+        "all_conditions": int(valid.sum()),
+    }
     base_report["quote_matched_rows"] = int(quote_matched.sum())
-    merged_probability = pd.to_numeric(
-        merged.get("probability_up_30m", pd.Series(np.nan, index=merged.index)),
-        errors="coerce",
-    )
-    merged_quote_age = pd.to_numeric(
-        merged.get("actual_quote_age_seconds", pd.Series(np.nan, index=merged.index)),
-        errors="coerce",
-    )
-    merged_readiness = pd.to_numeric(
-        merged.get("data_readiness_score", pd.Series(np.nan, index=merged.index)),
-        errors="coerce",
-    )
-    valid = (
-        quote_matched
-        & merged.get("prediction_status", pd.Series("", index=merged.index)).astype(str).str.upper().eq("PASS")
-        & merged.get("actual_quote_status", pd.Series("", index=merged.index)).astype(str).str.upper().eq("PASS")
-        & merged.get("trained_for_symbol", pd.Series(False, index=merged.index)).map(_true)
-        & ~merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
-        & merged_probability.between(0, 1)
-        & merged_quote_age.between(0, MAX_INPUT_AGE_SECONDS)
-        & merged_readiness.ge(MIN_DATA_READINESS)
-        & merged.get("forecast_target_timestamp_utc", pd.Series(None, index=merged.index)).notna()
-        & merged.get("_symbol_norm_internal", pd.Series("", index=merged.index)).ne("")
-    )
     row_ids = merged.loc[valid, "_row_id_internal"].astype(int).tolist()
     clean = frame.iloc[row_ids].copy()
     clean["symbol"] = (
@@ -483,6 +535,7 @@ def load_clean_session_data(
         "prediction_rows_from_partial_slots": 0,
         "clean_prediction_rows_from_partial_slots": 0,
         "row_level_quality_rejections": 0,
+        "row_gate_condition_counts": {},
         "clean_prediction_rows": 0,
         "quote_rows_retained": 0,
         "manifest_errors": [],
@@ -617,6 +670,9 @@ def load_clean_session_data(
                 prediction_frames.append(clean[prediction_columns].copy())
                 report["clean_prediction_rows"] += len(clean)
                 report["row_level_quality_rejections"] += int(row_gate.get("quarantined_rows", 0))
+                for condition, count in (row_gate.get("condition_counts") or {}).items():
+                    aggregate = report["row_gate_condition_counts"]
+                    aggregate[condition] = int(aggregate.get(condition, 0)) + int(count)
                 slot_clean = bool(
                     prediction_manifest_is_clean(manifest)
                     and key in clean_quote_keys
