@@ -875,12 +875,13 @@ class AllNSEMinutePredictor:
                         symbol in self._trained_symbols
                         if self._trained_symbols else None
                     )
+                    data_limited = not np.isfinite(readiness) or readiness < MIN_SIGNAL_READINESS
                     signal = (
                         proposed_signal
-                        if readiness >= MIN_SIGNAL_READINESS and trained_for_symbol is not False
+                        if not data_limited and trained_for_symbol is not False
                         else "HOLD"
                     )
-                    if readiness < MIN_SIGNAL_READINESS:
+                    if data_limited:
                         prediction_status = "PASS_DATA_LIMITED"
                     elif trained_for_symbol is False:
                         prediction_status = "PASS_UNTRAINED_SYMBOL"
@@ -906,8 +907,8 @@ class AllNSEMinutePredictor:
                         ),
                         "feature_count": len(self._model_api.FEATURES),
                         "non_missing_feature_count": int(x.iloc[idx].notna().sum()),
-                        "data_readiness_score": readiness,
-                        "data_limited": readiness < MIN_SIGNAL_READINESS,
+                        "data_readiness_score": readiness if np.isfinite(readiness) else None,
+                        "data_limited": data_limited,
                         "forecast_target_timestamp_utc": (
                             (decision_ts + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat()
                         ),
@@ -920,7 +921,9 @@ class AllNSEMinutePredictor:
 
                     base_model_version = self._production_model_version()
                     readiness_segment = (
-                        "READINESS_LOW" if readiness < MIN_SIGNAL_READINESS else "READINESS_READY"
+                        "READINESS_UNKNOWN" if not np.isfinite(readiness)
+                        else "READINESS_LOW" if data_limited
+                        else "READINESS_READY"
                     )
                     model_version = f"{base_model_version}__{readiness_segment}"
                     row["base_model_version"] = base_model_version
