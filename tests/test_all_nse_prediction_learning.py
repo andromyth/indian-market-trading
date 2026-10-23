@@ -456,3 +456,27 @@ def test_near_empty_readiness_and_explicitly_untrained_rows_remain_ineligible():
     assert gate["condition_counts"]["trained_false"] == 1
     assert gate["condition_counts"]["readiness_valid"] == 0
     assert gate["condition_counts"]["all_conditions"] == 0
+
+
+def test_matcher_falls_back_to_model_values_when_raw_columns_exist_but_are_null():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    # This is what older Drive Parquets look like after the loader has
+    # materialized newer schema columns with null values.
+    pred["probability_up_30m_raw"] = None
+    pred["expected_return_30m_raw"] = None
+    pred["probability_up_30m"] = 0.62
+    pred["expected_return_30m"] = 0.01
+    predictions = pd.DataFrame([pred])
+    quotes = pd.DataFrame([
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:30:15Z",
+            "actual_observed_price": 102.0,
+            "quote_status": "PASS",
+        }
+    ])
+    result = match_matured_outcomes(predictions, quotes)
+    assert result.loc[0, "validation_status"] == "VALIDATED"
+    assert result.loc[0, "probability_up"] == pytest.approx(0.62)
+    assert result.loc[0, "expected_return"] == pytest.approx(0.01)
+    assert result.loc[0, "actual_return"] == pytest.approx(0.02)
