@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from all_nse_prediction_learning import (
+    match_matured_outcomes,
+    prediction_manifest_is_clean,
+    quote_manifest_is_clean,
+)
+
+
+def prediction_manifest(**overrides):
+    base = {
+        "status": "OK",
+        "quality_gate_pass": True,
+        "expected_symbol_count": 2,
+        "row_count": 2,
+        "prediction_count": 2,
+        "missing_quote_count": 0,
+        "data_limited_count": 0,
+        "untrained_symbol_count": 0,
+        "model_failure_count": 0,
+        "trained_symbol_manifest_available": True,
+        "history_ready": True,
+        "history_seed_coverage_symbols": 2,
+        "history_seed_failed_batches": 0,
+    }
+    return {**base, **overrides}
+
+
+def quote_manifest(**overrides):
+    base = {
+        "status": "OK",
+        "expected_symbol_count": 2,
+        "row_count": 2,
+        "quoted_symbol_count": 2,
+        "missing_quote_count": 0,
+        "unmapped_symbol_count": 0,
+        "pending_snapshot_recovery": {"errors": []},
+        "pending_manifest_recovery": {"errors": []},
+    }
+    return {**base, **overrides}
+
+
+def test_complete_full_nse_prediction_manifest_is_eligible():
+    assert prediction_manifest_is_clean(prediction_manifest())
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "PARTIAL"},
+        {"quality_gate_pass": False},
+        {"row_count": 1},
+        {"prediction_count": 1},
+        {"missing_quote_count": 1},
+        {"data_limited_count": 1},
+        {"untrained_symbol_count": 1},
+        {"model_failure_count": 1},
+        {"history_ready": False},
+        {"history_seed_coverage_symbols": 1},
+        {"history_seed_failed_batches": 1},
+    ],
+)
+def test_partial_or_low_readiness_prediction_slot_is_quarantined(changes):
+    assert not prediction_manifest_is_clean(prediction_manifest(**changes))
+
+
+def test_complete_quote_manifest_is_eligible():
+    assert quote_manifest_is_clean(quote_manifest())
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "PARTIAL"},
+        {"row_count": 1},
+        {"quoted_symbol_count": 1},
+        {"missing_quote_count": 1},
+        {"unmapped_symbol_count": 1},
+        {"pending_snapshot_recovery": {"errors": ["upload failed"]}},
+        {"pending_manifest_recovery": {"errors": ["upload failed"]}},
+    ],
+)
+def test_partial_quote_slot_is_quarantined(changes):
+    assert not quote_manifest_is_clean(quote_manifest(**changes))
+
+
+def _prediction(target="2026-10-01T04:30:00Z"):
+    return {
+        "symbol": "ABC",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_status": "PASS",
+        "actual_quote_age_seconds": 5.0,
+        "forecast_target_timestamp_utc": target,
+        "forecast_key": "ABC|2026-10-01T04:00:00Z|30|model-v1",
+        "probability_up_30m": 0.62,
+        "probability_up_30m_raw": 0.62,
+        "expected_return_30m": 0.01,
+        "expected_return_30m_raw": 0.01,
+        "raw_model_signal": "BUY",
+        "signal_raw": "BUY",
+        "prediction_status": "PASS",
+        "model_version": "all_nse_intraday__2026-09-30",
+        "model_family": "logistic_regression+ridge",
+        "data_readiness_score": 1.0,
+    }
+
+
+def test_matured_outcome_uses_nearest_clean_target_quote_within_tolerance():
+    predictions = pd.DataFrame([_prediction()])
+    quotes = pd.DataFrame([
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:30:15Z",
+            "actual_observed_price": 102.0,
+            "quote_status": "PASS",
+        },
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:29:00Z",
+            "actual_observed_price": 101.0,
+            "quote_status": "PASS",
+        },
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:30:20Z",
+            "actual_observed_price": 999.0,
+            "quote_status": "PARTIAL",
+        },
+    ])
+    result = match_matured_outcomes(predictions, quotes)
+    assert len(result) == 1
+    assert result.loc[0, "validation_status"] == "VALIDATED"
+    assert result.loc[0, "actual_target_price"] == pytest.approx(102.0)
+    assert result.loc[0, "actual_return"] == pytest.approx(0.02)
+    assert result.loc[0, "target_quote_distance_seconds"] == pytest.approx(15.0)
+    assert result.loc[0, "model_version"] == "all_nse_intraday__2026-09-30"
+
+
+def test_unmatched_or_too_distant_target_quote_is_not_scored():
+    predictions = pd.DataFrame([_prediction()])
+    quotes = pd.DataFrame([
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:35:00Z",
+            "actual_observed_price": 102.0,
+            "quote_status": "PASS",
+        }
+    ])
+    result = match_matured_outcomes(predictions, quotes)
+    assert result.loc[0, "validation_status"] == "PENDING_TARGET_QUOTE"
+    assert pd.isna(result.loc[0, "actual_return"])
+
+
+def test_matcher_never_uses_partial_quote_rows():
+    predictions = pd.DataFrame([_prediction()])
+    quotes = pd.DataFrame([
+        {
+            "symbol": "ABC",
+            "quote_observed_at_utc": "2026-10-01T04:30:00Z",
+            "actual_observed_price": 105.0,
+            "quote_status": "QUOTE_REQUEST_ERROR",
+        }
+    ])
+    result = match_matured_outcomes(predictions, quotes)
+    assert result.loc[0, "validation_status"] == "PENDING_TARGET_QUOTE"
+    assert pd.isna(result.loc[0, "actual_return"])
