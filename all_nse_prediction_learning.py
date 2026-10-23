@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""Quality-gated outcome learning for the deployed full-NSE 30-minute predictor.
+
+Partial capture files are retained in Drive for operations/audit, but only a slot
+whose quote and prediction manifests are complete may contribute to calibration.
+This module changes only the calibrated probability/return/signal overlay; it does
+not replace classifier/regressor joblib weights or place orders.
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import re
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+from audit_all_universe_minute_snapshots import (
+    _download_json,
+    _find_folder,
+    _list_children,
+)
+from prediction_learning_engine import _run_calibration_autopilot
+from persistent_store import GoogleDriveStore
+
+IST = ZoneInfo("Asia/Kolkata")
+PREDICTION_ROOT = "production_data/all_nse_minute_predictions"
+QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
+LEARNING_ROOT = f"{PREDICTION_ROOT}/learning"
+MIME_FOLDER = "application/vnd.google-apps.folder"
+MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
+MODEL_VERSION_PREFIX = "all_nse_intraday__"
+
+
+def _number(value: Any) -> float:
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _true(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def bounded_calibration_sample(
+    frame: pd.DataFrame,
+    *,
+    max_rows_per_session: int = 12000,
+    expected_slots_per_session: int = 75,
+) -> pd.DataFrame:
+    """Deterministically sample calibration rows across each session's time slots.
+
+    The complete clean outcome ledger remains available for audit/metrics. This
+    bounded, stratified view prevents a multi-million-row month from making the
+    bootstrap/calibrator step unbounded while retaining cross-sectional coverage.
+    """
+    if frame.empty or max_rows_per_session < 1:
+        return frame.copy()
+    required = {"symbol", "target_timestamp_utc"}
+    if not required.issubset(frame.columns):
+        return frame.copy()
+
+    working = frame.copy()
+    target = pd.to_datetime(working["target_timestamp_utc"], errors="coerce", utc=True)
+    valid = target.notna()
+    working = working.loc[valid].copy()
+    if working.empty:
+        return frame.iloc[0:0].copy()
+    target = target.loc[valid].dt.tz_convert(IST)
+    working["_learning_session"] = target.dt.strftime("%Y-%m-%d")
+    working["_learning_slot"] = target.dt.floor("5min").astype(str)
+    working["_learning_rank"] = pd.util.hash_pandas_object(
+        working["symbol"].astype(str) + "|" + working["_learning_session"] + "|" + working["_learning_slot"],
+        index=False,
+    ).astype("uint64").to_numpy()
+    per_slot = max(1, (max_rows_per_session + expected_slots_per_session - 1) // expected_slots_per_session)
+
+    selected = []
+    for _, slot_group in working.groupby(["_learning_session", "_learning_slot"], sort=True):
+        if len(slot_group) > per_slot:
+            slot_group = slot_group.nsmallest(per_slot, "_learning_rank")
+        selected.append(slot_group)
+
+    sampled = pd.concat(selected, ignore_index=False) if selected else working.iloc[0:0].copy()
+    sampled_sessions = []
+    for _, session_group in sampled.groupby("_learning_session", sort=True):
+        if len(session_group) > max_rows_per_session:
+            session_group = session_group.nsmallest(max_rows_per_session, "_learning_rank")
+        sampled_sessions.append(session_group)
+    result = pd.concat(sampled_sessions, ignore_index=False) if sampled_sessions else sampled.iloc[0:0].copy()
+    return result.drop(columns=["_learning_session", "_learning_slot", "_learning_rank"]).reset_index(drop=True)
+
+
+def prediction_manifest_is_clean(manifest: dict[str, Any]) -> bool:
+    """Require the full-NSE inference slot to be complete and model-ready."""
+    try:
+        expected = int(manifest.get("expected_symbol_count") or 0)
+        rows = int(manifest.get("row_count") or 0)
+        predictions = int(manifest.get("prediction_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        manifest.get("status") == "OK"
+        and manifest.get("quality_gate_pass") is True
+        and expected > 0
+        and rows == expected
+        and predictions == expected
+        and int(manifest.get("missing_quote_count") or 0) == 0
+        and int(manifest.get("data_limited_count") or 0) == 0
+        and int(manifest.get("untrained_symbol_count") or 0) == 0
+        and int(manifest.get("model_failure_count") or 0) == 0
+        and manifest.get("trained_symbol_manifest_available") is True
+        and manifest.get("history_ready") is True
+        and int(manifest.get("history_seed_coverage_symbols") or 0) == expected
+        and int(manifest.get("history_seed_failed_batches") or 0) == 0
+    )
+
+
+def quote_manifest_is_clean(manifest: dict[str, Any]) -> bool:
+    """Require every official-universe quote row and every provider batch."""
+    try:
+        expected = int(manifest.get("expected_symbol_count") or 0)
+        rows = int(manifest.get("row_count") or 0)
+        quoted = int(manifest.get("quoted_symbol_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    pending_snapshot_errors = len((manifest.get("pending_snapshot_recovery") or {}).get("errors") or [])
+    pending_manifest_errors = len((manifest.get("pending_manifest_recovery") or {}).get("errors") or [])
+    return bool(
+        manifest.get("status") == "OK"
+        and expected > 0
+        and rows == expected
+        and quoted == expected
+        and int(manifest.get("missing_quote_count") or 0) == 0
+        and int(manifest.get("unmapped_symbol_count") or 0) == 0
+        and pending_snapshot_errors == 0
+        and pending_manifest_errors == 0
+    )
+
+
+def match_matured_outcomes(
+    predictions: pd.DataFrame,
+    quotes: pd.DataFrame,
+    *,
+    max_target_distance_seconds: int = MAX_TARGET_QUOTE_DISTANCE_SECONDS,
+) -> pd.DataFrame:
+    """Vector-match matured forecasts to the nearest clean target-window quote.
+
+    Source timestamps are provider observation times, not exchange-stamped
+    one-minute candle closes. Unmatched targets remain pending, never scored.
+    """
+    output_columns = [
+        "forecast_key", "symbol", "decision_timestamp_utc", "target_timestamp_utc",
+        "actual_quote_timestamp_utc", "target_quote_distance_seconds", "reference_price",
+        "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
+        "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
+        "calibration_profile_id", "model_version", "model_family", "horizon_min",
+        "input_age_seconds", "feature_coverage", "validation_status", "source", "quote_basis",
+    ]
+    if predictions.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    pred = predictions.copy()
+    pred["symbol"] = pred["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+    pred["_target_ts"] = pd.to_datetime(pred.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
+    pred["_decision_ts"] = pd.to_datetime(pred.get("actual_observed_at_utc"), errors="coerce", utc=True)
+    pred["_reference"] = pd.to_numeric(pred.get("actual_market_value"), errors="coerce")
+    pred["_probability"] = pd.to_numeric(
+        pred.get("probability_up_30m_raw", pred.get("probability_up_30m")), errors="coerce"
+    )
+    pred["_expected_return"] = pd.to_numeric(
+        pred.get("expected_return_30m_raw", pred.get("expected_return_30m")), errors="coerce"
+    )
+    if "model_version" not in pred:
+        pred["model_version"] = "LEGACY_UNKNOWN"
+    pred["model_version"] = pred["model_version"].fillna("LEGACY_UNKNOWN").astype(str)
+    for col in ("probability_up_30m_calibrated", "expected_return_30m_calibrated",
+                "actual_quote_age_seconds", "data_readiness_score"):
+        if col not in pred:
+            pred[col] = np.nan
+    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
+                "model_family", "forecast_key"):
+        if col not in pred:
+            pred[col] = None
+
+    quote_cols = ["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"]
+    if quotes.empty:
+        q = pd.DataFrame(columns=["symbol", "_quote_ts", "_quote_price"])
+    else:
+        q = quotes[quote_cols].copy()
+        q["symbol"] = q["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+        q["_quote_ts"] = pd.to_datetime(q["quote_observed_at_utc"], errors="coerce", utc=True)
+        q["_quote_price"] = pd.to_numeric(q["actual_observed_price"], errors="coerce")
+        q = q.loc[
+            q["_quote_ts"].notna()
+            & q["_quote_price"].gt(0)
+            & q["quote_status"].astype(str).str.upper().eq("PASS")
+        ].sort_values(["_quote_ts", "symbol"]).drop_duplicates(["symbol", "_quote_ts"], keep="last")
+        q = q[["symbol", "_quote_ts", "_quote_price"]]
+
+    valid_left_mask = pred["_target_ts"].notna() & pred["symbol"].ne("")
+    left_valid = pred.loc[valid_left_mask].sort_values(["_target_ts", "symbol"])
+    left_invalid = pred.loc[~valid_left_mask].copy()
+    if not left_valid.empty and not q.empty:
+        matched = pd.merge_asof(
+            left_valid,
+            q.sort_values(["_quote_ts", "symbol"]),
+            left_on="_target_ts",
+            right_on="_quote_ts",
+            by="symbol",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=max_target_distance_seconds),
+        )
+    else:
+        matched = left_valid.copy()
+        matched["_quote_ts"] = pd.NaT
+        matched["_quote_price"] = np.nan
+    if not left_invalid.empty:
+        left_invalid["_quote_ts"] = pd.NaT
+        left_invalid["_quote_price"] = np.nan
+        merged = pd.concat([matched, left_invalid], ignore_index=True, sort=False)
+    else:
+        merged = matched
+
+    reference = pd.to_numeric(merged["_reference"], errors="coerce")
+    target_price = pd.to_numeric(merged["_quote_price"], errors="coerce")
+    quote_ok = merged["_quote_ts"].notna() & reference.gt(0) & target_price.gt(0)
+    merged["validation_status"] = np.where(quote_ok, "VALIDATED", "PENDING_TARGET_QUOTE")
+    merged["actual_return"] = np.where(quote_ok, target_price / reference - 1.0, np.nan)
+    target_distance_seconds = pd.Series(np.nan, index=merged.index, dtype=float)
+    distance_mask = merged["_quote_ts"].notna() & merged["_target_ts"].notna()
+    if distance_mask.any():
+        target_distance_seconds.loc[distance_mask] = (
+            merged.loc[distance_mask, "_quote_ts"] - merged.loc[distance_mask, "_target_ts"]
+        ).dt.total_seconds().abs()
+    merged["target_quote_distance_seconds"] = target_distance_seconds
+    merged["decision_timestamp_utc"] = merged["_decision_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["target_timestamp_utc"] = merged["_target_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["actual_quote_timestamp_utc"] = merged["_quote_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["reference_price"] = reference
+    merged["actual_target_price"] = target_price
+    merged["probability_up"] = merged["_probability"]
+    merged["probability_up_calibrated"] = pd.to_numeric(merged["probability_up_30m_calibrated"], errors="coerce")
+    merged["expected_return"] = merged["_expected_return"]
+    merged["expected_return_calibrated"] = pd.to_numeric(merged["expected_return_30m_calibrated"], errors="coerce")
+    signal = merged["signal_raw"].fillna("").astype(str).str.strip()
+    fallback = merged["raw_model_signal"].fillna("").astype(str).str.strip()
+    signal = signal.mask(signal.eq(""), fallback)
+    signal = signal.mask(signal.eq(""), merged["signal"].fillna("").astype(str).str.strip())
+    merged["signal"] = signal.mask(signal.eq(""), "HOLD").str.upper()
+    merged["horizon_min"] = 30
+    merged["input_age_seconds"] = pd.to_numeric(merged["actual_quote_age_seconds"], errors="coerce")
+    merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
+    merged["source"] = "all_nse_intraday_production"
+    merged["quote_basis"] = "nearest clean provider quote observation within target tolerance; not exchange-stamped 1m OHLCV"
+    return merged[output_columns].reset_index(drop=True)
+
+def _day_folder_files(store: Any, root: str, day: date) -> list[dict[str, Any]]:
+    folder_id = _find_folder(store, root.split("/") + [f"{day:%Y}", f"{day:%m}", f"{day:%d}"])
+    return _list_children(store, folder_id) if folder_id else []
+
+
+def _download_bytes(store: Any, file_id: str) -> bytes:
+    payload = store.service.files().get_media(fileId=file_id).execute()
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, bytearray):
+        return bytes(payload)
+    if hasattr(payload, "getvalue"):
+        return payload.getvalue()
+    return str(payload).encode("utf-8")
+
+
+def _file_map(files: list[dict[str, Any]], prefix: str, suffix: str) -> dict[str, dict[str, Any]]:
+    result = {}
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8}}_\d{{4}}){re.escape(suffix)}$")
+    for item in files:
+        match = pattern.match(str(item.get("name") or ""))
+        if match:
+            result[match.group(1)] = item
+    return result
+
+
+def load_clean_session_data(
+    store: Any, start_date: date, end_date: date
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    prediction_frames: list[pd.DataFrame] = []
+    quote_frames: list[pd.DataFrame] = []
+    prediction_columns = [
+        "symbol", "actual_observed_at_utc", "actual_market_value", "actual_quote_status",
+        "actual_quote_age_seconds", "forecast_target_timestamp_utc", "forecast_key",
+        "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
+        "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
+        "probability_up_30m_calibrated", "expected_return_30m_calibrated",
+        "signal_calibrated", "calibration_profile_id", "model_version", "model_family",
+        "data_readiness_score",
+    ]
+    report = {
+        "calendar_days_scanned": (end_date - start_date).days + 1,
+        "prediction_slots_seen": 0,
+        "prediction_slots_eligible": 0,
+        "prediction_slots_quarantined": 0,
+        "quote_slots_seen": 0,
+        "quote_slots_eligible": 0,
+        "quote_slots_quarantined": 0,
+        "prediction_rows_retained_for_diagnostics": 0,
+        "clean_prediction_rows": 0,
+        "quote_rows_retained": 0,
+        "manifest_errors": [],
+        "parquet_errors": [],
+        "excluded_reasons": {},
+    }
+
+    current = start_date
+    while current <= end_date:
+        pred_files = _day_folder_files(store, PREDICTION_ROOT, current)
+        quote_files = _day_folder_files(store, QUOTE_ROOT, current)
+        pred_manifests = _file_map(pred_files, "manifest_", ".json")
+        pred_parquets = _file_map(pred_files, "predictions_", ".parquet")
+        quote_manifests = _file_map(quote_files, "manifest_", ".json")
+        quote_parquets = _file_map(quote_files, "snapshot_", ".parquet")
+        clean_quote_keys: set[str] = set()
+
+        for key, mf in quote_manifests.items():
+            report["quote_slots_seen"] += 1
+            try:
+                manifest = _download_json(store, mf["id"])
+            except Exception as exc:
+                report["manifest_errors"].append(f"quote/{current}/{key}: {type(exc).__name__}: {exc}")
+                report["quote_slots_quarantined"] += 1
+                report["excluded_reasons"]["quote_manifest_unreadable"] = report["excluded_reasons"].get("quote_manifest_unreadable", 0) + 1
+                continue
+            if not quote_manifest_is_clean(manifest) or key not in quote_parquets:
+                report["quote_slots_quarantined"] += 1
+                reason = "quote_incomplete_or_snapshot_missing"
+                report["excluded_reasons"][reason] = report["excluded_reasons"].get(reason, 0) + 1
+                continue
+            try:
+                raw = _download_bytes(store, quote_parquets[key]["id"])
+                frame = pd.read_parquet(io.BytesIO(raw))
+                expected = int(manifest.get("expected_symbol_count") or 0)
+                if len(frame) != expected or frame["symbol"].astype(str).str.upper().nunique() != expected:
+                    raise ValueError(f"quote row/universe mismatch: rows={len(frame)} unique={frame['symbol'].nunique()} expected={expected}")
+                quote_frames.append(frame[["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"]].copy())
+                clean_quote_keys.add(key)
+                report["quote_slots_eligible"] += 1
+            except Exception as exc:
+                report["parquet_errors"].append(f"quote/{current}/{key}: {type(exc).__name__}: {exc}")
+                report["quote_slots_quarantined"] += 1
+                report["excluded_reasons"]["quote_parquet_invalid"] = report["excluded_reasons"].get("quote_parquet_invalid", 0) + 1
+
+        for key, mf in pred_manifests.items():
+            report["prediction_slots_seen"] += 1
+            try:
+                manifest = _download_json(store, mf["id"])
+            except Exception as exc:
+                report["manifest_errors"].append(f"prediction/{current}/{key}: {type(exc).__name__}: {exc}")
+                report["prediction_slots_quarantined"] += 1
+                report["excluded_reasons"]["prediction_manifest_unreadable"] = report["excluded_reasons"].get("prediction_manifest_unreadable", 0) + 1
+                continue
+            # Prediction rows are eligible only if both the prediction model and
+            # the contemporaneous all-universe quote capture passed their full gates.
+            if not prediction_manifest_is_clean(manifest) or key not in pred_parquets or key not in clean_quote_keys:
+                report["prediction_slots_quarantined"] += 1
+                reason = "prediction_incomplete_or_quote_slot_not_clean"
+                report["excluded_reasons"][reason] = report["excluded_reasons"].get(reason, 0) + 1
+                continue
+            try:
+                raw = _download_bytes(store, pred_parquets[key]["id"])
+                frame = pd.read_parquet(io.BytesIO(raw))
+                expected = int(manifest.get("expected_symbol_count") or 0)
+                if len(frame) != expected or frame["symbol"].astype(str).str.upper().nunique() != expected:
+                    raise ValueError(f"prediction row/universe mismatch: rows={len(frame)} unique={frame['symbol'].nunique()} expected={expected}")
+                report["prediction_rows_retained_for_diagnostics"] += len(frame)
+                symbol = frame["symbol"].astype(str).str.upper().str.replace(".NS", "", regex=False)
+                probability = pd.to_numeric(frame.get("probability_up_30m"), errors="coerce")
+                quote_age = pd.to_numeric(frame.get("actual_quote_age_seconds"), errors="coerce")
+                valid_row = (
+                    frame.get("prediction_status", pd.Series("", index=frame.index)).astype(str).eq("PASS")
+                    & frame.get("actual_quote_status", pd.Series("", index=frame.index)).astype(str).str.upper().eq("PASS")
+                    & frame.get("trained_for_symbol", pd.Series(False, index=frame.index)).map(_true)
+                    & ~frame.get("data_limited", pd.Series(True, index=frame.index)).map(_true)
+                    & probability.between(0, 1)
+                    & quote_age.le(120)
+                    & pd.to_numeric(frame.get("actual_market_value"), errors="coerce").gt(0)
+                    & frame.get("forecast_target_timestamp_utc", pd.Series(None, index=frame.index)).notna()
+                )
+                clean = frame.loc[valid_row].copy()
+                clean["symbol"] = symbol.loc[valid_row]
+                if "model_version" not in clean:
+                    clean["model_version"] = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                else:
+                    clean["model_version"] = clean["model_version"].fillna(
+                        str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                    ).astype(str)
+                for column in prediction_columns:
+                    if column not in clean:
+                        clean[column] = None
+                clean["model_version"] = clean["model_version"].fillna(
+                    str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                ).astype(str)
+                prediction_frames.append(clean[prediction_columns].copy())
+                report["clean_prediction_rows"] += len(clean)
+                report["prediction_slots_eligible"] += 1
+                if len(clean) != expected:
+                    # The whole slot remains auditable; only individually clean
+                    # rows become candidates, and an unexpected shortfall is flagged.
+                    report["excluded_reasons"]["row_level_quality_failures_in_manifest_ok_slot"] = report["excluded_reasons"].get("row_level_quality_failures_in_manifest_ok_slot", 0) + (expected - len(clean))
+            except Exception as exc:
+                report["parquet_errors"].append(f"prediction/{current}/{key}: {type(exc).__name__}: {exc}")
+                report["prediction_slots_quarantined"] += 1
+                report["excluded_reasons"]["prediction_parquet_invalid"] = report["excluded_reasons"].get("prediction_parquet_invalid", 0) + 1
+        current += timedelta(days=1)
+
+    predictions = (
+        pd.concat(prediction_frames, ignore_index=True, copy=False)
+        if prediction_frames else pd.DataFrame(columns=prediction_columns)
+    )
+    quotes = (
+        pd.concat(quote_frames, ignore_index=True, copy=False)
+        if quote_frames else pd.DataFrame(columns=["symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"])
+    )
+    # Drop references to individual Parquet fragments after concatenation so the
+    # multi-week full-universe run does not retain both fragmented and combined data.
+    prediction_frames.clear()
+    quote_frames.clear()
+    report["quote_rows_retained"] = len(quotes)
+    if not predictions.empty:
+        decision_ts = pd.to_datetime(predictions.get("actual_observed_at_utc"), errors="coerce", utc=True)
+        target_ts = pd.to_datetime(predictions.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
+        same_session = (
+            decision_ts.notna()
+            & target_ts.notna()
+            & (decision_ts.dt.tz_convert(IST).dt.date == target_ts.dt.tz_convert(IST).dt.date)
+        )
+        predictions = predictions.loc[same_session].copy()
+    return predictions, quotes, report
+
+
+def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "diagnostics/all_nse_prediction_learning") -> dict[str, Any]:
+    store = GoogleDriveStore()
+    predictions, quotes, ingest = load_clean_session_data(store, start_date, end_date)
+    outcomes = match_matured_outcomes(predictions, quotes)
+    del predictions, quotes
+    if outcomes.empty:
+        fit_frame = pd.DataFrame()
+    else:
+        # Old snapshots predate explicit model-version logging. Keep their scored
+        # outcomes in the audit, but never mix them into a version-specific fit.
+        fit_frame = outcomes.loc[
+            outcomes["validation_status"].eq("VALIDATED")
+            & ~outcomes["model_version"].astype(str).isin(["", "LEGACY_UNKNOWN", "None", "nan"])
+            & pd.to_numeric(outcomes["probability_up"], errors="coerce").between(0, 1)
+            & pd.to_numeric(outcomes["actual_return"], errors="coerce").notna()
+        ].copy()
+    fit_frame["target_timestamp_utc"] = fit_frame.get("target_timestamp_utc", pd.Series(dtype=object))
+    report: dict[str, Any] = {
+        "audit_name": "all-nse-production-outcome-learning",
+        "schema_version": "all-nse-production-outcome-learning-v1",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
+        "scope": "ALL-NSE pooled production 30-minute classifier/regressor",
+        "capture_interval_minutes": 5,
+        "partial_data_policy": "Persist partial snapshots for diagnostics, but exclude any slot not passing both full-universe quote and prediction quality gates from outcome fitting.",
+        "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
+        "ingestion": ingest,
+        "outcome_summary": {
+            "prediction_rows_in_clean_slots": int(len(predictions)),
+            "matched_validated_outcomes": int(outcomes["validation_status"].eq("VALIDATED").sum()) if not outcomes.empty else 0,
+            "pending_or_unmatched_outcomes": int(outcomes["validation_status"].ne("VALIDATED").sum()) if not outcomes.empty else 0,
+            "unique_symbols_scored": int(outcomes.loc[outcomes["validation_status"].eq("VALIDATED"), "symbol"].nunique()) if not outcomes.empty else 0,
+            "model_versions_in_fit": sorted(fit_frame["model_version"].dropna().astype(str).unique().tolist()) if not fit_frame.empty else [],
+            "fit_eligible_rows": int(len(fit_frame)),
+            "fit_eligible_sessions": int(pd.to_datetime(fit_frame["target_timestamp_utc"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d").nunique()) if not fit_frame.empty else 0,
+        },
+        "recommendation_update": {
+            "status": "WAITING_FOR_CLEAN_MATURED_OUTCOMES",
+            "base_classifier_regressor_weights_modified": False,
+            "calibration_profile_auto_applied": False,
+            "minimum_autopilot_rows": 600,
+            "minimum_autopilot_sessions": 15,
+            "activation_policy": "Eligible profiles enter SHADOW, and only profiles that subsequently improve live log loss without worsening Brier score can progress to ACTIVE. Active calibration changes live probability/return/signal outputs; base joblib weights remain unchanged.",
+        },
+        "production_model_changed": False,
+        "orders_placed": False,
+    }
+
+    calibration_result = {
+        "status": "NOT_RUN_INSUFFICIENT_CLEAN_VERSIONED_ROWS",
+        "profiles_live": 0,
+        "reason": "No validated outcomes were available for an explicitly versioned full-NSE model, or the versioned clean sample was empty.",
+    }
+    if not fit_frame.empty:
+        # Run through the same persisted registry used by the runtime calibration
+        # overlay. Version-specific entries keep this model separate from the
+        # watchlist model even though both use the same lifecycle state file.
+        full_fit_rows = int(len(fit_frame))
+        runtime_frame = bounded_calibration_sample(fit_frame)
+        runtime_frame["validation_status"] = "VALIDATED"
+        runtime_frame["horizon_min"] = 30
+        runtime_frame["probability_up"] = pd.to_numeric(runtime_frame["probability_up"], errors="coerce")
+        runtime_frame["expected_return"] = pd.to_numeric(runtime_frame["expected_return"], errors="coerce")
+        runtime_frame["input_age_seconds"] = pd.to_numeric(runtime_frame["input_age_seconds"], errors="coerce")
+        autopilot_dir = Path(output_dir) / "calibration_autopilot"
+        calibration_result = _run_calibration_autopilot(store, runtime_frame, autopilot_dir)
+        from calibration_autopilot import profile_key
+        full_nse_keys = {
+            profile_key(30, version)
+            for version in fit_frame["model_version"].dropna().astype(str).unique()
+        }
+        active_keys = sorted(set(calibration_result.get("active_profile_keys", [])) & full_nse_keys)
+        shadow_keys = sorted(set(calibration_result.get("shadow_profile_keys", [])) & full_nse_keys)
+        report["recommendation_update"]["autopilot_rows_full_clean_sample"] = full_fit_rows
+        report["recommendation_update"]["autopilot_rows_used"] = int(len(runtime_frame))
+        report["recommendation_update"]["autopilot_max_rows_per_session"] = 12000
+        report["recommendation_update"]["autopilot_sampling"] = "deterministic hash sample stratified by 5-minute target slot; all complete clean outcomes remain in audit CSV"
+        report["recommendation_update"]["status"] = calibration_result.get("status", "UNKNOWN")
+        report["recommendation_update"]["calibration_profiles_live"] = len(active_keys) + len(shadow_keys)
+        report["recommendation_update"]["calibration_profiles_active_for_full_nse"] = len(active_keys)
+        report["recommendation_update"]["calibration_profiles_shadow_for_full_nse"] = len(shadow_keys)
+        report["recommendation_update"]["active_profile_keys_for_full_nse"] = active_keys
+        report["recommendation_update"]["shadow_profile_keys_for_full_nse"] = shadow_keys
+        report["recommendation_update"]["base_classifier_regressor_weights_modified"] = False
+        report["recommendation_update"]["calibration_profile_auto_applied"] = bool(active_keys)
+    report["calibration_autopilot"] = calibration_result
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}"
+    outcomes_path = out_dir / f"all_nse_outcomes_{stamp}.csv.gz"
+    report_path = out_dir / f"all_nse_prediction_learning_report_{stamp}.json"
+    outcomes.to_csv(outcomes_path, index=False, compression="gzip")
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    remote_dir = f"{LEARNING_ROOT}/{end_date:%Y/%m/%d}"
+    upload_results = {}
+    for key, path, mime_type in [
+        ("outcomes", outcomes_path, "application/gzip"),
+        ("report", report_path, "application/json"),
+    ]:
+        result = store.upload_or_update(path, f"{remote_dir}/{path.name}", mime_type=mime_type)
+        upload_results[key] = result
+        if result.get("status") != "OK":
+            raise RuntimeError(f"Drive upload failed for {key}: {result}")
+    latest = out_dir / "latest_all_nse_learning_report.json"
+    latest.write_text(json.dumps({
+        "status": report["recommendation_update"]["status"],
+        "generated_at_utc": report["generated_at_utc"],
+        "date_range": report["date_range"],
+        "report_path": f"{remote_dir}/{report_path.name}",
+        "outcomes_path": f"{remote_dir}/{outcomes_path.name}",
+        "upload_results": upload_results,
+        "production_model_changed": False,
+        "partial_data_quarantined": True,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    latest_result = store.upload_or_update(
+        latest, f"{LEARNING_ROOT}/latest_all_nse_learning_report.json",
+        mime_type="application/json",
+    )
+    if latest_result.get("status") != "OK":
+        raise RuntimeError(f"Drive latest report upload failed: {latest_result}")
+    report["google_drive_sync"] = {"status": "OK", "remote_directory": remote_dir, "uploads": upload_results, "latest_manifest": latest_result}
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    final_report_upload = store.upload_or_update(report_path, f"{remote_dir}/{report_path.name}", mime_type="application/json")
+    if final_report_upload.get("status") != "OK":
+        raise RuntimeError(f"Drive final report update failed: {final_report_upload}")
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-date", default="")
+    parser.add_argument("--end-date", default="")
+    parser.add_argument("--out-dir", default="diagnostics/all_nse_prediction_learning")
+    args = parser.parse_args()
+    today = datetime.now(IST).date()
+    end_date = date.fromisoformat(args.end_date) if args.end_date else today
+    start_date = date.fromisoformat(args.start_date) if args.start_date else end_date - timedelta(days=29)
+    if end_date < start_date:
+        parser.error("--end-date must be on or after --start-date")
+    result = run_learning(start_date, end_date, output_dir=args.out_dir)
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

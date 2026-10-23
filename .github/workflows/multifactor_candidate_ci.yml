@@ -49,6 +49,7 @@ jobs:
           final_algorithm_data_readiness_v2.py
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
           all_nse_delivery_model.py
+          all_nse_intraday_model.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
@@ -101,6 +102,7 @@ jobs:
           calibration_overlay.py
           all_universe_minute_capture.py
           all_nse_minute_prediction_capture.py
+          all_nse_prediction_learning.py
           audit_all_universe_minute_snapshots.py
           nse_intraday_all_universe_sync.py
           audit_autonomous_intraday_outcomes.py
@@ -156,6 +158,7 @@ jobs:
           tests/test_calibration_autopilot.py
           tests/test_all_universe_minute_capture.py
           tests/test_all_nse_minute_prediction_capture.py
+          tests/test_all_nse_prediction_learning.py
           tests/test_all_universe_minute_audit.py
           tests/test_intraday_bundle_cache.py
           tests/test_nse_eod_archive_presence.py

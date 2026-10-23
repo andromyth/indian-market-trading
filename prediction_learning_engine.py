@@ -778,10 +778,20 @@ def _run_calibration_autopilot(store: Any, frame: pd.DataFrame | None, output_di
                 report_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str), encoding="utf-8")
                 return result
     status = "NO_MATURED_OUTCOMES" if report.get("status") == "NO_MATURED_OUTCOMES" else "COMPLETED"
+    live_profiles = [
+        profile for profile in active_doc.get("profiles", [])
+        if isinstance(profile, dict)
+    ]
+    active_profiles = [profile for profile in live_profiles if profile.get("stage") == "ACTIVE"]
+    shadow_profiles = [profile for profile in live_profiles if profile.get("stage") == "SHADOW"]
     result = {
         "status": status,
         "registry_overwritten": registry_overwritten,
-        "profiles_live": len(active_doc.get("profiles", [])),
+        "profiles_live": len(live_profiles),
+        "profiles_active": len(active_profiles),
+        "profiles_shadow": len(shadow_profiles),
+        "active_profile_keys": sorted({str(profile.get("key")) for profile in active_profiles if profile.get("key")}),
+        "shadow_profile_keys": sorted({str(profile.get("key")) for profile in shadow_profiles if profile.get("key")}),
         "keys_evaluated": report.get("summary", {}).get("keys_evaluated", 0),
         "local_registry_path": str(registry_path),
         "local_active_profile_path": str(active_path),
