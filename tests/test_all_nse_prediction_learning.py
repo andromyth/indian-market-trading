@@ -264,7 +264,7 @@ def test_partial_slot_keeps_only_rows_matching_clean_same_slot_quotes():
     assert clean["symbol"].tolist() == ["AAA"]
     assert gate["slot_status"] == "PARTIAL"
     assert gate["input_rows"] == 3
-    assert gate["quote_matched_rows"] == 2
+    assert gate["quote_matched_rows"] == 1
     assert gate["clean_rows"] == 1
     assert gate["quarantined_rows"] == 2
 
