@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from all_nse_prediction_learning import (
+    bounded_calibration_sample,
     match_matured_outcomes,
     prediction_manifest_is_clean,
     quote_manifest_is_clean,
@@ -168,3 +169,23 @@ def test_matcher_never_uses_partial_quote_rows():
     result = match_matured_outcomes(predictions, quotes)
     assert result.loc[0, "validation_status"] == "PENDING_TARGET_QUOTE"
     assert pd.isna(result.loc[0, "actual_return"])
+
+
+def test_calibration_sample_is_bounded_deterministic_and_stratified_by_target_slot():
+    rows = []
+    for day in ("2026-10-01", "2026-10-02"):
+        for minute in (0, 5, 10):
+            for stock in range(100):
+                rows.append({
+                    "symbol": f"S{stock:03d}",
+                    "target_timestamp_utc": f"{day}T04:{minute:02d}:00Z",
+                    "probability_up": 0.4 + (stock % 20) / 100,
+                    "actual_return": 0.001 if stock % 2 else -0.001,
+                })
+    frame = pd.DataFrame(rows)
+    one = bounded_calibration_sample(frame, max_rows_per_session=20, expected_slots_per_session=3)
+    two = bounded_calibration_sample(frame, max_rows_per_session=20, expected_slots_per_session=3)
+    assert len(one) <= 40
+    assert one.equals(two)
+    assert set(one["target_timestamp_utc"]).issubset(set(frame["target_timestamp_utc"]))
+    assert one.groupby(pd.to_datetime(one["target_timestamp_utc"], utc=True).dt.strftime("%Y-%m-%d")).size().max() <= 20
