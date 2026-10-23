@@ -34,7 +34,9 @@ permissions:
 
 concurrency:
   group: autonomous-prediction-learning
-  cancel-in-progress: false
+  # Only an explicitly tagged emergency restart push may cancel a stale run.
+  # Scheduled/manual runs and ordinary code pushes stay serialized.
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.event.head_commit.message, '[restart-learning]') }}
 
 jobs:
   learn:
