@@ -408,10 +408,21 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         runtime_frame["input_age_seconds"] = pd.to_numeric(runtime_frame["input_age_seconds"], errors="coerce")
         autopilot_dir = Path(output_dir) / "calibration_autopilot"
         calibration_result = _run_calibration_autopilot(store, runtime_frame, autopilot_dir)
+        from calibration_autopilot import profile_key
+        full_nse_keys = {
+            profile_key(30, version)
+            for version in fit_frame["model_version"].dropna().astype(str).unique()
+        }
+        active_keys = sorted(set(calibration_result.get("active_profile_keys", [])) & full_nse_keys)
+        shadow_keys = sorted(set(calibration_result.get("shadow_profile_keys", [])) & full_nse_keys)
         report["recommendation_update"]["status"] = calibration_result.get("status", "UNKNOWN")
-        report["recommendation_update"]["calibration_profiles_live"] = calibration_result.get("profiles_live", 0)
+        report["recommendation_update"]["calibration_profiles_live"] = len(active_keys) + len(shadow_keys)
+        report["recommendation_update"]["calibration_profiles_active_for_full_nse"] = len(active_keys)
+        report["recommendation_update"]["calibration_profiles_shadow_for_full_nse"] = len(shadow_keys)
+        report["recommendation_update"]["active_profile_keys_for_full_nse"] = active_keys
+        report["recommendation_update"]["shadow_profile_keys_for_full_nse"] = shadow_keys
         report["recommendation_update"]["base_classifier_regressor_weights_modified"] = False
-        report["recommendation_update"]["calibration_profile_auto_applied"] = bool(calibration_result.get("profiles_live", 0))
+        report["recommendation_update"]["calibration_profile_auto_applied"] = bool(active_keys)
     report["calibration_autopilot"] = calibration_result
 
     out_dir = Path(output_dir)
