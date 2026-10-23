@@ -1,4 +1,5 @@
 name: Verify minute prediction persistence
+# Read-only Drive audit rerun requested after Scheduler cadence update (2026-10-23).
 
 on:
   workflow_dispatch:
