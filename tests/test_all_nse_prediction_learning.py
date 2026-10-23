@@ -8,6 +8,7 @@ from all_nse_prediction_learning import (
     match_matured_outcomes,
     prediction_manifest_is_clean,
     quote_manifest_is_clean,
+    select_row_level_clean_predictions,
 )
 
 
@@ -189,3 +190,105 @@ def test_calibration_sample_is_bounded_deterministic_and_stratified_by_target_sl
     assert one.equals(two)
     assert set(one["target_timestamp_utc"]).issubset(set(frame["target_timestamp_utc"]))
     assert one.groupby(pd.to_datetime(one["target_timestamp_utc"], utc=True).dt.strftime("%Y-%m-%d")).size().max() <= 20
+
+
+def test_partial_slot_keeps_only_rows_matching_clean_same_slot_quotes():
+    rows = [
+        {
+            **_prediction(target="2026-10-01T04:30:00Z"),
+            "symbol": "AAA",
+            "actual_observed_at_utc": "2026-10-01T04:00:02Z",
+            "actual_market_value": 100.0,
+            "actual_quote_status": "PASS",
+            "actual_quote_age_seconds": 10.0,
+            "trained_for_symbol": True,
+            "data_limited": False,
+            "data_readiness_score": 0.95,
+        },
+        {
+            **_prediction(target="2026-10-01T04:30:00Z"),
+            "symbol": "BBB",
+            "actual_observed_at_utc": None,
+            "actual_market_value": None,
+            "actual_quote_status": "MISSING_QUOTE",
+            "actual_quote_age_seconds": None,
+            "trained_for_symbol": False,
+            "data_limited": True,
+            "data_readiness_score": 0.20,
+            "prediction_status": "MISSING_CURRENT_QUOTE",
+        },
+        {
+            **_prediction(target="2026-10-01T04:30:00Z"),
+            "symbol": "CCC",
+            "actual_observed_at_utc": "2026-10-01T04:00:04Z",
+            "actual_market_value": 50.0,
+            "actual_quote_status": "PASS",
+            "actual_quote_age_seconds": 4.0,
+            "trained_for_symbol": True,
+            "data_limited": False,
+            "data_readiness_score": 0.90,
+        },
+    ]
+    predictions = pd.DataFrame(rows)
+    contemporaneous_quotes = pd.DataFrame([
+        {
+            "symbol": "AAA",
+            "quote_observed_at_utc": "2026-10-01T04:00:03Z",
+            "actual_observed_price": 100.0,
+            "quote_status": "PASS",
+        },
+        {
+            "symbol": "BBB",
+            "quote_observed_at_utc": None,
+            "actual_observed_price": None,
+            "quote_status": "MISSING_QUOTE",
+        },
+        {
+            "symbol": "CCC",
+            "quote_observed_at_utc": "2026-10-01T04:00:04Z",
+            "actual_observed_price": 49.5,
+            "quote_status": "PASS",
+        },
+    ])
+    manifest = prediction_manifest(
+        status="PARTIAL",
+        quality_gate_pass=False,
+        expected_symbol_count=3,
+        row_count=3,
+        prediction_count=1,
+        missing_quote_count=1,
+    )
+    clean, gate = select_row_level_clean_predictions(
+        predictions, contemporaneous_quotes, manifest
+    )
+    assert clean["symbol"].tolist() == ["AAA"]
+    assert gate["slot_status"] == "PARTIAL"
+    assert gate["input_rows"] == 3
+    assert gate["quote_matched_rows"] == 2
+    assert gate["clean_rows"] == 1
+    assert gate["quarantined_rows"] == 2
+
+
+def test_row_level_gate_excludes_stale_same_symbol_quote_and_low_readiness():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    pred.update({
+        "symbol": "AAA",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_age_seconds": 200.0,
+        "trained_for_symbol": True,
+        "data_limited": False,
+        "data_readiness_score": 0.50,
+    })
+    quote = pd.DataFrame([{
+        "symbol": "AAA",
+        "quote_observed_at_utc": "2026-10-01T04:03:30Z",
+        "actual_observed_price": 100.0,
+        "quote_status": "PASS",
+    }])
+    clean, gate = select_row_level_clean_predictions(
+        pd.DataFrame([pred]), quote, prediction_manifest(status="PARTIAL")
+    )
+    assert clean.empty
+    assert gate["clean_rows"] == 0
+    assert gate["quarantined_rows"] == 1
