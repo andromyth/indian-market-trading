@@ -34,9 +34,10 @@ permissions:
 
 concurrency:
   group: autonomous-prediction-learning
-  # A relevant code push supersedes an in-progress run on stale code.
-  # Scheduled/manual runs remain serialized and do not cancel each other.
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  # Never terminate a learning run mid-write: it persists candidate registry,
+  # active profiles, and latest-report pointers. New runs queue behind the
+  # current run and evaluate the newest main revision after it completes.
+  cancel-in-progress: false
 
 jobs:
   learn:
