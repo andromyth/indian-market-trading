@@ -1,13 +1,8 @@
 name: NSE ALL-universe intraday 1-minute sync
 
 on:
-  # Also run a recovery capture when this workflow definition changes.
-  # Scoped to the workflow file only, so ordinary code pushes do not launch a full-universe sync.
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/nse_intraday_sync.yml"
+  # Manual-only until the legacy NSE chart endpoint is verified to return usable rows.
+  # The live five-minute prediction/actual capture is handled by private Cloud Run.
   workflow_dispatch:
     inputs:
       start_index:
@@ -18,12 +13,10 @@ on:
         description: '0 = full NSE universe'
         required: false
         default: '0'
-  # Capture the full current NSE universe once every trading hour during the
-  # regular cash session. Persisted 1-minute data is then available to the
-  # live 5-minute prediction engine without a manual Colab run.
-  # 09:15, 10:15, ... 15:15 IST = 03:45, 04:45, ... 09:45 UTC.
-  schedule:
-    - cron: '45 3-9 * * 1-5'
+  # Do not automatically rescan NSE's public chart endpoint: on 2026-10-23
+  # it returned an empty 62-byte chart payload for all 2,613 requested symbols.
+  # Empty source responses must remain visible; this workflow is manual-only
+  # until the chart adapter is independently repaired and verified.
 concurrency:
   group: nse-all-universe-intraday
   cancel-in-progress: false
