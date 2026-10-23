@@ -11,6 +11,8 @@ from all_nse_prediction_learning import (
     quote_manifest_is_clean,
     select_row_level_clean_predictions,
     calibration_model_version,
+    is_usable_model_version,
+    resolve_base_model_version,
 )
 
 
@@ -45,6 +47,57 @@ def quote_manifest(**overrides):
         "pending_manifest_recovery": {"errors": []},
     }
     return {**base, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("row_base", "row_version", "manifest_version", "expected", "source"),
+    [
+        (
+            "LEGACY_UNKNOWN",
+            "LEGACY_UNKNOWN__READINESS_READY",
+            "all_nse_intraday__2026-10-22__classifier123_regressor456",
+            "all_nse_intraday__2026-10-22__classifier123_regressor456",
+            "manifest_model_version",
+        ),
+        (
+            "all_nse_intraday__row-hash-abc",
+            "all_nse_intraday__row-hash-abc__READINESS_READY",
+            "all_nse_intraday__manifest-hash-xyz",
+            "all_nse_intraday__row-hash-abc",
+            "row_base_model_version",
+        ),
+        (
+            "",
+            "all_nse_intraday__row-hash-abc__READINESS_LOW",
+            "all_nse_intraday__manifest-hash-xyz",
+            "all_nse_intraday__row-hash-abc",
+            "row_model_version",
+        ),
+        (
+            "unversioned",
+            "all_nse_intraday__unversioned__READINESS_READY",
+            "all_nse_intraday__unversioned",
+            "LEGACY_UNKNOWN",
+            "legacy_unknown_fallback",
+        ),
+    ],
+)
+def test_model_version_resolution_skips_sentinels_and_uses_manifest_fallback(
+    row_base, row_version, manifest_version, expected, source
+):
+    assert resolve_base_model_version(row_base, row_version, manifest_version) == (expected, source)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "LEGACY_UNKNOWN", "UNKNOWN", "unversioned", "all_nse_intraday__unversioned"],
+)
+def test_unusable_model_version_sentinels_are_not_fit_eligible(value):
+    assert not is_usable_model_version(value)
+
+
+def test_versioned_artifact_with_readiness_suffix_is_fit_eligible():
+    assert is_usable_model_version("all_nse_intraday__2026-10-22__abc__READINESS_READY")
 
 
 def test_complete_full_nse_prediction_manifest_is_eligible():
