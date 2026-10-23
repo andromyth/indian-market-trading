@@ -49,6 +49,7 @@ jobs:
           final_algorithm_data_readiness_v2.py
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
           all_nse_delivery_model.py
+          all_nse_intraday_model.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
