@@ -918,7 +918,13 @@ class AllNSEMinutePredictor:
                         "error": None,
                     })
 
-                    model_version = self._production_model_version()
+                    base_model_version = self._production_model_version()
+                    readiness_segment = (
+                        "READINESS_LOW" if readiness < MIN_SIGNAL_READINESS else "READINESS_READY"
+                    )
+                    model_version = f"{base_model_version}__{readiness_segment}"
+                    row["base_model_version"] = base_model_version
+                    row["readiness_segment"] = readiness_segment
                     row["model_version"] = model_version
                     row["probability_up_30m_raw"] = probability
                     row["expected_return_30m_raw"] = expected_return
@@ -941,14 +947,25 @@ class AllNSEMinutePredictor:
                     row["probability_up_30m_calibrated"] = overlay.get("probability_up_calibrated")
                     row["expected_return_30m_calibrated"] = overlay.get("expected_return_calibrated")
                     row["predicted_price_30m_calibrated"] = overlay.get("predicted_price_calibrated")
-                    row["signal_calibrated"] = overlay.get("signal_calibrated")
+                    row["calibrated_signal_advisory"] = overlay.get("signal_calibrated")
+                    # A data-limited inference must remain HOLD even if an
+                    # active probability calibrator would otherwise suggest BUY/SELL.
+                    row["signal_calibrated"] = (
+                        overlay.get("signal_calibrated")
+                        if row.get("prediction_status") == "PASS" and not row.get("data_limited")
+                        else "HOLD"
+                    )
                     row["calibration_profile_id"] = overlay.get("calibration_profile_id")
                     row["calibration_stage"] = overlay.get("calibration_stage")
                     row["calibration_applied"] = bool(overlay.get("calibration_applied", False))
                     if row["calibration_applied"]:
                         row["probability_up_30m"] = overlay.get("probability_up", probability)
                         row["expected_return_30m"] = overlay.get("expected_return", expected_return)
-                        row["signal"] = overlay.get("signal", signal)
+                        row["signal"] = (
+                            overlay.get("signal", signal)
+                            if row.get("prediction_status") == "PASS" and not row.get("data_limited")
+                            else "HOLD"
+                        )
                         calibrated_probability = _safe_float(row.get("probability_up_30m"))
                         if calibrated_probability is not None:
                             row["confidence"] = (
@@ -1081,6 +1098,7 @@ class AllNSEMinutePredictor:
             "capture_interval_minutes": 5,
             "cycle_minute_ist": minute.isoformat(),
             "model_version": self._production_model_version(),
+            "calibration_versioning": "per-row readiness segment; READINESS_LOW primary action remains HOLD",
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "expected_symbol_count": len(symbols),
             "row_count": len(records),
