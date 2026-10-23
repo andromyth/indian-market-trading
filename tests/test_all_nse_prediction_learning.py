@@ -274,7 +274,7 @@ def test_partial_slot_keeps_only_rows_matching_clean_same_slot_quotes():
     assert gate["condition_counts"]["all_conditions"] == 1
 
 
-def test_row_level_gate_reports_unknown_training_membership_without_promoting_it():
+def test_row_level_gate_accepts_pass_pooled_prediction_with_unknown_membership():
     pred = _prediction(target="2026-10-01T04:30:00Z")
     pred.update({
         "symbol": "AAA",
@@ -294,9 +294,36 @@ def test_row_level_gate_reports_unknown_training_membership_without_promoting_it
     clean, gate = select_row_level_clean_predictions(
         pd.DataFrame([pred]), quote, prediction_manifest(status="PARTIAL")
     )
-    assert clean.empty
+    assert clean["symbol"].tolist() == ["AAA"]
     assert gate["condition_counts"]["trained_unknown"] == 1
-    assert gate["condition_counts"]["all_non_quote_conditions"] == 0
+    assert gate["condition_counts"]["all_non_quote_conditions"] == 1
+    assert gate["condition_counts"]["all_conditions"] == 1
+
+
+def test_row_level_gate_rejects_explicitly_untrained_prediction():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    pred.update({
+        "symbol": "AAA",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_age_seconds": 5.0,
+        "prediction_status": "PASS_UNTRAINED_SYMBOL",
+        "trained_for_symbol": False,
+        "data_limited": False,
+        "data_readiness_score": 0.95,
+    })
+    quote = pd.DataFrame([{
+        "symbol": "AAA",
+        "quote_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_observed_price": 100.0,
+        "quote_status": "PASS",
+    }])
+    clean, gate = select_row_level_clean_predictions(
+        pd.DataFrame([pred]), quote, prediction_manifest(status="PARTIAL")
+    )
+    assert clean.empty
+    assert gate["condition_counts"]["trained_false"] == 1
+    assert gate["condition_counts"]["prediction_status_pass"] == 0
     assert gate["condition_counts"]["all_conditions"] == 0
 
 
