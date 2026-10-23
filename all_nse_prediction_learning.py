@@ -34,6 +34,8 @@ QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 LEARNING_ROOT = f"{PREDICTION_ROOT}/learning"
 MIME_FOLDER = "application/vnd.google-apps.folder"
 MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
+MAX_INPUT_AGE_SECONDS = 120
+MIN_DATA_READINESS = 0.70
 MODEL_VERSION_PREFIX = "all_nse_intraday__"
 
 
@@ -145,6 +147,154 @@ def quote_manifest_is_clean(manifest: dict[str, Any]) -> bool:
         and pending_snapshot_errors == 0
         and pending_manifest_errors == 0
     )
+
+
+def select_row_level_clean_predictions(
+    frame: pd.DataFrame,
+    quote_frame: pd.DataFrame,
+    manifest: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Keep only individually complete predictions from an OK or PARTIAL slot.
+
+    A PARTIAL slot is never promoted to slot-level OK. Rows enter outcomes only
+    when their own prediction is trained/ready and matches the same-symbol,
+    same-slot clean quote on price and observation timestamp. Missing, stale,
+    untrained, feature-limited, or source-mismatched rows are quarantined.
+    """
+    empty = frame.iloc[0:0].copy()
+    base_report = {
+        "slot_status": str(manifest.get("status") or "UNKNOWN").upper(),
+        "input_rows": int(len(frame)),
+        "quote_matched_rows": 0,
+        "clean_rows": 0,
+        "quarantined_rows": int(len(frame)),
+    }
+    if frame.empty or str(manifest.get("status") or "").upper() not in {"OK", "PARTIAL"}:
+        return empty, base_report
+    required_quotes = {"symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"}
+    if not required_quotes.issubset(set(quote_frame.columns)) or quote_frame.empty:
+        return empty, base_report
+    if "symbol" not in frame.columns:
+        return empty, base_report
+
+    pred = frame.copy().reset_index(drop=True)
+    pred["_row_id_internal"] = np.arange(len(pred))
+    pred["_symbol_norm_internal"] = (
+        pred["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+    )
+    pred_ts = pd.to_datetime(
+        pred.get("actual_observed_at_utc", pd.Series(pd.NaT, index=pred.index)),
+        errors="coerce", utc=True,
+    )
+    pred_price = pd.to_numeric(
+        pred.get("actual_market_value", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
+    )
+    probability = pd.to_numeric(
+        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
+    )
+    quote_age = pd.to_numeric(
+        pred.get("actual_quote_age_seconds", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
+    )
+    readiness = pd.to_numeric(
+        pred.get("data_readiness_score", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
+    )
+    target_ts = pd.to_datetime(
+        pred.get("forecast_target_timestamp_utc", pd.Series(pd.NaT, index=pred.index)),
+        errors="coerce", utc=True,
+    )
+    pred_status = pred.get("prediction_status", pd.Series("", index=pred.index)).astype(str).str.upper()
+    actual_status = pred.get("actual_quote_status", pd.Series("", index=pred.index)).astype(str).str.upper()
+    trained = pred.get("trained_for_symbol", pd.Series(False, index=pred.index)).map(_true)
+    data_limited = pred.get("data_limited", pd.Series(True, index=pred.index)).map(_true)
+
+    quotes = quote_frame[list(required_quotes)].copy()
+    quotes["_symbol_norm_internal"] = (
+        quotes["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+    )
+    if quotes["_symbol_norm_internal"].duplicated().any():
+        return empty, base_report
+    quotes["_quote_ts_internal"] = pd.to_datetime(
+        quotes["quote_observed_at_utc"], errors="coerce", utc=True
+    )
+    quotes["_quote_price_internal"] = pd.to_numeric(
+        quotes["actual_observed_price"], errors="coerce"
+    )
+    quotes["_quote_status_internal"] = quotes["quote_status"].astype(str).str.upper()
+    merged = pred.merge(
+        quotes[[
+            "_symbol_norm_internal", "_quote_ts_internal", "_quote_price_internal",
+            "_quote_status_internal",
+        ]],
+        on="_symbol_norm_internal",
+        how="left",
+        validate="many_to_one",
+    )
+    merged_pred_ts = pd.to_datetime(
+        merged.get("actual_observed_at_utc", pd.Series(pd.NaT, index=merged.index)),
+        errors="coerce", utc=True,
+    )
+    merged_quote_ts = pd.to_datetime(merged["_quote_ts_internal"], errors="coerce", utc=True)
+    timestamp_delta = (merged_pred_ts - merged_quote_ts).dt.total_seconds().abs()
+    merged_pred_price = pd.to_numeric(
+        merged.get("actual_market_value", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    merged_quote_price = pd.to_numeric(merged["_quote_price_internal"], errors="coerce")
+    price_match = pd.Series(
+        np.isclose(
+            merged_pred_price.to_numpy(dtype=float),
+            merged_quote_price.to_numpy(dtype=float),
+            rtol=1e-7,
+            atol=1e-4,
+        ),
+        index=merged.index,
+    )
+    quote_matched = (
+        merged["_quote_status_internal"].eq("PASS")
+        & merged_quote_price.gt(0)
+        & merged_quote_ts.notna()
+        & merged_pred_ts.notna()
+        & timestamp_delta.le(MAX_INPUT_AGE_SECONDS)
+        & merged_pred_price.gt(0)
+        & price_match
+    )
+    base_report["quote_matched_rows"] = int(quote_matched.sum())
+    merged_probability = pd.to_numeric(
+        merged.get("probability_up_30m", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    merged_quote_age = pd.to_numeric(
+        merged.get("actual_quote_age_seconds", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    merged_readiness = pd.to_numeric(
+        merged.get("data_readiness_score", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    valid = (
+        quote_matched
+        & merged.get("prediction_status", pd.Series("", index=merged.index)).astype(str).str.upper().eq("PASS")
+        & merged.get("actual_quote_status", pd.Series("", index=merged.index)).astype(str).str.upper().eq("PASS")
+        & merged.get("trained_for_symbol", pd.Series(False, index=merged.index)).map(_true)
+        & ~merged.get("data_limited", pd.Series(True, index=merged.index)).map(_true)
+        & merged_probability.between(0, 1)
+        & merged_quote_age.between(0, MAX_INPUT_AGE_SECONDS)
+        & merged_readiness.ge(MIN_DATA_READINESS)
+        & merged.get("forecast_target_timestamp_utc", pd.Series(None, index=merged.index)).notna()
+        & merged.get("_symbol_norm_internal", pd.Series("", index=merged.index)).ne("")
+    )
+    row_ids = merged.loc[valid, "_row_id_internal"].astype(int).tolist()
+    clean = frame.iloc[row_ids].copy()
+    clean["symbol"] = (
+        clean["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False)
+    )
+    base_report["clean_rows"] = int(len(clean))
+    base_report["quarantined_rows"] = int(len(frame) - len(clean))
+    return clean, base_report
 
 
 def match_matured_outcomes(
