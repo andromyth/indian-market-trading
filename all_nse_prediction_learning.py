@@ -492,7 +492,6 @@ def match_matured_outcomes(
             ) else "UNKNOWN"
         )
     )
-    merged["data_limited"] = merged["data_limited"].map(_true)
     merged["prediction_status"] = merged["prediction_status"].fillna("UNKNOWN").astype(str).str.upper()
     for column, default in (
         ("prediction_slot_status", "UNKNOWN"),
