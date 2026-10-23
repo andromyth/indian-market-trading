@@ -671,6 +671,9 @@ def load_clean_session_data(
 def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "diagnostics/all_nse_prediction_learning") -> dict[str, Any]:
     store = GoogleDriveStore()
     predictions, quotes, ingest = load_clean_session_data(store, start_date, end_date)
+    # Keep the pre-match eligible prediction-row count for reporting before
+    # releasing the large source frames to bound peak memory on runner.
+    prediction_rows_for_outcome_summary = int(len(predictions))
     outcomes = match_matured_outcomes(predictions, quotes)
     del predictions, quotes
     if outcomes.empty:
@@ -696,7 +699,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
-            "prediction_rows_in_clean_slots": int(len(predictions)),
+            "prediction_rows_in_clean_slots": prediction_rows_for_outcome_summary,
             "matched_validated_outcomes": int(outcomes["validation_status"].eq("VALIDATED").sum()) if not outcomes.empty else 0,
             "pending_or_unmatched_outcomes": int(outcomes["validation_status"].ne("VALIDATED").sum()) if not outcomes.empty else 0,
             "unique_symbols_scored": int(outcomes.loc[outcomes["validation_status"].eq("VALIDATED"), "symbol"].nunique()) if not outcomes.empty else 0,
