@@ -224,14 +224,16 @@ def model_status() -> dict[str,Any]:
     # Profile identity must change when either deployed estimator changes, even
     # when two builds share the same training cutoff timestamp.
     artifact_version = (
-        f"{m.get('trained_until') or 'unknown'}__{classifier_sha[:12]}_{regressor_sha[:12]}"
-        if classifier_sha and regressor_sha else None
+        f"{m.get('model_version') or m.get('trained_until') or 'unknown'}__{classifier_sha[:12]}_{regressor_sha[:12]}"
+        if classifier_sha and regressor_sha else (
+            str(m.get("model_version") or m.get("trained_until") or "unversioned")
+        )
     )
     return {
         "status":m.get("status","REPLACEMENT"),
         "model_family":m.get("model_family"),
         "target":m.get("target"),
-        "model_version":str(m.get("model_version") or artifact_version or m.get("trained_until") or "unversioned"),
+        "model_version":str(artifact_version or "unversioned"),
         "feature_count":len(FEATURES),
         "training_symbols":m.get("training_symbols",[]),
         "training_symbol_count":m.get("training_symbol_count"),
