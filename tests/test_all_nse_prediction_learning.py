@@ -90,7 +90,13 @@ def test_model_version_resolution_skips_sentinels_and_uses_manifest_fallback(
 
 @pytest.mark.parametrize(
     "value",
-    [None, "", "LEGACY_UNKNOWN", "UNKNOWN", "unversioned", "all_nse_intraday__unversioned"],
+    [
+        None, "", "LEGACY_UNKNOWN", "UNKNOWN", "unversioned",
+        "all_nse_intraday__unversioned",
+        "LEGACY_UNKNOWN__READINESS_LOW",
+        "LEGACY_UNKNOWN__READINESS_READY",
+        "LEGACY_UNKNOWN__READINESS_UNKNOWN",
+    ],
 )
 def test_unusable_model_version_sentinels_are_not_fit_eligible(value):
     assert not is_usable_model_version(value)
