@@ -97,7 +97,7 @@ jobs:
             --strict
 
       - name: Score the full-NSE prediction ledger and stage validated calibration
-        if: ${{ always() && steps.target.outputs.should_run == 'true' && steps.target.outcome == 'success' && steps.drive.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.target.outputs.should_run == 'true' && steps.target.outcome == 'success' && steps.drive.outcome == 'success' }}
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
