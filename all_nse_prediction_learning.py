@@ -496,7 +496,7 @@ def match_matured_outcomes(
             pred[col] = np.nan
     for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibrated_signal_advisory",
                 "calibration_profile_id", "model_family", "forecast_key", "prediction_status",
-                "trained_for_symbol", "data_limited"):
+                "trained_for_symbol", "data_limited", "model_version_source"):
         if col not in pred:
             pred[col] = None
 
