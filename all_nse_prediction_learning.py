@@ -271,6 +271,18 @@ def select_row_level_clean_predictions(
         ),
         index=merged.index,
     )
+    merged_probability = pd.to_numeric(
+        merged.get("probability_up_30m", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    merged_quote_age = pd.to_numeric(
+        merged.get("actual_quote_age_seconds", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
+    merged_readiness = pd.to_numeric(
+        merged.get("data_readiness_score", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    )
     quote_matched = (
         merged["_quote_status_internal"].eq("PASS")
         & merged_quote_price.gt(0)
