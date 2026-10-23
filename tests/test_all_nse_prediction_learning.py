@@ -11,6 +11,7 @@ from all_nse_prediction_learning import (
     quote_manifest_is_clean,
     select_row_level_clean_predictions,
     calibration_model_version,
+    select_versioned_fit_rows,
 )
 
 
@@ -456,3 +457,68 @@ def test_near_empty_readiness_and_explicitly_untrained_rows_remain_ineligible():
     assert gate["condition_counts"]["trained_false"] == 1
     assert gate["condition_counts"]["readiness_valid"] == 0
     assert gate["condition_counts"]["all_conditions"] == 0
+
+
+def test_versioned_fit_diagnostics_exclude_unknown_suffixed_legacy_profiles():
+    outcomes = pd.DataFrame([
+        {
+            "validation_status": "VALIDATED",
+            "model_version": "LEGACY_UNKNOWN__READINESS_LOW",
+            "base_model_version": "LEGACY_UNKNOWN",
+            "readiness_segment": "READINESS_LOW",
+            "probability_up": 0.61,
+            "actual_return": 0.012,
+            "target_timestamp_utc": "2026-10-01T04:30:00Z",
+        },
+        {
+            "validation_status": "VALIDATED",
+            "model_version": "all_nse_intraday__2026-10-23__a1b2c3__READINESS_LOW",
+            "base_model_version": "all_nse_intraday__2026-10-23__a1b2c3",
+            "readiness_segment": "READINESS_LOW",
+            "probability_up": 0.57,
+            "actual_return": -0.004,
+            "target_timestamp_utc": "2026-10-02T04:30:00Z",
+        },
+        {
+            "validation_status": "PENDING_TARGET_QUOTE",
+            "model_version": "all_nse_intraday__2026-10-23__a1b2c3__READINESS_LOW",
+            "base_model_version": "all_nse_intraday__2026-10-23__a1b2c3",
+            "readiness_segment": "READINESS_LOW",
+            "probability_up": 0.57,
+            "actual_return": None,
+            "target_timestamp_utc": "2026-10-02T04:30:00Z",
+        },
+    ])
+    fit, diagnostics = select_versioned_fit_rows(outcomes)
+    assert len(fit) == 1
+    assert fit.iloc[0]["base_model_version"] == "all_nse_intraday__2026-10-23__a1b2c3"
+    assert diagnostics["validated_outcome_rows"] == 2
+    assert diagnostics["validated_rows_with_explicit_model_version"] == 1
+    assert diagnostics["validated_rows_with_unknown_model_version"] == 1
+    assert diagnostics["fit_eligible_rows"] == 1
+    assert diagnostics["model_version_counts_top20"]["LEGACY_UNKNOWN__READINESS_LOW"] == 1
+
+
+def test_versioned_fit_diagnostics_reports_empty_and_all_legacy_outcomes():
+    legacy = pd.DataFrame([
+        {
+            "validation_status": "VALIDATED",
+            "model_version": "LEGACY_UNKNOWN__READINESS_READY",
+            "base_model_version": "LEGACY_UNKNOWN",
+            "readiness_segment": "READINESS_READY",
+            "probability_up": 0.55,
+            "actual_return": 0.002,
+            "target_timestamp_utc": "2026-10-01T04:30:00Z",
+        }
+    ])
+    fit, diagnostics = select_versioned_fit_rows(legacy)
+    assert fit.empty
+    assert diagnostics["validated_outcome_rows"] == 1
+    assert diagnostics["validated_rows_with_explicit_model_version"] == 0
+    assert diagnostics["validated_rows_with_unknown_model_version"] == 1
+    assert diagnostics["fit_eligible_rows"] == 0
+
+    empty_fit, empty_diagnostics = select_versioned_fit_rows(pd.DataFrame())
+    assert empty_fit.empty
+    assert empty_diagnostics["outcome_rows"] == 0
+    assert empty_diagnostics["fit_eligible_rows"] == 0
