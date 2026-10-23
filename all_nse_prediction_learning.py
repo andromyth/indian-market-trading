@@ -187,7 +187,7 @@ def match_matured_outcomes(
                 "actual_quote_age_seconds", "data_readiness_score"):
         if col not in pred:
             pred[col] = np.nan
-    for col in ("signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
+    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
                 "model_family", "forecast_key"):
         if col not in pred:
             pred[col] = None
@@ -236,7 +236,13 @@ def match_matured_outcomes(
     quote_ok = merged["_quote_ts"].notna() & reference.gt(0) & target_price.gt(0)
     merged["validation_status"] = np.where(quote_ok, "VALIDATED", "PENDING_TARGET_QUOTE")
     merged["actual_return"] = np.where(quote_ok, target_price / reference - 1.0, np.nan)
-    merged["target_quote_distance_seconds"] = (merged["_quote_ts"] - merged["_target_ts"]).dt.total_seconds().abs()
+    target_distance_seconds = pd.Series(np.nan, index=merged.index, dtype=float)
+    distance_mask = merged["_quote_ts"].notna() & merged["_target_ts"].notna()
+    if distance_mask.any():
+        target_distance_seconds.loc[distance_mask] = (
+            merged.loc[distance_mask, "_quote_ts"] - merged.loc[distance_mask, "_target_ts"]
+        ).dt.total_seconds().abs()
+    merged["target_quote_distance_seconds"] = target_distance_seconds
     merged["decision_timestamp_utc"] = merged["_decision_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged["target_timestamp_utc"] = merged["_target_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged["actual_quote_timestamp_utc"] = merged["_quote_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
