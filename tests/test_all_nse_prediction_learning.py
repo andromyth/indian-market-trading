@@ -203,6 +203,23 @@ def test_matured_outcome_uses_nearest_clean_target_quote_within_tolerance():
     assert result.loc[0, "model_version"] == "all_nse_intraday__2026-09-30"
 
 
+def test_matured_outcome_falls_back_to_legacy_probability_when_raw_column_is_null():
+    pred = _prediction()
+    pred["probability_up_30m_raw"] = None
+    pred["expected_return_30m_raw"] = None
+    predictions = pd.DataFrame([pred])
+    quotes = pd.DataFrame([{
+        "symbol": "ABC",
+        "quote_observed_at_utc": "2026-10-01T04:30:10Z",
+        "actual_observed_price": 102.0,
+        "quote_status": "PASS",
+    }])
+    result = match_matured_outcomes(predictions, quotes)
+    assert result.loc[0, "validation_status"] == "VALIDATED"
+    assert result.loc[0, "probability_up"] == pytest.approx(0.62)
+    assert result.loc[0, "expected_return"] == pytest.approx(0.01)
+
+
 def test_unmatched_or_too_distant_target_quote_is_not_scored():
     predictions = pd.DataFrame([_prediction()])
     quotes = pd.DataFrame([
