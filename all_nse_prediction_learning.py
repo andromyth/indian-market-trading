@@ -156,12 +156,16 @@ def select_row_level_clean_predictions(
     quote_frame: pd.DataFrame,
     manifest: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Keep only individually complete predictions from an OK or PARTIAL slot.
+    """Keep individually complete predictions from an OK or PARTIAL slot.
 
     A PARTIAL slot is never promoted to slot-level OK. Rows enter outcomes only
-    when their own prediction is trained/ready and matches the same-symbol,
-    same-slot clean quote on price and observation timestamp. Missing, stale,
-    untrained, feature-limited, or source-mismatched rows are quarantined.
+    when the producer marked them PASS, input readiness and quote checks pass,
+    and the same-symbol quote from that slot corroborates the observation.
+    Explicitly untrained (False) rows are excluded. UNKNOWN training membership
+    remains labelled UNKNOWN rather than being presented as trained: this is a
+    pooled feature model, and its inference contract allows PASS when per-symbol
+    membership is not supplied. Those rows remain tied to the recorded model
+    version and are counted separately in the learning report.
     """
     empty = frame.iloc[0:0].copy()
     base_report = {
@@ -326,7 +330,7 @@ def select_row_level_clean_predictions(
     non_quote_valid = (
         prediction_status_pass
         & actual_quote_status_pass
-        & trained_true
+        & ~trained_false
         & data_limited_false
         & probability_valid
         & quote_age_valid
@@ -381,6 +385,7 @@ def match_matured_outcomes(
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
         "calibration_profile_id", "model_version", "model_family", "horizon_min",
         "input_age_seconds", "feature_coverage", "validation_status", "source", "quote_basis",
+        "prediction_status", "trained_for_symbol", "trained_membership_status", "data_limited",
         "prediction_slot_status", "quote_slot_status", "slot_quality_gate_pass",
     ]
     if predictions.empty:
@@ -405,7 +410,7 @@ def match_matured_outcomes(
         if col not in pred:
             pred[col] = np.nan
     for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
-                "model_family", "forecast_key"):
+                "model_family", "forecast_key", "prediction_status", "trained_for_symbol", "data_limited"):
         if col not in pred:
             pred[col] = None
 
@@ -479,6 +484,16 @@ def match_matured_outcomes(
     merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
     merged["source"] = "all_nse_intraday_production"
     merged["quote_basis"] = "nearest clean provider quote observation within target tolerance; not exchange-stamped 1m OHLCV"
+    merged["trained_membership_status"] = merged["trained_for_symbol"].map(
+        lambda value: "TRAINED" if _true(value) else (
+            "UNTRAINED" if (
+                (isinstance(value, (bool, np.bool_)) and not bool(value))
+                or str(value).strip().lower() in {"false", "0", "no"}
+            ) else "UNKNOWN"
+        )
+    )
+    merged["data_limited"] = merged["data_limited"].map(_true)
+    merged["prediction_status"] = merged["prediction_status"].fillna("UNKNOWN").astype(str).str.upper()
     for column, default in (
         ("prediction_slot_status", "UNKNOWN"),
         ("quote_slot_status", "UNKNOWN"),
@@ -525,6 +540,7 @@ def load_clean_session_data(
     prediction_columns = [
         "symbol", "actual_observed_at_utc", "actual_market_value", "actual_quote_status",
         "actual_quote_age_seconds", "forecast_target_timestamp_utc", "forecast_key",
+        "prediction_status", "trained_for_symbol", "data_limited",
         "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
@@ -763,7 +779,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
         "scope": "ALL-NSE pooled production 30-minute classifier/regressor",
         "capture_interval_minutes": 5,
-        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine every row that fails prediction, readiness, same-slot quote price/status, or timestamp validation. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
+        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine every row that fails PASS prediction status, readiness, same-slot quote price/status, or timestamp validation. Explicitly untrained rows are excluded; pooled-model rows with unknown membership can be evaluated only when the production predictor marked them PASS, with membership remaining labelled UNKNOWN. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
