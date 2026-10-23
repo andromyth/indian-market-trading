@@ -74,15 +74,18 @@ _INVALID_MODEL_VERSION_VALUES = {
 
 
 def is_usable_model_version(value: Any) -> bool:
-    """Reject blank/sentinel versions that cannot safely scope calibration."""
-    if value is None or pd.isna(value):
+    """Reject blank or sentinel identities that cannot safely scope calibration."""
+    if value is None:
         return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        pass
     candidate = str(value).strip()
     lowered = candidate.lower()
-    # Readiness suffixes do not make a sentinel such as LEGACY_UNKNOWN into
-    # a trustworthy model identity.
     for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
-        if lowered.endswith(suffix):
+        if lowered.endswith(suffix.lower()):
             lowered = lowered[:-len(suffix)]
             break
     if lowered in _INVALID_MODEL_VERSION_VALUES:
@@ -97,23 +100,21 @@ def resolve_base_model_version(
     row_model_version: Any,
     manifest_model_version: Any,
 ) -> tuple[str, str]:
-    """Prefer trustworthy row version, then row model version, then slot manifest.
-
-    A legacy/sentinel row value must never shadow a trustworthy manifest version.
-    """
+    """Resolve a trustworthy base identity without letting a sentinel shadow a manifest."""
     for source, value in (
         ("row_base_model_version", row_base_version),
         ("row_model_version", row_model_version),
         ("manifest_model_version", manifest_model_version),
     ):
-        if is_usable_model_version(value):
-            text_value = str(value).strip()
-            for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
-                if text_value.endswith(suffix):
-                    text_value = text_value[:-len(suffix)]
-                    break
-            if is_usable_model_version(text_value):
-                return text_value, source
+        if not is_usable_model_version(value):
+            continue
+        text_value = str(value).strip()
+        for suffix in (READINESS_LOW_SUFFIX, READINESS_READY_SUFFIX, READINESS_UNKNOWN_SUFFIX):
+            if text_value.lower().endswith(suffix.lower()):
+                text_value = text_value[:-len(suffix)]
+                break
+        if is_usable_model_version(text_value):
+            return text_value, source
     return "LEGACY_UNKNOWN", "legacy_unknown_fallback"
 
 
@@ -466,8 +467,8 @@ def match_matured_outcomes(
         "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
         "calibrated_signal_advisory",
-        "calibration_profile_id", "model_version", "base_model_version", "model_version_source",
-        "readiness_segment", "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
+        "calibration_profile_id", "model_version", "base_model_version", "model_version_source", "readiness_segment",
+        "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
         "validation_status", "source", "quote_basis", "prediction_status",
         "trained_for_symbol", "trained_membership_status", "data_limited",
         "prediction_slot_status", "quote_slot_status", "slot_quality_gate_pass",
@@ -480,20 +481,28 @@ def match_matured_outcomes(
     pred["_target_ts"] = pd.to_datetime(pred.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
     pred["_decision_ts"] = pd.to_datetime(pred.get("actual_observed_at_utc"), errors="coerce", utc=True)
     pred["_reference"] = pd.to_numeric(pred.get("actual_market_value"), errors="coerce")
-    # Prefer the explicit base-model outputs where present, but fall back
-    # per row to legacy output columns when newer schema columns exist but are null.
+    # Older persisted prediction Parquets do not contain the explicit *_raw
+    # columns. The loader adds missing columns as nulls, so choosing the raw
+    # column merely because it exists would silently discard otherwise valid
+    # probabilities/returns. Use the raw field only when it is populated, then
+    # fall back row-by-row to the legacy/model output field.
     probability_raw = pd.to_numeric(
-        pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
+        pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
     )
     probability_legacy = pd.to_numeric(
-        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
+        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
     )
     pred["_probability"] = probability_raw.where(probability_raw.notna(), probability_legacy)
+
     return_raw = pd.to_numeric(
-        pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"
+        pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
     )
     return_legacy = pd.to_numeric(
-        pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"
+        pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)),
+        errors="coerce",
     )
     pred["_expected_return"] = return_raw.where(return_raw.notna(), return_legacy)
     if "model_version" not in pred:
@@ -502,6 +511,9 @@ def match_matured_outcomes(
     if "base_model_version" not in pred:
         pred["base_model_version"] = pred["model_version"]
     pred["base_model_version"] = pred["base_model_version"].fillna(pred["model_version"]).astype(str)
+    if "model_version_source" not in pred:
+        pred["model_version_source"] = "row_model_version"
+    pred["model_version_source"] = pred["model_version_source"].fillna("unknown").astype(str)
     if "readiness_segment" not in pred:
         pred["readiness_segment"] = pd.to_numeric(
             pred.get("data_readiness_score", pd.Series(np.nan, index=pred.index)), errors="coerce"
@@ -602,12 +614,14 @@ def match_matured_outcomes(
         ("prediction_slot_status", "UNKNOWN"),
         ("quote_slot_status", "UNKNOWN"),
         ("slot_quality_gate_pass", False),
+        ("model_version_source", "unknown"),
     ):
         if column not in merged:
             merged[column] = default
     merged["prediction_slot_status"] = merged["prediction_slot_status"].fillna("UNKNOWN").astype(str)
     merged["quote_slot_status"] = merged["quote_slot_status"].fillna("UNKNOWN").astype(str)
     merged["slot_quality_gate_pass"] = merged["slot_quality_gate_pass"].map(_true)
+    merged["model_version_source"] = merged["model_version_source"].fillna("unknown").astype(str)
     return merged[output_columns].reset_index(drop=True)
 
 def _day_folder_files(store: Any, root: str, day: date) -> list[dict[str, Any]]:
@@ -788,7 +802,7 @@ def load_clean_session_data(
                     quote_slot_frames[key],
                     manifest,
                 )
-                manifest_model_version = str(manifest.get("model_version") or "LEGACY_UNKNOWN")
+                manifest_model_version = manifest.get("model_version")
                 for column in prediction_columns:
                     if column not in clean:
                         clean[column] = None
@@ -798,11 +812,12 @@ def load_clean_session_data(
                     clean["model_version"] = pd.Series(dtype=str)
                     clean["model_version_source"] = pd.Series(dtype=str)
                 else:
-                    raw_base_values = clean["base_model_version"].tolist()
-                    raw_row_values = clean["model_version"].tolist()
                     resolved = [
                         resolve_base_model_version(row_base, row_version, manifest_model_version)
-                        for row_base, row_version in zip(raw_base_values, raw_row_values)
+                        for row_base, row_version in zip(
+                            clean["base_model_version"].tolist(),
+                            clean["model_version"].tolist(),
+                        )
                     ]
                     base_versions = [item[0] for item in resolved]
                     version_sources = [item[1] for item in resolved]
