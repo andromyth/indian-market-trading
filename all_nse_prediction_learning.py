@@ -416,6 +416,7 @@ def match_matured_outcomes(
         "actual_quote_timestamp_utc", "target_quote_distance_seconds", "reference_price",
         "actual_target_price", "actual_return", "probability_up", "probability_up_calibrated",
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
+        "calibrated_signal_advisory",
         "calibration_profile_id", "model_version", "base_model_version", "readiness_segment",
         "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
         "validation_status", "source", "quote_basis", "prediction_status",
@@ -450,8 +451,9 @@ def match_matured_outcomes(
                 "actual_quote_age_seconds", "data_readiness_score"):
         if col not in pred:
             pred[col] = np.nan
-    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibration_profile_id",
-                "model_family", "forecast_key", "prediction_status", "trained_for_symbol", "data_limited"):
+    for col in ("signal", "signal_raw", "raw_model_signal", "signal_calibrated", "calibrated_signal_advisory",
+                "calibration_profile_id", "model_family", "forecast_key", "prediction_status",
+                "trained_for_symbol", "data_limited"):
         if col not in pred:
             pred[col] = None
 
@@ -520,6 +522,7 @@ def match_matured_outcomes(
     signal = signal.mask(signal.eq(""), fallback)
     signal = signal.mask(signal.eq(""), merged["signal"].fillna("").astype(str).str.strip())
     merged["signal"] = signal.mask(signal.eq(""), "HOLD").str.upper()
+    merged["calibrated_signal_advisory"] = merged["calibrated_signal_advisory"].fillna("").astype(str).str.upper()
     merged["horizon_min"] = 30
     merged["input_age_seconds"] = pd.to_numeric(merged["actual_quote_age_seconds"], errors="coerce")
     merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
@@ -586,7 +589,8 @@ def load_clean_session_data(
         "readiness_segment", "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
-        "signal_calibrated", "calibration_profile_id", "model_version", "model_family",
+        "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
+        "model_version", "base_model_version", "readiness_segment", "model_family",
         "data_readiness_score", "prediction_slot_status", "quote_slot_status",
         "slot_quality_gate_pass",
     ]
