@@ -23,6 +23,9 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import os
+
+import calibration_overlay as calibration_overlay_module
 
 IST = ZoneInfo("Asia/Kolkata")
 REMOTE_ROOT = "production_data/all_nse_minute_predictions"
@@ -201,6 +204,8 @@ class AllNSEMinutePredictor:
         self._trained_symbols: set[str] = set()
         self._nifty_code: str | None = None
         self._market_history = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self._calibration = None
+        self._calibration_init_error_logged = False
         self._last_health: dict[str, Any] = {
             "status": "NOT_STARTED",
             "history_ready": False,
@@ -237,6 +242,61 @@ class AllNSEMinutePredictor:
                 "history_seed_error": self._seed_error,
                 "trained_symbol_count": len(self._trained_symbols),
             })
+
+    def _production_model_version(self) -> str:
+        trained_until = self._model_status.get("trained_until")
+        version = self._model_status.get("model_version") or trained_until
+        if version:
+            return f"all_nse_intraday__{str(version).strip()}"
+        return "all_nse_intraday__unversioned"
+
+    def _apply_calibration_overlay(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Fail-open, version-specific calibration; SHADOW never changes live outputs."""
+        mode = calibration_overlay_module.resolve_mode(
+            os.getenv("ALL_NSE_CALIBRATION_MODE", "active")
+        )
+        if mode == "off":
+            return row
+        try:
+            if self._calibration is None:
+                def load_profile_document():
+                    from persistent_store import GoogleDriveStore
+                    from googleapiclient.http import MediaIoBaseDownload
+                    store = GoogleDriveStore()
+                    remote = "production_data/intraday_predictions/learning/calibration/active_calibration_profile.json"
+                    parent = store.root_id
+                    parts = remote.strip("/").split("/")
+                    for part in parts[:-1]:
+                        found = store._find_child(parent, part)
+                        if not found:
+                            return None
+                        parent = found["id"]
+                    found = store._find_child(parent, parts[-1])
+                    if not found:
+                        return None
+                    buffer = io.BytesIO()
+                    request = store.service.files().get_media(fileId=found["id"])
+                    downloader = MediaIoBaseDownload(buffer, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    return json.loads(buffer.getvalue().decode("utf-8"))
+
+                self._calibration = calibration_overlay_module.CalibrationOverlay(
+                    load_profile_document, mode=mode, refresh_seconds=900
+                )
+            else:
+                self._calibration.mode = mode
+            return self._calibration.annotate(row)
+        except Exception as exc:
+            if not self._calibration_init_error_logged:
+                self._log(
+                    "all_nse_calibration_overlay_unavailable",
+                    error=f"{type(exc).__name__}: {str(exc)[:240]}",
+                    fail_open=True,
+                )
+                self._calibration_init_error_logged = True
+            return row
 
     @staticmethod
     def _nifty_instrument_code() -> str | None:
@@ -857,6 +917,45 @@ class AllNSEMinutePredictor:
                         ),
                         "error": None,
                     })
+
+                    model_version = self._production_model_version()
+                    row["model_version"] = model_version
+                    row["probability_up_30m_raw"] = probability
+                    row["expected_return_30m_raw"] = expected_return
+                    row["signal_raw"] = signal
+                    reference_price = _safe_float(row.get("actual_market_value"))
+                    predicted_price = (
+                        reference_price * (1.0 + expected_return)
+                        if reference_price is not None and expected_return is not None
+                        and np.isfinite(expected_return) else None
+                    )
+                    overlay = self._apply_calibration_overlay({
+                        "horizon_min": 30,
+                        "model_version": model_version,
+                        "probability_up": probability,
+                        "expected_return": expected_return,
+                        "predicted_price": predicted_price,
+                        "reference_close": reference_price,
+                        "signal": signal,
+                    })
+                    row["probability_up_30m_calibrated"] = overlay.get("probability_up_calibrated")
+                    row["expected_return_30m_calibrated"] = overlay.get("expected_return_calibrated")
+                    row["predicted_price_30m_calibrated"] = overlay.get("predicted_price_calibrated")
+                    row["signal_calibrated"] = overlay.get("signal_calibrated")
+                    row["calibration_profile_id"] = overlay.get("calibration_profile_id")
+                    row["calibration_stage"] = overlay.get("calibration_stage")
+                    row["calibration_applied"] = bool(overlay.get("calibration_applied", False))
+                    if row["calibration_applied"]:
+                        row["probability_up_30m"] = overlay.get("probability_up", probability)
+                        row["expected_return_30m"] = overlay.get("expected_return", expected_return)
+                        row["signal"] = overlay.get("signal", signal)
+                        calibrated_probability = _safe_float(row.get("probability_up_30m"))
+                        if calibrated_probability is not None:
+                            row["confidence"] = (
+                                "HIGH" if abs(calibrated_probability - 0.5) >= 0.25
+                                else "MEDIUM" if abs(calibrated_probability - 0.5) >= 0.12
+                                else "LOW"
+                            )
                     if readiness < MIN_SIGNAL_READINESS:
                         data_limited_count += 1
                     prediction_count += 1
@@ -981,6 +1080,7 @@ class AllNSEMinutePredictor:
             "schema_version": "all-nse-minute-prediction-v1",
             "capture_interval_minutes": 5,
             "cycle_minute_ist": minute.isoformat(),
+            "model_version": self._production_model_version(),
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "expected_symbol_count": len(symbols),
             "row_count": len(records),
