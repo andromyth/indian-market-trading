@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Quality-gated outcome learning for the deployed full-NSE 30-minute predictor.
 
-Partial capture files are retained in Drive for operations/audit, but only a slot
-whose quote and prediction manifests are complete may contribute to calibration.
-This module changes only the calibrated probability/return/signal overlay; it does
-not replace classifier/regressor joblib weights or place orders.
+Partial capture files remain in Drive for operations/audit and keep their
+PARTIAL status. Individual symbol rows can enter outcome evaluation only when
+their prediction, feature readiness, same-slot quote, and timestamp checks pass;
+a valid row never upgrades its containing slot to OK. This module changes only
+the calibrated probability/return/signal overlay; it does not replace
+classifier/regressor joblib weights or place orders.
 """
 from __future__ import annotations
 
@@ -690,7 +692,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
         "scope": "ALL-NSE pooled production 30-minute classifier/regressor",
         "capture_interval_minutes": 5,
-        "partial_data_policy": "Persist partial snapshots for diagnostics, but exclude any slot not passing both full-universe quote and prediction quality gates from outcome fitting.",
+        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine every row that fails prediction, readiness, same-slot quote price/status, or timestamp validation. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
