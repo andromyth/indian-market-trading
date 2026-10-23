@@ -14,6 +14,20 @@ on:
   # Existing outcome audit starts at 16:00 IST; learning runs later to allow it to finish.
   schedule:
     - cron: "0 11 * * 1-5"
+  # Run once when the full-NSE learner/runtime integration changes on main;
+  # future production-model versions can be evaluated without waiting for Monday.
+  push:
+    branches:
+      - main
+    paths:
+      - "all_nse_prediction_learning.py"
+      - "all_nse_minute_prediction_capture.py"
+      - "all_nse_intraday_model.py"
+      - "audit_all_universe_minute_snapshots.py"
+      - "calibration_autopilot.py"
+      - "calibration_overlay.py"
+      - "prediction_learning_engine.py"
+      - ".github/workflows/autonomous_prediction_learning.yml"
 
 permissions:
   contents: read
