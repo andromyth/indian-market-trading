@@ -226,3 +226,19 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     assert written.loc["BBB", "actual_market_value"] == 202.5
     assert written.loc["BBB", "probability_up_30m"] == pytest.approx(0.2)
     assert written.loc["BBB", "signal"] == "SELL"
+
+    # The version and readiness segment must be persisted with every prediction,
+    # otherwise historical outcomes cannot be safely attributed to this artifact.
+    expected_base_version = predictor._production_model_version()
+    assert written.loc["AAA", "base_model_version"] == expected_base_version
+    assert written.loc["BBB", "base_model_version"] == expected_base_version
+    assert written.loc["AAA", "model_version"] == f"{expected_base_version}__READINESS_READY"
+    assert written.loc["BBB", "model_version"] == f"{expected_base_version}__READINESS_READY"
+
+    import json
+    minute_manifest_path = (
+        tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
+        f"{minute:%d}" / f"manifest_{minute:%Y%m%d_%H%M}.json"
+    )
+    saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
+    assert saved_manifest["model_version"] == expected_base_version
