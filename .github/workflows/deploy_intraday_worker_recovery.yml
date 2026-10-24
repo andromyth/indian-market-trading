@@ -11,6 +11,7 @@ on:
       - "autonomous_intraday_worker_service.py"
       - "all_universe_minute_capture.py"
       - "all_nse_minute_prediction_capture.py"
+      - "all_nse_intraday_model.py"
       - "calibration_overlay.py"
       - "audit_all_universe_minute_snapshots.py"
       - "verify_minute_prediction_persistence.py"
