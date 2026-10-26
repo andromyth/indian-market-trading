@@ -1,4 +1,5 @@
 name: Diagnose latest NSE quote exceptions
+# Triggered after provider adapter changes to capture sanitized provider-side error details.
 
 on:
   workflow_dispatch:
