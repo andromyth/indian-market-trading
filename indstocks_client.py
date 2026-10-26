@@ -118,20 +118,19 @@ def _safe_provider_error_detail(response: requests.Response) -> str:
         if value is None:
             continue
 
-        rendered = re.sub(r"[\\r\\n\\t]+", " ", str(value)).strip()
+        rendered = re.sub(r"[\r\n\t]+", " ", str(value)).strip()
         rendered = re.sub(
-            r"(?i)(authorization\\s*[:=]\\s*)(?:(?:bearer|token)\\s+)?[^\\s,;&]+",
-            r"\\1[REDACTED]",
+            r"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|token)\s+)?[^\s,;&]+",
+            r"\1[REDACTED]",
             rendered,
         )
         rendered = re.sub(
-            r"(?i)\\b((?:x-api-key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|mpin|totp|password|secret)\\s*[:=]\\s*)"
-            r"(?:\"[^\"]*\"|'[^']*'|[^\\s,;&]+)",
-            r"\\1[REDACTED]",
+            r"(?i)\b((?:x-api-key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|mpin|totp|password|secret)\s*[:=]\s*)[^\s,;&]+",
+            r"\1[REDACTED]",
             rendered,
         )
         rendered = re.sub(
-            r"\\b[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b",
+            r"\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
             "[REDACTED_JWT]",
             rendered,
         )
@@ -143,7 +142,6 @@ def _safe_provider_error_detail(response: requests.Response) -> str:
     if not parts:
         return ""
     return "; provider_response=" + ", ".join(parts)
-
 
 def _generate_token() -> str:
     client_id = _setting("INDSTOCKS_CLIENT_ID")
