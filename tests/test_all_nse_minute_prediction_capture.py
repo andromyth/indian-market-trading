@@ -12,6 +12,18 @@ import all_nse_minute_prediction_capture as capture
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def test_session_aware_return_does_not_use_overnight_gap():
+    import all_nse_intraday_model as model
+
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2026-10-23 15:28:00", tz=IST),
+        pd.Timestamp("2026-10-23 15:29:00", tz=IST),
+        pd.Timestamp("2026-10-26 09:15:00", tz=IST),
+    ])
+    close = pd.Series([99.0, 100.0, 150.0], index=idx)
+    assert model._session_aware_returns(close, 1) == pytest.approx(100.0 / 99.0 - 1.0)
+
+
 def test_current_quote_is_actual_close_without_fabricated_minute_ohlc():
     minute = pd.Timestamp("2026-10-21 10:00:00", tz=IST)
     quote = {
@@ -34,6 +46,7 @@ def test_current_quote_is_actual_close_without_fabricated_minute_ohlc():
     assert record["symbol"] == "RELIANCE"
     assert record["actual_market_value"] == 102.5
     assert record["actual_quote_status"] == "PASS"
+    assert record["actual_quote_age_seconds"] == pytest.approx(7.0)
     assert record["actual_timestamp_basis"] == "collector_observation_time_not_exchange_tick_timestamp"
     assert price_row is not None
     assert price_row["Close"] == 102.5
@@ -139,6 +152,11 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     predictor._model_status = {
         "training_symbol_count": 2,
         "trained_until": "2026-10-20T09:15:00+00:00",
+        "manifest_sha256_match": True,
+    }
+    predictor._refresh_current_session_history = lambda _minute: {
+        "status": "OK", "batch_count": 1, "failed_batches": 0,
+        "failed_symbols": [], "updated_symbols": 2, "elapsed_seconds": 0.1,
     }
 
     idx = pd.date_range(

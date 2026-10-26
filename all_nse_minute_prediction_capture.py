@@ -623,8 +623,7 @@ class AllNSEMinutePredictor:
             start_ms, end_ms = int(window_start.timestamp() * 1000), int(minute.timestamp() * 1000)
             entries = sorted((str(s), str(c)) for s, c in codes.items() if str(c).strip())
             if nifty_code:
-                entries.append(("__NIFTY50__", str(nifty_code))
-                )
+                entries.append(("__NIFTY50__", str(nifty_code)))
             batches = [entries[i:i + HISTORY_BATCH_SIZE] for i in range(0, len(entries), HISTORY_BATCH_SIZE)]
 
             def rate_limit_start() -> None:
