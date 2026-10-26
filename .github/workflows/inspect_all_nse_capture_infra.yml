@@ -45,6 +45,39 @@ jobs:
           gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(metadata.generation,status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic,status.conditions)' || true
           echo "=== Recent Cloud Run revisions ==="
           gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --sort-by='~metadata.creationTimestamp' --format='table(metadata.name,metadata.creationTimestamp,status.conditions[0].status,status.conditions[0].reason)' || true
+          echo "=== Safe runtime configuration: variable names and Secret Manager references only ==="
+          READY_REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)' 2>/dev/null || true)"
+          if [[ -n "$READY_REVISION" ]] && gcloud run revisions describe "$READY_REVISION" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/ready_revision.json 2>/dev/null; then
+            python - /tmp/ready_revision.json <<'PY'
+          import json, sys
+          payload=json.load(open(sys.argv[1],encoding="utf-8"))
+          containers=(payload.get("spec") or {}).get("containers") or []
+          for index, container in enumerate(containers):
+              for item in container.get("env") or []:
+                  name=item.get("name")
+                  source=item.get("valueSource") or {}
+                  secret=(source.get("secretKeyRef") or {})
+                  if secret:
+                      entry={"container_index":index,"env_name":name,"source_type":"secretKeyRef","secret_name":secret.get("secret"),"secret_version":secret.get("version")}
+                  else:
+                      entry={"container_index":index,"env_name":name,"source_type":"literal_or_other","literal_value":"REDACTED"}
+                  print("SAFE_RUNTIME_ENV_REFERENCE="+json.dumps(entry,sort_keys=True))
+          PY
+          else
+            echo "SAFE_RUNTIME_ENV_REFERENCE_STATUS=UNAVAILABLE"
+          fi
+          echo "=== Safe INDstocks Secret Manager presence check (names/status only; values never read to output) ==="
+          for secret_name in indstocks-client-id indstocks-mpin indstocks-totp-secret indstocks-access-token; do
+            if gcloud secrets describe "$secret_name" --project="$PROJECT_ID" >/dev/null 2>&1; then
+              if gcloud secrets versions access latest --secret="$secret_name" --project="$PROJECT_ID" >/dev/null 2>&1; then
+                echo "INDSTOCKS_SECRET=$secret_name STATUS=LATEST_VERSION_READABLE"
+              else
+                echo "INDSTOCKS_SECRET=$secret_name STATUS=NO_READABLE_LATEST_VERSION"
+              fi
+            else
+              echo "INDSTOCKS_SECRET=$secret_name STATUS=MISSING_OR_UNREADABLE"
+            fi
+          done
           echo "=== Recent Cloud Builds ==="
           gcloud builds list --project="$PROJECT_ID" --limit=8 --sort-by='~createTime' --format='table(id,status,createTime,finishTime,logUrl)' || true
           echo "=== Cloud Run HTTP request metrics for last 20 minutes ==="
