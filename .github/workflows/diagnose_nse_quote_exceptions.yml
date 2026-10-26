@@ -78,9 +78,14 @@ jobs:
               str(k): int(v) for k, v in
               frame["quote_status"].fillna("NULL").astype(str).value_counts().items()
           }
-          failed = frame.loc[
+          failed_frame = frame.loc[
               frame["quote_status"].astype(str).str.upper().ne("PASS"), needed
-          ].sort_values("symbol").to_dict(orient="records")
+          ].sort_values("symbol")
+          failed = failed_frame.head(10).to_dict(orient="records")
+          quote_error_counts = {
+              str(k): int(v) for k, v in
+              failed_frame["quote_error"].fillna("<NULL>").astype(str).value_counts().head(20).items()
+          }
           unmapped = frame.loc[
               frame["instrument_code"].isna()
               | frame["instrument_code"].astype(str).str.strip().isin(["", "None", "nan"]),
@@ -95,8 +100,19 @@ jobs:
               "missing_quote_count": manifest.get("missing_quote_count"),
               "unmapped_symbol_count": manifest.get("unmapped_symbol_count"),
               "quote_status_counts": status_counts,
+              "quote_error_counts": quote_error_counts,
+              "non_pass_quote_row_count": int(len(failed_frame)),
+              "non_pass_quote_rows_first_10": failed,
+              "provider_batch_diagnostics": {
+                  key: manifest.get(key)
+                  for key in (
+                      "provider_batch_statuses", "provider_batch_results",
+                      "provider_request_error_count", "quote_batches",
+                      "batch_error_count", "source_error", "error",
+                  )
+                  if key in manifest
+              },
               "unmapped_symbol_rows": unmapped,
-              "non_pass_quote_rows": failed,
           }
           print("LATEST_NSE_QUOTE_EXCEPTION_DIAGNOSTIC:", json.dumps(result, sort_keys=True, default=str))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
