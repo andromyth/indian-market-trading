@@ -147,7 +147,68 @@ jobs:
                       int(pd.to_datetime(frame["forecast_target_timestamp_utc"], errors="coerce", utc=True).notna().sum())
                       if "forecast_target_timestamp_utc" in frame.columns else 0
                   ),
+                  "actual_market_value_non_null": (
+                      int(pd.to_numeric(frame["actual_market_value"], errors="coerce").notna().sum())
+                      if "actual_market_value" in frame.columns else 0
+                  ),
+                  "unique_symbol_count": (
+                      int(frame["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False).nunique())
+                      if "symbol" in frame.columns else 0
+                  ),
+                  "blank_symbol_count": (
+                      int(frame["symbol"].astype(str).str.strip().eq("").sum())
+                      if "symbol" in frame.columns else int(len(frame))
+                  ),
+                  "duplicate_symbol_count": (
+                      int(len(frame) - frame["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False).nunique())
+                      if "symbol" in frame.columns else int(len(frame))
+                  ),
+                  "symbol_identity_complete_and_unique": (
+                      "symbol" in frame.columns
+                      and not frame["symbol"].astype(str).str.strip().eq("").any()
+                      and not frame["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False).duplicated().any()
+                  ),
+                  "unique_forecast_key_count": (
+                      int(frame["forecast_key"].dropna().astype(str).nunique())
+                      if "forecast_key" in frame.columns else 0
+                  ),
               }
+          # Inspect the interval ledger independently from the +30-minute forecast horizon.
+          # A slot is a five-minute sampling time; target_timestamp remains +30 minutes.
+          recent_slot_summaries = []
+          for slot_key in available_keys[-24:]:
+              slot_manifest = latest_manifest if slot_key == latest_slot else _download_json(store, manifests[slot_key]["id"])
+              recent_slot_summaries.append({
+                  "slot_key_ist": slot_key,
+                  "manifest_status": slot_manifest.get("status"),
+                  "expected_symbol_count": slot_manifest.get("expected_symbol_count"),
+                  "row_count": slot_manifest.get("row_count"),
+                  "prediction_count": slot_manifest.get("prediction_count"),
+                  "quality_gate_pass": slot_manifest.get("quality_gate_pass"),
+                  "missing_quote_count": slot_manifest.get("missing_quote_count"),
+                  "data_limited_count": slot_manifest.get("data_limited_count"),
+                  "history_ready": slot_manifest.get("history_ready"),
+              })
+          slot_start = datetime.combine(session, datetime.min.time(), tzinfo=ist).replace(hour=9, minute=15)
+          last_session_anchor = datetime.combine(session, datetime.min.time(), tzinfo=ist).replace(hour=15, minute=25)
+          now_ist = datetime.now(ist)
+          if session < now_ist.date():
+              expected_end = last_session_anchor
+          else:
+              expected_end = min(now_ist.replace(second=0, microsecond=0), last_session_anchor)
+              expected_end = expected_end.replace(minute=(expected_end.minute // 5) * 5)
+          expected_slot_keys = []
+          cursor = slot_start
+          while cursor <= expected_end and cursor <= last_session_anchor:
+              expected_slot_keys.append(cursor.strftime("%Y%m%d_%H%M"))
+              cursor += timedelta(minutes=5)
+          available_slot_keys = set(available_keys)
+          missing_expected_slots = [key for key in expected_slot_keys if key not in available_slot_keys]
+          recent_expected_slots = expected_slot_keys[-12:]
+          recent_slot_presence = [
+              {"slot_key_ist": key, "prediction_and_manifest_persisted": key in available_slot_keys}
+              for key in recent_expected_slots
+          ]
           manifest_fields = {
               key: latest_manifest.get(key)
               for key in (
@@ -170,6 +231,22 @@ jobs:
               "latest_raw_prediction_stats": latest_stats,
               "prediction_rows_returned_for_outcome_matching": int(len(predictions)),
               "quote_rows_loaded": int(len(quotes)),
+              "clean_prediction_unique_symbols": (
+                  int(predictions["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False).nunique())
+                  if "symbol" in predictions.columns else 0
+              ),
+              "clean_quote_unique_symbols": (
+                  int(quotes["symbol"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False).nunique())
+                  if "symbol" in quotes.columns else 0
+              ),
+              "prediction_capture_interval_minutes": 5,
+              "prediction_horizon_minutes": 30,
+              "available_prediction_slots": int(len(available_keys)),
+              "expected_prediction_slots_so_far": int(len(expected_slot_keys)),
+              "missing_expected_prediction_slots_so_far": int(len(missing_expected_slots)),
+              "missing_prediction_slot_keys_first_20": missing_expected_slots[:20],
+              "recent_expected_slot_presence": recent_slot_presence,
+              "recent_persisted_slot_manifests": recent_slot_summaries,
               "ingestion": ingestion,
               "production_model_changed": False,
               "calibration_registry_changed": False,
