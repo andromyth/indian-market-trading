@@ -68,6 +68,8 @@ jobs:
               store, ["production_data", "all_universe_minute_snapshots", *today.split("/")]
           )
           newest_entry = None
+          snapshot_names = []
+          requested_slot_presence = {}
           newest_folder_path = f"production_data/all_universe_minute_snapshots/{today}"
           if day_folder:
               daily_files = _list_children(store, day_folder)
@@ -76,6 +78,12 @@ jobs:
                    and str(x.get("name", "")).endswith(".parquet")],
                   key=lambda x: str(x.get("name", "")),
               )
+              snapshot_names = [str(x.get("name", "")) for x in snapshots]
+              current_date_compact = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
+              requested_slot_presence = {
+                  f"{hhmm}": f"snapshot_{current_date_compact}_{hhmm}.parquet" in snapshot_names
+                  for hhmm in ("1320", "1325")
+              }
               if snapshots:
                   newest_entry = snapshots[-1]
           if newest_entry is None:
@@ -121,6 +129,8 @@ jobs:
               "cycle_minute_ist": manifest.get("cycle_minute_ist"),
               "selected_snapshot_source": "newest_daily_parquet" if newest_entry.get("name", "").startswith("snapshot_") and snapshot_path.endswith(".parquet") else "manifest_pointer",
               "selected_snapshot_filename": newest_entry.get("name"),
+              "requested_slot_presence_today_ist": requested_slot_presence,
+              "latest_daily_snapshot_filenames": snapshot_names[-10:],
               "manifest_status": manifest.get("status"),
               "snapshot_drive_path": snapshot_path,
               "expected_symbol_count": manifest.get("expected_symbol_count"),
