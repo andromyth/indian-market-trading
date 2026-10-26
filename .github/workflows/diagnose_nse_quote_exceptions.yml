@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - ".github/workflows/diagnose_nse_quote_exceptions.yml"
+      - "indstocks_client.py"
 
 permissions:
   contents: read
