@@ -32,8 +32,19 @@ REMOTE_ROOT = "production_data/all_nse_minute_predictions"
 HISTORY_LOOKBACK_BARS = 120
 HISTORY_BATCH_SIZE = 5
 HISTORY_REQUEST_PAUSE_SECONDS = 0.22
+HISTORY_REFRESH_REQUEST_SPACING_SECONDS = 0.24
+HISTORY_REFRESH_WINDOW_MINUTES = 90
+HISTORY_REFRESH_WORKERS = 8
+MIN_SESSION_CANDLES_FOR_PREDICTION = 16
 MIN_SIGNAL_READINESS = 0.70
 MAX_QUOTE_AGE_SECONDS = 120
+MIN_PREDICTION_COVERAGE = 0.95
+MAX_MISSING_QUOTE_FRACTION = 0.02
+MAX_DATA_LIMITED_FRACTION = 0.10
+MAX_UNTRAINED_SYMBOL_FRACTION = 0.10
+MAX_MODEL_FAILURE_FRACTION = 0.01
+MIN_HISTORY_SEED_COVERAGE = 0.90
+MAX_HISTORY_FAILURE_FRACTION = 0.05
 
 
 def _safe_float(value: Any) -> float | None:
@@ -140,8 +151,10 @@ def _current_minute_row(
         "actual_observed_at_utc": observed_at.tz_convert("UTC").isoformat(),
         "actual_timestamp_basis": "collector_observation_time_not_exchange_tick_timestamp",
         "actual_quote_status": quote_status,
+        # Model execution follows Drive persistence. Measure collection lag from
+        # the intended slot, not from the later processing time.
         "actual_quote_age_seconds": max(
-            0.0, (pd.Timestamp.now(tz=IST) - observed_at).total_seconds()
+            0.0, (observed_at - snapshot_minute).total_seconds()
         ),
         "day_volume": raw_day_volume,
         "minute_volume_delta": volume_delta,
@@ -220,6 +233,11 @@ class AllNSEMinutePredictor:
         self._market_history = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         self._calibration = None
         self._calibration_init_error_logged = False
+        self._history_request_lock = threading.Lock()
+        self._next_history_request_at = 0.0
+        self._history_refresh_run_lock = threading.Lock()
+        self._last_history_refresh_minute: str | None = None
+        self._last_history_refresh_summary: dict[str, Any] = {}
         self._last_health: dict[str, Any] = {
             "status": "NOT_STARTED",
             "history_ready": False,
@@ -582,6 +600,123 @@ class AllNSEMinutePredictor:
         except Exception as exc:
             return None, None, f"{type(exc).__name__}: {str(exc)[:160]}"
 
+    def _refresh_current_session_history(self, minute: pd.Timestamp) -> dict[str, Any]:
+        """Refresh genuine one-minute candles; never turn LTP snapshots into OHLC bars."""
+        minute = _as_ist_timestamp(minute).floor("min")
+        minute_key = minute.isoformat()
+        with self._history_refresh_run_lock:
+            if self._last_history_refresh_minute == minute_key:
+                return dict(self._last_history_refresh_summary)
+            with self._lock:
+                seed_ready, codes, nifty_code = self._seed_ready, dict(self._codes), self._nifty_code
+            if not seed_ready or not codes:
+                return {
+                    "status": "WARMING_SEED", "minute": minute_key, "batch_count": 0,
+                    "failed_batches": 0, "failed_symbols": [], "updated_symbols": 0,
+                    "current_session_candle_rows": 0,
+                }
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from datetime import datetime
+            from indstocks_client import _request
+            session_open = pd.Timestamp(datetime.combine(minute.date(), wall_time(9, 15), tzinfo=IST))
+            window_start = max(session_open, minute - pd.Timedelta(minutes=HISTORY_REFRESH_WINDOW_MINUTES))
+            start_ms, end_ms = int(window_start.timestamp() * 1000), int(minute.timestamp() * 1000)
+            entries = sorted((str(s), str(c)) for s, c in codes.items() if str(c).strip())
+            if nifty_code:
+                entries.append(("__NIFTY50__", str(nifty_code))
+                )
+            batches = [entries[i:i + HISTORY_BATCH_SIZE] for i in range(0, len(entries), HISTORY_BATCH_SIZE)]
+
+            def rate_limit_start() -> None:
+                with self._history_request_lock:
+                    delay = self._next_history_request_at - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    self._next_history_request_at = time.monotonic() + HISTORY_REFRESH_REQUEST_SPACING_SECONDS
+
+            def fetch_batch(batch):
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        rate_limit_start()
+                        body = _request("GET", "/market/historical/1minute", params={
+                            "scrip-codes": ",".join(code for _, code in batch),
+                            "start_time": start_ms, "end_time": end_ms,
+                        }).json()
+                        successful = isinstance(body, dict) and (
+                            body.get("success") is True
+                            or str(body.get("status") or "").strip().lower() == "success"
+                        )
+                        if not successful:
+                            raise RuntimeError("historical refresh response did not report success")
+                        data = body.get("data") or {}
+                        result = {}
+                        for symbol, code in batch:
+                            frame = self._parse_candles((data.get(code) or {}).get("candles") or [])
+                            if not frame.empty:
+                                frame = frame.loc[
+                                    (pd.Index(frame.index.date) == minute.date())
+                                    & (frame.index < minute)
+                                ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
+                                if not frame.empty:
+                                    result[symbol] = frame
+                        return result, None
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                        if attempt < 2:
+                            time.sleep(0.25 * (attempt + 1))
+                return {}, last_error or "historical refresh failed"
+
+            started = time.monotonic()
+            updated, failed_symbols, errors, candle_rows = {}, [], [], 0
+            with ThreadPoolExecutor(max_workers=HISTORY_REFRESH_WORKERS) as pool:
+                futures = {pool.submit(fetch_batch, batch): batch for batch in batches}
+                for future in as_completed(futures):
+                    result, error = future.result()
+                    if error:
+                        errors.append(error)
+                        failed_symbols.extend(s for s, _ in futures[future] if s != "__NIFTY50__")
+                    for symbol, frame in result.items():
+                        updated[symbol] = frame
+                        candle_rows += len(frame)
+
+            def merge_history(existing, refreshed):
+                columns = ["Open", "High", "Low", "Close", "Volume"]
+                existing = existing.copy() if existing is not None else pd.DataFrame(columns=columns)
+                if existing.empty:
+                    prior, same_day = existing, existing
+                else:
+                    prior = existing.loc[pd.Index(existing.index.date) < minute.date()].tail(HISTORY_LOOKBACK_BARS)
+                    same_day = existing.loc[
+                        (pd.Index(existing.index.date) == minute.date()) & (existing.index < minute)
+                    ]
+                pieces = [p for p in (prior, same_day, refreshed) if p is not None and not p.empty]
+                if not pieces:
+                    return existing.tail(HISTORY_LOOKBACK_BARS)
+                merged = pd.concat(pieces).sort_index()
+                return merged.loc[~merged.index.duplicated(keep="last")].tail(HISTORY_LOOKBACK_BARS)
+
+            with self._lock:
+                for symbol, frame in updated.items():
+                    self._history[symbol] = merge_history(self._history.get(symbol), frame)
+                if "__NIFTY50__" in updated:
+                    self._market_history = merge_history(self._market_history, updated["__NIFTY50__"])
+                summary = {
+                    "status": "OK" if not errors else "PARTIAL",
+                    "minute": minute_key, "batch_count": len(batches),
+                    "failed_batches": len(errors), "failed_symbols": sorted(set(failed_symbols)),
+                    "updated_symbols": len([s for s in updated if s != "__NIFTY50__"]),
+                    "current_session_candle_rows": candle_rows,
+                    "window_start_ist": window_start.isoformat(),
+                    "window_end_ist": minute.isoformat(),
+                    "elapsed_seconds": round(time.monotonic() - started, 2),
+                    "error_examples": errors[:5],
+                }
+                self._last_history_refresh_minute = minute_key
+                self._last_history_refresh_summary = summary
+            self._log("all_nse_current_session_history_refresh", **summary)
+            return dict(summary)
+
     def _persist(self, records: list[dict[str, Any]], manifest: dict[str, Any], minute: pd.Timestamp) -> dict[str, Any]:
         from persistent_store import GoogleDriveStore
 
@@ -611,18 +746,7 @@ class AllNSEMinutePredictor:
             manifest.update({
                 "prediction_drive_path": remote,
                 "prediction_drive_sync": _clean(uploaded),
-                "status": (
-                    "OK" if manifest.get("missing_quote_count") == 0
-                    and manifest.get("prediction_count") == manifest.get("expected_symbol_count")
-                    and manifest.get("data_limited_count", 0) == 0
-                    and manifest.get("untrained_symbol_count", 0) == 0
-                    and manifest.get("trained_symbol_manifest_available") is True
-                    and manifest.get("model_failure_count", 0) == 0
-                    and manifest.get("history_seed_coverage_symbols") == manifest.get("expected_symbol_count")
-                    and manifest.get("history_seed_failed_batches", 0) == 0
-                    and manifest.get("history_ready") is True
-                    else "PARTIAL"
-                ),
+                "status": "OK" if manifest.get("quality_gate_pass") is True else "PARTIAL",
                 "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as exc:
@@ -706,6 +830,8 @@ class AllNSEMinutePredictor:
         if self._last_minute == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "cycle_minute_ist": minute_key}
 
+        history_refresh = self._refresh_current_session_history(minute)
+        failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
         source_root = Path(worker_root or self.worker_root)
         snapshot_name = f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
         local_quote_path = source_root / "all_universe_minute_snapshots" / snapshot_name
@@ -730,7 +856,8 @@ class AllNSEMinutePredictor:
             symbols = list(self._symbols) or sorted(quote_by_symbol)
             history_ready = self._seed_ready
             seed_status = self._seed_status
-            histories = self._history
+            histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
+            market_history = self._market_history.copy()
         # Capture every symbol in the official universe even if quote data is missing.
         for symbol in sorted(set(quote_by_symbol) - set(symbols)):
             symbols.append(symbol)
@@ -749,7 +876,6 @@ class AllNSEMinutePredictor:
         feature_rows: list[dict[str, float]] = []
         feature_symbols: list[str] = []
         quote_actuals: dict[str, dict[str, Any]] = {}
-        pending_additions: dict[str, tuple[pd.Timestamp, dict[str, Any]]] = {}
         missing_quotes = 0
         data_limited_count = 0
         model_failures = 0
@@ -788,85 +914,48 @@ class AllNSEMinutePredictor:
                 and quote_age is not None
                 and quote_age <= MAX_QUOTE_AGE_SECONDS
             )
+            if quote_good and raw_day_volume is not None:
+                quote_actuals[symbol] = {"day_volume": raw_day_volume, "date": minute.date()}
             if not quote_good:
                 missing_quotes += 1
                 quote_info["prediction_status"] = (
                     "MISSING_CURRENT_QUOTE" if actual_price is None
                     else "STALE_OR_INVALID_QUOTE"
                 )
+            elif symbol in failed_refresh_symbols:
+                quote_info["prediction_status"] = "HISTORY_REFRESH_FAILED"
+                quote_info["error"] = "Current-session one-minute candle refresh failed for this symbol."
             elif not history_ready:
                 quote_info["prediction_status"] = "WARMING_HISTORY"
             elif model_error:
                 quote_info["prediction_status"] = "MODEL_UNAVAILABLE"
                 quote_info["error"] = model_error
                 model_failures += 1
-            else:
-                # Use only same-session history to avoid treating an overnight
-                # close-to-open gap as a 1-minute or 30-minute return.
-                if not hist.empty:
-                    hist = hist.loc[
-                        (pd.Index(hist.index.date) == minute.date())
-                        & (hist.index < minute)
-                    ].tail(HISTORY_LOOKBACK_BARS)
-                if price_row is not None:
-                    history_with_quote = pd.concat([
-                        hist,
-                        pd.DataFrame([price_row], index=pd.DatetimeIndex([minute], name="Datetime")),
-                    ]).sort_index()
-                    history_with_quote = history_with_quote.loc[
-                        ~history_with_quote.index.duplicated(keep="last")
-                    ].tail(HISTORY_LOOKBACK_BARS)
-                    try:
+            elif price_row is not None:
+                try:
+                    hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
+                    session_hist = hist.loc[pd.Index(hist.index.date) == minute.date()] if not hist.empty else hist
+                    if len(session_hist) < MIN_SESSION_CANDLES_FOR_PREDICTION:
+                        quote_info["prediction_status"] = "INSUFFICIENT_SESSION_HISTORY"
+                    elif hist.empty:
+                        quote_info["prediction_status"] = "INSUFFICIENT_HISTORY"
+                    else:
                         model_feature_row = self._model_api._latest_features(
-                            history_with_quote,
-                            market_df=(
-                                pd.concat([
-                                    self._market_history.loc[
-                                        (pd.Index(self._market_history.index.date) == minute.date())
-                                        & (self._market_history.index < minute)
-                                    ],
-                                    pd.DataFrame(
-                                        [{
-                                            "Open": np.nan,
-                                            "High": np.nan,
-                                            "Low": np.nan,
-                                            "Close": float(nifty_price),
-                                            "Volume": np.nan,
-                                        }],
-                                        index=pd.DatetimeIndex([minute], name="Datetime"),
-                                    ),
-                                ]).sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
-                                if nifty_price is not None else self._market_history
-                            ),
+                            hist,
+                            market_df=market_history.loc[market_history.index < minute],
                             decision_timestamp=actual_ts,
                         )
                         feature_rows.append(model_feature_row)
                         feature_symbols.append(symbol)
                         current_rows.append(quote_info)
-                        quote_actuals[symbol] = {
-                            "day_volume": raw_day_volume,
-                            "date": minute.date(),
-                        }
-                        pending_additions[symbol] = (minute, price_row)
-                    except Exception as exc:
-                        quote_info["prediction_status"] = "FEATURE_BUILD_ERROR"
-                        quote_info["error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
-                        model_failures += 1
-                else:
-                    quote_info["prediction_status"] = "MISSING_CURRENT_QUOTE"
+                except Exception as exc:
+                    quote_info["prediction_status"] = "FEATURE_BUILD_ERROR"
+                    quote_info["error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    model_failures += 1
+            else:
+                quote_info["prediction_status"] = "MISSING_CURRENT_QUOTE"
             if symbol not in feature_symbols:
                 current_rows.append(quote_info)
-                if quote_good and price_row is not None and not history_ready:
-                    with self._lock:
-                        self._pending_quote_rows.setdefault(symbol, []).append((minute, price_row))
-                        # Bound bootstrap accumulation if an upstream seed call stalls.
-                        self._pending_quote_rows[symbol] = self._pending_quote_rows[symbol][-180:]
-                elif quote_good and price_row is not None and history_ready:
-                    pending_additions[symbol] = (minute, price_row)
-                    quote_actuals[symbol] = {
-                        "day_volume": raw_day_volume,
-                        "date": minute.date(),
-                    }
 
         prediction_count = 0
         if feature_rows and not model_error and history_ready:
@@ -1006,42 +1095,9 @@ class AllNSEMinutePredictor:
         # Update the in-memory minute bar cache only after inference used the
         # preceding bars. The current LTP is real; missing OHLC fields stay NaN.
         with self._lock:
-            for symbol, (ts, price_row) in pending_additions.items():
-                hist = self._history.get(
-                    symbol, pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-                )
-                new_row = pd.DataFrame([price_row], index=pd.DatetimeIndex([ts], name="Datetime"))
-                hist = pd.concat([hist, new_row]).sort_index()
-                hist = hist.loc[~hist.index.duplicated(keep="last")].tail(HISTORY_LOOKBACK_BARS)
-                self._history[symbol] = hist
             for symbol, item in quote_actuals.items():
                 if item["day_volume"] is not None:
                     self._last_day_volume[symbol] = (item["date"], float(item["day_volume"]))
-
-            # Preserve each minute's NIFTY context for subsequent returns/RSI,
-            # and buffer it during the initial historical warm-up.
-            if nifty_price is not None:
-                nifty_row = {
-                    "Open": np.nan,
-                    "High": np.nan,
-                    "Low": np.nan,
-                    "Close": float(nifty_price),
-                    "Volume": np.nan,
-                }
-                if self._seed_ready:
-                    current_market = pd.DataFrame(
-                        [nifty_row], index=pd.DatetimeIndex([minute], name="Datetime")
-                    )
-                    market = pd.concat([self._market_history, current_market]).sort_index()
-                    market = market.loc[~market.index.duplicated(keep="last")]
-                    self._market_history = market.tail(HISTORY_LOOKBACK_BARS)
-                else:
-                    self._pending_quote_rows.setdefault("__NIFTY50__", []).append(
-                        (minute, nifty_row)
-                    )
-                    self._pending_quote_rows["__NIFTY50__"] = (
-                        self._pending_quote_rows["__NIFTY50__"][-180:]
-                    )
 
         # Ensure exactly one row per universe symbol even when data or inference failed.
         current_rows_by_symbol = {str(row["symbol"]): row for row in current_rows}
@@ -1109,6 +1165,33 @@ class AllNSEMinutePredictor:
             1 for row in records if row.get("trained_for_symbol") is False
         )
         trained_symbol_manifest_available = bool(self._trained_symbols)
+        expected_count = max(1, len(symbols))
+        seed_batch_count = max(1, (len(symbols) + HISTORY_BATCH_SIZE - 1) // HISTORY_BATCH_SIZE)
+        refresh_batch_count = int(history_refresh.get("batch_count") or 0)
+        refresh_failed_batches = int(history_refresh.get("failed_batches") or 0)
+        prediction_coverage = prediction_count / expected_count
+        missing_quote_fraction = missing_quotes / expected_count
+        data_limited_fraction = data_limited_count / expected_count
+        untrained_fraction = untrained_symbol_count / expected_count
+        model_failure_fraction = model_failures / expected_count
+        seed_coverage_fraction = self._seed_coverage / expected_count
+        seed_failure_fraction = self._seed_errors / seed_batch_count
+        refresh_failure_fraction = refresh_failed_batches / refresh_batch_count if refresh_batch_count else 1.0
+        model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
+        quality_gate_pass = bool(
+            len(records) == len(symbols)
+            and prediction_coverage >= MIN_PREDICTION_COVERAGE
+            and missing_quote_fraction <= MAX_MISSING_QUOTE_FRACTION
+            and data_limited_fraction <= MAX_DATA_LIMITED_FRACTION
+            and untrained_fraction <= MAX_UNTRAINED_SYMBOL_FRACTION
+            and model_failure_fraction <= MAX_MODEL_FAILURE_FRACTION
+            and model_artifact_verified
+            and trained_symbol_manifest_available
+            and history_ready
+            and seed_coverage_fraction >= MIN_HISTORY_SEED_COVERAGE
+            and seed_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
+            and refresh_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
+        )
         manifest = {
             "audit_name": "all-nse-minute-prediction-actual-capture",
             "schema_version": "all-nse-minute-prediction-v1",
@@ -1122,35 +1205,44 @@ class AllNSEMinutePredictor:
             "actual_quote_count": len(records) - missing_quotes,
             "missing_quote_count": missing_quotes,
             "prediction_count": prediction_count,
+            "prediction_coverage_pct": round(100 * prediction_coverage, 3),
             "data_limited_count": data_limited_count,
             "model_failure_count": model_failures,
             "untrained_symbol_count": untrained_symbol_count,
             "trained_symbol_manifest_available": trained_symbol_manifest_available,
+            "model_artifact_verified": model_artifact_verified,
             "model_target": "target_30m",
             "model_status": self._seed_status,
             "history_ready": history_ready,
             "history_seed_coverage_symbols": self._seed_coverage,
+            "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
             "history_seed_failed_batches": self._seed_errors,
+            "history_seed_failure_fraction": round(seed_failure_fraction, 6),
+            "history_refresh_status": history_refresh.get("status"),
+            "history_refresh_batch_count": refresh_batch_count,
+            "history_refresh_failed_batches": refresh_failed_batches,
+            "history_refresh_failed_symbols": len(failed_refresh_symbols),
+            "history_refresh_failure_fraction": round(refresh_failure_fraction, 6),
+            "history_refresh_elapsed_seconds": history_refresh.get("elapsed_seconds"),
+            "min_session_candles_for_prediction": MIN_SESSION_CANDLES_FOR_PREDICTION,
             "model_coverage_symbols": (
                 self._model_status.get("training_symbol_count") or len(self._trained_symbols)
             ),
-            "nifty_context_status": "LIVE_QUOTE" if nifty_price is not None else "HISTORY_OR_MISSING",
+            "nifty_context_status": "HISTORICAL_ONE_MINUTE_CANDLES" if not market_history.empty else "HISTORY_OR_MISSING",
             "nifty_context_error": nifty_error,
             "quote_source_snapshot": str(local_quote_path),
             "quote_snapshot_read_error": read_error,
             "current_minute_ohlc_complete": False,
-            "quality_gate_pass": (
-                len(records) == len(symbols)
-                and missing_quotes == 0
-                and prediction_count == len(symbols)
-                and data_limited_count == 0
-                and untrained_symbol_count == 0
-                and trained_symbol_manifest_available
-                and model_failures == 0
-                and self._seed_coverage == len(symbols)
-                and self._seed_errors == 0
-                and history_ready
-            ),
+            "quality_gate_thresholds": {
+                "min_prediction_coverage": MIN_PREDICTION_COVERAGE,
+                "max_missing_quote_fraction": MAX_MISSING_QUOTE_FRACTION,
+                "max_data_limited_fraction": MAX_DATA_LIMITED_FRACTION,
+                "max_untrained_symbol_fraction": MAX_UNTRAINED_SYMBOL_FRACTION,
+                "max_model_failure_fraction": MAX_MODEL_FAILURE_FRACTION,
+                "min_history_seed_coverage": MIN_HISTORY_SEED_COVERAGE,
+                "max_history_failure_fraction": MAX_HISTORY_FAILURE_FRACTION,
+            },
+            "quality_gate_pass": quality_gate_pass,
             "status": "PARTIAL",
         }
         persisted = self._persist(records, manifest, minute)

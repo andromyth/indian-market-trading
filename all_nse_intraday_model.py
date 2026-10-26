@@ -87,6 +87,26 @@ def _returns(c: pd.Series, n: int) -> float:
     return _safe(x.iloc[-1] / x.iloc[-1-n] - 1)
 
 
+def _session_aware_returns(c: pd.Series, n: int) -> float:
+    """Calculate returns within a session; use prior-session bars during warm-up."""
+    if c is None or c.empty:
+        return np.nan
+    values = pd.to_numeric(c, errors="coerce")
+    index = pd.DatetimeIndex(values.index)
+    index = index.tz_localize("Asia/Kolkata") if index.tz is None else index.tz_convert("Asia/Kolkata")
+    session_dates = pd.Index(index.date)
+    current_date = session_dates[-1]
+    current = values.loc[session_dates == current_date].dropna()
+    if len(current) > n:
+        return _returns(current, n)
+    previous_dates = sorted({day for day in session_dates if day < current_date})
+    if previous_dates:
+        previous = values.loc[session_dates == previous_dates[-1]].dropna()
+        if len(previous) > n:
+            return _returns(previous, n)
+    return np.nan
+
+
 def _rsi(c: pd.Series, n: int=14) -> float:
     x = pd.to_numeric(c, errors="coerce")
     d = x.diff()
@@ -122,8 +142,8 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     c,h,l,o,v = x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
     close = _safe(c.iloc[-1]); open_ = _safe(o.iloc[-1])
     vals = {
-        "ret_1":_returns(c,1),"ret_3":_returns(c,3),"ret_5":_returns(c,5),
-        "ret_10":_returns(c,10),"ret_15":_returns(c,15),"ret_30":_returns(c,30),
+        "ret_1":_session_aware_returns(c,1),"ret_3":_session_aware_returns(c,3),"ret_5":_session_aware_returns(c,5),
+        "ret_10":_session_aware_returns(c,10),"ret_15":_session_aware_returns(c,15),"ret_30":_session_aware_returns(c,30),
         "rsi14":_rsi(c),"atr14_pct":_atr_pct(x),
         "ma5_ratio":_safe(close/c.rolling(5,min_periods=5).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(5,min_periods=5).mean().iloc[-1] else np.nan,
         "ma10_ratio":_safe(close/c.rolling(10,min_periods=10).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(10,min_periods=10).mean().iloc[-1] else np.nan,
@@ -146,12 +166,12 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     vals["tod_cos"]=float(np.cos(2*np.pi*minutes/390.0))
 
     mc = _market_series(market_df)
-    vals["market_ret_1"]=_returns(mc,1)
-    vals["market_ret_3"]=_returns(mc,3)
-    vals["market_ret_5"]=_returns(mc,5)
-    vals["market_ret_10"]=_returns(mc,10)
-    vals["market_ret_15"]=_returns(mc,15)
-    vals["market_ret_30"]=_returns(mc,30)
+    vals["market_ret_1"]=_session_aware_returns(mc,1)
+    vals["market_ret_3"]=_session_aware_returns(mc,3)
+    vals["market_ret_5"]=_session_aware_returns(mc,5)
+    vals["market_ret_10"]=_session_aware_returns(mc,10)
+    vals["market_ret_15"]=_session_aware_returns(mc,15)
+    vals["market_ret_30"]=_session_aware_returns(mc,30)
     vals["market_rsi14"]=_rsi(mc)
     vals["relative_ret_1"] = _safe(vals["ret_1"]-vals["market_ret_1"]) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["market_ret_1"]) else np.nan
     vals["relative_ret_5"] = _safe(vals["ret_5"]-vals["market_ret_5"]) if np.isfinite(vals["ret_5"]) and np.isfinite(vals["market_ret_5"]) else np.nan
