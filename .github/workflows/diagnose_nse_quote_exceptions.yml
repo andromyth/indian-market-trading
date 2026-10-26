@@ -58,19 +58,43 @@ jobs:
           if not latest_file:
               raise SystemExit("latest_manifest.json is missing in Google Drive.")
           manifest = _download_json(store, latest_file["id"])
-          snapshot_path = str(manifest.get("snapshot_drive_path") or "")
-          if not snapshot_path:
-              raise SystemExit("Latest manifest has no confirmed snapshot_drive_path.")
-          parts = list(PurePosixPath(snapshot_path).parts)
-          snapshot_name = parts[-1]
-          parent = _find_folder(store, parts[:-1])
-          if not parent:
-              raise SystemExit(f"Snapshot parent folder is missing for {snapshot_path}")
-          snapshot_entry = store._find_child(parent, snapshot_name)
-          if not snapshot_entry:
-              raise SystemExit(f"Snapshot file is missing: {snapshot_path}")
+          # Do not trust latest_manifest.json alone: it can lag if the
+          # manifest update failed while the immutable per-slot snapshot upload
+          # succeeded. Discover the newest real Parquet object in today's folder.
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y/%m/%d")
+          day_folder = _find_folder(
+              store, ["production_data", "all_universe_minute_snapshots", *today.split("/")]
+          )
+          newest_entry = None
+          newest_folder_path = f"production_data/all_universe_minute_snapshots/{today}"
+          if day_folder:
+              daily_files = _list_children(store, day_folder)
+              snapshots = sorted(
+                  [x for x in daily_files if str(x.get("name", "")).startswith("snapshot_")
+                   and str(x.get("name", "")).endswith(".parquet")],
+                  key=lambda x: str(x.get("name", "")),
+              )
+              if snapshots:
+                  newest_entry = snapshots[-1]
+          if newest_entry is None:
+              snapshot_path = str(manifest.get("snapshot_drive_path") or "")
+              if not snapshot_path:
+                  raise SystemExit("No today's snapshot Parquet file and latest manifest has no snapshot_drive_path.")
+              parts = list(PurePosixPath(snapshot_path).parts)
+              snapshot_name = parts[-1]
+              parent = _find_folder(store, parts[:-1])
+              if not parent:
+                  raise SystemExit(f"Snapshot parent folder is missing for {snapshot_path}")
+              newest_entry = store._find_child(parent, snapshot_name)
+              if not newest_entry:
+                  raise SystemExit(f"Snapshot file is missing: {snapshot_path}")
+              snapshot_path = str(PurePosixPath(*parts))
+          else:
+              snapshot_path = f"{newest_folder_path}/{newest_entry['name']}"
 
-          raw = store.service.files().get_media(fileId=snapshot_entry["id"]).execute()
+          raw = store.service.files().get_media(fileId=newest_entry["id"]).execute()
           frame = pd.read_parquet(io.BytesIO(raw))
           needed = ["symbol", "instrument_code", "quote_status", "quote_error", "actual_observed_price"]
           for col in needed:
@@ -95,6 +119,8 @@ jobs:
           ].sort_values("symbol").to_dict(orient="records")
           result = {
               "cycle_minute_ist": manifest.get("cycle_minute_ist"),
+              "selected_snapshot_source": "newest_daily_parquet" if newest_entry.get("name", "").startswith("snapshot_") and snapshot_path.endswith(".parquet") else "manifest_pointer",
+              "selected_snapshot_filename": newest_entry.get("name"),
               "manifest_status": manifest.get("status"),
               "snapshot_drive_path": snapshot_path,
               "expected_symbol_count": manifest.get("expected_symbol_count"),
