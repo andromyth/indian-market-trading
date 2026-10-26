@@ -126,6 +126,10 @@ def test_prediction_audit_requires_all_slot_files_and_full_predictions_after_war
             "history_ready": True,
             "history_seed_coverage_symbols": 2,
             "history_seed_failed_batches": 0,
+            "history_refresh_batch_count": 1,
+            "history_refresh_failed_batches": 0,
+            "model_artifact_verified": True,
+            "trained_symbol_manifest_available": True,
             "quality_gate_pass": True,
         }
     report = build_prediction_audit(
@@ -168,6 +172,10 @@ def test_prediction_audit_fails_when_a_required_slot_is_partial():
             "history_ready": True,
             "history_seed_coverage_symbols": 2,
             "history_seed_failed_batches": 0,
+            "history_refresh_batch_count": 1,
+            "history_refresh_failed_batches": 0,
+            "model_artifact_verified": True,
+            "trained_symbol_manifest_available": True,
             "quality_gate_pass": True,
         }
     manifests[f"prediction-manifest-{bad_key}"]["status"] = "PARTIAL"

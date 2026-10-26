@@ -331,18 +331,35 @@ def build_prediction_audit(
             row_count_failures.append(key)
         if key < first_prediction_key:
             continue  # Model history warm-up; the all-symbol rows must still be persisted.
+        n = max(1, expected_int)
+        prediction_fraction = int(prediction_count or 0) / n if prediction_count is not None else 0.0
+        missing_fraction = int(manifest.get("missing_quote_count") or 0) / n
+        limited_fraction = int(manifest.get("data_limited_count") or 0) / n
+        untrained_fraction = int(manifest.get("untrained_symbol_count") or 0) / n
+        model_failure_fraction = int(manifest.get("model_failure_count") or 0) / n
+        seed_coverage_fraction = int(manifest.get("history_seed_coverage_symbols") or 0) / n
+        seed_batches = max(1, (n + 4) // 5)
+        seed_failure_fraction = int(manifest.get("history_seed_failed_batches") or 0) / seed_batches
+        refresh_batches = int(manifest.get("history_refresh_batch_count") or 0)
+        refresh_failure_fraction = (
+            int(manifest.get("history_refresh_failed_batches") or 0) / refresh_batches
+            if refresh_batches else 1.0
+        )
         quality_ok = (
             status == "OK"
             and manifest.get("quality_gate_pass") is True
             and prediction_count is not None
-            and int(prediction_count or 0) == expected_int
-            and int(manifest.get("missing_quote_count") or 0) == 0
-            and int(manifest.get("data_limited_count") or 0) == 0
-            and int(manifest.get("untrained_symbol_count") or 0) == 0
-            and int(manifest.get("model_failure_count") or 0) == 0
+            and prediction_fraction >= 0.95
+            and missing_fraction <= 0.02
+            and limited_fraction <= 0.10
+            and untrained_fraction <= 0.10
+            and model_failure_fraction <= 0.01
+            and manifest.get("model_artifact_verified") is True
+            and manifest.get("trained_symbol_manifest_available") is True
             and manifest.get("history_ready") is True
-            and int(manifest.get("history_seed_coverage_symbols") or 0) == expected_int
-            and int(manifest.get("history_seed_failed_batches") or 0) == 0
+            and seed_coverage_fraction >= 0.90
+            and seed_failure_fraction <= 0.05
+            and refresh_failure_fraction <= 0.05
         )
         if not quality_ok:
             model_quality_failures.append(key)

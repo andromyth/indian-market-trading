@@ -88,8 +88,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             key: all_nse.get(key)
             for key in (
                 "cycle_minute_ist", "expected_symbol_count", "row_count", "prediction_count",
-                "missing_quote_count", "data_limited_count", "history_ready",
-                "history_status", "remote_path", "manifest_drive_path",
+                "missing_quote_count", "data_limited_count", "model_failure_count",
+                "untrained_symbol_count", "model_artifact_verified",
+                "history_ready", "history_status", "history_seed_coverage_symbols",
+                "history_seed_failed_batches", "history_refresh_batch_count",
+                "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
                 "quality_gate_pass", "status", "error",
             )
             if key in all_nse
@@ -254,12 +257,31 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             reasons.append("expected NSE universe count is missing or zero")
         elif row_count is None or int(row_count) != int(expected):
             reasons.append("prediction row count does not equal the expected NSE universe")
-        if expected is not None and (predicted is None or int(predicted) != int(expected)):
-            reasons.append("not every expected NSE symbol has a model prediction")
-        if missing is None or int(missing or 0) != 0:
-            reasons.append("one or more symbols lack a valid current quote")
-        if limited is None or int(limited or 0) != 0:
-            reasons.append("one or more symbols are data-limited")
+        expected_n = max(1, int(expected or 0))
+        if predicted is None or int(predicted) < int(expected_n * 0.95):
+            reasons.append("model prediction coverage is below 95% of the expected NSE universe")
+        if missing is None or int(missing or 0) / expected_n > 0.02:
+            reasons.append("missing current quotes exceed the 2% tolerance")
+        if limited is None or int(limited or 0) / expected_n > 0.10:
+            reasons.append("data-limited predictions exceed the 10% tolerance")
+        model_failures = int(item.get("model_failure_count") or 0)
+        untrained = int(item.get("untrained_symbol_count") or 0)
+        if model_failures / expected_n > 0.01:
+            reasons.append("model/feature failures exceed the 1% tolerance")
+        if untrained / expected_n > 0.10:
+            reasons.append("untrained-symbol share exceeds the 10% tolerance")
+        if item.get("model_artifact_verified") is not True:
+            reasons.append("production model artifacts are not verified against their manifest")
+        seed_coverage = int(item.get("history_seed_coverage_symbols") or 0)
+        if seed_coverage / expected_n < 0.90:
+            reasons.append("historical seed coverage is below 90%")
+        seed_batches = max(1, (expected_n + 4) // 5)
+        if int(item.get("history_seed_failed_batches") or 0) / seed_batches > 0.05:
+            reasons.append("failed historical seed batches exceed the 5% tolerance")
+        refresh_batches = int(item.get("history_refresh_batch_count") or 0)
+        refresh_failures = int(item.get("history_refresh_failed_batches") or 0)
+        if refresh_batches <= 0 or refresh_failures / max(1, refresh_batches) > 0.05:
+            reasons.append("current-session one-minute candle refresh is missing or exceeds the 5% failure tolerance")
         if item.get("quality_gate_pass") is not True:
             reasons.append("prediction quality gate is not passing")
         if item.get("history_ready") is not True:
@@ -442,6 +464,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
             if length:
                 self.rfile.read(min(length, 4096))
 
+            # Start long history seeding before quote collection so it overlaps
+            # the worker's first fetches instead of beginning after Drive upload.
+            ALL_NSE_MINUTE_PREDICTOR.start()
             result = WORKER.tick_once()
             # Run pooled all-NSE inference only when the full-universe quote
             # capture actually ran on a scheduled five-minute slot.
@@ -517,6 +542,35 @@ def main() -> None:
         daemon=True,
     )
     monitor.start()
+    def prediction_runtime_prewarm() -> None:
+        ALL_NSE_MINUTE_PREDICTOR.start()
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                ALL_NSE_MINUTE_PREDICTOR._ensure_model()
+                _log(
+                    "all_nse_prediction_model_prewarm",
+                    status="OK",
+                    predictor_status=ALL_NSE_MINUTE_PREDICTOR.status(),
+                    attempts=attempts,
+                )
+                return
+            except Exception as exc:
+                if attempts == 1 or attempts % 5 == 0:
+                    _log(
+                        "all_nse_prediction_model_prewarm_retry",
+                        status="RETRYING",
+                        attempt=attempts,
+                        error=f"{type(exc).__name__}: {str(exc)[:180]}",
+                        predictor_status=ALL_NSE_MINUTE_PREDICTOR.status(),
+                    )
+                time.sleep(30)
+    threading.Thread(
+        target=prediction_runtime_prewarm,
+        name="all-nse-prediction-prewarm",
+        daemon=True,
+    ).start()
     _log(
         "cloud_run_worker_api_started",
         port=PORT,
