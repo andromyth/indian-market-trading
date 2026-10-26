@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import io
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -74,6 +75,76 @@ def _totp(secret: str, at_time: float | None = None) -> str:
     return f"{number:06d}"
 
 
+def _safe_provider_error_detail(response: requests.Response) -> str:
+    """Return allowlisted provider error fields without exposing credentials or PII.
+
+    Provider 403 responses can mean either token/authentication failure or an
+    account/endpoint permission denial. Keep only structured diagnostic fields;
+    never include the raw response body or arbitrary nested payloads.
+    """
+    try:
+        body = response.json()
+    except (ValueError, requests.RequestException):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+
+    aliases = {
+        "error_type": ("error_type", "errorType", "type"),
+        "code": ("code", "error_code", "errorCode"),
+        "message": ("message", "error_message", "errorMessage", "error_description", "errorDescription"),
+        "detail": ("detail", "description"),
+        "request_id": ("request_id", "requestId", "correlation_id", "correlationId"),
+    }
+
+    # Some API gateways wrap diagnostic fields inside an "error" object.
+    containers = [body]
+    nested = body.get("error")
+    if isinstance(nested, dict):
+        containers.append(nested)
+
+    parts: list[str] = []
+    seen: set[str] = set()
+    for label, names in aliases.items():
+        value = None
+        for container in containers:
+            for name in names:
+                candidate = container.get(name)
+                if isinstance(candidate, (str, int, float, bool)):
+                    value = candidate
+                    break
+            if value is not None:
+                break
+        if value is None:
+            continue
+
+        rendered = re.sub(r"[\\r\\n\\t]+", " ", str(value)).strip()
+        rendered = re.sub(
+            r"(?i)(authorization\\s*[:=]\\s*)(?:(?:bearer|token)\\s+)?[^\\s,;&]+",
+            r"\\1[REDACTED]",
+            rendered,
+        )
+        rendered = re.sub(
+            r"(?i)\\b((?:x-api-key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|mpin|totp|password|secret)\\s*[:=]\\s*)"
+            r"(?:\"[^\"]*\"|'[^']*'|[^\\s,;&]+)",
+            r"\\1[REDACTED]",
+            rendered,
+        )
+        rendered = re.sub(
+            r"\\b[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b",
+            "[REDACTED_JWT]",
+            rendered,
+        )
+        rendered = rendered[:240]
+        if rendered and label not in seen:
+            parts.append(f"{label}={rendered}")
+            seen.add(label)
+
+    if not parts:
+        return ""
+    return "; provider_response=" + ", ".join(parts)
+
+
 def _generate_token() -> str:
     client_id = _setting("INDSTOCKS_CLIENT_ID")
     mpin = _setting("INDSTOCKS_MPIN")
@@ -105,6 +176,7 @@ def _generate_token() -> str:
             detail = "token generation rate-limited; wait before retrying"
         else:
             detail = f"HTTP {response.status_code}"
+        detail += _safe_provider_error_detail(response)
         raise RuntimeError(f"INDstocks token generation failed: {detail}")
     try:
         body = response.json()
@@ -168,6 +240,7 @@ def _request(method: str, path: str, *, params: dict[str, Any] | None = None) ->
             detail = "HTTP 429; provider rate limit reached"
         else:
             detail = f"HTTP {response.status_code}"
+        detail += _safe_provider_error_detail(response)
         raise RuntimeError(f"INDstocks API {detail}")
     return response
 

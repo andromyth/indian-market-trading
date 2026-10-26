@@ -61,3 +61,52 @@ def test_historical_candles_normalize_to_ohlcv(monkeypatch):
     assert len(frame) == 1
     assert frame.iloc[0]["Close"] == 101
     assert str(frame.index.tz) == "Asia/Kolkata"
+
+def test_request_403_preserves_sanitized_provider_error(monkeypatch):
+    class FakeResponse:
+        status_code = 403
+
+        def json(self):
+            return {
+                "success": False,
+                "error_type": "UserException",
+                "code": "MARKET_DATA_PERMISSION_DENIED",
+                "message": "This account cannot access this quote endpoint",
+                "request_id": "req-123",
+                "access_token": "must-not-be-included",
+            }
+
+    monkeypatch.setattr(client, "access_token", lambda: "unit-test-token")
+    monkeypatch.setattr(client.requests, "request", lambda *args, **kwargs: FakeResponse())
+
+    try:
+        client._request("GET", "/market/quotes/full", params={"scrip-codes": "NSE_2885"})
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("HTTP 403 should raise RuntimeError")
+
+    assert "HTTP 403" in message
+    assert "UserException" in message
+    assert "MARKET_DATA_PERMISSION_DENIED" in message
+    assert "This account cannot access this quote endpoint" in message
+    assert "req-123" in message
+    assert "must-not-be-included" not in message
+    assert "unit-test-token" not in message
+
+
+def test_provider_error_detail_redacts_inline_credentials():
+    class FakeResponse:
+        def json(self):
+            return {
+                "error_type": "TokenException",
+                "message": "Authorization: Bearer bearer-secret token=inline-secret MPIN=123456",
+            }
+
+    detail = client._safe_provider_error_detail(FakeResponse())
+    assert "TokenException" in detail
+    assert "Authorization: [REDACTED]" in detail
+    assert "inline-secret" not in detail
+    assert "123456" not in detail
+    assert "bearer-secret" not in detail
+
