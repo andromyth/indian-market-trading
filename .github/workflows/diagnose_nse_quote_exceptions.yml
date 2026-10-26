@@ -1,0 +1,105 @@
+name: Diagnose latest NSE quote exceptions
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/diagnose_nse_quote_exceptions.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Drive and Parquet dependencies
+        run: python -m pip install --disable-pip-version-check pandas pyarrow google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Read latest snapshot and print quote exceptions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io
+          import json
+          from pathlib import PurePosixPath
+          import os
+          import pandas as pd
+          from audit_all_universe_minute_snapshots import _find_folder, _list_children, _download_json
+          from persistent_store import GoogleDriveStore
+
+          store = GoogleDriveStore()
+          root = _find_folder(store, ["production_data", "all_universe_minute_snapshots"])
+          if not root:
+              raise SystemExit("Drive folder production_data/all_universe_minute_snapshots was not found.")
+          root_files = _list_children(store, root)
+          latest_file = next((x for x in root_files if x.get("name") == "latest_manifest.json"), None)
+          if not latest_file:
+              raise SystemExit("latest_manifest.json is missing in Google Drive.")
+          manifest = _download_json(store, latest_file["id"])
+          snapshot_path = str(manifest.get("snapshot_drive_path") or "")
+          if not snapshot_path:
+              raise SystemExit("Latest manifest has no confirmed snapshot_drive_path.")
+          parts = list(PurePosixPath(snapshot_path).parts)
+          snapshot_name = parts[-1]
+          parent = _find_folder(store, parts[:-1])
+          if not parent:
+              raise SystemExit(f"Snapshot parent folder is missing for {snapshot_path}")
+          snapshot_entry = store._find_child(parent, snapshot_name)
+          if not snapshot_entry:
+              raise SystemExit(f"Snapshot file is missing: {snapshot_path}")
+
+          raw = store.service.files().get_media(fileId=snapshot_entry["id"]).execute()
+          frame = pd.read_parquet(io.BytesIO(raw))
+          needed = ["symbol", "instrument_code", "quote_status", "quote_error", "actual_observed_price"]
+          for col in needed:
+              if col not in frame.columns:
+                  frame[col] = None
+          status_counts = {
+              str(k): int(v) for k, v in
+              frame["quote_status"].fillna("NULL").astype(str).value_counts().items()
+          }
+          failed = frame.loc[
+              frame["quote_status"].astype(str).str.upper().ne("PASS"), needed
+          ].sort_values("symbol").to_dict(orient="records")
+          unmapped = frame.loc[
+              frame["instrument_code"].isna()
+              | frame["instrument_code"].astype(str).str.strip().isin(["", "None", "nan"]),
+              ["symbol", "instrument_code", "quote_status", "quote_error"],
+          ].sort_values("symbol").to_dict(orient="records")
+          result = {
+              "cycle_minute_ist": manifest.get("cycle_minute_ist"),
+              "manifest_status": manifest.get("status"),
+              "snapshot_drive_path": snapshot_path,
+              "expected_symbol_count": manifest.get("expected_symbol_count"),
+              "quoted_symbol_count": manifest.get("quoted_symbol_count"),
+              "missing_quote_count": manifest.get("missing_quote_count"),
+              "unmapped_symbol_count": manifest.get("unmapped_symbol_count"),
+              "quote_status_counts": status_counts,
+              "unmapped_symbol_rows": unmapped,
+              "non_pass_quote_rows": failed,
+          }
+          print("LATEST_NSE_QUOTE_EXCEPTION_DIAGNOSTIC:", json.dumps(result, sort_keys=True, default=str))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("## Latest NSE quote exceptions\n\n")
+              fh.write(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+          PY
