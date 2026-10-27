@@ -83,8 +83,18 @@ jobs:
         run: |
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          SA="indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com"
-          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          TOKEN=""
+          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            if [[ "$SA" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            fi
+            if [[ -n "$TOKEN" ]]; then
+              echo "WORKER_HEALTH_PRIVATE_INVOKER_TOKEN=AVAILABLE"
+              break
+            fi
+          done
           if [[ -z "$TOKEN" ]]; then
             echo "WORKER_HEALTH_CHECK=UNVERIFIABLE_NO_PRIVATE_INVOKER_TOKEN"
             exit 1
