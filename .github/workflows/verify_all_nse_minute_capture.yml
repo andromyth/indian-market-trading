@@ -77,46 +77,57 @@ jobs:
           done
           echo "ERROR: no ready Cloud Run revision created after the worker-code commit time."
           exit 1
-      - name: Probe full-universe quote and prediction capture using read-only identity checks
+      - name: Probe private quote and prediction diagnostics without overstating off-session readiness
         shell: bash
         run: |
           set -euo pipefail
-          IN_NSE_CASH_SESSION="$(python - <<'PY'
+          SESSION_ACTIVE="$(python - <<'PY'
           from datetime import datetime, time
           from zoneinfo import ZoneInfo
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           print("true" if now.weekday() < 5 and time(9, 15) <= now.time() < time(15, 30) else "false")
           PY
           )"
-          if [[ "$IN_NSE_CASH_SESSION" != "true" ]]; then
+          if [[ "$SESSION_ACTIVE" != "true" ]]; then
             echo "LIVE_CAPTURE_CHECK=DEFERRED_OUTSIDE_NSE_CASH_SESSION"
-            echo "READY_WORKER_REVISION_CHECK=PASS"
-            echo "DETAIL=Fresh quote/prediction diagnostics require an active market session; the deployment workflow separately verifies the private Scheduler jobs and Drive preflight."
-            exit 0
+            echo "NOTE=Diagnostic endpoints will be queried read-only; no live-session freshness claim will be made."
           fi
+
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
           CAPTURE_OK=0
           PREDICTION_OK=0
-          AUTH_OK=0
-          for SA in "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+          CAPTURE_DIAGNOSTIC_OK=0
+          PREDICTION_DIAGNOSTIC_OK=0
+
+          # First try the already-authenticated diagnostic identity itself.
+          # Only if it cannot mint/use a token, try the existing Scheduler
+          # identities; no IAM bindings or Scheduler settings are changed.
+          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
             echo "TRYING_READ_ONLY_INVOKER=$SA"
-            if ! TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>&1)"; then
-              echo "IDENTITY_IMPERSONATION_UNAVAILABLE=$SA"
+            if [[ "$SA" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            fi
+            if [[ -z "$TOKEN" ]]; then
+              echo "IDENTITY_TOKEN_UNAVAILABLE=$SA"
               continue
             fi
+
             for item in "capturez:ALL_NSE_QUOTE_CAPTURE" "predictionz:ALL_NSE_PREDICTION_ACTUAL_CAPTURE"; do
               PATH_PART="${item%%:*}"
               LABEL="${item##*:}"
               HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/$PATH_PART")" || HTTP_CODE=000
               echo "${LABEL}_HTTP_STATUS=$HTTP_CODE"
               set +e
-              python - "$RESPONSE" "$HTTP_CODE" "$LABEL" <<'PY'
+              python - "$RESPONSE" "$HTTP_CODE" "$LABEL" "$SESSION_ACTIVE" <<'PY'
           import json, sys
-          path, code, label = sys.argv[1:]
+          path, code, label, session_active = sys.argv[1:]
           try:
-              payload=json.load(open(path,encoding="utf-8"))
+              with open(path, encoding="utf-8") as handle:
+                  payload=json.load(handle)
           except Exception:
               print(f"{label}_DIAGNOSTIC_BODY_UNAVAILABLE")
               sys.exit(2)
@@ -124,36 +135,40 @@ jobs:
           if payload.get("probe") != expected_probe:
               print(f"{label}_IDENTITY_CANNOT_READ_PRIVATE_DIAGNOSTIC")
               sys.exit(2)
+          print(f"{label}_AUTHENTICATED_DIAGNOSTIC=PASS")
           print(f"{label}_STATUS={payload.get('status')}")
-          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons"):
+          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct"):
               if key in payload:
                   print(f"{label}_{key.upper()}={payload.get(key)}")
-          sys.exit(0 if code == "200" and payload.get("status") == "ok" else 1)
+          if code == "200" and payload.get("status") == "ok":
+              sys.exit(0)
+          # Valid authenticated diagnostic response, but not a live-ready result.
+          sys.exit(1)
           PY
               RC=$?
               set -e
-              if [[ $RC -eq 0 ]]; then
-                AUTH_OK=1
-                if [[ "$PATH_PART" == "capturez" ]]; then CAPTURE_OK=1; else PREDICTION_OK=1; fi
-              elif [[ $RC -eq 1 ]]; then
-                AUTH_OK=1
+              if [[ "$PATH_PART" == "capturez" ]]; then
+                if [[ $RC -eq 0 ]]; then CAPTURE_DIAGNOSTIC_OK=1; [[ "$SESSION_ACTIVE" == "true" ]] && CAPTURE_OK=1
+                elif [[ $RC -eq 1 ]]; then CAPTURE_DIAGNOSTIC_OK=1
+                fi
               else
-                break
+                if [[ $RC -eq 0 ]]; then PREDICTION_DIAGNOSTIC_OK=1; [[ "$SESSION_ACTIVE" == "true" ]] && PREDICTION_OK=1
+                elif [[ $RC -eq 1 ]]; then PREDICTION_DIAGNOSTIC_OK=1
+                fi
               fi
+              if [[ $RC -eq 2 ]]; then break; fi
             done
-            if [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]; then break; fi
+
+            if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]; then break; fi
           done
-          if [[ "$CAPTURE_OK" == "1" ]]; then
-            echo "QUOTE_CAPTURE_VERDICT=PASS"
+
+          if [[ "$SESSION_ACTIVE" == "true" ]]; then
+            if [[ "$CAPTURE_OK" == "1" ]]; then echo "QUOTE_CAPTURE_VERDICT=PASS"; else echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            if [[ "$PREDICTION_OK" == "1" ]]; then echo "PREDICTION_ACTUAL_VERDICT=PASS"; else echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]
           else
-            echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_UNVERIFIABLE"
+            if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" ]]; then echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            if [[ "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]; then echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            echo "LIVE_CAPTURE_READINESS=NOT_ASSERTED_OUTSIDE_SESSION"
+            [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]
           fi
-          if [[ "$PREDICTION_OK" == "1" ]]; then
-            echo "PREDICTION_ACTUAL_VERDICT=PASS"
-          else
-            echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_UNVERIFIABLE"
-          fi
-          if [[ "$AUTH_OK" != "1" ]]; then
-            echo "ACCESS_BLOCKER=deployment identity cannot impersonate either existing invoker service account; no Scheduler configuration was changed."
-          fi
-          [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]
