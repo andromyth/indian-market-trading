@@ -302,6 +302,49 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
     assert before.index.max() == minute - pd.Timedelta(minutes=1)
 
 
+def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tmp_path, monkeypatch):
+    import threading
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    minute = pd.Timestamp("2026-10-27 10:20:00", tz=IST)
+    calls = []
+    completed = threading.Event()
+    execution_context = []
+
+    def fake_refresh(target):
+        calls.append(target)
+        execution_context.append(threading.current_thread() is not threading.main_thread())
+        completed.set()
+        return {
+            "status": "OK",
+            "minute": target.isoformat(),
+            "batch_count": 1,
+            "failed_batches": 0,
+            "failed_symbols": [],
+            "updated_symbols": 1,
+            "current_session_candle_rows": 1,
+            "elapsed_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(predictor, "_refresh_current_session_history", fake_refresh)
+
+    # Bootstrap must not compete with its own full-universe history seeding.
+    waiting = predictor._schedule_current_session_history_refresh(minute)
+    assert waiting["status"] == "WARMING_SEED"
+    assert calls == []
+
+    predictor._seed_ready = True
+    predictor._seed_complete = True
+    predictor._codes = {"AAA": "NSE_100"}
+    scheduled = predictor._schedule_current_session_history_refresh(minute)
+
+    assert scheduled["status"] == "SCHEDULED_ASYNC"
+    assert scheduled["batch_count"] == 0
+    assert completed.wait(timeout=2.0)
+    assert len(calls) == 1
+    assert execution_context == [True]
+
+
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     predictor._symbols = ["AAA", "BBB", "CCC"]

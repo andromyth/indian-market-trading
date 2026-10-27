@@ -36,6 +36,7 @@ HISTORY_REFRESH_REQUEST_SPACING_SECONDS = 0.24
 HISTORY_REFRESH_WINDOW_MINUTES = 90
 HISTORY_REFRESH_WORKERS = 8
 MIN_SESSION_CANDLES_FOR_PREDICTION = 16
+MAX_HISTORY_CANDLE_AGE_MINUTES = 5
 MIN_SIGNAL_READINESS = 0.70
 MAX_QUOTE_AGE_SECONDS = 120
 MIN_PREDICTION_COVERAGE = 0.95
@@ -298,6 +299,7 @@ class AllNSEMinutePredictor:
         self._history_request_lock = threading.Lock()
         self._next_history_request_at = 0.0
         self._history_refresh_run_lock = threading.Lock()
+        self._history_refresh_scheduled = False
         self._last_history_refresh_minute: str | None = None
         self._last_history_refresh_summary: dict[str, Any] = {}
         self._last_health: dict[str, Any] = {
@@ -905,6 +907,92 @@ class AllNSEMinutePredictor:
         except Exception as exc:
             return None, None, f"{type(exc).__name__}: {str(exc)[:160]}"
 
+    def _schedule_current_session_history_refresh(
+        self,
+        minute: pd.Timestamp,
+    ) -> dict[str, Any]:
+        """Refresh history in the background so the five-minute tick can persist promptly.
+
+        The full-universe quote capture already takes roughly two minutes. Running
+        another 500+ provider requests synchronously after capture can push the
+        whole Scheduler request past its 300-second deadline. This refresh updates
+        the cache for the next slot; the current forecast uses only cached candles
+        strictly before its decision minute and rejects stale history.
+        """
+        minute = _as_ist_timestamp(minute).floor("min")
+        minute_key = minute.isoformat()
+        with self._lock:
+            if self._last_history_refresh_minute == minute_key:
+                return dict(self._last_history_refresh_summary)
+            if self._history_refresh_scheduled:
+                return {
+                    "status": "IN_PROGRESS",
+                    "minute": minute_key,
+                    "batch_count": 0,
+                    "failed_batches": 0,
+                    "failed_symbols": [],
+                    "updated_symbols": 0,
+                    "current_session_candle_rows": 0,
+                }
+            # Initial seeding is already fetching a full history range. Do not
+            # compete with it for provider quota; let the seeder finish first.
+            if not self._seed_ready or not self._seed_complete or not self._codes:
+                return {
+                    "status": "WARMING_SEED",
+                    "minute": minute_key,
+                    "batch_count": 0,
+                    "failed_batches": 0,
+                    "failed_symbols": [],
+                    "updated_symbols": 0,
+                    "current_session_candle_rows": 0,
+                }
+            self._history_refresh_scheduled = True
+
+        def refresh_in_background() -> None:
+            try:
+                summary = self._refresh_current_session_history(minute)
+                self._log(
+                    "all_nse_background_history_refresh_finished",
+                    **summary,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {str(exc)[:200]}"
+                with self._lock:
+                    self._last_history_refresh_minute = minute_key
+                    self._last_history_refresh_summary = {
+                        "status": "ERROR",
+                        "minute": minute_key,
+                        "batch_count": 0,
+                        "failed_batches": 1,
+                        "failed_symbols": [],
+                        "updated_symbols": 0,
+                        "current_session_candle_rows": 0,
+                        "error": error,
+                    }
+                self._log(
+                    "all_nse_background_history_refresh_failed",
+                    minute=minute_key,
+                    error=error,
+                )
+            finally:
+                with self._lock:
+                    self._history_refresh_scheduled = False
+
+        threading.Thread(
+            target=refresh_in_background,
+            name="all-nse-current-session-history-refresh",
+            daemon=True,
+        ).start()
+        return {
+            "status": "SCHEDULED_ASYNC",
+            "minute": minute_key,
+            "batch_count": 0,
+            "failed_batches": 0,
+            "failed_symbols": [],
+            "updated_symbols": 0,
+            "current_session_candle_rows": 0,
+        }
+
     def _refresh_current_session_history(self, minute: pd.Timestamp) -> dict[str, Any]:
         """Refresh genuine one-minute candles; never turn LTP snapshots into OHLC bars."""
         minute = _as_ist_timestamp(minute).floor("min")
@@ -1142,7 +1230,13 @@ class AllNSEMinutePredictor:
         if self._last_minute == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "cycle_minute_ist": minute_key}
 
-        history_refresh = self._refresh_current_session_history(minute)
+        # Do not put hundreds of history API requests on the prediction
+        # critical path. Schedule a fresh candle cache for the next slot.
+        # Capture is timestamp-aligned; prediction below filters every input
+        # candle to strictly before this minute and rejects data older than the
+        # explicit freshness threshold.
+        refresh_target = max(minute, pd.Timestamp.now(tz=IST).floor("min"))
+        history_refresh = self._schedule_current_session_history_refresh(refresh_target)
         failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
         source_root = Path(worker_root or self.worker_root)
         snapshot_name = f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
@@ -1205,6 +1299,18 @@ class AllNSEMinutePredictor:
             quote = quote_by_symbol.get(symbol)
             hist = histories.get(symbol, pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]))
             hist = hist.copy()
+            # Point-in-time safety: the actual quote and derived volume delta may
+            # only use completed historical candles strictly before the slot.
+            if not hist.empty and isinstance(hist.index, pd.DatetimeIndex):
+                hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
+            elif not hist.empty:
+                hist = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+            history_age_minutes = None
+            if not hist.empty and isinstance(hist.index, pd.DatetimeIndex):
+                latest_history_at = _as_ist_timestamp(hist.index.max())
+                history_age_minutes = max(
+                    0.0, (minute - latest_history_at).total_seconds() / 60.0
+                )
             quote_info, price_row, raw_day_volume = _current_minute_row(
                 symbol=symbol,
                 snapshot_minute=minute,
@@ -1255,12 +1361,17 @@ class AllNSEMinutePredictor:
                 model_failures += 1
             elif price_row is not None:
                 try:
-                    hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
                     session_hist = hist.loc[pd.Index(hist.index.date) == minute.date()] if not hist.empty else hist
                     if len(session_hist) < MIN_SESSION_CANDLES_FOR_PREDICTION:
                         quote_info["prediction_status"] = "INSUFFICIENT_SESSION_HISTORY"
                     elif hist.empty:
                         quote_info["prediction_status"] = "INSUFFICIENT_HISTORY"
+                    elif history_age_minutes is None or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
+                        quote_info["prediction_status"] = "STALE_HISTORY"
+                        quote_info["error"] = (
+                            "Latest completed stock candle is missing or older than "
+                            f"{MAX_HISTORY_CANDLE_AGE_MINUTES} minutes at the decision slot."
+                        )
                     else:
                         model_feature_row = self._model_api._latest_features(
                             hist,
@@ -1498,7 +1609,13 @@ class AllNSEMinutePredictor:
         model_failure_fraction = model_failures / expected_count
         seed_coverage_fraction = seed_coverage_symbols / expected_count
         seed_failure_fraction = seed_failed_batches / seed_batch_count
-        refresh_failure_fraction = refresh_failed_batches / refresh_batch_count if refresh_batch_count else 1.0
+        refresh_failure_fraction = (
+            refresh_failed_batches / refresh_batch_count
+            if refresh_batch_count
+            else 0.0 if history_refresh.get("status") in {
+                "SCHEDULED_ASYNC", "IN_PROGRESS", "WARMING_SEED"
+            } else 1.0
+        )
         model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
         quality_gate_pass = bool(
             len(records) == len(symbols)
@@ -1543,6 +1660,7 @@ class AllNSEMinutePredictor:
             "history_seed_failed_batches": seed_failed_batches,
             "history_seed_failure_fraction": round(seed_failure_fraction, 6),
             "history_refresh_status": history_refresh.get("status"),
+            "history_refresh_mode": "BACKGROUND_NONBLOCKING",
             "history_refresh_batch_count": refresh_batch_count,
             "history_refresh_failed_batches": refresh_failed_batches,
             "history_refresh_failed_symbols": len(failed_refresh_symbols),
