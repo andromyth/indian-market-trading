@@ -77,6 +77,7 @@ jobs:
           done
           echo "ERROR: no ready Cloud Run revision created after the worker-code commit time."
           exit 1
+
       - name: Probe private quote and prediction diagnostics without overstating off-session readiness
         shell: bash
         run: |
@@ -172,3 +173,92 @@ jobs:
             echo "LIVE_CAPTURE_READINESS=NOT_ASSERTED_OUTSIDE_SESSION"
             [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]
           fi
+
+      - name: Verify actual Cloud Run INDstocks credentials and read-only data endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          READY_REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
+          gcloud run revisions describe "$READY_REVISION" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/ready_revision.json
+          python - <<'PY'
+          from __future__ import annotations
+          import os, subprocess, sys
+          from pathlib import Path
+          import pandas as pd
+
+          names=("INDSTOCKS_CLIENT_ID","INDSTOCKS_MPIN","INDSTOCKS_TOTP_SECRET","INDSTOCKS_ACCESS_TOKEN")
+          payload=__import__("json").loads(Path("/tmp/ready_revision.json").read_text())
+          envs={}
+          for container in (payload.get("spec") or {}).get("containers") or []:
+              for item in container.get("env") or []:
+                  envs[item.get("name")]=item
+
+          def secret_value(secret, version):
+              result=subprocess.run(
+                  ["gcloud","secrets","versions","access",str(version),"--secret",secret,
+                   "--project",os.environ["PROJECT_ID"]],
+                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False
+              )
+              return result.stdout.decode().strip() if result.returncode==0 else ""
+
+          for name in names:
+              item=envs.get(name) or {}
+              if item.get("value"):
+                  os.environ[name]=item["value"]
+              else:
+                  ref=((item.get("valueSource") or {}).get("secretKeyRef") or {})
+                  if ref.get("secret"):
+                      value=secret_value(ref["secret"],ref.get("version","latest"))
+                      if value:
+                          os.environ[name]=value
+
+          auto=all(os.environ.get(k,"").strip() for k in names[:3])
+          manual=bool(os.environ.get("INDSTOCKS_ACCESS_TOKEN","").strip())
+          if not auto and not manual:
+              print("PROVIDER_AUTH=FAIL; Cloud Run revision has no readable complete provider credential configuration.")
+              print("NO_CREDENTIAL_VALUES_PRINTED=true")
+              sys.exit(2)
+
+          import importlib
+          import indstocks_client as client
+          candidates=["totp"] if auto else []
+          if manual:
+              candidates.append("manual")
+          success=None
+          for mode in candidates:
+              if mode=="manual":
+                  for key in names[:3]:
+                      os.environ.pop(key,None)
+              client=importlib.reload(client)
+              try:
+                  client.profile()
+                  instruments=client._load_instruments("NSE")
+                  if instruments is None or instruments.empty:
+                      raise RuntimeError("instrument master unavailable")
+                  candles=client.historical_1m("RELIANCE.NS",days=3)
+                  if candles is None or candles.empty:
+                      raise RuntimeError("one-minute history endpoint returned no rows")
+                  symbol_rows=instruments.loc[
+                      instruments["TRADING_SYMBOL"].astype(str).str.upper().eq("RELIANCE")
+                  ]
+                  if symbol_rows.empty:
+                      raise RuntimeError("RELIANCE not in NSE instrument master")
+                  code="NSE_"+str(symbol_rows.iloc[0]["SECURITY_ID"]).strip()
+                  quote_response=client._request("GET","/market/quotes/full",params={"scrip-codes":code})
+                  success=(mode,len(instruments),len(candles),quote_response.status_code)
+                  break
+              except Exception as exc:
+                  print(f"PROVIDER_CANDIDATE=FAIL mode={mode} error_type={type(exc).__name__}")
+          if success is None:
+              print("PROVIDER_AUTH=FAIL; configured credentials could not pass profile, quote API, and historical candle checks.")
+              print("NO_CREDENTIAL_VALUES_PRINTED=true")
+              sys.exit(3)
+          mode,instrument_count,candle_count,quote_status=success
+          print(f"PROVIDER_AUTH=PASS mode={mode}")
+          print("PROFILE_ENDPOINT=PASS")
+          print(f"NSE_INSTRUMENT_MASTER=PASS symbols={len(instruments)}")
+          print(f"QUOTE_ENDPOINT=PASS http_status={quote_status}")
+          print(f"ONE_MINUTE_HISTORY=PASS rows={candle_count}")
+          print("NO_CREDENTIAL_VALUES_PRINTED=true")
+          Path("/tmp/ready_revision.json").unlink(missing_ok=True)
+          PY
