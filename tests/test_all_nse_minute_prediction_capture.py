@@ -302,6 +302,94 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
     assert before.index.max() == minute - pd.Timedelta(minutes=1)
 
 
+def test_stale_market_history_is_excluded_from_feature_context():
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    index = pd.date_range(
+        minute - pd.Timedelta(minutes=8),
+        periods=3,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    market = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [10.0, 12.0, 11.0],
+        },
+        index=index,
+    )
+
+    before = capture.AllNSEMinutePredictor._market_history_before(market, minute)
+
+    assert before.empty
+    assert isinstance(before.index, pd.DatetimeIndex)
+    assert str(before.index.tz) == "Asia/Kolkata"
+
+
+def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeypatch):
+    import data_fetcher
+
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    idx = pd.date_range(
+        minute.tz_convert("UTC") - pd.Timedelta(minutes=2),
+        periods=5,
+        freq="min",
+        tz="UTC",
+        name="Datetime",
+    )
+    frame = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "High": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "Low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "Close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "Volume": [10.0, 12.0, 11.0, 13.0, 14.0],
+        },
+        index=idx,
+    )
+    monkeypatch.setattr(
+        data_fetcher,
+        "_yahoo_chart_history",
+        lambda symbol, period, interval: frame,
+    )
+
+    result = capture.AllNSEMinutePredictor._fetch_yahoo_nifty_history(minute)
+
+    assert len(result) == 2
+    assert str(result.index.tz) == "Asia/Kolkata"
+    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result["Close"].tolist() == [100.5, 101.5]
+
+
+def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
+    assert capture.AllNSEMinutePredictor._nifty_instrument_code() is None
+
+
+def test_nifty_quote_uses_a_fresh_real_candle_when_no_rest_index_token_exists(tmp_path):
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    now = pd.Timestamp.now(tz=IST)
+    latest = now.floor("min") - pd.Timedelta(minutes=1)
+    predictor._market_history = pd.DataFrame(
+        {
+            "Open": [24990.0],
+            "High": [25010.0],
+            "Low": [24980.0],
+            "Close": [25000.0],
+            "Volume": [1000.0],
+        },
+        index=pd.DatetimeIndex([latest], name="Datetime"),
+    )
+
+    price, observed_at, error = predictor._fetch_current_nifty_quote()
+
+    assert price == pytest.approx(25000.0)
+    assert observed_at == latest
+    assert error is None
+
+
 def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tmp_path, monkeypatch):
     import threading
 
