@@ -99,8 +99,10 @@ jobs:
           trap 'rm -f "$RESPONSE"' EXIT
           CAPTURE_OK=0
           PREDICTION_OK=0
+          PROVIDER_OK=0
           CAPTURE_DIAGNOSTIC_OK=0
           PREDICTION_DIAGNOSTIC_OK=0
+          PROVIDER_DIAGNOSTIC_OK=0
 
           # First try the already-authenticated diagnostic identity itself.
           # Only if it cannot mint/use a token, try the existing Scheduler
@@ -117,7 +119,7 @@ jobs:
               continue
             fi
 
-            for item in "capturez:ALL_NSE_QUOTE_CAPTURE" "predictionz:ALL_NSE_PREDICTION_ACTUAL_CAPTURE"; do
+            for item in "capturez:ALL_NSE_QUOTE_CAPTURE" "predictionz:ALL_NSE_PREDICTION_ACTUAL_CAPTURE" "providerz:INDSTOCKS_PROVIDER_HEALTH"; do
               PATH_PART="${item%%:*}"
               LABEL="${item##*:}"
               HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/$PATH_PART")" || HTTP_CODE=000
@@ -132,13 +134,18 @@ jobs:
           except Exception:
               print(f"{label}_DIAGNOSTIC_BODY_UNAVAILABLE")
               sys.exit(2)
-          expected_probe = "all_nse_quote_capture" if label == "ALL_NSE_QUOTE_CAPTURE" else "all_nse_minute_prediction_actual"
-          if payload.get("probe") != expected_probe:
+          expected_probes = {
+              "ALL_NSE_QUOTE_CAPTURE": "all_nse_quote_capture",
+              "ALL_NSE_PREDICTION_ACTUAL_CAPTURE": "all_nse_minute_prediction_actual",
+              "INDSTOCKS_PROVIDER_HEALTH": "indstocks_provider_health",
+          }
+          expected_probe = expected_probes.get(label)
+          if not expected_probe or payload.get("probe") != expected_probe:
               print(f"{label}_IDENTITY_CANNOT_READ_PRIVATE_DIAGNOSTIC")
               sys.exit(2)
           print(f"{label}_AUTHENTICATED_DIAGNOSTIC=PASS")
           print(f"{label}_STATUS={payload.get('status')}")
-          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct"):
+          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct","checks","failed_check","error_type","nse_instrument_count","one_minute_history_rows","latest_one_minute_candle_at","reason"):
               if key in payload:
                   print(f"{label}_{key.upper()}={payload.get(key)}")
           if code == "200" and payload.get("status") == "ok":
@@ -152,128 +159,30 @@ jobs:
                 if [[ $RC -eq 0 ]]; then CAPTURE_DIAGNOSTIC_OK=1; [[ "$SESSION_ACTIVE" == "true" ]] && CAPTURE_OK=1
                 elif [[ $RC -eq 1 ]]; then CAPTURE_DIAGNOSTIC_OK=1
                 fi
-              else
+              elif [[ "$PATH_PART" == "predictionz" ]]; then
                 if [[ $RC -eq 0 ]]; then PREDICTION_DIAGNOSTIC_OK=1; [[ "$SESSION_ACTIVE" == "true" ]] && PREDICTION_OK=1
                 elif [[ $RC -eq 1 ]]; then PREDICTION_DIAGNOSTIC_OK=1
+                fi
+              else
+                if [[ $RC -eq 0 ]]; then PROVIDER_DIAGNOSTIC_OK=1; PROVIDER_OK=1
+                elif [[ $RC -eq 1 ]]; then PROVIDER_DIAGNOSTIC_OK=1
                 fi
               fi
               if [[ $RC -eq 2 ]]; then break; fi
             done
 
-            if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]; then break; fi
+            if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" && "$PROVIDER_DIAGNOSTIC_OK" == "1" ]]; then break; fi
           done
 
           if [[ "$SESSION_ACTIVE" == "true" ]]; then
             if [[ "$CAPTURE_OK" == "1" ]]; then echo "QUOTE_CAPTURE_VERDICT=PASS"; else echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
             if [[ "$PREDICTION_OK" == "1" ]]; then echo "PREDICTION_ACTUAL_VERDICT=PASS"; else echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
-            [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" ]]
+            if [[ "$PROVIDER_OK" == "1" ]]; then echo "INDSTOCKS_PROVIDER_VERDICT=PASS"; else echo "INDSTOCKS_PROVIDER_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" && "$PROVIDER_OK" == "1" ]]
           else
             if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" ]]; then echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
             if [[ "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]; then echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
+            if [[ "$PROVIDER_OK" == "1" ]]; then echo "INDSTOCKS_PROVIDER_VERDICT=PASS"; else echo "INDSTOCKS_PROVIDER_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
             echo "LIVE_CAPTURE_READINESS=NOT_ASSERTED_OUTSIDE_SESSION"
-            [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]
+            [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" && "$PREDICTION_DIAGNOSTIC_OK" == "1" && "$PROVIDER_DIAGNOSTIC_OK" == "1" && "$PROVIDER_OK" == "1" ]]
           fi
-
-      - name: Verify actual Cloud Run INDstocks credentials and read-only data endpoints
-        shell: bash
-        run: |
-          set -euo pipefail
-          READY_REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
-          gcloud run revisions describe "$READY_REVISION" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/ready_revision.json
-          python - <<'PY'
-          from __future__ import annotations
-          import os, subprocess, sys
-          from pathlib import Path
-          import pandas as pd
-
-          names=("INDSTOCKS_CLIENT_ID","INDSTOCKS_MPIN","INDSTOCKS_TOTP_SECRET","INDSTOCKS_ACCESS_TOKEN")
-          payload=__import__("json").loads(Path("/tmp/ready_revision.json").read_text())
-          envs={}
-          for container in (payload.get("spec") or {}).get("containers") or []:
-              for item in container.get("env") or []:
-                  envs[item.get("name")]=item
-
-          def secret_value(secret, version):
-              result=subprocess.run(
-                  ["gcloud","secrets","versions","access",str(version),"--secret",secret,
-                   "--project",os.environ["PROJECT_ID"]],
-                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False
-              )
-              return result.stdout.decode().strip() if result.returncode==0 else ""
-
-          unreadable_refs=[]
-          for name in names:
-              item=envs.get(name) or {}
-              if item.get("value"):
-                  os.environ[name]=item["value"]
-                  continue
-              ref=((item.get("valueSource") or {}).get("secretKeyRef") or {})
-              if not ref:
-                  ref=((item.get("valueFrom") or {}).get("secretKeyRef") or {})
-              if ref:
-                  secret=ref.get("secret") or ref.get("name") or ""
-                  if "/secrets/" in secret:
-                      secret=secret.rsplit("/secrets/",1)[-1]
-                  version=ref.get("version") or ref.get("key") or "latest"
-                  value=secret_value(secret,version) if secret else ""
-                  if value:
-                      os.environ[name]=value
-                  else:
-                      unreadable_refs.append(name)
-                      print(f"PROVIDER_SECRET_REFERENCE_PRESENT={name} readable_to_diagnostic_identity=false")
-              else:
-                  print(f"PROVIDER_CREDENTIAL_ENV_MISSING={name}")
-
-          auto=all(os.environ.get(k,"").strip() for k in names[:3])
-          manual=bool(os.environ.get("INDSTOCKS_ACCESS_TOKEN","").strip())
-          if not auto and not manual:
-              if unreadable_refs:
-                  print("PROVIDER_AUTH=UNVERIFIABLE; secret references exist but this diagnostic identity cannot read their values.")
-              else:
-                  print("PROVIDER_AUTH=FAIL; Cloud Run revision has no complete provider credential configuration.")
-              print("NO_CREDENTIAL_VALUES_PRINTED=true")
-              sys.exit(2)
-
-          import importlib
-          import indstocks_client as client
-          candidates=["totp"] if auto else []
-          if manual:
-              candidates.append("manual")
-          success=None
-          for mode in candidates:
-              if mode=="manual":
-                  for key in names[:3]:
-                      os.environ.pop(key,None)
-              client=importlib.reload(client)
-              try:
-                  client.profile()
-                  instruments=client._load_instruments("NSE")
-                  if instruments is None or instruments.empty:
-                      raise RuntimeError("instrument master unavailable")
-                  candles=client.historical_1m("RELIANCE.NS",days=3)
-                  if candles is None or candles.empty:
-                      raise RuntimeError("one-minute history endpoint returned no rows")
-                  symbol_rows=instruments.loc[
-                      instruments["TRADING_SYMBOL"].astype(str).str.upper().eq("RELIANCE")
-                  ]
-                  if symbol_rows.empty:
-                      raise RuntimeError("RELIANCE not in NSE instrument master")
-                  code="NSE_"+str(symbol_rows.iloc[0]["SECURITY_ID"]).strip()
-                  quote_response=client._request("GET","/market/quotes/full",params={"scrip-codes":code})
-                  success=(mode,len(instruments),len(candles),quote_response.status_code)
-                  break
-              except Exception as exc:
-                  print(f"PROVIDER_CANDIDATE=FAIL mode={mode} error_type={type(exc).__name__}")
-          if success is None:
-              print("PROVIDER_AUTH=FAIL; configured credentials could not pass profile, quote API, and historical candle checks.")
-              print("NO_CREDENTIAL_VALUES_PRINTED=true")
-              sys.exit(3)
-          mode,instrument_count,candle_count,quote_status=success
-          print(f"PROVIDER_AUTH=PASS mode={mode}")
-          print("PROFILE_ENDPOINT=PASS")
-          print(f"NSE_INSTRUMENT_MASTER=PASS symbols={len(instruments)}")
-          print(f"QUOTE_ENDPOINT=PASS http_status={quote_status}")
-          print(f"ONE_MINUTE_HISTORY=PASS rows={candle_count}")
-          print("NO_CREDENTIAL_VALUES_PRINTED=true")
-          Path("/tmp/ready_revision.json").unlink(missing_ok=True)
-          PY
