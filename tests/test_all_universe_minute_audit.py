@@ -148,6 +148,7 @@ def test_snapshot_capture_passes_when_each_slot_has_more_than_90_percent_complet
     )
     assert report["minimum_complete_symbol_coverage_pct"] > 90.0
     assert report["all_slots_meet_symbol_completeness_threshold"] is True
+    assert report["capture_status_gate_pass"] is True
     assert report["capture_quality_gate_pass"] is True
     assert report["snapshot_quality_gate_pass"] is True
     assert report["quality_gate_pass"] is True
@@ -201,6 +202,7 @@ def test_snapshot_capture_does_not_pass_at_exactly_90_percent_complete_symbols()
     )
     assert report["observed_quote_coverage_pct"] == 90.0
     assert report["minimum_complete_symbol_coverage_pct"] == 90.0
+    assert report["capture_status_gate_pass"] is False
     assert report["capture_quality_gate_pass"] is False
     assert report["quality_gate_pass"] is False
     assert report["audit_status"] == "NEEDS_ATTENTION"
@@ -218,6 +220,7 @@ def test_audit_accepts_recovered_drive_write_when_artifacts_are_present():
         snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["quality_gate_pass"] is True
+    assert report["capture_status_gate_pass"] is True
     assert recovered_key in report["recovered_persistence_issue_minutes"]
 
 
