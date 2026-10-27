@@ -174,10 +174,13 @@ jobs:
               "expected_minutes", "snapshot_files_present", "missing_snapshot_minutes",
               "minute_manifests_present", "missing_manifest_minutes",
               "capture_status_counts", "capture_status_gate_pass",
-              "capture_success_quote_coverage_threshold_pct", "capture_quality_gate_pass",
-              "snapshot_quality_gate_pass", "total_expected_symbol_minutes",
+              "complete_symbol_coverage_threshold_pct", "capture_quality_gate_pass",
+              "snapshot_quality_gate_pass", "corrupt_snapshot_minutes",
+              "failed_symbol_completeness_minutes", "total_expected_symbol_minutes",
               "total_quoted_symbol_minutes", "total_missing_quote_rows",
-              "observed_quote_coverage_pct", "matched_outcomes",
+              "observed_quote_coverage_pct", "total_complete_symbol_rows",
+              "average_complete_symbol_coverage_pct", "minimum_complete_symbol_coverage_pct",
+              "all_slots_meet_symbol_completeness_threshold", "matched_outcomes",
               "prediction_expected_slots", "prediction_files_present",
               "missing_prediction_minutes", "prediction_manifests_present",
               "missing_prediction_manifest_minutes", "prediction_row_count_failures",
@@ -265,7 +268,7 @@ jobs:
           if os.getenv("WATCHLIST_MINUTE_AUDIT_OK", "true").lower() != "true":
               failures.append("WATCHLIST_MINUTE_CAPTURE_FAILED: per-minute prediction/actual snapshots are missing or incomplete.")
           if report.get("nse_trading_day") and not report.get("capture_quality_gate_pass", report.get("quality_gate_pass")):
-              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: snapshot/manifest persistence is incomplete or aggregate quote coverage is not above 90%.")
+              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: snapshot/manifest persistence is incomplete, unreadable, or at least one five-minute slot has 90% or fewer complete symbol rows.")
           if report.get("nse_trading_day") and not report.get("prediction_quality_gate_pass", False):
               failures.append("ALL_NSE_MINUTE_PREDICTION_FAILED: minute prediction files/manifests or model-quality checks are incomplete.")
           if failures:
