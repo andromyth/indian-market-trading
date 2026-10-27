@@ -37,37 +37,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! gcloud services describe cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --format='value(state)' 2>/dev/null | grep -qx ENABLED; then
+          STATE="$(gcloud services list --enabled --project="$PROJECT_ID" \
+            --filter="config.name=cloudresourcemanager.googleapis.com" \
+            --format='value(config.name)')"
+          if [[ "$STATE" != "cloudresourcemanager.googleapis.com" ]]; then
             echo "CLOUD_RESOURCE_MANAGER_API_ENABLE_ATTEMPT=true"
             gcloud services enable cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --quiet
+            STATE="$(gcloud services list --enabled --project="$PROJECT_ID" \
+              --filter="config.name=cloudresourcemanager.googleapis.com" \
+              --format='value(config.name)')"
           fi
-          STATE="$(gcloud services describe cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --format='value(state)')"
-          [[ "$STATE" == "ENABLED" ]] || { echo "ERROR: Cloud Resource Manager API state=$STATE"; exit 1; }
+          [[ "$STATE" == "cloudresourcemanager.googleapis.com" ]] || {
+            echo "ERROR: Cloud Resource Manager API is not enabled"
+            exit 1
+          }
           echo "CLOUD_RESOURCE_MANAGER_API=ENABLED"
 
-      - name: Grant read-only Cloud Logging access to the diagnostic identity
+      - name: Verify read-only Cloud Logging access is configured
         shell: bash
         run: |
           set -euo pipefail
-          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-            --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
-            --role="roles/logging.viewer" \
-            --condition=None \
-            --quiet
-          echo "IAM_GRANT_OK=roles/logging.viewer principal=$DIAGNOSTIC_IDENTITY scope=project"
+          BINDING="$(gcloud projects get-iam-policy "$PROJECT_ID" \
+            --flatten="bindings[].members" \
+            --filter="bindings.role=roles/logging.viewer AND bindings.members:serviceAccount:$DIAGNOSTIC_IDENTITY" \
+            --format='value(bindings.role)')"
+          [[ "$BINDING" == *"roles/logging.viewer"* ]] || {
+            echo "ERROR: roles/logging.viewer is missing for $DIAGNOSTIC_IDENTITY; grant it using an authorized project administrator"
+            exit 1
+          }
+          echo "IAM_BINDING_PRESENT=roles/logging.viewer principal=$DIAGNOSTIC_IDENTITY scope=project"
 
-      - name: Allow only OIDC token minting on the existing Scheduler invoker
+      - name: Verify OIDC-only token minting permission is configured
         shell: bash
         run: |
           set -euo pipefail
-          # OIDC-only is narrower than Service Account Token Creator; the probe
-          # must not gain OAuth access tokens, signBlob, or signJwt privileges.
-          gcloud iam service-accounts add-iam-policy-binding "$SCHEDULER_IDENTITY" \
+          BINDING="$(gcloud iam service-accounts get-iam-policy "$SCHEDULER_IDENTITY" \
             --project="$PROJECT_ID" \
-            --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
-            --role="roles/iam.serviceAccountOpenIdTokenCreator" \
-            --quiet
-          echo "IAM_GRANT_OK=roles/iam.serviceAccountOpenIdTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
+            --flatten="bindings[].members" \
+            --filter="bindings.role=roles/iam.serviceAccountOpenIdTokenCreator AND bindings.members:serviceAccount:$DIAGNOSTIC_IDENTITY" \
+            --format='value(bindings.role)')"
+          [[ "$BINDING" == *"roles/iam.serviceAccountOpenIdTokenCreator"* ]] || {
+            echo "ERROR: roles/iam.serviceAccountOpenIdTokenCreator is missing for $DIAGNOSTIC_IDENTITY on $SCHEDULER_IDENTITY; grant it using an authorized project administrator"
+            exit 1
+          }
+          echo "IAM_BINDING_PRESENT=roles/iam.serviceAccountOpenIdTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
 
       - name: Verify log access and private endpoint authentication
         shell: bash
