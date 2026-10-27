@@ -53,34 +53,13 @@ jobs:
           }
           echo "CLOUD_RESOURCE_MANAGER_API=ENABLED"
 
-      - name: Verify read-only Cloud Logging access is configured
+      - name: Explain IAM policy checks are validated by least-privilege runtime probes
         shell: bash
         run: |
           set -euo pipefail
-          BINDING="$(gcloud projects get-iam-policy "$PROJECT_ID" \
-            --flatten="bindings[].members" \
-            --filter="bindings.role=roles/logging.viewer AND bindings.members:serviceAccount:$DIAGNOSTIC_IDENTITY" \
-            --format='value(bindings.role)')"
-          [[ "$BINDING" == *"roles/logging.viewer"* ]] || {
-            echo "ERROR: roles/logging.viewer is missing for $DIAGNOSTIC_IDENTITY; grant it using an authorized project administrator"
-            exit 1
-          }
-          echo "IAM_BINDING_PRESENT=roles/logging.viewer principal=$DIAGNOSTIC_IDENTITY scope=project"
-
-      - name: Verify OIDC-only token minting permission is configured
-        shell: bash
-        run: |
-          set -euo pipefail
-          BINDING="$(gcloud iam service-accounts get-iam-policy "$SCHEDULER_IDENTITY" \
-            --project="$PROJECT_ID" \
-            --flatten="bindings[].members" \
-            --filter="bindings.role=roles/iam.serviceAccountOpenIdTokenCreator AND bindings.members:serviceAccount:$DIAGNOSTIC_IDENTITY" \
-            --format='value(bindings.role)')"
-          [[ "$BINDING" == *"roles/iam.serviceAccountOpenIdTokenCreator"* ]] || {
-            echo "ERROR: roles/iam.serviceAccountOpenIdTokenCreator is missing for $DIAGNOSTIC_IDENTITY on $SCHEDULER_IDENTITY; grant it using an authorized project administrator"
-            exit 1
-          }
-          echo "IAM_BINDING_PRESENT=roles/iam.serviceAccountOpenIdTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
+          echo "Skipping get-iam-policy inspection: the diagnostic identity is intentionally not granted project-wide IAM-policy read access."
+          echo "The following step verifies only the permissions required for diagnostics by performing a real Cloud Logging read and minting an OIDC token for the private service."
+          echo "NO_PROJECT_IAM_POLICY_READ_REQUIRED=true"
 
       - name: Verify log access and private endpoint authentication
         shell: bash
