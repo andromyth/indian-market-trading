@@ -260,3 +260,27 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     )
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
     assert saved_manifest["model_version"] == expected_base_version
+
+def test_history_seed_batches_never_mix_nifty_index_with_equities():
+    entries = [(f"STOCK{i}", f"NSE_{i}") for i in range(1, 11)]
+
+    batches = capture._history_seed_batches(entries, "NSE_99999", batch_size=5)
+
+    assert [len(batch) for batch in batches] == [5, 5, 1]
+    assert all(all(symbol != "__NIFTY50__" for symbol, _ in batch) for batch in batches[:-1])
+    assert batches[-1] == [("__NIFTY50__", "NSE_99999")]
+    assert [symbol for batch in batches[:-1] for symbol, _ in batch] == [
+        symbol for symbol, _ in entries
+    ]
+
+
+def test_history_seed_batches_work_without_nifty_index():
+    entries = [(f"STOCK{i}", f"NSE_{i}") for i in range(1, 8)]
+
+    batches = capture._history_seed_batches(entries, None, batch_size=5)
+
+    assert [len(batch) for batch in batches] == [5, 2]
+    assert [symbol for batch in batches for symbol, _ in batch] == [
+        symbol for symbol, _ in entries
+    ]
+
