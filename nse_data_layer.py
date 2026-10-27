@@ -2153,28 +2153,119 @@ def fetch_nse_bulk_symbol_history(symbol: str, start: date | datetime, end: date
     return out.sort_values("date").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
 
 EQUITY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+UNIVERSE_FALLBACK_TTL_SECONDS = 86400
+_SUPPORTED_UNIVERSE_SERIES = {"EQ", "BE", "BZ", "SM", "ST", "SZ", "GB", "RR"}
+
+
+def _indstocks_equity_universe_fallback() -> pd.DataFrame:
+    """Build a clearly labelled NSE roster from the configured broker instrument master.
+
+    Used only when NSE's official universe CSV is unreachable and no usable
+    official cache exists. The caller retains source provenance in the returned
+    frame; this fallback is for read-only live capture continuity.
+    """
+    from indstocks_client import _load_instruments
+
+    master = _load_instruments("NSE")
+    if master is None or master.empty:
+        raise RuntimeError("INDstocks returned an empty NSE instrument master")
+    frame = master.copy()
+    frame.columns = [str(c).strip().upper() for c in frame.columns]
+    symbol_col = next(
+        (c for c in ("TRADING_SYMBOL", "SYMBOL", "CH_SYMBOL") if c in frame.columns),
+        None,
+    )
+    if symbol_col is None:
+        raise RuntimeError("INDstocks instrument master has no trading symbol column")
+    if "EXCH" in frame.columns:
+        frame = frame.loc[frame["EXCH"].astype(str).str.strip().str.upper().eq("NSE")].copy()
+    if "SERIES" in frame.columns:
+        frame["SERIES"] = frame["SERIES"].astype(str).str.strip().str.upper()
+        frame = frame.loc[
+            frame["SERIES"].isin(_SUPPORTED_UNIVERSE_SERIES) | frame["SERIES"].eq("")
+        ].copy()
+        frame["_series_priority"] = frame["SERIES"].ne("EQ").astype("int8")
+    else:
+        frame["SERIES"] = ""
+        frame["_series_priority"] = 1
+    frame["SYMBOL"] = frame[symbol_col].astype(str).str.strip().str.upper()
+    frame = frame.loc[frame["SYMBOL"].ne("") & ~frame["SYMBOL"].isin({"NAN", "NONE", "SYMBOL"})]
+    if "SECURITY_ID" not in frame.columns:
+        frame["SECURITY_ID"] = ""
+    frame["SECURITY_ID"] = frame["SECURITY_ID"].astype(str).str.strip()
+    frame = frame.sort_values("_series_priority", kind="stable").drop_duplicates("SYMBOL", keep="first")
+    result = frame[["SYMBOL", "SERIES", "SECURITY_ID"]].copy()
+    result["EXCH"] = "NSE"
+    result["UNIVERSE_SOURCE"] = "INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK"
+    return result.reset_index(drop=True)
+
 
 def fetch_nse_equity_universe(force_refresh: bool = False) -> pd.DataFrame:
-    """Fetch the current NSE-listed/available-for-trading equity universe.
+    """Fetch the official NSE equity universe, with an explicit broker-master fallback.
 
-    This is the official NSE securities CSV linked from the current
-    "Securities available for Trading" page.
+    The official NSE CSV remains authoritative when available. In hosted Cloud
+    Run regions where NSE archive requests are blocked, use a cached provider
+    instrument master or rebuild it from the configured INDstocks API so live
+    capture can still identify its symbols. Fallback provenance is returned in
+    UNIVERSE_SOURCE and is never silently represented as official NSE CSV data.
     """
     cache = NORMALIZED_ROOT / "universe" / "EQUITY_L.csv"
-    if cache.exists() and not force_refresh and (time.time() - cache.stat().st_mtime) < 86400:
+    fallback_cache = NORMALIZED_ROOT / "universe" / "EQUITY_L_INDSTOCKS_FALLBACK.csv"
+    now = time.time()
+    if cache.exists() and not force_refresh and (now - cache.stat().st_mtime) < 86400:
         return pd.read_csv(cache)
+    if fallback_cache.exists() and not force_refresh and (now - fallback_cache.stat().st_mtime) < UNIVERSE_FALLBACK_TTL_SECONDS:
+        return pd.read_csv(fallback_cache)
+
     _ensure_local()
     cache.parent.mkdir(parents=True, exist_ok=True)
     try:
         r = requests.get(EQUITY_UNIVERSE_URL, headers=HEADERS, timeout=(3, 8))
         r.raise_for_status()
-        cache.write_bytes(r.content)
         df = pd.read_csv(io.BytesIO(r.content))
-    except Exception:
+        if df.empty:
+            raise RuntimeError("NSE official equity universe CSV is empty")
+        cache.write_bytes(r.content)
+        return df
+    except Exception as official_error:
+        # A stale official roster is preferable to having no universe, but do
+        # not hide its age/source from downstream diagnostics.
         if cache.exists():
-            return pd.read_csv(cache)
-        raise
-    return df
+            try:
+                stale = pd.read_csv(cache)
+                if not stale.empty:
+                    stale["UNIVERSE_SOURCE"] = "NSE_OFFICIAL_CSV_STALE_CACHE"
+                    stale["UNIVERSE_STALE_CACHE_AGE_SECONDS"] = max(
+                        0, int(time.time() - cache.stat().st_mtime)
+                    )
+                    return stale
+            except Exception:
+                pass
+        if fallback_cache.exists() and not force_refresh:
+            try:
+                fallback = pd.read_csv(fallback_cache)
+                if not fallback.empty:
+                    return fallback
+            except Exception:
+                pass
+        try:
+            fallback = _indstocks_equity_universe_fallback()
+            fallback_cache.write_text(fallback.to_csv(index=False), encoding="utf-8")
+            print(
+                "[NSE_UNIVERSE_FALLBACK] "
+                + json.dumps({
+                    "source": "INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK",
+                    "symbol_count": int(fallback["SYMBOL"].nunique()),
+                    "official_error_type": type(official_error).__name__,
+                }, sort_keys=True),
+                flush=True,
+            )
+            return fallback
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "NSE official universe fetch failed and INDstocks universe fallback "
+                f"was unavailable ({type(fallback_error).__name__})"
+            ) from official_error
 
 def nse_equity_symbols(force_refresh: bool = False) -> list[str]:
     df = fetch_nse_equity_universe(force_refresh=force_refresh)
