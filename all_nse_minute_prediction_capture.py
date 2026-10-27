@@ -1135,6 +1135,9 @@ class AllNSEMinutePredictor:
             history_ready = self._seed_ready
             history_seed_complete = self._seed_complete
             seed_status = self._seed_status
+            seed_coverage_symbols = self._seed_coverage
+            seed_failed_batches = self._seed_errors
+            seed_universe_source = self._seed_universe_source
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
             market_history = self._market_history.copy()
         # Capture every symbol in the official universe even if quote data is missing.
@@ -1455,8 +1458,8 @@ class AllNSEMinutePredictor:
         data_limited_fraction = data_limited_count / expected_count
         untrained_fraction = untrained_symbol_count / expected_count
         model_failure_fraction = model_failures / expected_count
-        seed_coverage_fraction = self._seed_coverage / expected_count
-        seed_failure_fraction = self._seed_errors / seed_batch_count
+        seed_coverage_fraction = seed_coverage_symbols / expected_count
+        seed_failure_fraction = seed_failed_batches / seed_batch_count
         refresh_failure_fraction = refresh_failed_batches / refresh_batch_count if refresh_batch_count else 1.0
         model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
         quality_gate_pass = bool(
@@ -1493,13 +1496,13 @@ class AllNSEMinutePredictor:
             "trained_symbol_manifest_available": trained_symbol_manifest_available,
             "model_artifact_verified": model_artifact_verified,
             "model_target": "target_30m",
-            "model_status": self._seed_status,
+            "model_status": seed_status,
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,
-            "history_seed_universe_source": self._seed_universe_source,
-            "history_seed_coverage_symbols": self._seed_coverage,
+            "history_seed_universe_source": seed_universe_source,
+            "history_seed_coverage_symbols": seed_coverage_symbols,
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
-            "history_seed_failed_batches": self._seed_errors,
+            "history_seed_failed_batches": seed_failed_batches,
             "history_seed_failure_fraction": round(seed_failure_fraction, 6),
             "history_refresh_status": history_refresh.get("status"),
             "history_refresh_batch_count": refresh_batch_count,
@@ -1535,9 +1538,9 @@ class AllNSEMinutePredictor:
                 **persisted,
                 "status": persisted.get("status"),
                 "history_ready": self._seed_ready,
-                "history_seed_complete": self._seed_complete,
+                "history_seed_complete": history_seed_complete,
                 "universe_symbols": len(self._symbols) or len(symbols),
-                "history_symbols": self._seed_coverage,
+                "history_symbols": seed_coverage_symbols,
                 "last_capture_minute_ist": minute.isoformat(),
                 "last_prediction_count": prediction_count,
                 "last_persistence_status": persisted.get("status"),
@@ -1553,6 +1556,8 @@ class AllNSEMinutePredictor:
             data_limited_count=data_limited_count,
             history_ready=history_ready,
             history_seed_complete=history_seed_complete,
+            history_seed_coverage_symbols=seed_coverage_symbols,
+            history_seed_failed_batches=seed_failed_batches,
             status=persisted.get("status"),
             remote_path=persisted.get("remote_path"),
             error=persisted.get("error"),
