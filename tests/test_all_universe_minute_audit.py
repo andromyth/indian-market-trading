@@ -2,17 +2,37 @@ from __future__ import annotations
 
 from datetime import date
 
+import pandas as pd
+
 from audit_all_universe_minute_snapshots import build_audit_report, build_prediction_audit, expected_minutes
+
+
+def _snapshot_frame(total=2, incomplete=0):
+    rows = []
+    complete_count = total - incomplete
+    for index in range(total):
+        complete = index < complete_count
+        rows.append({
+            "symbol": f"SYM{index:04d}",
+            "instrument_code": f"NSE_{1000 + index}",
+            "quote_status": "PASS" if complete else "MISSING_QUOTE",
+            "actual_observed_price": 100.0 + index if complete else None,
+            "quote_observed_at_utc": "2026-10-16T03:45:00+00:00",
+        })
+    return pd.DataFrame(rows)
 
 
 def _complete_day_files(session_date):
     files = []
     manifests = {}
+    snapshots = {}
     for index, key in enumerate(expected_minutes(session_date)):
+        snapshot_id = f"snapshot-{key}"
         files.append({
-            "id": f"snapshot-{key}",
+            "id": snapshot_id,
             "name": f"snapshot_{key}.parquet",
         })
+        snapshots[snapshot_id] = _snapshot_frame()
         manifest_id = f"manifest-{key}"
         files.append({
             "id": manifest_id,
@@ -29,7 +49,7 @@ def _complete_day_files(session_date):
             "matched_outcome_count": 2,
             "pending_snapshot_recovery": {"errors": []},
         }
-    return files, manifests
+    return files, manifests, snapshots
 
 
 def test_expected_minutes_cover_open_through_last_five_minute_slot():
@@ -45,9 +65,10 @@ def test_expected_minutes_cover_open_through_last_five_minute_slot():
 
 def test_audit_passes_only_when_every_snapshot_and_manifest_is_present():
     session_date = date(2026, 10, 16)
-    files, manifests = _complete_day_files(session_date)
+    files, manifests, snapshots = _complete_day_files(session_date)
     report, rows = build_audit_report(
-        session_date, files, lambda file_id: manifests[file_id]
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["expected_minutes"] == 75
     assert report["snapshot_files_present"] == 75
@@ -60,50 +81,84 @@ def test_audit_passes_only_when_every_snapshot_and_manifest_is_present():
 
 def test_audit_fails_when_a_minute_snapshot_is_missing():
     session_date = date(2026, 10, 16)
-    files, manifests = _complete_day_files(session_date)
+    files, manifests, snapshots = _complete_day_files(session_date)
     missing_key = "20261016_1005"
     files = [
         item for item in files
         if item["name"] != f"snapshot_{missing_key}.parquet"
     ]
     report, _ = build_audit_report(
-        session_date, files, lambda file_id: manifests[file_id]
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["quality_gate_pass"] is False
     assert missing_key in report["missing_snapshot_minutes"]
 
 
 
-def test_snapshot_capture_passes_with_more_than_90_percent_quote_coverage_even_if_slots_are_partial():
+def test_snapshot_capture_requires_more_than_90_percent_complete_symbols_in_every_slot():
     session_date = date(2026, 10, 16)
-    files, manifests = _complete_day_files(session_date)
+    files, manifests, snapshots = _complete_day_files(session_date)
     keys = expected_minutes(session_date)
 
-    # Five slots each miss one of two quotes; aggregate coverage remains >90%.
+    # Five slots each have only 1 of 2 complete symbols. Although whole-day
+    # average quote coverage is high, these five individual snapshots must fail.
     for key in keys[:5]:
         manifest = manifests[f"manifest-{key}"]
         manifest.update({
             "status": "PARTIAL",
             "quoted_symbol_count": 1,
             "missing_quote_count": 1,
-            "unmapped_symbol_count": 1,
+            "unmapped_symbol_count": 0,
         })
+        snapshots[f"snapshot-{key}"] = _snapshot_frame(total=2, incomplete=1)
 
     report, _ = build_audit_report(
-        session_date, files, lambda file_id: manifests[file_id]
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["observed_quote_coverage_pct"] > 90.0
+    assert report["minimum_complete_symbol_coverage_pct"] == 50.0
+    assert set(keys[:5]).issubset(report["failed_symbol_completeness_minutes"])
+    assert report["capture_quality_gate_pass"] is False
+    assert report["snapshot_quality_gate_pass"] is False
+    assert report["quality_gate_pass"] is False
+    assert report["audit_status"] == "NEEDS_ATTENTION"
+
+
+def test_snapshot_capture_passes_when_each_slot_has_more_than_90_percent_complete_symbols():
+    session_date = date(2026, 10, 16)
+    files, manifests, snapshots = _complete_day_files(session_date)
+
+    # 10 of 11 symbols have complete rows in every five-minute snapshot.
+    for key in expected_minutes(session_date):
+        manifest = manifests[f"manifest-{key}"]
+        manifest.update({
+            "status": "PARTIAL",
+            "expected_symbol_count": 11,
+            "quoted_symbol_count": 10,
+            "missing_quote_count": 1,
+            "unmapped_symbol_count": 0,
+        })
+        snapshots[f"snapshot-{key}"] = _snapshot_frame(total=11, incomplete=1)
+
+    report, _ = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
+    )
+    assert report["minimum_complete_symbol_coverage_pct"] > 90.0
+    assert report["all_slots_meet_symbol_completeness_threshold"] is True
     assert report["capture_quality_gate_pass"] is True
     assert report["snapshot_quality_gate_pass"] is True
     assert report["quality_gate_pass"] is True
     assert report["audit_status"] == "PASS"
 
 
-def test_snapshot_capture_does_not_pass_at_exactly_90_percent_quote_coverage():
+def test_snapshot_capture_does_not_pass_at_exactly_90_percent_complete_symbols():
     session_date = date(2026, 10, 16)
-    files, manifests = _complete_day_files(session_date)
+    files, manifests, snapshots = _complete_day_files(session_date)
 
-    # Each slot has 9/10 quoted symbols: exactly 90%, not more than 90%.
+    # Every slot has 9 of 10 symbols complete: exactly 90%, not greater than 90%.
     for key in expected_minutes(session_date):
         manifest = manifests[f"manifest-{key}"]
         manifest.update({
@@ -111,13 +166,16 @@ def test_snapshot_capture_does_not_pass_at_exactly_90_percent_quote_coverage():
             "expected_symbol_count": 10,
             "quoted_symbol_count": 9,
             "missing_quote_count": 1,
-            "unmapped_symbol_count": 1,
+            "unmapped_symbol_count": 0,
         })
+        snapshots[f"snapshot-{key}"] = _snapshot_frame(total=10, incomplete=1)
 
     report, _ = build_audit_report(
-        session_date, files, lambda file_id: manifests[file_id]
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["observed_quote_coverage_pct"] == 90.0
+    assert report["minimum_complete_symbol_coverage_pct"] == 90.0
     assert report["capture_quality_gate_pass"] is False
     assert report["quality_gate_pass"] is False
     assert report["audit_status"] == "NEEDS_ATTENTION"
@@ -125,13 +183,14 @@ def test_snapshot_capture_does_not_pass_at_exactly_90_percent_quote_coverage():
 
 def test_audit_accepts_recovered_drive_write_when_artifacts_are_present():
     session_date = date(2026, 10, 16)
-    files, manifests = _complete_day_files(session_date)
+    files, manifests, snapshots = _complete_day_files(session_date)
     recovered_key = "20261016_1005"
     recovered_id = f"manifest-{recovered_key}"
     manifests[recovered_id]["status"] = "PERSISTENCE_ERROR"
 
     report, _ = build_audit_report(
-        session_date, files, lambda file_id: manifests[file_id]
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
     )
     assert report["quality_gate_pass"] is True
     assert recovered_key in report["recovered_persistence_issue_minutes"]
