@@ -121,10 +121,14 @@ jobs:
           print("WORKER_HEALTH_DRIVE_AUTH_METHOD="+str(drive.get("write_auth_method") or drive.get("auth_method")))
           print("WORKER_HEALTH_CAPTURE_STATUS="+str(data.get("all_universe_capture_status")))
           print("WORKER_HEALTH_PREDICTION_STATUS="+str(data.get("all_nse_minute_prediction_status")))
-          if code != "200" or data.get("drive_preflight_status") != "OK" or drive.get("write_ready") is not True or drive.get("reachable") is False:
-              print("WORKER_HEALTH_VERDICT=FAIL")
+          # The root endpoint intentionally returns HTTP 503 when live
+          # capture/prediction quality is degraded. This step is specifically
+          # the Drive write-preflight gate; detailed capture and prediction
+          # readiness are evaluated in the next probe step.
+          if data.get("drive_preflight_status") != "OK" or drive.get("write_ready") is not True or drive.get("reachable") is False:
+              print("DRIVE_WRITE_PREFLIGHT=FAIL")
               sys.exit(1)
-          print("WORKER_HEALTH_VERDICT=PASS")
+          print("DRIVE_WRITE_PREFLIGHT=PASS")
           PY
 
       - name: Probe private quote and prediction diagnostics without overstating off-session readiness
