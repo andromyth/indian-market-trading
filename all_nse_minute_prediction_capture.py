@@ -479,14 +479,24 @@ class AllNSEMinutePredictor:
                                 # Honor the provider's five-request/second limit and
                                 # back off if a transient 429/5xx occurs.
                                 time.sleep(0.6 * (attempt + 1))
+                    is_nifty_batch = len(batch) == 1 and batch[0][0] == "__NIFTY50__"
                     if batch_error:
-                        batch_errors += 1
-                        self._log(
-                            "all_nse_history_batch_failed",
-                            batch_index=batch_index,
-                            batch_size=len(batch),
-                            error=batch_error,
-                        )
+                        if is_nifty_batch:
+                            # NIFTY context is optional to the stock-universe seed;
+                            # a provider-specific index error must not count as a
+                            # failed stock history batch.
+                            self._log(
+                                "all_nse_nifty_history_seed_failed",
+                                error_type=batch_error.split(":", 1)[0],
+                            )
+                        else:
+                            batch_errors += 1
+                            self._log(
+                                "all_nse_history_batch_failed",
+                                batch_index=batch_index,
+                                batch_size=len(batch),
+                                error=batch_error,
+                            )
                     else:
                         data = body.get("data") or {}
                         for symbol, code in batch:
@@ -496,9 +506,86 @@ class AllNSEMinutePredictor:
                                 # Do not seed a still-forming candle; the live quote is
                                 # appended as a separately timestamped partial row.
                                 frame = frame.loc[frame.index < now.floor("min")]
-                                histories[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
+                                if not frame.empty:
+                                    histories[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
                     if batch_index < len(batches):
                         time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
+
+                # Retry missing equity histories individually. The provider may
+                # reject one malformed/stale code in a multi-symbol request; this
+                # salvages the other symbols and brings coverage back above its
+                # existing threshold when the source actually has candles.
+                historical_coverage = sum(
+                    1 for symbol in symbols
+                    if symbol in histories and not histories[symbol].empty
+                )
+                coverage_target = min(
+                    len(symbols),
+                    int(np.ceil(len(symbols) * MIN_HISTORY_SEED_COVERAGE)),
+                )
+                targeted_attempts = 0
+                targeted_recovered = 0
+                targeted_errors = 0
+                missing_entries = [
+                    (symbol, code) for symbol, code in entries
+                    if symbol not in histories or histories[symbol].empty
+                ]
+                max_targeted_attempts = min(40, len(missing_entries))
+                for symbol, code in missing_entries[:max_targeted_attempts]:
+                    if historical_coverage >= coverage_target:
+                        break
+                    targeted_attempts += 1
+                    try:
+                        retry_body = _request(
+                            "GET",
+                            "/market/historical/1minute",
+                            params={
+                                "scrip-codes": code,
+                                "start_time": start_ms,
+                                "end_time": end_ms,
+                            },
+                        ).json()
+                        requests_made += 1
+                        retry_success = isinstance(retry_body, dict) and (
+                            retry_body.get("success") is True
+                            or str(retry_body.get("status") or "").strip().lower() == "success"
+                        )
+                        if not retry_success:
+                            raise RuntimeError("single-symbol historical response did not report success")
+                        retry_instrument = (retry_body.get("data") or {}).get(code) or {}
+                        retry_frame = self._parse_candles(
+                            retry_instrument.get("candles") or []
+                        )
+                        if not retry_frame.empty:
+                            retry_frame = retry_frame.loc[
+                                retry_frame.index < now.floor("min")
+                            ]
+                        if not retry_frame.empty:
+                            histories[symbol] = retry_frame.tail(HISTORY_LOOKBACK_BARS)
+                            historical_coverage += 1
+                            targeted_recovered += 1
+                    except Exception as exc:
+                        targeted_errors += 1
+                        # Avoid flooding Cloud Logging when a large tail of the
+                        # official universe has no usable minute history.
+                        if targeted_errors <= 3:
+                            self._log(
+                                "all_nse_history_targeted_retry_failed",
+                                symbol=symbol,
+                                error_type=type(exc).__name__,
+                            )
+                    if targeted_attempts < max_targeted_attempts:
+                        time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
+
+                self._log(
+                    "all_nse_history_seed_repair_summary",
+                    initial_batch_errors=batch_errors,
+                    targeted_attempts=targeted_attempts,
+                    targeted_recovered=targeted_recovered,
+                    targeted_errors=targeted_errors,
+                    history_symbols_after_repair=historical_coverage,
+                    history_coverage_target=coverage_target,
+                )
 
                 # Count only actual historical API results, not live quote rows
                 # buffered while the potentially long bootstrap is in progress.
