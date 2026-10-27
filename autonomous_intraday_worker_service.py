@@ -311,6 +311,80 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
     return (200 if not reasons else 503), payload
 
 
+
+def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
+    """Verify the worker's own read-only market-data credentials without exposing secrets."""
+    from indstocks_client import (
+        configured,
+        historical_1m,
+        latest_quote,
+        profile,
+        _load_instruments,
+    )
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "probe": "indstocks_provider_health",
+        "checked_at_utc": checked_at,
+        "status": "degraded",
+        "checks": {},
+    }
+    if not configured():
+        payload["reason"] = "INDstocks credentials are not configured in the worker runtime."
+        payload["checks"]["credentials_configured"] = False
+        return 503, payload
+    payload["checks"]["credentials_configured"] = True
+
+    # Never return profile fields, access tokens, quote values, or provider response bodies.
+    try:
+        profile()
+        payload["checks"]["profile_authentication"] = "PASS"
+    except Exception as exc:
+        payload["checks"]["profile_authentication"] = "FAIL"
+        payload["failed_check"] = "profile_authentication"
+        payload["error_type"] = type(exc).__name__
+        return 503, payload
+
+    try:
+        instruments = _load_instruments("NSE")
+        if instruments is None or instruments.empty:
+            raise RuntimeError("empty instrument master")
+        payload["checks"]["nse_instrument_master"] = "PASS"
+        payload["nse_instrument_count"] = int(len(instruments))
+    except Exception as exc:
+        payload["checks"]["nse_instrument_master"] = "FAIL"
+        payload["failed_check"] = "nse_instrument_master"
+        payload["error_type"] = type(exc).__name__
+        return 503, payload
+
+    try:
+        quote = latest_quote("RELIANCE.NS")
+        price = quote.get("live_price", quote.get("ltp"))
+        if price is None or float(price) <= 0:
+            raise RuntimeError("no valid live price")
+        payload["checks"]["single_equity_quote"] = "PASS"
+    except Exception as exc:
+        payload["checks"]["single_equity_quote"] = "FAIL"
+        payload["failed_check"] = "single_equity_quote"
+        payload["error_type"] = type(exc).__name__
+        return 503, payload
+
+    try:
+        candles = historical_1m("RELIANCE.NS", days=3)
+        if candles is None or candles.empty:
+            raise RuntimeError("no one-minute history returned")
+        payload["checks"]["one_minute_history"] = "PASS"
+        payload["one_minute_history_rows"] = int(len(candles))
+        payload["latest_one_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
+    except Exception as exc:
+        payload["checks"]["one_minute_history"] = "FAIL"
+        payload["failed_check"] = "one_minute_history"
+        payload["error_type"] = type(exc).__name__
+        return 503, payload
+
+    payload["status"] = "ok"
+    return 200, payload
+
 def _preflight() -> dict[str, Any]:
     """Check Drive outside the listener's startup path and retain safe diagnostics.
 
@@ -383,6 +457,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/providerz":
+            code, payload = _indstocks_provider_diagnostic()
+            self._send_json(code, payload)
+            return
         if self.path in {"/capturez", "/predictionz"}:
             code, payload = _capture_diagnostic(self.path)
             self._send_json(code, payload)
