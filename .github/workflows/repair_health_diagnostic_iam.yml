@@ -33,6 +33,18 @@ jobs:
         with:
           project_id: indian-market-trading
 
+      - name: Ensure Cloud Resource Manager API is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gcloud services describe cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --format='value(state)' 2>/dev/null | grep -qx ENABLED; then
+            echo "CLOUD_RESOURCE_MANAGER_API_ENABLE_ATTEMPT=true"
+            gcloud services enable cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --quiet
+          fi
+          STATE="$(gcloud services describe cloudresourcemanager.googleapis.com --project="$PROJECT_ID" --format='value(state)')"
+          [[ "$STATE" == "ENABLED" ]] || { echo "ERROR: Cloud Resource Manager API state=$STATE"; exit 1; }
+          echo "CLOUD_RESOURCE_MANAGER_API=ENABLED"
+
       - name: Grant read-only Cloud Logging access to the diagnostic identity
         shell: bash
         run: |
@@ -48,8 +60,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Do not grant Service Account Token Creator: the probe needs only
-          # OIDC ID tokens, not OAuth access tokens, signBlob, or signJwt.
+          # OIDC-only is narrower than Service Account Token Creator; the probe
+          # must not gain OAuth access tokens, signBlob, or signJwt privileges.
           gcloud iam service-accounts add-iam-policy-binding "$SCHEDULER_IDENTITY" \
             --project="$PROJECT_ID" \
             --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
