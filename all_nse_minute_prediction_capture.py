@@ -47,6 +47,28 @@ MIN_HISTORY_SEED_COVERAGE = 0.90
 MAX_HISTORY_FAILURE_FRACTION = 0.05
 
 
+def _history_seed_batches(
+    stock_entries: list[tuple[str, str]],
+    nifty_code: str | None,
+    batch_size: int = HISTORY_BATCH_SIZE,
+) -> list[list[tuple[str, str]]]:
+    """Batch equity history together, but keep the NIFTY index token separate.
+
+    INDstocks can reject a mixed equity+index history request with HTTP 400.
+    The index is context only and must never consume or invalidate an equity
+    batch.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    batches = [
+        stock_entries[offset:offset + batch_size]
+        for offset in range(0, len(stock_entries), batch_size)
+    ]
+    if nifty_code:
+        batches.append([("__NIFTY50__", nifty_code)])
+    return batches
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None or pd.isna(value):
@@ -422,14 +444,12 @@ class AllNSEMinutePredictor:
                 start_ms = int(start.timestamp() * 1000)
                 end_ms = int(end.timestamp() * 1000)
                 entries = [(symbol, codes[symbol]) for symbol in symbols if symbol in codes]
-                if nifty_code:
-                    entries.append(("__NIFTY50__", nifty_code))
+                batches = _history_seed_batches(entries, nifty_code, HISTORY_BATCH_SIZE)
 
                 histories: dict[str, pd.DataFrame] = {}
                 batch_errors = 0
                 requests_made = 0
-                for offset in range(0, len(entries), HISTORY_BATCH_SIZE):
-                    batch = entries[offset:offset + HISTORY_BATCH_SIZE]
+                for batch_index, batch in enumerate(batches, start=1):
                     code_list = [code for _, code in batch]
                     body = None
                     batch_error = None
@@ -463,7 +483,7 @@ class AllNSEMinutePredictor:
                         batch_errors += 1
                         self._log(
                             "all_nse_history_batch_failed",
-                            batch_index=offset // HISTORY_BATCH_SIZE + 1,
+                            batch_index=batch_index,
                             batch_size=len(batch),
                             error=batch_error,
                         )
@@ -477,7 +497,7 @@ class AllNSEMinutePredictor:
                                 # appended as a separately timestamped partial row.
                                 frame = frame.loc[frame.index < now.floor("min")]
                                 histories[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
-                    if offset + HISTORY_BATCH_SIZE < len(entries):
+                    if batch_index < len(batches):
                         time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
 
                 # Count only actual historical API results, not live quote rows
