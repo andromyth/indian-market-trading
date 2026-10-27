@@ -80,10 +80,20 @@ jobs:
                   name=item.get("name")
                   source=item.get("valueSource") or {}
                   secret=(source.get("secretKeyRef") or {})
+                  if not secret:
+                      secret=((item.get("valueFrom") or {}).get("secretKeyRef") or {})
                   if secret:
-                      entry={"container_index":index,"env_name":name,"source_type":"secretKeyRef","secret_name":secret.get("secret"),"secret_version":secret.get("version")}
+                      entry={
+                          "container_index":index,
+                          "env_name":name,
+                          "source_type":"secretKeyRef",
+                          "secret_name":secret.get("secret") or secret.get("name"),
+                          "secret_version":secret.get("version") or secret.get("key") or "latest"
+                      }
+                  elif "value" in item and item.get("value") not in (None, ""):
+                      entry={"container_index":index,"env_name":name,"source_type":"literal_value","literal_value":"REDACTED"}
                   else:
-                      entry={"container_index":index,"env_name":name,"source_type":"literal_or_other","literal_value":"REDACTED"}
+                      entry={"container_index":index,"env_name":name,"source_type":"unset_or_unknown","literal_value":"REDACTED"}
                   print("SAFE_RUNTIME_ENV_REFERENCE="+json.dumps(entry,sort_keys=True))
           PY
           else
