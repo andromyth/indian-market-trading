@@ -284,3 +284,41 @@ def test_history_seed_batches_work_without_nifty_index():
         symbol for symbol, _ in entries
     ]
 
+def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp_path, monkeypatch):
+    import requests
+    import nse_data_layer
+
+    monkeypatch.setattr(nse_data_layer, "NORMALIZED_ROOT", tmp_path / "normalized")
+    monkeypatch.setattr(nse_data_layer, "RAW_ROOT", tmp_path / "raw")
+
+    def blocked_archive(*_args, **_kwargs):
+        raise requests.HTTPError("403 Forbidden")
+
+    def fake_instruments(exchange):
+        assert exchange == "NSE"
+        return pd.DataFrame([
+            {"TRADING_SYMBOL": "AAA", "SECURITY_ID": "100", "EXCH": "NSE", "SERIES": "EQ"},
+            {"TRADING_SYMBOL": "BBB", "SECURITY_ID": "200", "EXCH": "NSE", "SERIES": "BE"},
+            {"TRADING_SYMBOL": "BBB", "SECURITY_ID": "201", "EXCH": "NSE", "SERIES": "EQ"},
+            {"TRADING_SYMBOL": "IGNORED", "SECURITY_ID": "300", "EXCH": "BSE", "SERIES": "EQ"},
+            {"TRADING_SYMBOL": "T0TEST", "SECURITY_ID": "400", "EXCH": "NSE", "SERIES": "T0"},
+        ])
+
+    monkeypatch.setattr(nse_data_layer.requests, "get", blocked_archive)
+    monkeypatch.setattr("indstocks_client._load_instruments", fake_instruments)
+
+    first = nse_data_layer.fetch_nse_equity_universe(force_refresh=True)
+    assert set(first["SYMBOL"]) == {"AAA", "BBB"}
+    assert first["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
+    assert first.loc[first["SYMBOL"].eq("BBB"), "SECURITY_ID"].iloc[0] == "201"
+
+    # A fresh fallback cache avoids repeatedly hitting the NSE archive during
+    # every five-minute tick while that endpoint remains blocked.
+    def should_not_call_archive(*_args, **_kwargs):
+        raise AssertionError("cached universe should be used while fresh")
+
+    monkeypatch.setattr(nse_data_layer.requests, "get", should_not_call_archive)
+    second = nse_data_layer.fetch_nse_equity_universe(force_refresh=False)
+    assert set(second["SYMBOL"]) == {"AAA", "BBB"}
+    assert second["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
+
