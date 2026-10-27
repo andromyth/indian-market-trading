@@ -102,7 +102,7 @@ jobs:
           fi
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
-          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/healthz")" || HTTP_CODE=000
+          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/")" || HTTP_CODE=000
           echo "WORKER_HEALTH_HTTP_STATUS=$HTTP_CODE"
           python - "$RESPONSE" "$HTTP_CODE" <<'PY'
           import json, sys
