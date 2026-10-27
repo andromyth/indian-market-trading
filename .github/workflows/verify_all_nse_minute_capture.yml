@@ -160,6 +160,7 @@ jobs:
           echo "NATURAL_TICK_PREVIOUS_ATTEMPT=$BEFORE"
           for attempt in $(seq 1 72); do
             JOB_JSON="$(gcloud scheduler jobs describe "$JOB_NAME" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+            set +e
             CHECK="$(printf '%s' "$JOB_JSON" | python -c '
           import datetime, json, sys
           job=json.load(sys.stdin)
@@ -180,7 +181,9 @@ jobs:
           }, sort_keys=True))
           sys.exit(0 if newer else 1)
           ' "$BEFORE")"
-            if printf '%s' "$CHECK" | grep -q '"new_attempt": true'; then
+            CHECK_RC=$?
+            set -e
+            if [[ $CHECK_RC -eq 0 ]] && printf '%s' "$CHECK" | grep -q '"new_attempt": true'; then
               echo "NATURAL_TICK_OBSERVED=$CHECK"
               echo "The authenticated scheduler invoked the private worker; the following step checks its saved capture results."
               exit 0
