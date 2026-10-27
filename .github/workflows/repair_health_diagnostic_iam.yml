@@ -1,0 +1,90 @@
+name: Repair health diagnostic IAM access
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/repair_health_diagnostic_iam.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  repair-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+      DIAGNOSTIC_IDENTITY: google-service-account-json@indian-market-trading.iam.gserviceaccount.com
+      SCHEDULER_IDENTITY: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Grant read-only Cloud Logging access to the diagnostic identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
+            --role="roles/logging.viewer" \
+            --condition=None \
+            --quiet
+          echo "IAM_GRANT_OK=roles/logging.viewer principal=$DIAGNOSTIC_IDENTITY scope=project"
+
+      - name: Allow OIDC token minting only for the existing Scheduler invoker
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud iam service-accounts add-iam-policy-binding "$SCHEDULER_IDENTITY" \
+            --project="$PROJECT_ID" \
+            --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
+            --role="roles/iam.serviceAccountTokenCreator" \
+            --quiet
+          echo "IAM_GRANT_OK=roles/iam.serviceAccountTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
+
+      - name: Verify log access and private endpoint authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\"" \
+            --project="$PROJECT_ID" --limit=1 --format='value(timestamp)' >/dev/null
+          echo "CLOUD_LOGGING_ACCESS=PASS"
+
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SCHEDULER_IDENTITY" --audiences="$SERVICE_URL" 2>/dev/null)"
+          [[ -n "$TOKEN" ]] || { echo "ERROR: unable to mint health-probe OIDC token"; exit 1; }
+
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
+          for endpoint in capturez predictionz; do
+            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/$endpoint")"
+            python - "$RESPONSE" "$endpoint" "$CODE" <<'PY'
+          import json, sys
+          path, endpoint, code = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              body = json.load(handle)
+          expected = "all_nse_quote_capture" if endpoint == "capturez" else "all_nse_minute_prediction_actual"
+          if body.get("probe") != expected:
+              raise SystemExit(f"ENDPOINT_AUTH_FAILED endpoint=/{endpoint} http={code} response={body}")
+          print(f"ENDPOINT_AUTH=PASS endpoint=/{endpoint} http={code} diagnostic_status={body.get('status')}")
+          if code not in {"200", "503"}:
+              raise SystemExit(f"UNEXPECTED_HTTP_STATUS endpoint=/{endpoint} http={code}")
+          PY
+          done
+          echo "IAM_DIAGNOSTIC_REPAIR=PASS"
