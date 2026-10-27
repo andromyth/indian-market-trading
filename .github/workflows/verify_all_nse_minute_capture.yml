@@ -131,6 +131,65 @@ jobs:
           print("DRIVE_WRITE_PREFLIGHT=PASS")
           PY
 
+      - name: Wait for the next naturally scheduled capture tick after deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r SESSION_ACTIVE JOB_NAME <<< "$(python - <<'PY'
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          active = now.weekday() < 5 and time(9, 15) <= now.time() < time(15, 30)
+          minutes = now.hour * 60 + now.minute
+          if not active:
+              print("false NONE")
+          elif minutes <= 9 * 60 + 55:
+              print("true intraday-worker-0915-0959")
+          elif minutes < 15 * 60:
+              print("true intraday-worker-1000-1459")
+          else:
+              print("true intraday-worker-1500-1530")
+          PY
+          )"
+          if [[ "$SESSION_ACTIVE" != "true" ]]; then
+            echo "NATURAL_TICK_WAIT=SKIPPED_OUTSIDE_NSE_SESSION"
+            exit 0
+          fi
+          echo "NATURAL_TICK_JOB=$JOB_NAME"
+          BEFORE="$(gcloud scheduler jobs describe "$JOB_NAME" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
+          echo "NATURAL_TICK_PREVIOUS_ATTEMPT=$BEFORE"
+          for attempt in $(seq 1 72); do
+            JOB_JSON="$(gcloud scheduler jobs describe "$JOB_NAME" --project="$PROJECT_ID" --location="$REGION" --format=json)"
+            CHECK="$(printf '%s' "$JOB_JSON" | python -c '
+          import datetime, json, sys
+          job=json.load(sys.stdin)
+          def parse(v):
+              try:
+                  return datetime.datetime.fromisoformat(str(v).replace("Z","+00:00")) if v else None
+              except (TypeError, ValueError):
+                  return None
+          before=parse(sys.argv[1])
+          attempted=parse(job.get("lastAttemptTime"))
+          newer=attempted is not None and (before is None or attempted > before)
+          status=job.get("status") or {}
+          print(json.dumps({
+              "new_attempt": newer,
+              "lastAttemptTime": job.get("lastAttemptTime"),
+              "last_attempt_code": status.get("code"),
+              "last_attempt_message": str(status.get("message") or "")[:200],
+          }, sort_keys=True))
+          sys.exit(0 if newer else 1)
+          ' "$BEFORE")"
+            if printf '%s' "$CHECK" | grep -q '"new_attempt": true'; then
+              echo "NATURAL_TICK_OBSERVED=$CHECK"
+              echo "The authenticated scheduler invoked the private worker; the following step checks its saved capture results."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: no new natural Cloud Scheduler attempt occurred within 6 minutes."
+          exit 1
+
       - name: Probe private quote and prediction diagnostics without overstating off-session readiness
         shell: bash
         run: |
