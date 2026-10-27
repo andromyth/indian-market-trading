@@ -263,6 +263,45 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
 
 
 
+def test_missing_nifty_context_does_not_break_timestamp_filtering():
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    # Empty frames from pandas default to RangeIndex; comparing that index to
+    # a Timestamp previously raised TypeError for almost every symbol.
+    empty_range_index = pd.DataFrame(
+        columns=["Open", "High", "Low", "Close", "Volume"]
+    )
+
+    empty_market = capture.AllNSEMinutePredictor._market_history_before(
+        empty_range_index,
+        minute,
+    )
+
+    assert empty_market.empty
+    assert isinstance(empty_market.index, pd.DatetimeIndex)
+    assert str(empty_market.index.tz) == "Asia/Kolkata"
+
+    index = pd.date_range(
+        minute - pd.Timedelta(minutes=1),
+        periods=3,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    market = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [10.0, 12.0, 11.0],
+        },
+        index=index,
+    )
+    before = capture.AllNSEMinutePredictor._market_history_before(market, minute)
+    assert len(before) == 1
+    assert before.index.max() == minute - pd.Timedelta(minutes=1)
+
+
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     predictor._symbols = ["AAA", "BBB", "CCC"]
