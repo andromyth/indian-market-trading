@@ -69,6 +69,37 @@ def _history_seed_batches(
     return batches
 
 
+def _history_seed_universe(
+    official_symbols: list[str] | None,
+    instrument_codes: dict[str, str],
+) -> tuple[list[str], str]:
+    """Resolve the history-seed roster, with a provider-master fallback.
+
+    The live capture can continue using the official NSE roster, but the
+    background feature warm-up must not be permanently blocked when NSE's
+    EQUITY_L.csv endpoint returns 403. Its fallback is limited to NSE equity
+    symbols already mapped by the validated INDstocks instrument master.
+    """
+    official = sorted({
+        str(symbol).strip().upper().replace(".NS", "")
+        for symbol in (official_symbols or [])
+        if str(symbol).strip()
+    })
+    if official:
+        return official, "NSE_OFFICIAL_EQUITY_L"
+
+    fallback = sorted({
+        str(symbol).strip().upper().replace(".NS", "")
+        for symbol in instrument_codes
+        if str(symbol).strip()
+    })
+    if fallback:
+        return fallback, "INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK"
+    raise RuntimeError(
+        "Neither the official NSE equity roster nor the INDstocks NSE instrument master yielded symbols"
+    )
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None or pd.isna(value):
@@ -238,6 +269,7 @@ class AllNSEMinutePredictor:
         self._seed_ready = False
         self._seed_status = "NOT_STARTED"
         self._seed_error: str | None = None
+        self._seed_universe_source = "NOT_SET"
         self._seed_coverage = 0
         self._seed_errors = 0
         self._symbols: list[str] = []
@@ -294,6 +326,7 @@ class AllNSEMinutePredictor:
                 "history_seed_coverage_symbols": self._seed_coverage,
                 "history_seed_failed_batches": self._seed_errors,
                 "history_seed_error": self._seed_error,
+                "history_seed_universe_source": self._seed_universe_source,
                 "trained_symbol_count": len(self._trained_symbols),
             })
 
@@ -425,17 +458,46 @@ class AllNSEMinutePredictor:
 
                 if not configured():
                     raise RuntimeError("INDstocks credentials are not configured")
-                symbols = sorted({
-                    str(s).strip().upper().replace(".NS", "")
-                    for s in official_nse_symbols(force_refresh=False)
-                    if str(s).strip()
-                })
+                # Load the validated provider instrument master first. If the NSE
+                # archive roster is blocked (for example HTTP 403 on EQUITY_L.csv),
+                # use the mapped NSE equity symbols for model warm-up instead of
+                # leaving this revision with a zero-symbol predictor.
                 codes = _instrument_map()
-                nifty_code = self._nifty_instrument_code()
+                official_universe_error = None
+                try:
+                    official_symbols = official_nse_symbols(force_refresh=False)
+                except Exception as exc:
+                    official_symbols = []
+                    official_universe_error = exc
+                symbols, universe_source = _history_seed_universe(
+                    official_symbols,
+                    codes,
+                )
+                if official_universe_error is not None or universe_source != "NSE_OFFICIAL_EQUITY_L":
+                    self._log(
+                        "all_nse_history_universe_fallback",
+                        source=universe_source,
+                        symbol_count=len(symbols),
+                        official_error_type=(
+                            type(official_universe_error).__name__
+                            if official_universe_error is not None else None
+                        ),
+                    )
+                try:
+                    nifty_code = self._nifty_instrument_code()
+                except Exception as exc:
+                    # Index context is optional and must never prevent stock
+                    # prediction warm-up from starting.
+                    nifty_code = None
+                    self._log(
+                        "all_nse_nifty_instrument_lookup_failed",
+                        error_type=type(exc).__name__,
+                    )
                 with self._lock:
                     self._symbols = symbols
                     self._codes = {s: codes[s] for s in symbols if s in codes}
                     self._nifty_code = nifty_code
+                    self._seed_universe_source = universe_source
 
                 now = pd.Timestamp.now(tz=IST)
                 previous_day = self._previous_trading_date(now.date())
@@ -641,6 +703,7 @@ class AllNSEMinutePredictor:
                     universe_count=len(symbols),
                     mapped_symbol_count=len(self._codes),
                     history_symbol_count=self._seed_coverage,
+                    history_universe_source=self._seed_universe_source,
                     historical_batch_count=requests_made,
                     failed_batches=batch_errors,
                     nifty_history_rows=len(self._market_history),
@@ -1320,6 +1383,7 @@ class AllNSEMinutePredictor:
             "model_target": "target_30m",
             "model_status": self._seed_status,
             "history_ready": history_ready,
+            "history_seed_universe_source": self._seed_universe_source,
             "history_seed_coverage_symbols": self._seed_coverage,
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
             "history_seed_failed_batches": self._seed_errors,
