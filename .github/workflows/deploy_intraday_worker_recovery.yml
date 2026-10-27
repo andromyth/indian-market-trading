@@ -178,14 +178,22 @@ jobs:
             gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(name,state,schedule,lastAttemptTime,status)' || exit 1
           done
 
-          # Validate Drive preflight through the real authenticated private /tick path.
-          # /tick returns HTTP 503 when Drive read/write preflight is not ready. Invoke
-          # a Scheduler job whose normal schedule is outside the current market window,
-          # so this probe uses the already-authorized OIDC identity without requiring
-          # project-wide Cloud Logging access for the GitHub deploy identity.
-          PROBE_JOB=intraday-worker-0915-0959
-          echo "DRIVE_PREFLIGHT_PROBE_JOB=$PROBE_JOB"
+          # An authenticated /tick probe runs the complete capture pipeline when
+          # sent on a five-minute slot. Never force an extra full-universe capture
+          # while the NSE market is open; doing so can exhaust the Scheduler request
+          # deadline and overlap the normal production slot. Outside market hours,
+          # the same Scheduler identity can safely confirm Drive preflight.
+          LOCAL_DOW="$(TZ=Asia/Kolkata date +%u)"
+          LOCAL_HHMM="$(TZ=Asia/Kolkata date +%H%M)"
+          LOCAL_MINUTES=$((10#${LOCAL_HHMM:0:2} * 60 + 10#${LOCAL_HHMM:2:2}))
           PROBE_OK=false
+          if [[ "$LOCAL_DOW" -le 5 && "$LOCAL_MINUTES" -ge 555 && "$LOCAL_MINUTES" -lt 930 ]]; then
+            echo "DRIVE_PREFLIGHT_PROBE_SKIPPED=true reason=market_open_no_extra_tick"
+            echo "Drive preflight will be verified by the normal authenticated scheduled tick."
+            PROBE_OK=true
+          else
+            PROBE_JOB=intraday-worker-0915-0959
+            echo "DRIVE_PREFLIGHT_PROBE_JOB=$PROBE_JOB"
 
           for probe in 1 2 3; do
             BEFORE="$(gcloud scheduler jobs describe "$PROBE_JOB" --project="$PROJECT_ID" --location="$REGION" --format='value(lastAttemptTime)')"
@@ -256,4 +264,5 @@ jobs:
           if [[ "$PROBE_OK" != "true" ]]; then
             echo "ERROR: Could not confirm successful authenticated /tick and Drive preflight."
             exit 1
+          fi
           fi
