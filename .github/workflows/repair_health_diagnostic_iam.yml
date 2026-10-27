@@ -65,29 +65,55 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "CHECK=cloud_logging_read"
           gcloud logging read \
             "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\"" \
             --project="$PROJECT_ID" --limit=1 --format='value(timestamp)' >/dev/null
           echo "CLOUD_LOGGING_ACCESS=PASS"
 
-          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SCHEDULER_IDENTITY" --audiences="$SERVICE_URL" 2>/dev/null)"
-          [[ -n "$TOKEN" ]] || { echo "ERROR: unable to mint health-probe OIDC token"; exit 1; }
+          echo "CHECK=cloud_run_service_url"
+          if ! SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"; then
+            echo "ERROR=cloud_run_services_describe_failed"
+            exit 1
+          fi
+          [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_service_url_missing"; exit 1; }
+          echo "CLOUD_RUN_SERVICE_URL=RESOLVED"
 
+          echo "CHECK=scheduler_oidc_token_mint"
+          TOKEN_FILE="$(mktemp)"
+          TOKEN_ERROR_FILE="$(mktemp)"
           RESPONSE="$(mktemp)"
-          trap 'rm -f "$RESPONSE"' EXIT
+          trap 'rm -f "$TOKEN_FILE" "$TOKEN_ERROR_FILE" "$RESPONSE"' EXIT
+          if ! gcloud auth print-identity-token \
+            --impersonate-service-account="$SCHEDULER_IDENTITY" \
+            --audiences="$SERVICE_URL" >"$TOKEN_FILE" 2>"$TOKEN_ERROR_FILE"; then
+            echo "ERROR=oidc_token_mint_failed"
+            sed -n '1,12p' "$TOKEN_ERROR_FILE"
+            exit 1
+          fi
+          TOKEN="$(cat "$TOKEN_FILE")"
+          [[ -n "$TOKEN" ]] || { echo "ERROR=oidc_token_empty"; exit 1; }
+          echo "SCHEDULER_OIDC_TOKEN_MINT=PASS"
+
           for endpoint in capturez predictionz; do
-            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+            echo "CHECK=private_endpoint_$endpoint"
+            if ! CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
-              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/$endpoint")"
+              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/$endpoint")"; then
+              echo "ERROR=endpoint_request_failed endpoint=/$endpoint"
+              exit 1
+            fi
             python - "$RESPONSE" "$endpoint" "$CODE" <<'PY'
           import json, sys
           path, endpoint, code = sys.argv[1:]
-          with open(path, encoding="utf-8") as handle:
-              body = json.load(handle)
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  body = json.load(handle)
+          except Exception as exc:
+              raise SystemExit(f"ENDPOINT_RESPONSE_NOT_JSON endpoint=/{endpoint} http={code} error={exc}")
           expected = "all_nse_quote_capture" if endpoint == "capturez" else "all_nse_minute_prediction_actual"
           if body.get("probe") != expected:
-              raise SystemExit(f"ENDPOINT_AUTH_FAILED endpoint=/{endpoint} http={code} response={body}")
+              raise SystemExit(f"ENDPOINT_PROBE_MISMATCH endpoint=/{endpoint} http={code} keys={sorted(body) if isinstance(body, dict) else type(body).__name__}")
           print(f"ENDPOINT_AUTH=PASS endpoint=/{endpoint} http={code} diagnostic_status={body.get('status')}")
           if code not in {"200", "503"}:
               raise SystemExit(f"UNEXPECTED_HTTP_STATUS endpoint=/{endpoint} http={code}")
