@@ -555,24 +555,69 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "reason": "Full-NSE prediction snapshots are written on five-minute capture slots only.",
                 }
             else:
-                try:
-                    prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
-                        capture_result,
-                        WORKER.root,
+                prediction_capture = {"status": "ERROR", "error": "Prediction capture did not run."}
+                prediction_error = None
+                for prediction_attempt in range(1, 4):
+                    try:
+                        prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
+                            capture_result,
+                            WORKER.root,
+                        )
+                        prediction_status = str(prediction_capture.get("status") or "").upper()
+                        if prediction_status not in {"ERROR", "PERSISTENCE_ERROR"}:
+                            prediction_error = None
+                            break
+                        prediction_error = str(
+                            prediction_capture.get("error")
+                            or f"prediction capture returned {prediction_status}"
+                        )
+                    except Exception as prediction_exc:
+                        prediction_error = (
+                            f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
+                        )
+                        prediction_capture = {
+                            "status": "ERROR",
+                            "error": prediction_error,
+                        }
+                    if prediction_attempt < 3:
+                        _log(
+                            "all_nse_minute_prediction_capture_retry",
+                            attempt=prediction_attempt,
+                            next_attempt=prediction_attempt + 1,
+                            error=prediction_error,
+                        )
+                        time.sleep(0.5 * prediction_attempt)
+                result["all_nse_minute_predictions"] = prediction_capture
+                if prediction_error:
+                    _log(
+                        "all_nse_minute_prediction_capture_failed",
+                        attempts=3,
+                        error=prediction_error,
                     )
-                    result["all_nse_minute_predictions"] = prediction_capture
-                except Exception as prediction_exc:
-                    prediction_error = f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
-                    result["all_nse_minute_predictions"] = {
-                        "status": "ERROR",
-                        "error": prediction_error,
-                    }
-                    _log("all_nse_minute_prediction_capture_failed", error=prediction_error)
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result)
             # A tick completed even if one symbol/source failed; errors are
             # persisted in the response/logs and should not rerun the same minute.
-            self._send_json(200, {
+            capture_status = str(
+                (result.get("all_universe_capture") or {}).get("status") or ""
+            ).upper()
+            prediction_status = str(
+                (result.get("all_nse_minute_predictions") or {}).get("status") or ""
+            ).upper()
+            # Ask Cloud Scheduler to retry only durability/execution failures.
+            # Quality-gated PARTIAL results remain visible as PARTIAL; they are
+            # not converted into success or silently retried as if they were 5xx.
+            retryable_persistence_failure = (
+                capture_status == "PERSISTENCE_ERROR"
+                or prediction_status in {"ERROR", "PERSISTENCE_ERROR"}
+            )
+            if retryable_persistence_failure:
+                _log(
+                    "cloud_run_tick_retryable_persistence_failure",
+                    capture_status=capture_status,
+                    prediction_status=prediction_status,
+                )
+            self._send_json(503 if retryable_persistence_failure else 200, {
                 "status": result.get("status"),
                 "minute": result.get("minute"),
                 "cycle": result.get("cycle"),
