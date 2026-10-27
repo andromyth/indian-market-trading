@@ -80,21 +80,58 @@ jobs:
           echo "CLOUD_RUN_SERVICE_URL=RESOLVED"
 
           echo "CHECK=scheduler_oidc_token_mint"
-          TOKEN_FILE="$(mktemp)"
-          TOKEN_ERROR_FILE="$(mktemp)"
+          TOKEN_RESPONSE="$(mktemp)"
           RESPONSE="$(mktemp)"
-          trap 'rm -f "$TOKEN_FILE" "$TOKEN_ERROR_FILE" "$RESPONSE"' EXIT
-          if ! gcloud auth print-identity-token \
-            --impersonate-service-account="$SCHEDULER_IDENTITY" \
-            --audiences="$SERVICE_URL" >"$TOKEN_FILE" 2>"$TOKEN_ERROR_FILE"; then
-            echo "ERROR=oidc_token_mint_failed"
-            sed -n '1,12p' "$TOKEN_ERROR_FILE"
+          trap 'rm -f "$TOKEN_RESPONSE" "$RESPONSE"' EXIT
+          CALLER_ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          [[ -n "$CALLER_ACCESS_TOKEN" ]] || { echo "ERROR=caller_access_token_empty"; exit 1; }
+          TOKEN_HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+            --output "$TOKEN_RESPONSE" --write-out '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $CALLER_ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(python -c 'import json,sys; print(json.dumps({"audience":sys.argv[1],"includeEmail":True}))' "$SERVICE_URL")" \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SCHEDULER_IDENTITY:generateIdToken")" || {
+              unset CALLER_ACCESS_TOKEN
+              echo "ERROR=oidc_token_api_request_failed"
+              exit 1
+            }
+          unset CALLER_ACCESS_TOKEN
+          if [[ "$TOKEN_HTTP_CODE" != "200" ]]; then
+            echo "ERROR=oidc_token_api_rejected http=$TOKEN_HTTP_CODE"
+            python - "$TOKEN_RESPONSE" <<'PY'
+          import json, sys
+          try:
+              body = json.load(open(sys.argv[1], encoding="utf-8"))
+              error = body.get("error", {})
+              print("IAM_CREDENTIALS_ERROR=" + str(error.get("status", "UNKNOWN")) + ": " + str(error.get("message", "No error message returned")))
+          except Exception:
+              print("IAM_CREDENTIALS_ERROR=response was not valid JSON")
+          PY
             exit 1
           fi
-          TOKEN="$(cat "$TOKEN_FILE")"
+          TOKEN="$(python - "$TOKEN_RESPONSE" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              body = json.load(handle)
+          token = body.get("token") or body.get("idToken")
+          if not token:
+              error = body.get("error", {})
+              raise SystemExit("OIDC_TOKEN_MISSING: " + str(error.get("message", "response did not contain an ID token")))
+          print(token)
+          PY
+          )"
           [[ -n "$TOKEN" ]] || { echo "ERROR=oidc_token_empty"; exit 1; }
-          echo "SCHEDULER_OIDC_TOKEN_MINT=PASS"
-
+          echo "SCHEDULER_OIDC_TOKEN_MINT=PASS method=iamcredentials.generateIdToken"
+          unset TOKEN
+          # Keep the token only in memory for the authenticated endpoint probes.
+          TOKEN="$(python - "$TOKEN_RESPONSE" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              body = json.load(handle)
+          print(body.get("token") or body.get("idToken") or "")
+          PY
+          )"
           for endpoint in capturez predictionz; do
             echo "CHECK=private_endpoint_$endpoint"
             if ! CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
