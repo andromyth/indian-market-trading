@@ -115,8 +115,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Patch only schedule metadata. Do not send httpTarget/oidcToken back
-          # to the API: that would require iam.serviceAccounts.actAs for the
+          # Patch schedule/retry metadata only. Do not send httpTarget/oidcToken
+          # back to the API: that would require iam.serviceAccounts.actAs for the
           # existing Scheduler identity, which this deploy identity must not alter.
           ACCESS_TOKEN="$(gcloud auth print-access-token)"
           patch_schedule() {
@@ -132,6 +132,13 @@ jobs:
               "schedule": schedule,
               "timeZone": "Asia/Kolkata",
               "attemptDeadline": "300s",
+              "retryConfig": {
+                  "retryCount": 2,
+                  "maxRetryDuration": "45s",
+                  "minBackoffDuration": "5s",
+                  "maxBackoffDuration": "15s",
+                  "maxDoublings": 1,
+              },
           }))
           PY
           )"
@@ -139,7 +146,7 @@ jobs:
               --header "Authorization: Bearer $ACCESS_TOKEN" \
               --header "Content-Type: application/json" \
               --data "$payload" \
-              "https://cloudscheduler.googleapis.com/v1/$name?updateMask=schedule,timeZone,attemptDeadline" \
+              "https://cloudscheduler.googleapis.com/v1/$name?updateMask=schedule,timeZone,attemptDeadline,retryConfig" \
               >/dev/null
           }
           patch_schedule "intraday-worker-0915-0959" "15-55/5 9 * * 1-5"
@@ -158,6 +165,35 @@ jobs:
           verify_schedule "intraday-worker-0915-0959" "15-55/5 9 * * 1-5"
           verify_schedule "intraday-worker-1000-1459" "*/5 10-14 * * 1-5"
           verify_schedule "intraday-worker-1500-1530" "0-25/5 15 * * 1-5"
+
+          verify_retry_config() {
+            job="$1"
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format=json |
+              python -c '
+          import json, sys
+          job = json.load(sys.stdin)
+          retry = job.get("retryConfig") or {}
+          expected = {
+              "retryCount": 2,
+              "maxRetryDuration": "45s",
+              "minBackoffDuration": "5s",
+              "maxBackoffDuration": "15s",
+              "maxDoublings": 1,
+          }
+          mismatches = {
+              key: {"expected": value, "actual": retry.get(key)}
+              for key, value in expected.items()
+              if retry.get(key) != value
+          }
+          if mismatches:
+              print(json.dumps({"job": job.get("name"), "retry_config_mismatch": mismatches}, sort_keys=True))
+              sys.exit(1)
+          print("BOUNDED_RETRIES_VERIFIED job=" + str(job.get("name")) + " retryConfig=" + json.dumps(retry, sort_keys=True))
+          '
+          }
+          verify_retry_config "intraday-worker-0915-0959"
+          verify_retry_config "intraday-worker-1000-1459"
+          verify_retry_config "intraday-worker-1500-1530"
 
       - name: Verify ready revision, traffic, scheduler states and startup diagnostics
         shell: bash
