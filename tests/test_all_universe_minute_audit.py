@@ -74,6 +74,55 @@ def test_audit_fails_when_a_minute_snapshot_is_missing():
 
 
 
+def test_snapshot_capture_passes_with_more_than_90_percent_quote_coverage_even_if_slots_are_partial():
+    session_date = date(2026, 10, 16)
+    files, manifests = _complete_day_files(session_date)
+    keys = expected_minutes(session_date)
+
+    # Five slots each miss one of two quotes; aggregate coverage remains >90%.
+    for key in keys[:5]:
+        manifest = manifests[f"manifest-{key}"]
+        manifest.update({
+            "status": "PARTIAL",
+            "quoted_symbol_count": 1,
+            "missing_quote_count": 1,
+            "unmapped_symbol_count": 1,
+        })
+
+    report, _ = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id]
+    )
+    assert report["observed_quote_coverage_pct"] > 90.0
+    assert report["capture_quality_gate_pass"] is True
+    assert report["snapshot_quality_gate_pass"] is True
+    assert report["quality_gate_pass"] is True
+    assert report["audit_status"] == "PASS"
+
+
+def test_snapshot_capture_does_not_pass_at_exactly_90_percent_quote_coverage():
+    session_date = date(2026, 10, 16)
+    files, manifests = _complete_day_files(session_date)
+
+    # Each slot has 9/10 quoted symbols: exactly 90%, not more than 90%.
+    for key in expected_minutes(session_date):
+        manifest = manifests[f"manifest-{key}"]
+        manifest.update({
+            "status": "PARTIAL",
+            "expected_symbol_count": 10,
+            "quoted_symbol_count": 9,
+            "missing_quote_count": 1,
+            "unmapped_symbol_count": 1,
+        })
+
+    report, _ = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id]
+    )
+    assert report["observed_quote_coverage_pct"] == 90.0
+    assert report["capture_quality_gate_pass"] is False
+    assert report["quality_gate_pass"] is False
+    assert report["audit_status"] == "NEEDS_ATTENTION"
+
+
 def test_audit_accepts_recovered_drive_write_when_artifacts_are_present():
     session_date = date(2026, 10, 16)
     files, manifests = _complete_day_files(session_date)
