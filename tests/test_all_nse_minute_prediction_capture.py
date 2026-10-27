@@ -261,15 +261,52 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
     assert saved_manifest["model_version"] == expected_base_version
 
+
+
+def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    predictor._symbols = ["AAA", "BBB", "CCC"]
+    idx = pd.date_range(
+        "2026-10-26 15:20:00",
+        periods=3,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    frame = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [10.0, 12.0, 11.0],
+        },
+        index=idx,
+    )
+
+    predictor._publish_history_seed_progress(
+        {"__NIFTY50__": frame, "AAA": frame},
+        coverage_symbols=1,
+        failed_batches=0,
+    )
+
+    status = predictor.status()
+    assert status["history_ready"] is True
+    assert status["history_seed_complete"] is False
+    assert status["history_seed_coverage_symbols"] == 1
+    assert status["status"] == "READY_PARTIAL"
+    assert "AAA" in predictor._history
+    assert len(predictor._market_history) == 3
+
 def test_history_seed_batches_never_mix_nifty_index_with_equities():
     entries = [(f"STOCK{i}", f"NSE_{i}") for i in range(1, 11)]
 
     batches = capture._history_seed_batches(entries, "NSE_99999", batch_size=5)
 
-    assert [len(batch) for batch in batches] == [5, 5, 1]
-    assert all(all(symbol != "__NIFTY50__" for symbol, _ in batch) for batch in batches[:-1])
-    assert batches[-1] == [("__NIFTY50__", "NSE_99999")]
-    assert [symbol for batch in batches[:-1] for symbol, _ in batch] == [
+    assert [len(batch) for batch in batches] == [1, 5, 5]
+    assert batches[0] == [("__NIFTY50__", "NSE_99999")]
+    assert all(all(symbol != "__NIFTY50__" for symbol, _ in batch) for batch in batches[1:])
+    assert [symbol for batch in batches[1:] for symbol, _ in batch] == [
         symbol for symbol, _ in entries
     ]
 
