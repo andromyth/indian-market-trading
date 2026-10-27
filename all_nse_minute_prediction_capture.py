@@ -398,27 +398,64 @@ class AllNSEMinutePredictor:
 
     @staticmethod
     def _nifty_instrument_code() -> str | None:
-        """Resolve the REST quote/history token; never reuse a WebSocket token."""
-        from indstocks_client import _request
+        """Do not convert an INDstocks source=index underlying ID into an NSE scrip code.
 
-        response = _request("GET", "/market/instruments", params={"source": "index"})
-        index_master = pd.read_csv(io.BytesIO(response.content), dtype=str)
-        if index_master.empty or len(index_master.columns) < 3:
-            return None
-        # The source=index schema is positional: EXCH, SEGMENT(index name), SECURITY_ID.
-        index_master = index_master.iloc[:, :3].copy()
-        index_master.columns = ["EXCH", "INDEX_NAME", "SECURITY_ID"]
-        index_master["EXCH"] = index_master["EXCH"].astype(str).str.strip().str.upper()
-        index_master["INDEX_NAME"] = index_master["INDEX_NAME"].astype(str).str.strip().str.upper()
-        index_master["SECURITY_ID"] = index_master["SECURITY_ID"].astype(str).str.strip()
-        rows = index_master.loc[
-            index_master["EXCH"].eq("NSE")
-            & index_master["INDEX_NAME"].str.contains("NIFTY 50", regex=False)
-            & index_master["SECURITY_ID"].str.fullmatch(r"\d+")
-        ]
-        if rows.empty:
-            return None
-        return f"NSE_{rows.iloc[0]['SECURITY_ID']}"
+        The source=index instrument master exposes index underlyings, not a
+        documented NSE cash-equity token accepted by /market/quotes/full or
+        /market/historical/1minute. The old NSE_<SECURITY_ID> conversion caused
+        HTTP 400 on both REST paths. NIFTY context uses verified one-minute Yahoo
+        candles as a fallback instead; no WebSocket token or fabricated OHLC is used.
+        """
+        return None
+
+    @staticmethod
+    def _fetch_yahoo_nifty_history(minute: pd.Timestamp) -> pd.DataFrame:
+        """Fetch genuine NIFTY 50 one-minute candles strictly before a decision time."""
+        columns = ["Open", "High", "Low", "Close", "Volume"]
+        empty = pd.DataFrame(
+            columns=columns,
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        )
+        decision_minute = _as_ist_timestamp(minute).floor("min")
+        try:
+            from data_fetcher import _yahoo_chart_history
+
+            frame = _yahoo_chart_history("^NSEI", "5d", "1m")
+            if frame is None or frame.empty:
+                return empty
+            frame = frame.copy()
+            aliases = {str(column).strip().lower(): column for column in frame.columns}
+            rename = {}
+            for required in columns:
+                source = aliases.get(required.lower())
+                if source is not None and source != required:
+                    rename[source] = required
+            frame = frame.rename(columns=rename)
+            if "Close" not in frame.columns:
+                return empty
+            for required in columns:
+                if required not in frame.columns:
+                    frame[required] = np.nan
+                frame[required] = pd.to_numeric(frame[required], errors="coerce")
+            # Yahoo timestamps are epoch-derived and may arrive UTC-aware or
+            # naive; normalize every row to an explicit IST DatetimeIndex.
+            index = pd.DatetimeIndex(
+                pd.to_datetime(frame.index, errors="coerce", utc=True)
+            ).tz_convert(IST)
+            frame.index = index
+            frame.index.name = "Datetime"
+            frame = frame.loc[~frame.index.isna()]
+            frame = frame.loc[
+                (frame.index < decision_minute)
+                & frame["Close"].notna()
+                & frame["Close"].gt(0)
+            ].sort_index()
+            frame = frame.loc[~frame.index.duplicated(keep="last")]
+            return frame[columns].tail(HISTORY_LOOKBACK_BARS)
+        except Exception:
+            # Benchmark context is optional; keep stock persistence working and
+            # let the existing feature-readiness gate force low-readiness HOLD.
+            return empty
 
     @staticmethod
     def _previous_trading_date(value: date) -> date:
@@ -460,7 +497,16 @@ class AllNSEMinutePredictor:
         idx = market.index
         market.index = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
         decision_minute = _as_ist_timestamp(minute).floor("min")
-        return market.loc[market.index < decision_minute].copy()
+        before = market.loc[market.index < decision_minute].copy()
+        if before.empty:
+            return empty
+        # Market context is as time-sensitive as the individual stock candle.
+        # Do not count stale benchmark features toward readiness.
+        latest_timestamp = pd.Timestamp(before.index.max())
+        age_minutes = (decision_minute - latest_timestamp).total_seconds() / 60.0
+        if age_minutes < 0 or age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
+            return empty
+        return before
 
     @staticmethod
     def _parse_candles(candles: list[dict[str, Any]]) -> pd.DataFrame:
@@ -759,6 +805,24 @@ class AllNSEMinutePredictor:
                     history_coverage_target=coverage_target,
                 )
 
+                # If INDstocks cannot provide a documented REST index token,
+                # use genuine Yahoo NIFTY 50 one-minute OHLCV candles for context.
+                # This does not alter the stock history-coverage counter.
+                if "__NIFTY50__" not in histories or histories["__NIFTY50__"].empty:
+                    nifty_history = self._fetch_yahoo_nifty_history(now.floor("min"))
+                    if not nifty_history.empty:
+                        histories["__NIFTY50__"] = nifty_history
+                    self._log(
+                        "all_nse_nifty_yahoo_history_seed",
+                        source="YAHOO_FINANCE_1M",
+                        row_count=int(len(nifty_history)),
+                        latest_candle_ist=(
+                            nifty_history.index.max().isoformat()
+                            if not nifty_history.empty else None
+                        ),
+                        status="OK" if not nifty_history.empty else "UNAVAILABLE",
+                    )
+
                 # Count only actual historical API results, not live quote rows
                 # buffered while the potentially long bootstrap is in progress.
                 historical_coverage = sum(
@@ -887,25 +951,48 @@ class AllNSEMinutePredictor:
             }
 
     def _fetch_current_nifty_quote(self) -> tuple[float | None, pd.Timestamp | None, str | None]:
-        if not self._nifty_code:
-            return None, None, "NIFTY 50 index token was not resolved"
-        try:
-            from indstocks_client import _request
+        """Return a fresh market-context close; never treat an index ID as an equity token."""
+        quote_error = "INDstocks source=index IDs are not supported REST scrip-codes"
+        if self._nifty_code:
+            try:
+                from indstocks_client import _request
 
-            observed = pd.Timestamp.now(tz=IST)
-            body = _request(
-                "GET",
-                "/market/quotes/full",
-                params={"scrip-codes": self._nifty_code},
-            ).json()
-            data = body.get("data") or {}
-            quote = data.get(self._nifty_code) or {}
-            price = _safe_float(quote.get("live_price"))
-            if price is None or price <= 0:
-                raise RuntimeError("INDstocks NIFTY quote contained no live_price")
-            return price, observed, None
-        except Exception as exc:
-            return None, None, f"{type(exc).__name__}: {str(exc)[:160]}"
+                observed = pd.Timestamp.now(tz=IST)
+                body = _request(
+                    "GET",
+                    "/market/quotes/full",
+                    params={"scrip-codes": self._nifty_code},
+                ).json()
+                data = body.get("data") or {}
+                quote = data.get(self._nifty_code) or {}
+                price = _safe_float(quote.get("live_price"))
+                if price is not None and price > 0:
+                    return price, observed, None
+                quote_error = "INDstocks NIFTY REST response had no positive live_price"
+            except Exception as exc:
+                quote_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+
+        # This fallback is the close of a real one-minute benchmark candle, not
+        # an exchange-stamped live tick. Require a fresh candle.
+        with self._lock:
+            market = self._market_history.copy()
+        if isinstance(market.index, pd.DatetimeIndex) and not market.empty and "Close" in market:
+            market = market.loc[market.index <= pd.Timestamp.now(tz=IST)]
+            close = pd.to_numeric(market["Close"], errors="coerce").dropna()
+            if not close.empty:
+                timestamp = pd.Timestamp(close.index[-1])
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.tz_localize(IST)
+                else:
+                    timestamp = timestamp.tz_convert(IST)
+                age_seconds = (pd.Timestamp.now(tz=IST) - timestamp).total_seconds()
+                price = _safe_float(close.iloc[-1])
+                if (
+                    price is not None and price > 0 and 0 <= age_seconds
+                    <= MAX_HISTORY_CANDLE_AGE_MINUTES * 60
+                ):
+                    return price, timestamp, None
+        return None, None, quote_error
 
     def _schedule_current_session_history_refresh(
         self,
@@ -1080,6 +1167,23 @@ class AllNSEMinutePredictor:
                         updated[symbol] = frame
                         candle_rows += len(frame)
 
+            nifty_history_source = "INDSTOCKS_HISTORICAL_1M" if "__NIFTY50__" in updated else None
+            if "__NIFTY50__" not in updated or updated["__NIFTY50__"].empty:
+                # Provider index IDs are not REST scrip-codes; use the same genuine
+                # OHLCV fallback as bootstrap, excluding current/future minutes.
+                fallback = self._fetch_yahoo_nifty_history(minute)
+                if not fallback.empty:
+                    fallback = fallback.loc[
+                        (pd.Index(fallback.index.date) == minute.date())
+                        & (fallback.index < minute)
+                    ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
+                    if not fallback.empty:
+                        updated["__NIFTY50__"] = fallback
+                        candle_rows += len(fallback)
+                        nifty_history_source = "YAHOO_FINANCE_1M_FALLBACK"
+                if nifty_history_source is None:
+                    nifty_history_source = "MISSING"
+
             def merge_history(existing, refreshed):
                 columns = ["Open", "High", "Low", "Close", "Volume"]
                 existing = existing.copy() if existing is not None else pd.DataFrame(columns=columns)
@@ -1107,6 +1211,8 @@ class AllNSEMinutePredictor:
                     "failed_batches": len(errors), "failed_symbols": sorted(set(failed_symbols)),
                     "updated_symbols": len([s for s in updated if s != "__NIFTY50__"]),
                     "current_session_candle_rows": candle_rows,
+                    "nifty_history_source": nifty_history_source,
+                    "nifty_history_rows": int(len(updated.get("__NIFTY50__", pd.DataFrame()))),
                     "window_start_ist": window_start.isoformat(),
                     "window_end_ist": minute.isoformat(),
                     "elapsed_seconds": round(time.monotonic() - started, 2),
@@ -1670,7 +1776,16 @@ class AllNSEMinutePredictor:
             "model_coverage_symbols": (
                 self._model_status.get("training_symbol_count") or len(self._trained_symbols)
             ),
-            "nifty_context_status": "HISTORICAL_ONE_MINUTE_CANDLES" if not market_history.empty else "HISTORY_OR_MISSING",
+            "nifty_context_status": (
+                "HISTORICAL_ONE_MINUTE_CANDLES"
+                if not market_history_before_minute.empty else "HISTORY_OR_MISSING"
+            ),
+            "nifty_context_source": (
+                "YAHOO_FINANCE_1M_FALLBACK"
+                if self._nifty_code is None and not market_history_before_minute.empty
+                else "INDSTOCKS_REST" if self._nifty_code
+                else "MISSING"
+            ),
             "nifty_context_error": nifty_error,
             "quote_source_snapshot": str(local_quote_path),
             "quote_snapshot_read_error": read_error,
