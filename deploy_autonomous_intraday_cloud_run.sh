@@ -191,7 +191,13 @@ upsert_scheduler_job() {
     --oidc-service-account-email "$SCHEDULER_SA"
     --oidc-token-audience "$SERVICE_URL"
     --attempt-deadline 300s
-    --max-retry-attempts 0
+    # Retry brief HTTP 5xx/timeout failures only within a short window, so a
+    # failed persistence write can recover without overlapping later market slots.
+    --max-retry-attempts 2
+    --max-retry-duration 45s
+    --min-backoff 5s
+    --max-backoff 15s
+    --max-doublings 1
   )
 
   if gcloud scheduler jobs describe "$job_name" \
