@@ -44,6 +44,28 @@ jobs:
           set -uo pipefail
           echo "=== Cloud Run service ==="
           gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(metadata.generation,status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic,status.conditions)' || true
+          echo "=== Cloud Run invoker policy: verify service remains private (read-only) ==="
+          if gcloud run services get-iam-policy "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/service_iam_policy.json 2>/tmp/service_iam_policy.err; then
+            python - /tmp/service_iam_policy.json <<'PY'
+          import json,sys
+          policy=json.load(open(sys.argv[1],encoding="utf-8"))
+          public=[]
+          invokers=[]
+          for binding in policy.get("bindings",[]):
+              if binding.get("role") == "roles/run.invoker":
+                  for member in binding.get("members",[]):
+                      if member in ("allUsers","allAuthenticatedUsers"):
+                          public.append(member)
+                      elif member.startswith("serviceAccount:"):
+                          invokers.append(member)
+          print("SERVICE_PUBLIC_INVOKER_BINDINGS="+json.dumps(sorted(set(public))))
+          print("SERVICE_PRIVATE_VERDICT="+("FAIL_PUBLIC_INVOKER_BINDING" if public else "PASS_NO_PUBLIC_INVOKER_BINDING"))
+          print("SERVICE_ACCOUNT_INVOKER_COUNT="+str(len(set(invokers))))
+          PY
+          else
+            echo "SERVICE_PRIVATE_VERDICT=UNVERIFIABLE_IAM_POLICY_READ_DENIED"
+            sed -n '1,3p' /tmp/service_iam_policy.err || true
+          fi
           echo "=== Recent Cloud Run revisions ==="
           gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --sort-by='~metadata.creationTimestamp' --format='table(metadata.name,metadata.creationTimestamp,status.conditions[0].status,status.conditions[0].reason)' || true
           echo "=== Safe runtime configuration: variable names and Secret Manager references only ==="
