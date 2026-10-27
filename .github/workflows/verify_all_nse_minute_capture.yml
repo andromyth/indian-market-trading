@@ -78,6 +78,44 @@ jobs:
           echo "ERROR: no ready Cloud Run revision created after the worker-code commit time."
           exit 1
 
+      - name: Verify fresh private worker health and Drive write readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          SA="indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com"
+          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          if [[ -z "$TOKEN" ]]; then
+            echo "WORKER_HEALTH_CHECK=UNVERIFIABLE_NO_PRIVATE_INVOKER_TOKEN"
+            exit 1
+          fi
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
+          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/healthz")" || HTTP_CODE=000
+          echo "WORKER_HEALTH_HTTP_STATUS=$HTTP_CODE"
+          python - "$RESPONSE" "$HTTP_CODE" <<'PY'
+          import json, sys
+          path, code = sys.argv[1:]
+          try:
+              data=json.load(open(path,encoding="utf-8"))
+          except Exception:
+              print("WORKER_HEALTH_JSON=FAIL")
+              sys.exit(2)
+          print("WORKER_HEALTH_STATUS="+str(data.get("status")))
+          print("WORKER_HEALTH_DRIVE_PREFLIGHT_STATUS="+str(data.get("drive_preflight_status")))
+          drive=data.get("drive_preflight") or {}
+          print("WORKER_HEALTH_DRIVE_CONFIGURED="+str(drive.get("configured")))
+          print("WORKER_HEALTH_DRIVE_REACHABLE="+str(drive.get("reachable")))
+          print("WORKER_HEALTH_DRIVE_WRITE_READY="+str(drive.get("write_ready")))
+          print("WORKER_HEALTH_DRIVE_AUTH_METHOD="+str(drive.get("write_auth_method") or drive.get("auth_method")))
+          print("WORKER_HEALTH_CAPTURE_STATUS="+str(data.get("all_universe_capture_status")))
+          print("WORKER_HEALTH_PREDICTION_STATUS="+str(data.get("all_nse_minute_prediction_status")))
+          if code != "200" or data.get("drive_preflight_status") != "OK" or drive.get("write_ready") is not True or drive.get("reachable") is False:
+              print("WORKER_HEALTH_VERDICT=FAIL")
+              sys.exit(1)
+          print("WORKER_HEALTH_VERDICT=PASS")
+          PY
+
       - name: Probe private quote and prediction diagnostics without overstating off-session readiness
         shell: bash
         run: |
