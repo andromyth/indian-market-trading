@@ -8,6 +8,7 @@ on:
     paths:
       - ".github/workflows/verify_all_nse_minute_capture.yml"
       - "autonomous_intraday_worker_service.py"
+      - "all_nse_minute_prediction_capture.py"
 
 permissions:
   contents: read
@@ -49,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py)"
+          DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py all_nse_minute_prediction_capture.py)"
           CODE_COMMIT_TIME="$(git show -s --format=%cI "$DEPLOY_SHA")"
           echo "SERVICE_CODE_COMMIT=$DEPLOY_SHA"
           echo "SERVICE_CODE_COMMIT_TIME=$CODE_COMMIT_TIME"
