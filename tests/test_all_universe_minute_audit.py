@@ -154,6 +154,31 @@ def test_snapshot_capture_passes_when_each_slot_has_more_than_90_percent_complet
     assert report["audit_status"] == "PASS"
 
 
+def test_incomplete_core_quote_fields_do_not_count_as_complete_symbols():
+    session_date = date(2026, 10, 16)
+    files, manifests, snapshots = _complete_day_files(session_date)
+
+    for key in expected_minutes(session_date):
+        frame = _snapshot_frame(total=10, incomplete=0)
+        frame.loc[0, "instrument_code"] = None
+        frame.loc[1, "actual_observed_price"] = None
+        frame.loc[2, "quote_observed_at_utc"] = None
+        snapshots[f"snapshot-{key}"] = frame
+        manifests[f"manifest-{key}"].update({
+            "expected_symbol_count": 10,
+            "quoted_symbol_count": 10,
+            "missing_quote_count": 0,
+        })
+
+    report, rows = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
+    )
+    assert report["minimum_complete_symbol_coverage_pct"] == 70.0
+    assert report["capture_quality_gate_pass"] is False
+    assert int(rows.iloc[0]["complete_symbol_count"]) == 7
+
+
 def test_snapshot_capture_does_not_pass_at_exactly_90_percent_complete_symbols():
     session_date = date(2026, 10, 16)
     files, manifests, snapshots = _complete_day_files(session_date)
