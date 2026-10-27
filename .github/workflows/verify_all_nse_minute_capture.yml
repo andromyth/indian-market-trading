@@ -201,21 +201,36 @@ jobs:
               )
               return result.stdout.decode().strip() if result.returncode==0 else ""
 
+          unreadable_refs=[]
           for name in names:
               item=envs.get(name) or {}
               if item.get("value"):
                   os.environ[name]=item["value"]
+                  continue
+              ref=((item.get("valueSource") or {}).get("secretKeyRef") or {})
+              if not ref:
+                  ref=((item.get("valueFrom") or {}).get("secretKeyRef") or {})
+              if ref:
+                  secret=ref.get("secret") or ref.get("name") or ""
+                  if "/secrets/" in secret:
+                      secret=secret.rsplit("/secrets/",1)[-1]
+                  version=ref.get("version") or ref.get("key") or "latest"
+                  value=secret_value(secret,version) if secret else ""
+                  if value:
+                      os.environ[name]=value
+                  else:
+                      unreadable_refs.append(name)
+                      print(f"PROVIDER_SECRET_REFERENCE_PRESENT={name} readable_to_diagnostic_identity=false")
               else:
-                  ref=((item.get("valueSource") or {}).get("secretKeyRef") or {})
-                  if ref.get("secret"):
-                      value=secret_value(ref["secret"],ref.get("version","latest"))
-                      if value:
-                          os.environ[name]=value
+                  print(f"PROVIDER_CREDENTIAL_ENV_MISSING={name}")
 
           auto=all(os.environ.get(k,"").strip() for k in names[:3])
           manual=bool(os.environ.get("INDSTOCKS_ACCESS_TOKEN","").strip())
           if not auto and not manual:
-              print("PROVIDER_AUTH=FAIL; Cloud Run revision has no readable complete provider credential configuration.")
+              if unreadable_refs:
+                  print("PROVIDER_AUTH=UNVERIFIABLE; secret references exist but this diagnostic identity cannot read their values.")
+              else:
+                  print("PROVIDER_AUTH=FAIL; Cloud Run revision has no complete provider credential configuration.")
               print("NO_CREDENTIAL_VALUES_PRINTED=true")
               sys.exit(2)
 
