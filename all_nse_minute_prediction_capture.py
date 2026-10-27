@@ -65,7 +65,9 @@ def _history_seed_batches(
         for offset in range(0, len(stock_entries), batch_size)
     ]
     if nifty_code:
-        batches.append([("__NIFTY50__", nifty_code)])
+        # Fetch benchmark context first so early progressive stock forecasts
+        # have the same market-context input path as later rows.
+        batches.insert(0, [("__NIFTY50__", nifty_code)])
     return batches
 
 
@@ -471,15 +473,21 @@ class AllNSEMinutePredictor:
         """Publish completed history batches immediately instead of waiting for the full universe."""
         with self._lock:
             for symbol, frame in updates.items():
-                if symbol == "__NIFTY50__" or frame.empty:
+                if frame.empty:
                     continue
-                existing = self._history.get(symbol)
+                if symbol == "__NIFTY50__":
+                    existing = self._market_history
+                else:
+                    existing = self._history.get(symbol)
                 if existing is not None and not existing.empty:
                     # Seed results are fetched first; an already-refreshed live
                     # history frame is newer and wins on duplicate timestamps.
                     frame = pd.concat([frame, existing]).sort_index()
                     frame = frame.loc[~frame.index.duplicated(keep="last")]
-                self._history[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
+                if symbol == "__NIFTY50__":
+                    self._market_history = frame.tail(HISTORY_LOOKBACK_BARS)
+                else:
+                    self._history[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
             self._seed_coverage = int(coverage_symbols)
             self._seed_errors = int(failed_batches)
             self._seed_ready = bool(self._history)
@@ -620,7 +628,7 @@ class AllNSEMinutePredictor:
                     batch_updates = {
                         symbol: histories[symbol]
                         for symbol, _ in batch
-                        if symbol in histories and symbol != "__NIFTY50__"
+                        if symbol in histories
                     }
                     batch_coverage = sum(
                         1 for symbol in symbols
