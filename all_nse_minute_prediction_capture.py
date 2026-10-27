@@ -1803,8 +1803,13 @@ class AllNSEMinutePredictor:
             "status": "PARTIAL",
         }
         persisted = self._persist(records, manifest, minute)
+        persistence_confirmed = str(persisted.get("status") or "").upper() in {"OK", "PARTIAL"}
         with self._lock:
-            self._last_minute = minute_key
+            # A quality-gated PARTIAL result is still a durable snapshot and must
+            # not be reprocessed. A persistence error is different: leave the
+            # minute retryable so a transient Drive failure can recover in-place.
+            if persistence_confirmed:
+                self._last_minute = minute_key
             self._last_health = {
                 **persisted,
                 "status": persisted.get("status"),

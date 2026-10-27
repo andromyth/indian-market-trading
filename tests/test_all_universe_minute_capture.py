@@ -313,3 +313,64 @@ def test_pending_manifest_recovery_ignores_success_receipt_files(tmp_path):
     assert second_attempt["recovered"] == 0
     assert second_attempt["errors"] == []
     assert len(store.paths) == 1
+
+
+
+def test_resilient_quote_fetch_retries_transient_provider_failure():
+    calls = []
+
+    class Response:
+        def json(self):
+            return {
+                "status": "success",
+                "data": {
+                    "NSE_1": {"live_price": 100.0},
+                    "NSE_2": {"live_price": 200.0},
+                },
+            }
+
+    def request_fn(method, endpoint, params=None):
+        calls.append(params["scrip-codes"])
+        if len(calls) == 1:
+            raise RuntimeError("temporary provider failure")
+        return Response()
+
+    result = capture._fetch_quotes_resilient(
+        request_fn, ["NSE_1", "NSE_2"], retry_backoff_seconds=0
+    )
+
+    assert result["attempt_count"] == 2
+    assert result["quotes"]["NSE_1"]["live_price"] == 100.0
+    assert result["quotes"]["NSE_2"]["live_price"] == 200.0
+    assert result["unresolved_codes"] == []
+    assert calls == ["NSE_1,NSE_2", "NSE_1,NSE_2"]
+
+
+def test_resilient_quote_fetch_retries_only_symbols_missing_from_partial_response():
+    calls = []
+
+    class Response:
+        def __init__(self, data):
+            self.data = data
+
+        def json(self):
+            return {"status": "success", "data": self.data}
+
+    def request_fn(method, endpoint, params=None):
+        requested = params["scrip-codes"]
+        calls.append(requested)
+        if requested == "NSE_1,NSE_2":
+            return Response({"NSE_1": {"live_price": 100.0}})
+        return Response({"NSE_2": {"live_price": 200.0}})
+
+    result = capture._fetch_quotes_resilient(
+        request_fn, ["NSE_1", "NSE_2"], retry_backoff_seconds=0
+    )
+
+    assert result["attempt_count"] == 2
+    assert result["quotes"] == {
+        "NSE_1": {"live_price": 100.0},
+        "NSE_2": {"live_price": 200.0},
+    }
+    assert result["unresolved_codes"] == []
+    assert calls == ["NSE_1,NSE_2", "NSE_2"]

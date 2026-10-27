@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,9 @@ import pandas as pd
 
 IST = ZoneInfo("Asia/Kolkata")
 BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET URLs.
+QUOTE_REQUEST_MAX_ATTEMPTS = 3
+QUOTE_FALLBACK_BATCH_SIZE = 50
+QUOTE_RETRY_BACKOFF_SECONDS = 0.35
 REMOTE_ROOT = "production_data/all_universe_minute_snapshots"
 
 
@@ -92,6 +96,97 @@ def _instrument_map() -> dict[str, str]:
         str(row.TRADING_SYMBOL): f"NSE_{row.SECURITY_ID}"
         for row in frame[["TRADING_SYMBOL", "SECURITY_ID"]].itertuples(index=False)
         if str(row.TRADING_SYMBOL).strip()
+    }
+
+
+def _fetch_quotes_resilient(
+    request_fn: Any,
+    codes: list[str],
+    *,
+    max_attempts: int = QUOTE_REQUEST_MAX_ATTEMPTS,
+    fallback_batch_size: int = QUOTE_FALLBACK_BATCH_SIZE,
+    retry_backoff_seconds: float = QUOTE_RETRY_BACKOFF_SECONDS,
+) -> dict[str, Any]:
+    """Fetch quotes with bounded retries and small-batch fallback for gaps.
+
+    A transient HTTP/provider failure for one 500-code batch must not erase
+    hundreds of otherwise available observations for that five-minute slot.
+    Successful codes are retained; only unresolved codes are retried. When a
+    large request continues to fail or returns only a partial map, unresolved
+    codes are retried in smaller groups. Symbols still absent from the provider
+    response remain explicitly missing; no prices are fabricated.
+    """
+    requested = list(dict.fromkeys(str(code) for code in codes if str(code)))
+    quotes: dict[str, dict[str, Any]] = {}
+    last_error_by_code: dict[str, str] = {}
+    error_examples: list[str] = []
+    attempts_total = 0
+    fallback_batch_count = 0
+
+    def fetch_group(group: list[str], *, allow_split: bool) -> None:
+        nonlocal attempts_total, fallback_batch_count
+        pending = list(group)
+        last_error: str | None = None
+        for attempt in range(max(1, int(max_attempts))):
+            if not pending:
+                break
+            attempts_total += 1
+            try:
+                response = request_fn(
+                    "GET",
+                    "/market/quotes/full",
+                    params={"scrip-codes": ",".join(pending)},
+                )
+                body = response.json()
+                data = body.get("data", {}) if isinstance(body, dict) else {}
+                if not isinstance(data, dict):
+                    raise RuntimeError("INDstocks quote response has no data object")
+                success = (
+                    body.get("success") is True
+                    or str(body.get("status", "")).strip().lower() == "success"
+                )
+                if not success:
+                    raise RuntimeError(
+                        str(body.get("message") or body.get("error") or "quote request not successful")
+                    )
+                for code in pending:
+                    quote = data.get(code)
+                    if isinstance(quote, dict):
+                        quotes[code] = quote
+                        last_error_by_code.pop(code, None)
+                pending = [code for code in pending if code not in quotes]
+                # If the provider returned a valid but incomplete map, retry only
+                # missing codes rather than repeatedly downloading successful ones.
+                last_error = None
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+                if len(error_examples) < 8:
+                    error_examples.append(last_error)
+            if not pending:
+                return
+            if attempt + 1 < max(1, int(max_attempts)):
+                time.sleep(max(0.0, float(retry_backoff_seconds)) * (attempt + 1))
+
+        if pending and allow_split and len(pending) > max(1, int(fallback_batch_size)):
+            fallback_batch_count += (len(pending) + fallback_batch_size - 1) // fallback_batch_size
+            for offset in range(0, len(pending), fallback_batch_size):
+                fetch_group(pending[offset:offset + fallback_batch_size], allow_split=False)
+            return
+        if last_error:
+            for code in pending:
+                last_error_by_code[code] = last_error
+
+    fetch_group(requested, allow_split=True)
+    unresolved = [code for code in requested if code not in quotes]
+    return {
+        "quotes": quotes,
+        "requested_code_count": len(requested),
+        "matched_code_count": len(quotes),
+        "unresolved_codes": unresolved,
+        "attempt_count": attempts_total,
+        "fallback_batch_count": fallback_batch_count,
+        "last_error_by_code": last_error_by_code,
+        "error_examples": error_examples,
     }
 
 
@@ -470,57 +565,40 @@ def capture_all_universe_minute_snapshot(
     for batch_index, offset in enumerate(range(0, len(all_codes), BATCH_SIZE), start=1):
         batch = all_codes[offset:offset + BATCH_SIZE]
         codes = [code for _, code in batch]
-        try:
-            response = _request(
-                "GET",
-                "/market/quotes/full",
-                params={"scrip-codes": ",".join(codes)},
-            )
-            body = response.json()
-            data = body.get("data", {}) if isinstance(body, dict) else {}
-            if not isinstance(data, dict):
-                raise RuntimeError("INDstocks quote response has no data object")
-            success = (
-                body.get("success") is True
-                or str(body.get("status", "")).strip().lower() == "success"
-            )
-            if not success:
-                raise RuntimeError(
-                    str(body.get("message") or body.get("error") or "quote request not successful")
-                )
-            matched_code_count = sum(
-                1 for _, code in batch if isinstance(data.get(code), dict)
-            )
-            batch_diagnostics.append({
-                "batch_index": batch_index,
-                "requested_code_count": len(codes),
-                "response_data_key_count": len(data),
-                "matched_response_code_count": matched_code_count,
-                "response_key_samples": [str(key) for key in list(data.keys())[:5]],
-                "status": "OK",
-            })
-            observed_at = pd.Timestamp.now(tz=IST)
-            for symbol, code in batch:
-                quote = data.get(code)
-                rows.append(_quote_row(
-                    symbol, code, quote if isinstance(quote, dict) else None,
-                    observed_at, cycle_minute, prediction_map, forecast_rows,
-                ))
-        except Exception as exc:
+        fetched = _fetch_quotes_resilient(_request, codes)
+        data = fetched["quotes"]
+        unresolved = set(fetched["unresolved_codes"])
+        error_by_code = fetched["last_error_by_code"]
+        matched_code_count = sum(1 for _, code in batch if isinstance(data.get(code), dict))
+        if any(code in error_by_code for code in unresolved):
             request_errors += 1
-            observed_at = pd.Timestamp.now(tz=IST)
-            error = f"{type(exc).__name__}: {exc}"[:300]
-            batch_diagnostics.append({
-                "batch_index": batch_index,
-                "requested_code_count": len(codes),
-                "status": "ERROR",
-                "error": error,
-            })
-            for symbol, code in batch:
-                rows.append(_quote_row(
-                    symbol, code, None, observed_at, cycle_minute,
-                    prediction_map, forecast_rows, provider_error=error,
-                ))
+        batch_diagnostics.append({
+            "batch_index": batch_index,
+            "requested_code_count": len(codes),
+            "response_data_key_count": matched_code_count,
+            "matched_response_code_count": matched_code_count,
+            "status": "OK" if not unresolved else "PARTIAL",
+            "request_attempt_count": fetched["attempt_count"],
+            "fallback_batch_count": fetched["fallback_batch_count"],
+            "unresolved_code_count": len(unresolved),
+            "unresolved_symbol_samples": [
+                symbol for symbol, code in batch if code in unresolved
+            ][:10],
+            "error_examples": fetched["error_examples"],
+        })
+        observed_at = pd.Timestamp.now(tz=IST)
+        for symbol, code in batch:
+            quote = data.get(code)
+            provider_error = error_by_code.get(code)
+            if quote is None and code in unresolved and not provider_error:
+                # A successful provider response without this code means the
+                # quote is missing, not that the whole HTTP request failed.
+                provider_error = None
+            rows.append(_quote_row(
+                symbol, code, quote if isinstance(quote, dict) else None,
+                observed_at, cycle_minute, prediction_map, forecast_rows,
+                provider_error=provider_error,
+            ))
 
     for symbol in universe:
         if symbol not in instruments:
