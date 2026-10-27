@@ -117,8 +117,8 @@ jobs:
           }
           print("FULL_UNIVERSE_MINUTE_AUDIT_SUMMARY:", json.dumps(summary, sort_keys=True, default=str))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write("## Full-universe intraday capture audit\\n\\n")
-              fh.write(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\\n")
+              fh.write("## Full-universe intraday capture audit\n\n")
+              fh.write(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
 
           operational_failures = []
           if report.get("audit_status") == "PERSISTENCE_ERROR":
