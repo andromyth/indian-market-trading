@@ -173,7 +173,9 @@ jobs:
               "session_date", "nse_trading_day", "capture_interval_minutes",
               "expected_minutes", "snapshot_files_present", "missing_snapshot_minutes",
               "minute_manifests_present", "missing_manifest_minutes",
-              "capture_status_counts", "total_expected_symbol_minutes",
+              "capture_status_counts", "capture_status_gate_pass",
+              "capture_success_quote_coverage_threshold_pct", "capture_quality_gate_pass",
+              "snapshot_quality_gate_pass", "total_expected_symbol_minutes",
               "total_quoted_symbol_minutes", "total_missing_quote_rows",
               "observed_quote_coverage_pct", "matched_outcomes",
               "prediction_expected_slots", "prediction_files_present",
@@ -262,8 +264,10 @@ jobs:
           failures = []
           if os.getenv("WATCHLIST_MINUTE_AUDIT_OK", "true").lower() != "true":
               failures.append("WATCHLIST_MINUTE_CAPTURE_FAILED: per-minute prediction/actual snapshots are missing or incomplete.")
-          if report.get("nse_trading_day") and not report.get("quality_gate_pass"):
-              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: full-universe snapshot/manifest coverage or quote data-quality gate is incomplete.")
+          if report.get("nse_trading_day") and not report.get("capture_quality_gate_pass", report.get("quality_gate_pass")):
+              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: snapshot/manifest persistence is incomplete or aggregate quote coverage is not above 90%.")
+          if report.get("nse_trading_day") and not report.get("prediction_quality_gate_pass", False):
+              failures.append("ALL_NSE_MINUTE_PREDICTION_FAILED: minute prediction files/manifests or model-quality checks are incomplete.")
           if failures:
               raise SystemExit(" | ".join(failures))
           PY
