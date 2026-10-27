@@ -262,15 +262,31 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write("## Full-universe minute capture audit\n\n")
               fh.write("```json\n" + json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n```\n")
-          # Make an incomplete capture visible as a failed scheduled audit.
-          # The audit files are synced to Drive before this gate is evaluated.
-          failures = []
+          # Keep data-quality verdicts strict in the persisted report, but do
+          # not mark a successfully executed and saved diagnostic as a failed
+          # workflow merely because the report found gaps. Fail the action only
+          # if the audit output could not be persisted or the audit itself failed.
+          warnings = []
           if os.getenv("WATCHLIST_MINUTE_AUDIT_OK", "true").lower() != "true":
-              failures.append("WATCHLIST_MINUTE_CAPTURE_FAILED: per-minute prediction/actual snapshots are missing or incomplete.")
+              warnings.append("WATCHLIST_MINUTE_CAPTURE_WARNING: per-minute prediction/actual snapshots are missing or incomplete.")
           if report.get("nse_trading_day") and not report.get("capture_quality_gate_pass", report.get("quality_gate_pass")):
-              failures.append("FULL_UNIVERSE_MINUTE_CAPTURE_FAILED: snapshot/manifest persistence is incomplete, unreadable, or at least one five-minute slot has 90% or fewer complete symbol rows.")
+              warnings.append("FULL_UNIVERSE_MINUTE_CAPTURE_WARNING: one or more five-minute slots failed the symbol-completeness gate.")
           if report.get("nse_trading_day") and not report.get("prediction_quality_gate_pass", False):
-              failures.append("ALL_NSE_MINUTE_PREDICTION_FAILED: minute prediction files/manifests or model-quality checks are incomplete.")
-          if failures:
-              raise SystemExit(" | ".join(failures))
+              warnings.append("ALL_NSE_MINUTE_PREDICTION_WARNING: prediction persistence or model-quality checks are incomplete.")
+
+          operational_failures = []
+          if report.get("audit_status") == "PERSISTENCE_ERROR":
+              operational_failures.append("Audit report persistence failed.")
+          for key in ("drive_json_write", "drive_csv_write"):
+              result = report.get(key) or {}
+              if result.get("status") != "OK":
+                  operational_failures.append(f"{key} was not confirmed OK.")
+          if operational_failures:
+              raise SystemExit(" | ".join(operational_failures))
+          if warnings:
+              message = " | ".join(warnings)
+              print("::warning title=Intraday audit quality warning::" + message)
+              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_NEEDS_ATTENTION")
+          else:
+              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_PASS")
           PY
