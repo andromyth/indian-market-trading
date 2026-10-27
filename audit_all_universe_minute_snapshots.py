@@ -328,11 +328,34 @@ def build_audit_report(
                 > complete_symbol_coverage_threshold_pct
         )
     ]
-    statuses_data_complete = bool(all(
-        row["capture_status"] == "OK"
-        or str(row["minute_key_ist"]) in recovered_persistence_issue_minutes
-        for row in rows
-    ))
+    slot_coverage_by_minute = {
+        str(row["minute_key_ist"]): float(row["complete_symbol_coverage_pct"])
+        for _, row in frame.iterrows()
+    }
+    # Keep the status flag consistent with the symbol-completeness gate.
+    # PARTIAL is acceptable only when that slot has >90% complete symbol rows
+    # and its snapshot/manifest are present, unique, and readable.
+    statuses_data_complete = bool(
+        expected_count > 0
+        and all(
+            row["snapshot_present"]
+            and row["manifest_present"]
+            and int(row["snapshot_duplicate_file_count"]) == 0
+            and int(row["manifest_duplicate_file_count"]) == 0
+            and not row.get("snapshot_error")
+            and not row.get("manifest_error")
+            and slot_coverage_by_minute.get(str(row["minute_key_ist"]), 0.0)
+                > complete_symbol_coverage_threshold_pct
+            and (
+                row["capture_status"] in ("OK", "PARTIAL")
+                or (
+                    row["capture_status"] == "PERSISTENCE_ERROR"
+                    and str(row["minute_key_ist"]) in recovered_persistence_issue_minutes
+                )
+            )
+            for row in rows
+        )
+    )
     quality_gate_pass = bool(
         expected_count > 0
         and all_snapshots_present
