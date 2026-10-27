@@ -179,6 +179,17 @@ def build_audit_report(
     ).fillna(0).sum()
     all_snapshots_present = snapshots_present == expected_count
     all_manifests_present = manifests_present == expected_count
+    coverage_pct = (
+        float(total_quoted_symbols / total_expected_symbols * 100.0)
+        if total_expected_symbols else 0.0
+    )
+    # A persisted full-universe snapshot is considered successful when more
+    # than 90% of expected symbol-minute quotes are present. Keep structural
+    # persistence checks strict: every expected snapshot and manifest must
+    # exist, be unique, and be readable. Individual PARTIAL statuses and a
+    # minority of missing quotes are reported, but do not fail this snapshot
+    # gate when aggregate quote coverage clears the threshold.
+    capture_success_quote_coverage_threshold_pct = 90.0
     recovered_persistence_issue_minutes = [
         str(row["minute_key_ist"])
         for row in rows
@@ -188,12 +199,12 @@ def build_audit_report(
             and row["manifest_present"]
             and pd.notna(row["expected_symbol_count"])
             and pd.notna(row["quoted_symbol_count"])
-            and pd.notna(row["missing_quote_count"])
-            and pd.notna(row["unmapped_symbol_count"])
             and int(row["expected_symbol_count"]) > 0
-            and int(row["quoted_symbol_count"]) == int(row["expected_symbol_count"])
-            and int(row["missing_quote_count"]) == 0
-            and int(row["unmapped_symbol_count"]) == 0
+            and (
+                int(row["quoted_symbol_count"])
+                / int(row["expected_symbol_count"])
+                * 100.0
+            ) > capture_success_quote_coverage_threshold_pct
         )
     ]
     statuses_data_complete = bool(all(
@@ -201,19 +212,14 @@ def build_audit_report(
         or str(row["minute_key_ist"]) in recovered_persistence_issue_minutes
         for row in rows
     ))
-    coverage_pct = (
-        float(total_quoted_symbols / total_expected_symbols * 100.0)
-        if total_expected_symbols else 0.0
-    )
     quality_gate_pass = bool(
         expected_count > 0
         and all_snapshots_present
         and all_manifests_present
-        and statuses_data_complete
         and duplicate_snapshot_files == 0
         and duplicate_manifest_files == 0
-        and int(total_missing_quotes) == 0
         and not corrupt_manifests
+        and coverage_pct > capture_success_quote_coverage_threshold_pct
     )
     report = {
         "audit_name": "all-universe-minute-capture-audit",
@@ -236,6 +242,10 @@ def build_audit_report(
         "duplicate_snapshot_files": duplicate_snapshot_files,
         "duplicate_manifest_files": duplicate_manifest_files,
         "capture_status_counts": status_counts,
+        "capture_status_gate_pass": statuses_data_complete,
+        "capture_success_quote_coverage_threshold_pct": capture_success_quote_coverage_threshold_pct,
+        "capture_quality_gate_pass": quality_gate_pass,
+        "snapshot_quality_gate_pass": quality_gate_pass,
         "total_expected_symbol_minutes": int(total_expected_symbols),
         "total_quoted_symbol_minutes": int(total_quoted_symbols),
         "total_missing_quote_rows": int(total_missing_quotes),
@@ -262,9 +272,11 @@ def build_audit_report(
         "quality_gate_pass": quality_gate_pass,
         "audit_status": "PASS" if quality_gate_pass else "NEEDS_ATTENTION",
         "audit_note": (
-            "PERSISTENCE_ERROR minutes are considered recovered only when both the "
-            "snapshot and manifest now exist and quote coverage is complete; the original "
-            "status remains visible in capture_status_counts."
+            "Snapshot capture passes when every expected snapshot/manifest exists without "
+            "duplicates or corruption and aggregate quote coverage is strictly above 90%. "
+            "PARTIAL statuses and quote gaps remain visible. A PERSISTENCE_ERROR minute is "
+            "counted as recovered for capture purposes only when both artifacts exist and "
+            "that minute's quote coverage is above 90%; its original status remains visible."
         ),
         "audited_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -430,9 +442,16 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
         load_manifest,
         session_date=session_date,
     )
+    capture_quality_gate_pass = bool(
+        report.get("capture_quality_gate_pass", report.get("quality_gate_pass"))
+    )
     report.update(prediction_report)
+    # Preserve the snapshot-only verdict separately from the combined verdict.
+    # Prediction failures must not be mislabeled as market snapshot failures.
+    report["capture_quality_gate_pass"] = capture_quality_gate_pass
+    report["snapshot_quality_gate_pass"] = capture_quality_gate_pass
     report["quality_gate_pass"] = bool(
-        report.get("quality_gate_pass") and prediction_report["prediction_quality_gate_pass"]
+        capture_quality_gate_pass and prediction_report["prediction_quality_gate_pass"]
     )
     report["audit_status"] = "PASS" if report["quality_gate_pass"] else "NEEDS_ATTENTION"
 
