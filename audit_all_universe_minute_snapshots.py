@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import tempfile
 from datetime import date, datetime, time, timedelta, timezone
@@ -104,11 +105,85 @@ def _group_by_name(files: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
     return result
 
 
+
+def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
+    """Count unique symbols with a valid, complete core quote observation.
+
+    A symbol counts only when its row has PASS status, a nonblank symbol and
+    provider instrument code, a positive finite live price, and a valid
+    observation timestamp. Duplicate rows for a symbol are not counted as
+    complete; optional daily context fields are retained as data but do not
+    invalidate an otherwise valid live quote.
+    """
+    required = [
+        "symbol",
+        "instrument_code",
+        "quote_status",
+        "actual_observed_price",
+        "quote_observed_at_utc",
+    ]
+    if not isinstance(frame, pd.DataFrame):
+        return {
+            "snapshot_row_count": 0,
+            "complete_symbol_count": 0,
+            "snapshot_duplicate_symbol_count": 0,
+            "missing_required_snapshot_columns": required,
+            "snapshot_error": "Snapshot loader did not return a DataFrame",
+        }
+    missing_columns = [column for column in required if column not in frame.columns]
+    if missing_columns:
+        return {
+            "snapshot_row_count": int(len(frame)),
+            "complete_symbol_count": 0,
+            "snapshot_duplicate_symbol_count": 0,
+            "missing_required_snapshot_columns": missing_columns,
+            "snapshot_error": "Snapshot is missing required core quote columns",
+        }
+    if frame.empty:
+        return {
+            "snapshot_row_count": 0,
+            "complete_symbol_count": 0,
+            "snapshot_duplicate_symbol_count": 0,
+            "missing_required_snapshot_columns": [],
+            "snapshot_error": "Snapshot contains no symbol rows",
+        }
+
+    symbols = frame["symbol"].fillna("").astype(str).str.strip().str.upper()
+    nonblank = symbols.ne("")
+    symbol_counts = symbols.loc[nonblank].value_counts()
+    duplicate_symbol_count = int(
+        sum(int(count) - 1 for count in symbol_counts.values if int(count) > 1)
+    )
+    unique_symbol = symbols.map(symbol_counts).fillna(0).eq(1)
+    statuses = frame["quote_status"].fillna("").astype(str).str.strip().str.upper()
+    instruments = frame["instrument_code"].fillna("").astype(str).str.strip()
+    prices = pd.to_numeric(frame["actual_observed_price"], errors="coerce")
+    price_valid = prices.gt(0) & prices.lt(float("inf"))
+    timestamps = pd.to_datetime(
+        frame["quote_observed_at_utc"], errors="coerce", utc=True
+    )
+    complete = (
+        nonblank
+        & unique_symbol
+        & statuses.eq("PASS")
+        & instruments.ne("")
+        & price_valid
+        & timestamps.notna()
+    )
+    return {
+        "snapshot_row_count": int(len(frame)),
+        "complete_symbol_count": int(complete.sum()),
+        "snapshot_duplicate_symbol_count": duplicate_symbol_count,
+        "missing_required_snapshot_columns": [],
+        "snapshot_error": None,
+    }
+
 def build_audit_report(
     session_date: date,
     files: list[dict[str, Any]],
     manifest_loader,
     *,
+    snapshot_loader,
     as_of: datetime | pd.Timestamp | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     expected = expected_minutes(session_date, as_of=as_of)
@@ -121,6 +196,7 @@ def build_audit_report(
 
     rows: list[dict[str, Any]] = []
     corrupt_manifests: list[str] = []
+    corrupt_snapshots: list[str] = []
     for key in expected:
         manifests = minute_manifest_files[key]
         manifest: dict[str, Any] = {}
@@ -132,6 +208,22 @@ def build_audit_report(
                 manifest_error = f"{type(exc).__name__}: {exc}"
                 corrupt_manifests.append(key)
 
+        snapshot_metrics = {
+            "snapshot_row_count": 0,
+            "complete_symbol_count": 0,
+            "snapshot_duplicate_symbol_count": 0,
+            "missing_required_snapshot_columns": [],
+            "snapshot_error": "Snapshot file is missing",
+        }
+        if snapshot_files[key]:
+            try:
+                snapshot_frame = snapshot_loader(snapshot_files[key][0]["id"])
+                snapshot_metrics = _snapshot_completeness(snapshot_frame)
+                if snapshot_metrics.get("snapshot_error"):
+                    corrupt_snapshots.append(key)
+            except Exception as exc:
+                snapshot_metrics["snapshot_error"] = f"{type(exc).__name__}: {exc}"
+                corrupt_snapshots.append(key)
         rows.append({
             "minute_key_ist": key,
             "snapshot_present": bool(snapshot_files[key]),
@@ -153,6 +245,7 @@ def build_audit_report(
                 (manifest.get("pending_manifest_recovery") or {}).get("errors") or []
             ),
             "manifest_error": manifest_error,
+            **snapshot_metrics,
         })
 
     frame = pd.DataFrame(rows)
@@ -183,13 +276,44 @@ def build_audit_report(
         float(total_quoted_symbols / total_expected_symbols * 100.0)
         if total_expected_symbols else 0.0
     )
-    # A persisted full-universe snapshot is considered successful when more
-    # than 90% of expected symbol-minute quotes are present. Keep structural
-    # persistence checks strict: every expected snapshot and manifest must
-    # exist, be unique, and be readable. Individual PARTIAL statuses and a
-    # minority of missing quotes are reported, but do not fail this snapshot
-    # gate when aggregate quote coverage clears the threshold.
-    capture_success_quote_coverage_threshold_pct = 90.0
+    # Snapshot success is measured per scheduled slot: more than 90% of the
+    # expected symbols must each have one complete, valid quote row. Do not let
+    # a strong slot average hide a broken five-minute snapshot.
+    complete_symbol_coverage_threshold_pct = 90.0
+    frame["complete_symbol_coverage_pct"] = frame.apply(
+        lambda row: (
+            float(row["complete_symbol_count"] / row["expected_symbol_count"] * 100.0)
+            if pd.notna(row["expected_symbol_count"])
+            and float(row["expected_symbol_count"]) > 0
+            else 0.0
+        ),
+        axis=1,
+    )
+    slot_coverages = [float(value) for value in frame["complete_symbol_coverage_pct"]]
+    failed_symbol_completeness_minutes = [
+        str(row["minute_key_ist"])
+        for row in rows
+        if (
+            float(
+                frame.loc[frame["minute_key_ist"].eq(row["minute_key_ist"]),
+                          "complete_symbol_coverage_pct"].iloc[0]
+            ) <= complete_symbol_coverage_threshold_pct
+        )
+    ]
+    minimum_complete_symbol_coverage_pct = (
+        min(slot_coverages) if slot_coverages else 0.0
+    )
+    average_complete_symbol_coverage_pct = (
+        sum(slot_coverages) / len(slot_coverages) if slot_coverages else 0.0
+    )
+    total_complete_symbols = int(
+        pd.to_numeric(frame["complete_symbol_count"], errors="coerce").fillna(0).sum()
+    )
+    all_slots_meet_symbol_threshold = bool(
+        expected_count > 0
+        and len(slot_coverages) == expected_count
+        and all(value > complete_symbol_coverage_threshold_pct for value in slot_coverages)
+    )
     recovered_persistence_issue_minutes = [
         str(row["minute_key_ist"])
         for row in rows
@@ -198,13 +322,10 @@ def build_audit_report(
             and row["snapshot_present"]
             and row["manifest_present"]
             and pd.notna(row["expected_symbol_count"])
-            and pd.notna(row["quoted_symbol_count"])
-            and int(row["expected_symbol_count"]) > 0
-            and (
-                int(row["quoted_symbol_count"])
-                / int(row["expected_symbol_count"])
-                * 100.0
-            ) > capture_success_quote_coverage_threshold_pct
+            and float(row["expected_symbol_count"]) > 0
+            and float(row["complete_symbol_count"])
+                / float(row["expected_symbol_count"]) * 100.0
+                > complete_symbol_coverage_threshold_pct
         )
     ]
     statuses_data_complete = bool(all(
@@ -219,7 +340,8 @@ def build_audit_report(
         and duplicate_snapshot_files == 0
         and duplicate_manifest_files == 0
         and not corrupt_manifests
-        and coverage_pct > capture_success_quote_coverage_threshold_pct
+        and not corrupt_snapshots
+        and all_slots_meet_symbol_threshold
     )
     report = {
         "audit_name": "all-universe-minute-capture-audit",
@@ -238,18 +360,24 @@ def build_audit_report(
             key for key in expected if not minute_manifest_files[key]
         ],
         "corrupt_manifest_minutes": corrupt_manifests,
+        "corrupt_snapshot_minutes": corrupt_snapshots,
+        "failed_symbol_completeness_minutes": failed_symbol_completeness_minutes,
         "recovered_persistence_issue_minutes": recovered_persistence_issue_minutes,
         "duplicate_snapshot_files": duplicate_snapshot_files,
         "duplicate_manifest_files": duplicate_manifest_files,
         "capture_status_counts": status_counts,
         "capture_status_gate_pass": statuses_data_complete,
-        "capture_success_quote_coverage_threshold_pct": capture_success_quote_coverage_threshold_pct,
+        "complete_symbol_coverage_threshold_pct": complete_symbol_coverage_threshold_pct,
         "capture_quality_gate_pass": quality_gate_pass,
         "snapshot_quality_gate_pass": quality_gate_pass,
         "total_expected_symbol_minutes": int(total_expected_symbols),
         "total_quoted_symbol_minutes": int(total_quoted_symbols),
         "total_missing_quote_rows": int(total_missing_quotes),
         "observed_quote_coverage_pct": round(coverage_pct, 4),
+        "total_complete_symbol_rows": total_complete_symbols,
+        "average_complete_symbol_coverage_pct": round(average_complete_symbol_coverage_pct, 4),
+        "minimum_complete_symbol_coverage_pct": round(minimum_complete_symbol_coverage_pct, 4),
+        "all_slots_meet_symbol_completeness_threshold": all_slots_meet_symbol_threshold,
         "matched_outcomes": int(total_outcomes),
         "total_pending_snapshot_recovery_errors": int(
             pd.to_numeric(
@@ -272,11 +400,13 @@ def build_audit_report(
         "quality_gate_pass": quality_gate_pass,
         "audit_status": "PASS" if quality_gate_pass else "NEEDS_ATTENTION",
         "audit_note": (
-            "Snapshot capture passes when every expected snapshot/manifest exists without "
-            "duplicates or corruption and aggregate quote coverage is strictly above 90%. "
-            "PARTIAL statuses and quote gaps remain visible. A PERSISTENCE_ERROR minute is "
-            "counted as recovered for capture purposes only when both artifacts exist and "
-            "that minute's quote coverage is above 90%; its original status remains visible."
+            "Snapshot capture passes only when every expected snapshot and manifest exists "
+            "without duplicates or corruption, and every five-minute snapshot has strictly "
+            "more than 90% of expected symbols represented by one complete core quote row. "
+            "A complete row requires PASS quote status, a nonblank symbol and instrument code, "
+            "a positive finite observed price, and a valid quote-observation timestamp. "
+            "The gate is per slot, not an aggregate across the trading day. PARTIAL statuses, "
+            "missing symbols, invalid rows, and optional daily-context gaps remain diagnostic."
         ),
         "audited_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -421,10 +551,19 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
     files = _list_children(store, day_folder_id) if day_folder_id else []
     load_manifest = lambda file_id: _download_json(store, file_id)
     as_of = datetime.now(IST)
+    def load_snapshot(file_id: str) -> pd.DataFrame:
+        raw = store.service.files().get_media(fileId=file_id).execute()
+        if hasattr(raw, "read"):
+            raw = raw.read()
+        if not isinstance(raw, (bytes, bytearray)):
+            raise TypeError("Google Drive snapshot download did not return Parquet bytes")
+        return pd.read_parquet(io.BytesIO(raw))
+
     report, rows = build_audit_report(
         session_date,
         files,
         load_manifest,
+        snapshot_loader=load_snapshot,
         as_of=as_of,
     )
     prediction_day_parts = [
