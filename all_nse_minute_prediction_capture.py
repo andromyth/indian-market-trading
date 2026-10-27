@@ -267,6 +267,9 @@ class AllNSEMinutePredictor:
         self._lock = threading.RLock()
         self._seed_started = False
         self._seed_ready = False
+        # Readiness is progressive; completion is tracked separately so the
+        # worker can forecast eligible symbols while remaining history is seeded.
+        self._seed_complete = False
         self._seed_status = "NOT_STARTED"
         self._seed_error: str | None = None
         self._seed_universe_source = "NOT_SET"
@@ -321,6 +324,7 @@ class AllNSEMinutePredictor:
                 **self._last_health,
                 "status": self._seed_status if self._last_health.get("status") in {"NOT_STARTED", "WARMING_HISTORY"} else self._last_health.get("status"),
                 "history_ready": self._seed_ready,
+                "history_seed_complete": self._seed_complete,
                 "universe_symbols": len(self._symbols),
                 "history_symbols": len(self._history),
                 "history_seed_coverage_symbols": self._seed_coverage,
@@ -448,9 +452,48 @@ class AllNSEMinutePredictor:
         out = out.loc[~out.index.duplicated(keep="last")]
         return out
 
+    def _reserve_history_request_slot(self) -> None:
+        """Coordinate all history calls under the provider's five-requests/second limit."""
+        with self._history_request_lock:
+            delay = self._next_history_request_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            self._next_history_request_at = time.monotonic() + HISTORY_REFRESH_REQUEST_SPACING_SECONDS
+
+    def _publish_history_seed_progress(
+        self,
+        updates: dict[str, pd.DataFrame],
+        *,
+        coverage_symbols: int,
+        failed_batches: int,
+        complete: bool = False,
+    ) -> None:
+        """Publish completed history batches immediately instead of waiting for the full universe."""
+        with self._lock:
+            for symbol, frame in updates.items():
+                if symbol == "__NIFTY50__" or frame.empty:
+                    continue
+                existing = self._history.get(symbol)
+                if existing is not None and not existing.empty:
+                    # Seed results are fetched first; an already-refreshed live
+                    # history frame is newer and wins on duplicate timestamps.
+                    frame = pd.concat([frame, existing]).sort_index()
+                    frame = frame.loc[~frame.index.duplicated(keep="last")]
+                self._history[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
+            self._seed_coverage = int(coverage_symbols)
+            self._seed_errors = int(failed_batches)
+            self._seed_ready = bool(self._history)
+            self._seed_complete = bool(complete)
+            if not self._seed_ready:
+                self._seed_status = "WARMING_HISTORY"
+            elif complete and self._seed_coverage >= len(self._symbols) and failed_batches == 0:
+                self._seed_status = "READY"
+            else:
+                self._seed_status = "READY_PARTIAL"
+
     def _seed_history(self) -> None:
         """Fetch one recent trading session plus the current session in batches of five."""
-        while not self._seed_ready:
+        while True:
             try:
                 from all_universe_minute_capture import _instrument_map
                 from delivery_training_universe import official_nse_symbols
@@ -517,6 +560,7 @@ class AllNSEMinutePredictor:
                     batch_error = None
                     for attempt in range(3):
                         try:
+                            self._reserve_history_request_slot()
                             body = _request(
                                 "GET",
                                 "/market/historical/1minute",
@@ -570,8 +614,23 @@ class AllNSEMinutePredictor:
                                 frame = frame.loc[frame.index < now.floor("min")]
                                 if not frame.empty:
                                     histories[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
-                    if batch_index < len(batches):
-                        time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
+                    # Publish each successful batch as soon as it returns. Waiting
+                    # until all ~500 universe batches finish left history coverage
+                    # reported as zero throughout the morning and suppressed inference.
+                    batch_updates = {
+                        symbol: histories[symbol]
+                        for symbol, _ in batch
+                        if symbol in histories and symbol != "__NIFTY50__"
+                    }
+                    batch_coverage = sum(
+                        1 for symbol in symbols
+                        if symbol in histories and not histories[symbol].empty
+                    )
+                    self._publish_history_seed_progress(
+                        batch_updates,
+                        coverage_symbols=batch_coverage,
+                        failed_batches=batch_errors,
+                    )
 
                 # Retry missing equity histories individually. The provider may
                 # reject one malformed/stale code in a multi-symbol request; this
@@ -598,6 +657,7 @@ class AllNSEMinutePredictor:
                         break
                     targeted_attempts += 1
                     try:
+                        self._reserve_history_request_slot()
                         retry_body = _request(
                             "GET",
                             "/market/historical/1minute",
@@ -636,8 +696,14 @@ class AllNSEMinutePredictor:
                                 symbol=symbol,
                                 error_type=type(exc).__name__,
                             )
-                    if targeted_attempts < max_targeted_attempts:
-                        time.sleep(HISTORY_REQUEST_PAUSE_SECONDS)
+                    self._publish_history_seed_progress(
+                        {symbol: histories[symbol]} if symbol in histories else {},
+                        coverage_symbols=sum(
+                            1 for item in symbols
+                            if item in histories and not histories[item].empty
+                        ),
+                        failed_batches=batch_errors,
+                    )
 
                 self._log(
                     "all_nse_history_seed_repair_summary",
@@ -677,6 +743,22 @@ class AllNSEMinutePredictor:
                         market_base = market_base.loc[~market_base.index.duplicated(keep="last")]
                     # Keep the index's context history separate from stock histories;
                     # an available NIFTY series alone must not mark all-stock history ready.
+                    # Merge with any newer frames published by the incremental
+                    # refresh path while the initial seed was in progress.
+                    for symbol, live_frame in self._history.items():
+                        if symbol == "__NIFTY50__" or live_frame.empty:
+                            continue
+                        seeded_frame = histories.get(
+                            symbol,
+                            pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]),
+                        )
+                        if seeded_frame.empty:
+                            histories[symbol] = live_frame
+                        else:
+                            merged = pd.concat([seeded_frame, live_frame]).sort_index()
+                            histories[symbol] = merged.loc[
+                                ~merged.index.duplicated(keep="last")
+                            ].tail(HISTORY_LOOKBACK_BARS)
                     self._history = {
                         symbol: frame.tail(HISTORY_LOOKBACK_BARS)
                         for symbol, frame in histories.items()
@@ -689,6 +771,7 @@ class AllNSEMinutePredictor:
                         f"{batch_errors} historical batches did not return a success payload"
                     )
                     self._seed_ready = self._seed_coverage > 0
+                    self._seed_complete = True
                     self._seed_status = (
                         "READY"
                         if self._seed_ready and batch_errors == 0 and self._seed_coverage == len(symbols)
@@ -712,7 +795,11 @@ class AllNSEMinutePredictor:
             except Exception as exc:
                 with self._lock:
                     self._seed_error = f"{type(exc).__name__}: {str(exc)[:240]}"
-                    self._seed_status = "WARMING_HISTORY_ERROR"
+                    self._seed_ready = bool(self._history)
+                    self._seed_complete = False
+                    self._seed_status = (
+                        "READY_PARTIAL" if self._seed_ready else "WARMING_HISTORY_ERROR"
+                    )
                 self._log("all_nse_history_seed_failed", error=self._seed_error)
                 time.sleep(120)
 
@@ -778,7 +865,19 @@ class AllNSEMinutePredictor:
             if self._last_history_refresh_minute == minute_key:
                 return dict(self._last_history_refresh_summary)
             with self._lock:
-                seed_ready, codes, nifty_code = self._seed_ready, dict(self._codes), self._nifty_code
+                seed_ready = self._seed_ready
+                seed_complete = self._seed_complete
+                codes = dict(self._codes)
+                nifty_code = self._nifty_code
+                history_symbols = set(self._history)
+                if not seed_complete:
+                    # Do not run hundreds of refresh requests concurrently with
+                    # initial bootstrap. Refresh only symbols already seeded; the
+                    # roster expands progressively as the seed thread succeeds.
+                    codes = {
+                        symbol: code for symbol, code in codes.items()
+                        if symbol in history_symbols
+                    }
             if not seed_ready or not codes:
                 return {
                     "status": "WARMING_SEED", "minute": minute_key, "batch_count": 0,
@@ -797,11 +896,7 @@ class AllNSEMinutePredictor:
             batches = [entries[i:i + HISTORY_BATCH_SIZE] for i in range(0, len(entries), HISTORY_BATCH_SIZE)]
 
             def rate_limit_start() -> None:
-                with self._history_request_lock:
-                    delay = self._next_history_request_at - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)
-                    self._next_history_request_at = time.monotonic() + HISTORY_REFRESH_REQUEST_SPACING_SECONDS
+                self._reserve_history_request_slot()
 
             def fetch_batch(batch):
                 last_error = None
@@ -1024,6 +1119,7 @@ class AllNSEMinutePredictor:
         with self._lock:
             symbols = list(self._symbols) or sorted(quote_by_symbol)
             history_ready = self._seed_ready
+            history_seed_complete = self._seed_complete
             seed_status = self._seed_status
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
             market_history = self._market_history.copy()
@@ -1094,8 +1190,10 @@ class AllNSEMinutePredictor:
             elif symbol in failed_refresh_symbols:
                 quote_info["prediction_status"] = "HISTORY_REFRESH_FAILED"
                 quote_info["error"] = "Current-session one-minute candle refresh failed for this symbol."
-            elif not history_ready:
-                quote_info["prediction_status"] = "WARMING_HISTORY"
+            elif not history_ready or hist.empty:
+                quote_info["prediction_status"] = (
+                    "INSUFFICIENT_HISTORY" if history_seed_complete else "WARMING_HISTORY"
+                )
             elif model_error:
                 quote_info["prediction_status"] = "MODEL_UNAVAILABLE"
                 quote_info["error"] = model_error
@@ -1383,6 +1481,7 @@ class AllNSEMinutePredictor:
             "model_target": "target_30m",
             "model_status": self._seed_status,
             "history_ready": history_ready,
+            "history_seed_complete": history_seed_complete,
             "history_seed_universe_source": self._seed_universe_source,
             "history_seed_coverage_symbols": self._seed_coverage,
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
@@ -1422,6 +1521,7 @@ class AllNSEMinutePredictor:
                 **persisted,
                 "status": persisted.get("status"),
                 "history_ready": self._seed_ready,
+                "history_seed_complete": self._seed_complete,
                 "universe_symbols": len(self._symbols) or len(symbols),
                 "history_symbols": self._seed_coverage,
                 "last_capture_minute_ist": minute.isoformat(),
@@ -1438,6 +1538,7 @@ class AllNSEMinutePredictor:
             missing_quote_count=missing_quotes,
             data_limited_count=data_limited_count,
             history_ready=history_ready,
+            history_seed_complete=history_seed_complete,
             status=persisted.get("status"),
             remote_path=persisted.get("remote_path"),
             error=persisted.get("error"),
@@ -1451,5 +1552,6 @@ class AllNSEMinutePredictor:
             "data_limited_count": data_limited_count,
             "quality_gate_pass": manifest["quality_gate_pass"],
             "history_ready": history_ready,
+            "history_seed_complete": history_seed_complete,
             "history_status": seed_status,
         }
