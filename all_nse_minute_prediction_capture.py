@@ -289,7 +289,10 @@ class AllNSEMinutePredictor:
         self._model_status: dict[str, Any] = {}
         self._trained_symbols: set[str] = set()
         self._nifty_code: str | None = None
-        self._market_history = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self._market_history = pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        )
         self._calibration = None
         self._calibration_init_error_logged = False
         self._history_request_lock = threading.Lock()
@@ -425,6 +428,37 @@ class AllNSEMinutePredictor:
                 return d
             d -= timedelta(days=1)
         return value - timedelta(days=1)
+
+    @staticmethod
+    def _market_history_before(
+        market_history: pd.DataFrame | None,
+        minute: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Return only pre-decision benchmark rows; absent context must not block stock features.
+
+        When the NIFTY token/history endpoint is unavailable, the initial empty
+        DataFrame can carry a RangeIndex. Comparing that index with a Timestamp
+        raises TypeError and had incorrectly marked almost every symbol
+        FEATURE_BUILD_ERROR. Treat absent/malformed benchmark context as an
+        empty timestamp-indexed OHLCV frame so its features become NaN and the
+        model's existing readiness gate keeps the primary signal conservative.
+        """
+        columns = ["Open", "High", "Low", "Close", "Volume"]
+        empty = pd.DataFrame(
+            columns=columns,
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        )
+        if (
+            not isinstance(market_history, pd.DataFrame)
+            or market_history.empty
+            or not isinstance(market_history.index, pd.DatetimeIndex)
+        ):
+            return empty
+        market = market_history.copy()
+        idx = market.index
+        market.index = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+        decision_minute = _as_ist_timestamp(minute).floor("min")
+        return market.loc[market.index < decision_minute].copy()
 
     @staticmethod
     def _parse_candles(candles: list[dict[str, Any]]) -> pd.DataFrame:
@@ -1140,6 +1174,10 @@ class AllNSEMinutePredictor:
             seed_universe_source = self._seed_universe_source
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
             market_history = self._market_history.copy()
+        market_history_before_minute = self._market_history_before(
+            market_history,
+            minute,
+        )
         # Capture every symbol in the official universe even if quote data is missing.
         for symbol in sorted(set(quote_by_symbol) - set(symbols)):
             symbols.append(symbol)
@@ -1226,7 +1264,7 @@ class AllNSEMinutePredictor:
                     else:
                         model_feature_row = self._model_api._latest_features(
                             hist,
-                            market_df=market_history.loc[market_history.index < minute],
+                            market_df=market_history_before_minute,
                             decision_timestamp=actual_ts,
                         )
                         feature_rows.append(model_feature_row)
