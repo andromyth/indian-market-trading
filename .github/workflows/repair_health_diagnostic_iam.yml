@@ -44,16 +44,18 @@ jobs:
             --quiet
           echo "IAM_GRANT_OK=roles/logging.viewer principal=$DIAGNOSTIC_IDENTITY scope=project"
 
-      - name: Allow OIDC token minting only for the existing Scheduler invoker
+      - name: Allow only OIDC token minting on the existing Scheduler invoker
         shell: bash
         run: |
           set -euo pipefail
+          # Do not grant Service Account Token Creator: the probe needs only
+          # OIDC ID tokens, not OAuth access tokens, signBlob, or signJwt.
           gcloud iam service-accounts add-iam-policy-binding "$SCHEDULER_IDENTITY" \
             --project="$PROJECT_ID" \
             --member="serviceAccount:$DIAGNOSTIC_IDENTITY" \
-            --role="roles/iam.serviceAccountTokenCreator" \
+            --role="roles/iam.serviceAccountOpenIdTokenCreator" \
             --quiet
-          echo "IAM_GRANT_OK=roles/iam.serviceAccountTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
+          echo "IAM_GRANT_OK=roles/iam.serviceAccountOpenIdTokenCreator principal=$DIAGNOSTIC_IDENTITY target=$SCHEDULER_IDENTITY"
 
       - name: Verify log access and private endpoint authentication
         shell: bash
