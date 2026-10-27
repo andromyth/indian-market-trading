@@ -136,6 +136,21 @@ jobs:
                   ],
                   "prediction_status_counts": counts("prediction_status"),
                   "actual_quote_status_counts": counts("actual_quote_status"),
+                  "feature_build_error_counts": (
+                      frame.loc[
+                          frame.get("prediction_status", pd.Series(index=frame.index, dtype="string"))
+                          .astype(str).eq("FEATURE_BUILD_ERROR"), "error"
+                      ].astype("string").fillna("<NULL>").value_counts(dropna=False).head(10).to_dict()
+                      if "error" in frame.columns and "prediction_status" in frame.columns else {}
+                  ),
+                  "feature_build_error_examples": (
+                      frame.loc[
+                          frame.get("prediction_status", pd.Series(index=frame.index, dtype="string"))
+                          .astype(str).eq("FEATURE_BUILD_ERROR"),
+                          [col for col in ("symbol", "error") if col in frame.columns],
+                      ].head(12).to_dict(orient="records")
+                      if "prediction_status" in frame.columns else []
+                  ),
                   "trained_for_symbol_counts": counts("trained_for_symbol"),
                   "data_limited_counts": counts("data_limited"),
                   "data_readiness_score": numeric_summary("data_readiness_score"),
