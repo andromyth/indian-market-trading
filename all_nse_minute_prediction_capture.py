@@ -772,6 +772,12 @@ class AllNSEMinutePredictor:
                         for symbol, frame in histories.items()
                         if symbol != "__NIFTY50__" and not frame.empty
                     }
+                    # Preserve fresher NIFTY candles fetched during the bootstrap.
+                    if not self._market_history.empty:
+                        market_base = pd.concat([market_base, self._market_history]).sort_index()
+                        market_base = market_base.loc[
+                            ~market_base.index.duplicated(keep="last")
+                        ]
                     self._market_history = market_base.tail(HISTORY_LOOKBACK_BARS)
                     self._seed_coverage = historical_coverage
                     self._seed_errors = batch_errors
