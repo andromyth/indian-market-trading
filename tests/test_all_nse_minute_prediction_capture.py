@@ -180,7 +180,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     predictor._market_history = history.copy()
     predictor._model_api = SimpleNamespace(
         FEATURES=["f1", "f2"],
-        _latest_features=lambda price_df, market_df=None, decision_timestamp=None: {
+        _latest_features=lambda price_df, market_df=None, fno=None, decision_timestamp=None: {
             "f1": 1.0,
             "f2": 0.5,
         },
