@@ -240,8 +240,10 @@ def test_token_generation_failure_starts_cooldown_and_prevents_repeated_calls(mo
     ):
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
-    monkeypatch.setattr(client, "_CACHED_TOKEN", None)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", "stale-expired-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_GENERATED_AT", client.time.time() - 7200)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_GENERATED_VALUE", "stale-expired-token")
     monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
     monkeypatch.setattr(client, "_TOKEN_GENERATION_LAST_ERROR", None)
     calls = []
@@ -258,6 +260,10 @@ def test_token_generation_failure_starts_cooldown_and_prevents_repeated_calls(mo
 
     assert calls == ["attempt"]
     assert client._TOKEN_GENERATION_RETRY_AFTER > client.time.time()
+    assert client._CACHED_TOKEN is None
+    assert client._CACHED_TOKEN_EXPIRES_AT == 0.0
+    assert client._CACHED_TOKEN_GENERATED_AT == 0.0
+    assert client._CACHED_TOKEN_GENERATED_VALUE is None
 
 
 def test_rejected_token_refresh_failure_does_not_spam_rate_limited_endpoint(monkeypatch):
