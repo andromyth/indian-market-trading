@@ -292,6 +292,7 @@ class AllNSEMinutePredictor:
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._seed_started = False
+        self._seed_thread: threading.Thread | None = None
         self._seed_ready = False
         # Readiness is progressive; completion is tracked separately so the
         # worker can forecast eligible symbols while remaining history is seeded.
@@ -301,6 +302,7 @@ class AllNSEMinutePredictor:
         self._seed_universe_source = "NOT_SET"
         self._seed_coverage = 0
         self._seed_errors = 0
+        self._seed_deferred_batches = 0
         self._symbols: list[str] = []
         self._codes: dict[str, str] = {}
         self._history: dict[str, pd.DataFrame] = {}
@@ -339,17 +341,23 @@ class AllNSEMinutePredictor:
         }
 
     def start(self) -> None:
-        """Start the history bootstrap once; no credentials are read at import time."""
+        """Start or resume a deferred history bootstrap; never duplicate a live seed thread."""
         with self._lock:
-            if self._seed_started:
+            if self._seed_complete:
+                return
+            if self._seed_thread is not None and self._seed_thread.is_alive():
                 return
             self._seed_started = True
-            self._seed_status = "WARMING_HISTORY"
-        threading.Thread(
-            target=self._seed_history,
-            name="all-nse-minute-history-seed",
-            daemon=True,
-        ).start()
+            self._seed_status = (
+                "RESUMING_HISTORY" if self._seed_ready else "WARMING_HISTORY"
+            )
+            thread = threading.Thread(
+                target=self._seed_history,
+                name="all-nse-minute-history-seed",
+                daemon=True,
+            )
+            self._seed_thread = thread
+        thread.start()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -362,6 +370,7 @@ class AllNSEMinutePredictor:
                 "history_symbols": len(self._history),
                 "history_seed_coverage_symbols": self._seed_coverage,
                 "history_seed_failed_batches": self._seed_errors,
+                "history_seed_deferred_batches": self._seed_deferred_batches,
                 "history_seed_error": self._seed_error,
                 "history_seed_universe_source": self._seed_universe_source,
                 "history_refresh_pending_symbols": len(self._history_refresh_pending_symbols),
@@ -906,12 +915,39 @@ class AllNSEMinutePredictor:
                 end = now
                 start_ms = int(start.timestamp() * 1000)
                 end_ms = int(end.timestamp() * 1000)
-                entries = [(symbol, codes[symbol]) for symbol in symbols if symbol in codes]
-                batches = _history_seed_batches(entries, nifty_code, HISTORY_BATCH_SIZE)
+                # Preserve real history already published by previous successful
+                # batches or the current-session refresh. A resumed seed only needs
+                # to fetch symbols for which no cached history exists.
+                with self._lock:
+                    histories: dict[str, pd.DataFrame] = {
+                        symbol: frame.copy()
+                        for symbol, frame in self._history.items()
+                        if symbol in symbols and frame is not None and not frame.empty
+                    }
+                    if not self._market_history.empty:
+                        histories["__NIFTY50__"] = self._market_history.copy()
 
-                histories: dict[str, pd.DataFrame] = {}
+                entries = [
+                    (symbol, codes[symbol])
+                    for symbol in symbols
+                    if symbol in codes and (symbol not in histories or histories[symbol].empty)
+                ]
+                seed_nifty_code = (
+                    nifty_code
+                    if "__NIFTY50__" not in histories or histories["__NIFTY50__"].empty
+                    else None
+                )
+                batches = _history_seed_batches(
+                    entries,
+                    seed_nifty_code,
+                    HISTORY_BATCH_SIZE,
+                )
+
                 batch_errors = 0
                 requests_made = 0
+                auth_circuit_open = False
+                auth_error = None
+                deferred_batches = 0
                 for batch_index, batch in enumerate(batches, start=1):
                     code_list = [code for _, code in batch]
                     body = None
@@ -939,6 +975,13 @@ class AllNSEMinutePredictor:
                             break
                         except Exception as exc:
                             batch_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                            if _is_auth_recovery_error(batch_error):
+                                # A rejected token is a shared-account failure, not
+                                # a per-symbol data problem. Retrying every batch
+                                # only repeats the same token-generation HTTP 400.
+                                auth_circuit_open = True
+                                auth_error = batch_error
+                                break
                             if attempt < 2:
                                 # Honor the provider's five-request/second limit and
                                 # back off if a transient 429/5xx occurs.
@@ -989,6 +1032,17 @@ class AllNSEMinutePredictor:
                         coverage_symbols=batch_coverage,
                         failed_batches=batch_errors,
                     )
+                    if auth_circuit_open:
+                        deferred_batches = max(0, len(batches) - batch_index)
+                        self._log(
+                            "all_nse_history_seed_auth_deferred",
+                            failed_batch_index=batch_index,
+                            deferred_batches=deferred_batches,
+                            history_symbols_ready=batch_coverage,
+                            auth_error=auth_error,
+                            action="stop_seed_requests_until_next_scheduled_tick",
+                        )
+                        break
 
                 # Retry missing equity histories individually. The provider may
                 # reject one malformed/stale code in a multi-symbol request; this
@@ -1011,7 +1065,7 @@ class AllNSEMinutePredictor:
                 ]
                 max_targeted_attempts = min(40, len(missing_entries))
                 for symbol, code in missing_entries[:max_targeted_attempts]:
-                    if historical_coverage >= coverage_target:
+                    if auth_circuit_open or historical_coverage >= coverage_target:
                         break
                     targeted_attempts += 1
                     try:
@@ -1149,19 +1203,26 @@ class AllNSEMinutePredictor:
                     self._market_history = market_base.tail(HISTORY_LOOKBACK_BARS)
                     self._seed_coverage = historical_coverage
                     self._seed_errors = batch_errors
-                    self._seed_error = None if batch_errors == 0 else (
-                        f"{batch_errors} historical batches did not return a success payload"
+                    self._seed_deferred_batches = deferred_batches
+                    self._seed_error = (
+                        auth_error
+                        if auth_circuit_open
+                        else None if batch_errors == 0
+                        else f"{batch_errors} historical batches did not return a success payload"
                     )
-                    self._seed_ready = self._seed_coverage > 0
-                    self._seed_complete = True
+                    self._seed_ready = bool(self._history)
+                    # An auth-rejected seed is deferred, not completed; start()
+                    # can relaunch it on a later capture tick with cached history.
+                    self._seed_complete = not auth_circuit_open
                     self._seed_status = (
-                        "READY"
+                        "AUTH_DEFERRED" if auth_circuit_open
+                        else "READY"
                         if self._seed_ready and batch_errors == 0 and self._seed_coverage == len(symbols)
                         else "READY_PARTIAL" if self._seed_ready
                         else "HISTORY_SEED_EMPTY"
                     )
                     self._pending_quote_rows.clear()
-                if not self._seed_ready:
+                if not self._seed_ready and not auth_circuit_open:
                     raise RuntimeError("Historical warm-up returned no usable OHLCV bars")
                 self._log(
                     "all_nse_history_seed_completed",
@@ -1171,6 +1232,10 @@ class AllNSEMinutePredictor:
                     history_universe_source=self._seed_universe_source,
                     historical_batch_count=requests_made,
                     failed_batches=batch_errors,
+                    deferred_batches=deferred_batches,
+                    auth_circuit_open=auth_circuit_open,
+                    auth_error=auth_error,
+                    status="AUTH_DEFERRED" if auth_circuit_open else self._seed_status,
                     nifty_history_rows=len(self._market_history),
                 )
                 return
@@ -1722,6 +1787,7 @@ class AllNSEMinutePredictor:
             seed_status = self._seed_status
             seed_coverage_symbols = self._seed_coverage
             seed_failed_batches = self._seed_errors
+            seed_deferred_batches = self._seed_deferred_batches
             seed_universe_source = self._seed_universe_source
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
             market_history = self._market_history.copy()
@@ -2120,7 +2186,9 @@ class AllNSEMinutePredictor:
         untrained_fraction = untrained_symbol_count / expected_count
         model_failure_fraction = model_failures / expected_count
         seed_coverage_fraction = seed_coverage_symbols / expected_count
-        seed_failure_fraction = seed_failed_batches / seed_batch_count
+        seed_failure_fraction = (
+            seed_failed_batches + seed_deferred_batches
+        ) / seed_batch_count
         refresh_failure_fraction = (
             refresh_failed_batches / refresh_batch_count
             if refresh_batch_count
@@ -2171,6 +2239,7 @@ class AllNSEMinutePredictor:
             "history_seed_coverage_symbols": seed_coverage_symbols,
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
             "history_seed_failed_batches": seed_failed_batches,
+            "history_seed_deferred_batches": seed_deferred_batches,
             "history_seed_failure_fraction": round(seed_failure_fraction, 6),
             "history_refresh_status": history_refresh.get("status"),
             "history_refresh_mode": "BACKGROUND_NONBLOCKING",
@@ -2242,6 +2311,7 @@ class AllNSEMinutePredictor:
             history_seed_complete=history_seed_complete,
             history_seed_coverage_symbols=seed_coverage_symbols,
             history_seed_failed_batches=seed_failed_batches,
+            history_seed_deferred_batches=seed_deferred_batches,
             status=persisted.get("status"),
             remote_path=persisted.get("remote_path"),
             error=persisted.get("error"),
