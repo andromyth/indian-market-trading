@@ -198,3 +198,59 @@ def test_endpoint_permission_403_does_not_trigger_token_refresh(monkeypatch):
     with pytest.raises(RuntimeError, match="MARKET_DATA_PERMISSION_DENIED"):
         client._request("GET", "/market/quotes/full", params={"scrip-codes": "NSE_2885"})
     assert sent_tokens == ["current-token"]
+
+
+def test_token_generation_failure_starts_cooldown_and_prevents_repeated_calls(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", None)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_LAST_ERROR", None)
+    calls = []
+
+    def fail_rate_limited():
+        calls.append("attempt")
+        raise RuntimeError("token generation rate-limited; wait before retrying")
+
+    monkeypatch.setattr(client, "_generate_token", fail_rate_limited)
+    with pytest.raises(RuntimeError, match="suppressed for 60s"):
+        client.access_token()
+    with pytest.raises(RuntimeError, match="cooling down"):
+        client.access_token()
+
+    assert calls == ["attempt"]
+    assert client._TOKEN_GENERATION_RETRY_AFTER > client.time.time()
+
+
+def test_rejected_token_refresh_failure_does_not_spam_rate_limited_endpoint(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", "expired-token")
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_LAST_ERROR", None)
+    calls = []
+
+    def fail_rate_limited():
+        calls.append("attempt")
+        raise RuntimeError("token generation rate-limited; wait before retrying")
+
+    monkeypatch.setattr(client, "_generate_token", fail_rate_limited)
+    with pytest.raises(RuntimeError, match="suppressed for 60s"):
+        client._refresh_rejected_access_token("expired-token")
+    with pytest.raises(RuntimeError, match="cooling down"):
+        client._refresh_rejected_access_token("expired-token")
+
+    assert calls == ["attempt"]
+    assert client._TOKEN_GENERATION_RETRY_AFTER > client.time.time()

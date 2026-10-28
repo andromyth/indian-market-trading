@@ -27,10 +27,13 @@ import requests
 API_BASE = "https://api.indstocks.com"
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_TIMEOUT = 12
+TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS = 60
 
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
 _CACHED_TOKEN_EXPIRES_AT = 0.0
+_TOKEN_GENERATION_RETRY_AFTER = 0.0
+_TOKEN_GENERATION_LAST_ERROR: str | None = None
 _INSTRUMENTS: dict[str, tuple[float, pd.DataFrame]] = {}
 _INSTRUMENTS_LOCK = threading.Lock()
 
@@ -188,12 +191,48 @@ def _generate_token() -> str:
     return str(token)
 
 
+def _generate_and_cache_token_locked() -> str:
+    """Generate/cache one token while holding _TOKEN_LOCK, with failure cooldown."""
+    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
+    global _TOKEN_GENERATION_RETRY_AFTER, _TOKEN_GENERATION_LAST_ERROR
+
+    now = time.time()
+    if now < _TOKEN_GENERATION_RETRY_AFTER:
+        remaining = max(1, int(_TOKEN_GENERATION_RETRY_AFTER - now))
+        detail = f"; previous failure: {_TOKEN_GENERATION_LAST_ERROR}" if _TOKEN_GENERATION_LAST_ERROR else ""
+        raise RuntimeError(
+            f"INDstocks token generation is cooling down for another {remaining}s{detail}"
+        )
+
+    try:
+        token = _generate_token()
+    except Exception as exc:
+        _TOKEN_GENERATION_RETRY_AFTER = (
+            time.time() + TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS
+        )
+        _TOKEN_GENERATION_LAST_ERROR = f"{type(exc).__name__}: {str(exc)[:180]}"
+        # Do not log credential values or repeat provider calls from every
+        # concurrent history batch after a token endpoint failure/rate limit.
+        raise RuntimeError(
+            "INDstocks token generation failed; further attempts are suppressed "
+            f"for {TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS}s: "
+            f"{_TOKEN_GENERATION_LAST_ERROR}"
+        ) from None
+
+    _CACHED_TOKEN = token
+    _CACHED_TOKEN_EXPIRES_AT = time.time() + 23 * 3600
+    _TOKEN_GENERATION_RETRY_AFTER = 0.0
+    _TOKEN_GENERATION_LAST_ERROR = None
+    return token
+
+
 def access_token() -> str:
     """Return a cached TOTP-generated token or the configured manual token.
 
     TOTP tokens are refreshed at most once per process when less than one hour
     of the 24-hour validity period remains. INDstocks only allows one live
-    TOTP-generated token per account, so this adapter serializes generation.
+    TOTP-generated token per account, so this adapter serializes generation and
+    suppresses repeated token-endpoint calls for 60 seconds after a failure.
     """
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
     auto = _has_totp_credentials()
@@ -207,10 +246,7 @@ def access_token() -> str:
         now = time.time()
         if _CACHED_TOKEN and _CACHED_TOKEN_EXPIRES_AT > now + 3600:
             return _CACHED_TOKEN
-        token = _generate_token()
-        _CACHED_TOKEN = token
-        _CACHED_TOKEN_EXPIRES_AT = now + 23 * 3600
-        return token
+        return _generate_and_cache_token_locked()
 
 
 def _has_totp_credentials() -> bool:
@@ -240,9 +276,9 @@ def _is_rejected_access_token(response: requests.Response) -> bool:
 def _refresh_rejected_access_token(rejected_token: str) -> str:
     """Refresh a TOTP token rejected before its nominal 24-hour lifetime.
 
-    INDstocks may revoke a token early when a new session is created. Serializing
-    refreshes prevents concurrent requests using the same rejected token from
-    repeatedly generating new sessions.
+    INDstocks may revoke a token early when a new session is created. Refreshes
+    are serialized, and failed token generation is cooled down to prevent each
+    concurrent history batch from hammering a rate-limited token endpoint.
     """
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
     if not _has_totp_credentials():
@@ -261,10 +297,7 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
 
         _CACHED_TOKEN = None
         _CACHED_TOKEN_EXPIRES_AT = 0.0
-        refreshed = _generate_token()
-        _CACHED_TOKEN = refreshed
-        _CACHED_TOKEN_EXPIRES_AT = time.time() + 23 * 3600
-        return refreshed
+        return _generate_and_cache_token_locked()
 
 
 def _send_authenticated_request(
