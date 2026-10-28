@@ -1264,15 +1264,17 @@ class AllNSEMinutePredictor:
                     pending.update(failed_symbols)
                     self._history_refresh_pending_symbols = pending
 
+            refresh_cutoff = max(batch_end_minutes)
             nifty_history_source = "INDSTOCKS_HISTORICAL_1M" if "__NIFTY50__" in updated else None
             if "__NIFTY50__" not in updated or updated["__NIFTY50__"].empty:
-                # Provider index IDs are not REST scrip-codes; use the same genuine
-                # OHLCV fallback as bootstrap, excluding current/future minutes.
-                fallback = self._fetch_yahoo_nifty_history(minute)
+                # Benchmark refresh follows the same current-time cutoff as the
+                # equity batches. The next prediction still applies its own
+                # strict pre-decision filter, so no future bar enters inference.
+                fallback = self._fetch_yahoo_nifty_history(refresh_cutoff)
                 if not fallback.empty:
                     fallback = fallback.loc[
-                        (pd.Index(fallback.index.date) == minute.date())
-                        & (fallback.index < minute)
+                        (pd.Index(fallback.index.date) == refresh_cutoff.date())
+                        & (fallback.index < refresh_cutoff)
                     ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
                     if not fallback.empty:
                         updated["__NIFTY50__"] = fallback
