@@ -599,72 +599,120 @@ class AllNSEMinutePredictor:
             frame = frame.loc[~frame.index.duplicated(keep="last")]
             return frame[columns].tail(HISTORY_LOOKBACK_BARS)
 
-        for source, loader in candidates:
+        def try_source(source: str, loader: Any) -> pd.DataFrame:
+            """Fetch and normalize one source while keeping failures stage-specific."""
             try:
-                frame = normalize_candidate(loader())
-                latest = frame.index.max().isoformat() if not frame.empty else None
-                attempts.append({
-                    "source": source,
-                    "status": "OK" if not frame.empty else "NO_FRESH_CURRENT_SESSION_CANDLES",
-                    "rows": int(len(frame)),
-                    "latest_candle_ist": latest,
-                })
-                if not frame.empty:
-                    frame.attrs["market_context_source"] = source
-                    AllNSEMinutePredictor._log(
-                        "all_nse_nifty_context_fetch",
-                        status="OK",
-                        source=source,
-                        rows=int(len(frame)),
-                        latest_candle_ist=latest,
-                        cutoff_ist=cutoff.isoformat(),
-                        attempts=attempts,
-                    )
-                    return frame
+                raw = loader()
             except Exception as exc:
                 attempts.append({
                     "source": source,
+                    "stage": "fetch",
                     "status": "ERROR",
                     "error": f"{type(exc).__name__}: {str(exc)[:160]}",
                 })
+                return empty.copy()
 
-        try:
-            import yfinance as yf
-            raw = yf.download(
-                "^NSEI",
-                period="1d",
-                interval="1m",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                timeout=10,
-            )
-            frame = normalize_candidate(raw)
+            try:
+                frame = normalize_candidate(raw)
+            except Exception as exc:
+                attempts.append({
+                    "source": source,
+                    "stage": "normalize",
+                    "status": "ERROR",
+                    "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                })
+                return empty.copy()
+
             latest = frame.index.max().isoformat() if not frame.empty else None
             attempts.append({
-                "source": "yfinance_direct",
+                "source": source,
+                "stage": "normalize",
                 "status": "OK" if not frame.empty else "NO_FRESH_CURRENT_SESSION_CANDLES",
                 "rows": int(len(frame)),
                 "latest_candle_ist": latest,
             })
+            if frame.empty:
+                return empty.copy()
+
+            frame.attrs["market_context_source"] = source
+            AllNSEMinutePredictor._log(
+                "all_nse_nifty_context_fetch",
+                status="OK",
+                source=source,
+                rows=int(len(frame)),
+                latest_candle_ist=latest,
+                cutoff_ist=cutoff.isoformat(),
+                attempts=attempts,
+            )
+            return frame
+
+        for source, loader in candidates:
+            frame = try_source(source, loader)
             if not frame.empty:
-                frame.attrs["market_context_source"] = "yfinance_direct"
-                AllNSEMinutePredictor._log(
-                    "all_nse_nifty_context_fetch",
-                    status="OK",
-                    source="yfinance_direct",
-                    rows=int(len(frame)),
-                    latest_candle_ist=latest,
-                    cutoff_ist=cutoff.isoformat(),
-                    attempts=attempts,
-                )
                 return frame
+
+        # yfinance.Ticker.history has a different wrapper path from yf.download.
+        # Prefer it as the next fallback; it often yields ordinary OHLCV columns
+        # where yf.download can return MultiIndex columns or fail in its internals.
+        try:
+            import yfinance as yf
+
+            ticker = yf.Ticker("^NSEI")
+            ticker_history = getattr(ticker, "history", None)
+            if callable(ticker_history):
+                frame = try_source(
+                    "yfinance_ticker_history",
+                    lambda: ticker_history(
+                        period="1d",
+                        interval="1m",
+                        auto_adjust=False,
+                        actions=False,
+                        timeout=10,
+                    ),
+                )
+                if not frame.empty:
+                    return frame
+            else:
+                attempts.append({
+                    "source": "yfinance_ticker_history",
+                    "stage": "setup",
+                    "status": "UNAVAILABLE",
+                    "error": "Ticker.history is not callable",
+                })
         except Exception as exc:
             attempts.append({
-                "source": "yfinance_direct",
+                "source": "yfinance_ticker_history",
+                "stage": "setup",
                 "status": "ERROR",
                 "error": f"{type(exc).__name__}: {str(exc)[:160]}",
             })
+
+        # Keep yf.download as the final adapter, and record whether failure occurs
+        # during fetching or normalization. Never fabricate NIFTY candles.
+        try:
+            import yfinance as yf
+        except Exception as exc:
+            attempts.append({
+                "source": "yfinance_download",
+                "stage": "import",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+        else:
+            frame = try_source(
+                "yfinance_download",
+                lambda: yf.download(
+                    "^NSEI",
+                    period="1d",
+                    interval="1m",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    timeout=10,
+                ),
+            )
+            if not frame.empty:
+                return frame
 
         AllNSEMinutePredictor._log(
             "all_nse_nifty_context_fetch",
