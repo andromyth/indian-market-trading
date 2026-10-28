@@ -316,6 +316,32 @@ def test_pending_manifest_recovery_ignores_success_receipt_files(tmp_path):
 
 
 
+def test_resilient_quote_fetch_stops_on_shared_auth_failure_without_splitting():
+    calls = []
+
+    def request_fn(method, endpoint, params=None):
+        calls.append(params["scrip-codes"])
+        raise RuntimeError(
+            "INDstocks rejected the current access token and automatic "
+            "re-authentication failed: freshly generated INDstocks token was rejected"
+        )
+
+    codes = [f"NSE_{i}" for i in range(12)]
+    result = capture._fetch_quotes_resilient(
+        request_fn,
+        codes,
+        max_attempts=3,
+        fallback_batch_size=2,
+        retry_backoff_seconds=0,
+    )
+
+    assert calls == [",".join(codes)]
+    assert result["auth_failure"] is True
+    assert result["fallback_batch_count"] == 0
+    assert result["unresolved_codes"] == codes
+    assert set(result["last_error_by_code"]) == set(codes)
+
+
 def test_resilient_quote_fetch_retries_transient_provider_failure():
     calls = []
 

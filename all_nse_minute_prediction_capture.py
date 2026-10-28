@@ -47,7 +47,7 @@ MAX_MISSING_QUOTE_FRACTION = 0.02
 MAX_DATA_LIMITED_FRACTION = 0.10
 MAX_UNTRAINED_SYMBOL_FRACTION = 0.10
 MAX_MODEL_FAILURE_FRACTION = 0.01
-MIN_HISTORY_SEED_COVERAGE = 0.90
+MIN_HISTORY_SEED_COVERAGE = 0.95
 MAX_HISTORY_FAILURE_FRACTION = 0.05
 
 
@@ -73,6 +73,26 @@ def _history_seed_batches(
         # have the same market-context input path as later rows.
         batches.insert(0, [("__NIFTY50__", nifty_code)])
     return batches
+
+
+def _history_seed_meets_quality_gate(
+    coverage_symbols: int,
+    universe_symbols: int,
+    failed_batches: int,
+    batch_size: int = HISTORY_BATCH_SIZE,
+) -> bool:
+    """A seed is complete only when both history coverage and batch reliability pass."""
+    universe_count = max(0, int(universe_symbols))
+    if universe_count == 0:
+        return False
+    coverage_count = max(0, int(coverage_symbols))
+    failures = max(0, int(failed_batches))
+    requested_batches = max(1, int(np.ceil(universe_count / max(1, int(batch_size)))))
+    coverage_target = int(np.ceil(universe_count * MIN_HISTORY_SEED_COVERAGE))
+    return (
+        coverage_count >= coverage_target
+        and failures / requested_batches <= MAX_HISTORY_FAILURE_FRACTION
+    )
 
 
 def _history_seed_universe(
@@ -1390,11 +1410,15 @@ class AllNSEMinutePredictor:
                     self._seed_ready = bool(self._history)
                     # An auth-rejected seed is deferred, not completed; start()
                     # can relaunch it on a later capture tick with cached history.
-                    self._seed_complete = not auth_circuit_open
+                    seed_quality_complete = _history_seed_meets_quality_gate(
+                        historical_coverage,
+                        len(symbols),
+                        batch_errors,
+                    )
+                    self._seed_complete = not auth_circuit_open and seed_quality_complete
                     self._seed_status = (
                         "AUTH_DEFERRED" if auth_circuit_open
-                        else "READY"
-                        if self._seed_ready and batch_errors == 0 and self._seed_coverage == len(symbols)
+                        else "READY" if self._seed_ready and seed_quality_complete
                         else "READY_PARTIAL" if self._seed_ready
                         else "HISTORY_SEED_EMPTY"
                     )
@@ -1713,6 +1737,48 @@ class AllNSEMinutePredictor:
             "updated_symbols": 0,
             "current_session_candle_rows": 0,
         }
+
+    def _wait_for_current_session_history_refresh(
+        self,
+        minute: pd.Timestamp,
+        *,
+        timeout_seconds: float = 45.0,
+    ) -> dict[str, Any]:
+        """Wait briefly for a pre-capture refresh to finish before inference.
+
+        The full-universe quote collector runs in parallel with history refresh.
+        This bounded hand-off gives the refresh time to complete without allowing
+        a slow provider request to hang Cloud Scheduler. If the wait expires, the
+        stale-history guard still rejects outdated inputs.
+        """
+        minute = _as_ist_timestamp(minute).floor("min")
+        minute_key = minute.isoformat()
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            with self._lock:
+                in_progress = self._history_refresh_scheduled
+                completed_minute = self._last_history_refresh_minute
+                summary = dict(self._last_history_refresh_summary)
+                pending_count = len(self._history_refresh_pending_symbols)
+            if not in_progress:
+                if completed_minute == minute_key:
+                    return summary
+                return {
+                    "status": "NOT_CONFIRMED",
+                    "minute": minute_key,
+                    "last_completed_minute": completed_minute,
+                    "pending_symbol_count": pending_count,
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "status": "WAIT_TIMEOUT",
+                    "minute": minute_key,
+                    "last_completed_minute": completed_minute,
+                    "pending_symbol_count": pending_count,
+                    "wait_timeout_seconds": max(0.0, float(timeout_seconds)),
+                }
+            time.sleep(min(0.25, remaining))
 
     def _refresh_current_session_history(self, minute: pd.Timestamp) -> dict[str, Any]:
         """Refresh genuine one-minute candles; never turn LTP snapshots into OHLC bars."""
@@ -2083,8 +2149,13 @@ class AllNSEMinutePredictor:
         # Capture is timestamp-aligned; prediction below filters every input
         # candle to strictly before this minute and rejects data older than the
         # explicit freshness threshold.
-        refresh_target = max(minute, pd.Timestamp.now(tz=IST).floor("min"))
+        refresh_target = minute
         history_refresh = self._schedule_current_session_history_refresh(refresh_target)
+        if str(history_refresh.get("status") or "").upper() in {"IN_PROGRESS", "SCHEDULED_ASYNC"}:
+            history_refresh = self._wait_for_current_session_history_refresh(
+                refresh_target,
+                timeout_seconds=45.0,
+            )
         failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
         source_root = Path(worker_root or self.worker_root)
         snapshot_name = f"snapshot_{minute:%Y%m%d_%H%M}.parquet"

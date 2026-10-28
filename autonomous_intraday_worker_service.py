@@ -19,7 +19,12 @@ from typing import Any
 
 import pandas as pd
 
-from autonomous_intraday_worker import AutonomousIntradayWorker, _clean_json, _log
+from autonomous_intraday_worker import (
+    AutonomousIntradayWorker,
+    _clean_json,
+    _log,
+    is_all_nse_capture_slot,
+)
 from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 from market_session_guard import IST
 
@@ -51,6 +56,38 @@ WORKER = AutonomousIntradayWorker(
 
 # Separate pooled ALL-NSE inference path; the existing news watchlist remains unchanged.
 ALL_NSE_MINUTE_PREDICTOR = AllNSEMinutePredictor(WORKER_ROOT)
+
+
+def _prepare_all_nse_history_before_capture(
+    now: pd.Timestamp | datetime | None = None,
+) -> dict[str, Any]:
+    """Start same-slot history refresh before the slow full-universe quote fetch."""
+    stamp = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+    minute = stamp.floor("min")
+    ALL_NSE_MINUTE_PREDICTOR.start()
+    if not is_all_nse_capture_slot(minute):
+        return {"status": "NOT_SCHEDULED", "minute": minute.isoformat()}
+    try:
+        result = ALL_NSE_MINUTE_PREDICTOR._schedule_current_session_history_refresh(minute)
+        _log(
+            "all_nse_pre_capture_history_refresh",
+            minute=minute.isoformat(),
+            refresh_status=result.get("status"),
+            updated_symbols=result.get("updated_symbols"),
+            pending_symbol_count=result.get("pending_symbol_count"),
+            failed_batches=result.get("failed_batches"),
+        )
+        return result
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+        _log(
+            "all_nse_pre_capture_history_refresh_failed",
+            minute=minute.isoformat(),
+            error=detail,
+        )
+        # A failed refresh is surfaced, but must not block quote capture/write.
+        return {"status": "ERROR", "minute": minute.isoformat(), "error": detail}
 
 
 def _record_tick_result(result: dict[str, Any]) -> None:
@@ -542,10 +579,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
             if length:
                 self.rfile.read(min(length, 4096))
 
-            # Start long history seeding before quote collection so it overlaps
-            # the worker's first fetches instead of beginning after Drive upload.
-            ALL_NSE_MINUTE_PREDICTOR.start()
+            # Seed and refresh history before the full-universe quote collector
+            # starts. This lets fresh one-minute candles arrive during the quote
+            # fetch instead of starting refresh only after quote collection ends.
+            history_prefetch = _prepare_all_nse_history_before_capture()
             result = WORKER.tick_once()
+            result["all_nse_pre_capture_history_refresh"] = history_prefetch
             # Run pooled all-NSE inference only when the full-universe quote
             # capture actually ran on a scheduled five-minute slot.
             capture_result = result.get("all_universe_capture") or {}

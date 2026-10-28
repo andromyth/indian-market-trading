@@ -824,6 +824,25 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
 
 
 
+def test_history_seed_completion_requires_quality_thresholds():
+    assert capture._history_seed_meets_quality_gate(
+        coverage_symbols=19,
+        universe_symbols=20,
+        failed_batches=0,
+    ) is True
+    assert capture._history_seed_meets_quality_gate(
+        coverage_symbols=18,
+        universe_symbols=20,
+        failed_batches=0,
+    ) is False
+    assert capture._history_seed_meets_quality_gate(
+        coverage_symbols=20,
+        universe_symbols=20,
+        failed_batches=2,
+        batch_size=5,
+    ) is False
+
+
 def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypatch):
     import all_universe_minute_capture
     import delivery_training_universe

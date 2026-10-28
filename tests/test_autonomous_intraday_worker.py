@@ -486,6 +486,35 @@ def test_minute_snapshot_persists_prediction_and_actual_price_to_drive(tmp_path,
 
 
 
+def test_all_nse_history_refresh_is_started_before_quote_capture(monkeypatch):
+    import autonomous_intraday_worker_service as service
+
+    calls = []
+
+    class FakePredictor:
+        def start(self):
+            calls.append(("start", None))
+
+        def _schedule_current_session_history_refresh(self, minute):
+            calls.append(("refresh", minute))
+            return {"status": "SCHEDULED_ASYNC", "minute": minute.isoformat()}
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", FakePredictor())
+    result = service._prepare_all_nse_history_before_capture(
+        pd.Timestamp("2026-10-28 14:20:12", tz=IST)
+    )
+    assert [name for name, _ in calls] == ["start", "refresh"]
+    assert calls[1][1] == pd.Timestamp("2026-10-28 14:20:00", tz=IST)
+    assert result["status"] == "SCHEDULED_ASYNC"
+
+    calls.clear()
+    result = service._prepare_all_nse_history_before_capture(
+        pd.Timestamp("2026-10-28 14:22:12", tz=IST)
+    )
+    assert [name for name, _ in calls] == ["start"]
+    assert result["status"] == "NOT_SCHEDULED"
+
+
 def test_service_drive_preflight_failure_is_diagnostic_not_startup_exception(monkeypatch):
     import persistent_store
     from autonomous_intraday_worker_service import STATE, _preflight

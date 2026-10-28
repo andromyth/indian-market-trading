@@ -99,6 +99,21 @@ def _instrument_map() -> dict[str, str]:
     }
 
 
+def _is_shared_quote_auth_failure(error: Any) -> bool:
+    """Recognize shared INDstocks auth/token failures that small-batch retries cannot heal."""
+    detail = str(error or "").lower()
+    return any(marker in detail for marker in (
+        "token generation",
+        "automatic re-authentication failed",
+        "automatic reauthentication failed",
+        "freshly generated indstocks token was rejected",
+        "access token may have expired",
+        "invalid access token",
+        "access_token is either incorrect",
+        "http 401; the access token",
+    ))
+
+
 def _fetch_quotes_resilient(
     request_fn: Any,
     codes: list[str],
@@ -122,10 +137,15 @@ def _fetch_quotes_resilient(
     error_examples: list[str] = []
     attempts_total = 0
     fallback_batch_count = 0
+    auth_failure_detail: str | None = None
 
     def fetch_group(group: list[str], *, allow_split: bool) -> None:
-        nonlocal attempts_total, fallback_batch_count
+        nonlocal attempts_total, fallback_batch_count, auth_failure_detail
         pending = list(group)
+        if auth_failure_detail is not None:
+            for code in pending:
+                last_error_by_code[code] = auth_failure_detail
+            return
         last_error: str | None = None
         for attempt in range(max(1, int(max_attempts))):
             if not pending:
@@ -162,15 +182,31 @@ def _fetch_quotes_resilient(
                 last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
                 if len(error_examples) < 8:
                     error_examples.append(last_error)
+                if _is_shared_quote_auth_failure(last_error):
+                    auth_failure_detail = last_error
+                    for code in pending:
+                        last_error_by_code[code] = last_error
+                    return
             if not pending:
+                return
+            if auth_failure_detail is not None:
+                for code in pending:
+                    last_error_by_code[code] = auth_failure_detail
                 return
             if attempt + 1 < max(1, int(max_attempts)):
                 time.sleep(max(0.0, float(retry_backoff_seconds)) * (attempt + 1))
 
-        if pending and allow_split and len(pending) > max(1, int(fallback_batch_size)):
+        if (
+            pending
+            and auth_failure_detail is None
+            and allow_split
+            and len(pending) > max(1, int(fallback_batch_size))
+        ):
             fallback_batch_count += (len(pending) + fallback_batch_size - 1) // fallback_batch_size
             for offset in range(0, len(pending), fallback_batch_size):
                 fetch_group(pending[offset:offset + fallback_batch_size], allow_split=False)
+                if auth_failure_detail is not None:
+                    break
             return
         if last_error:
             for code in pending:
@@ -187,6 +223,8 @@ def _fetch_quotes_resilient(
         "fallback_batch_count": fallback_batch_count,
         "last_error_by_code": last_error_by_code,
         "error_examples": error_examples,
+        "auth_failure": auth_failure_detail is not None,
+        "auth_error": auth_failure_detail,
     }
 
 
@@ -556,6 +594,8 @@ def capture_all_universe_minute_snapshot(
     rows: list[dict[str, Any]] = []
     request_errors = 0
     batch_diagnostics: list[dict[str, Any]] = []
+    provider_auth_circuit_open = False
+    provider_auth_error: str | None = None
     all_codes = [
         (symbol, instruments[symbol])
         for symbol in universe
@@ -565,22 +605,53 @@ def capture_all_universe_minute_snapshot(
     for batch_index, offset in enumerate(range(0, len(all_codes), BATCH_SIZE), start=1):
         batch = all_codes[offset:offset + BATCH_SIZE]
         codes = [code for _, code in batch]
-        fetched = _fetch_quotes_resilient(_request, codes)
+        auth_circuit_blocked = provider_auth_circuit_open
+        if auth_circuit_blocked:
+            fetched = {
+                "quotes": {},
+                "requested_code_count": len(codes),
+                "matched_code_count": 0,
+                "unresolved_codes": list(codes),
+                "attempt_count": 0,
+                "fallback_batch_count": 0,
+                "last_error_by_code": {
+                    code: provider_auth_error or "Shared INDstocks authentication circuit is open"
+                    for code in codes
+                },
+                "error_examples": [provider_auth_error] if provider_auth_error else [],
+                "auth_failure": True,
+                "auth_error": provider_auth_error,
+            }
+        else:
+            fetched = _fetch_quotes_resilient(_request, codes)
+            if fetched.get("auth_failure"):
+                provider_auth_circuit_open = True
+                provider_auth_error = str(
+                    fetched.get("auth_error") or "Shared INDstocks authentication failed"
+                )
         data = fetched["quotes"]
         unresolved = set(fetched["unresolved_codes"])
         error_by_code = fetched["last_error_by_code"]
         matched_code_count = sum(1 for _, code in batch if isinstance(data.get(code), dict))
         if any(code in error_by_code for code in unresolved):
             request_errors += 1
+        if auth_circuit_blocked:
+            batch_status = "AUTH_CIRCUIT_BLOCKED"
+        elif fetched.get("auth_failure"):
+            batch_status = "AUTH_FAILURE"
+        else:
+            batch_status = "OK" if not unresolved else "PARTIAL"
         batch_diagnostics.append({
             "batch_index": batch_index,
             "requested_code_count": len(codes),
             "response_data_key_count": matched_code_count,
             "matched_response_code_count": matched_code_count,
-            "status": "OK" if not unresolved else "PARTIAL",
+            "status": batch_status,
             "request_attempt_count": fetched["attempt_count"],
             "fallback_batch_count": fetched["fallback_batch_count"],
             "unresolved_code_count": len(unresolved),
+            "auth_failure": bool(fetched.get("auth_failure")),
+            "auth_circuit_blocked": auth_circuit_blocked,
             "unresolved_symbol_samples": [
                 symbol for symbol, code in batch if code in unresolved
             ][:10],
@@ -609,6 +680,8 @@ def capture_all_universe_minute_snapshot(
             ))
 
     manifest["quote_request_error_count"] = request_errors
+    manifest["provider_auth_circuit_open"] = provider_auth_circuit_open
+    manifest["provider_auth_error"] = provider_auth_error
     manifest["quote_batch_diagnostics"] = batch_diagnostics
 
     frame = pd.DataFrame(rows)
