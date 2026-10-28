@@ -2019,6 +2019,16 @@ class AllNSEMinutePredictor:
         else:
             model_error = None
 
+        fno_context_by_symbol: dict[str, dict[str, Any]] = {}
+        fno_context_status = "NOT_ATTEMPTED"
+        fno_context_source_max_date = None
+        if history_ready and model_error is None and self._model_api is not None:
+            (
+                fno_context_by_symbol,
+                fno_context_status,
+                fno_context_source_max_date,
+            ) = self._load_completed_fno_context(minute)
+
         current_rows: list[dict[str, Any]] = []
         feature_rows: list[dict[str, float]] = []
         feature_symbols: list[str] = []
@@ -2109,6 +2119,7 @@ class AllNSEMinutePredictor:
                         model_feature_row = self._model_api._latest_features(
                             hist,
                             market_df=market_history_before_minute,
+                            fno=fno_context_by_symbol.get(symbol),
                             decision_timestamp=actual_ts,
                         )
                         feature_rows.append(model_feature_row)
@@ -2472,6 +2483,9 @@ class AllNSEMinutePredictor:
                 else "INDSTOCKS_REST" if self._nifty_code
                 else "MISSING"
             ),
+            "fno_context_status": fno_context_status,
+            "fno_context_source_max_date": fno_context_source_max_date,
+            "fno_context_symbol_count": len(fno_context_by_symbol),
             "nifty_context_error": nifty_error,
             "quote_source_snapshot": str(local_quote_path),
             "quote_snapshot_read_error": read_error,
@@ -2522,6 +2536,9 @@ class AllNSEMinutePredictor:
             history_seed_coverage_symbols=seed_coverage_symbols,
             history_seed_failed_batches=seed_failed_batches,
             history_seed_deferred_batches=seed_deferred_batches,
+            fno_context_status=fno_context_status,
+            fno_context_source_max_date=fno_context_source_max_date,
+            fno_context_symbol_count=len(fno_context_by_symbol),
             status=persisted.get("status"),
             remote_path=persisted.get("remote_path"),
             error=persisted.get("error"),
@@ -2537,4 +2554,7 @@ class AllNSEMinutePredictor:
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,
             "history_status": seed_status,
+            "fno_context_status": fno_context_status,
+            "fno_context_source_max_date": fno_context_source_max_date,
+            "fno_context_symbol_count": len(fno_context_by_symbol),
         }
