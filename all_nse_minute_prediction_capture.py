@@ -437,52 +437,163 @@ class AllNSEMinutePredictor:
 
     @staticmethod
     def _fetch_yahoo_nifty_history(minute: pd.Timestamp) -> pd.DataFrame:
-        """Fetch genuine NIFTY 50 one-minute candles strictly before a decision time."""
+        """Fetch genuine, fresh one-minute NIFTY 50 candles with fallback diagnostics."""
         columns = ["Open", "High", "Low", "Close", "Volume"]
         empty = pd.DataFrame(
             columns=columns,
             index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         )
-        decision_minute = _as_ist_timestamp(minute).floor("min")
-        try:
-            from data_fetcher import _yahoo_chart_history
+        cutoff = _as_ist_timestamp(minute).floor("min")
+        attempts: list[dict[str, Any]] = []
 
-            frame = _yahoo_chart_history("^NSEI", "5d", "1m")
+        # Try the existing direct Yahoo chart adapter first, then the repository's
+        # wider historical adapter (which can use cached/provider sources), and
+        # finally yfinance's direct download path. This is deliberately market
+        # context only; no proxy stock or synthetic OHLC is substituted for NIFTY.
+        try:
+            from data_fetcher import _normalize_historical_frame, _yahoo_chart_history, get_historical
+        except Exception as exc:
+            _normalize_historical_frame = None
+            _yahoo_chart_history = None
+            get_historical = None
+            attempts.append({
+                "source": "data_fetcher_import",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+
+        candidates: list[tuple[str, Any]] = []
+        if _yahoo_chart_history is not None:
+            candidates.append((
+                "yahoo_chart",
+                lambda: _yahoo_chart_history("^NSEI", "5d", "1m"),
+            ))
+        if get_historical is not None:
+            candidates.append((
+                "get_historical",
+                lambda: get_historical("^NSEI", period="5d", interval="1m", force_refresh=True),
+            ))
+
+        def normalize_candidate(candidate: Any) -> pd.DataFrame:
+            if candidate is None or getattr(candidate, "empty", True):
+                return empty.copy()
+            frame = (
+                _normalize_historical_frame(candidate)
+                if _normalize_historical_frame is not None
+                else candidate.copy()
+            )
             if frame is None or frame.empty:
-                return empty
+                return empty.copy()
             frame = frame.copy()
-            aliases = {str(column).strip().lower(): column for column in frame.columns}
-            rename = {}
-            for required in columns:
-                source = aliases.get(required.lower())
-                if source is not None and source != required:
-                    rename[source] = required
-            frame = frame.rename(columns=rename)
-            if "Close" not in frame.columns:
-                return empty
-            for required in columns:
-                if required not in frame.columns:
-                    frame[required] = np.nan
-                frame[required] = pd.to_numeric(frame[required], errors="coerce")
-            # Yahoo timestamps are epoch-derived and may arrive UTC-aware or
-            # naive; normalize every row to an explicit IST DatetimeIndex.
-            index = pd.DatetimeIndex(
-                pd.to_datetime(frame.index, errors="coerce", utc=True)
-            ).tz_convert(IST)
-            frame.index = index
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = [str(value).strip() for value in frame.columns.get_level_values(-1)]
+            aliases = {
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "adj close": "Close", "adj_close": "Close",
+                "volume": "Volume", "vol": "Volume",
+            }
+            frame = frame.rename(columns={
+                col: aliases.get(str(col).strip().lower(), col)
+                for col in frame.columns
+            })
+            raw_index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
+            if raw_index.tz is None:
+                raw_index = raw_index.tz_localize(IST)
+            else:
+                raw_index = raw_index.tz_convert(IST)
+            frame.index = raw_index
             frame.index.name = "Datetime"
             frame = frame.loc[~frame.index.isna()]
+            for column in columns:
+                if column not in frame.columns:
+                    frame[column] = np.nan
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
             frame = frame.loc[
-                (frame.index < decision_minute)
+                (pd.Index(frame.index.date) == cutoff.date())
+                & (frame.index < cutoff)
                 & frame["Close"].notna()
                 & frame["Close"].gt(0)
             ].sort_index()
             frame = frame.loc[~frame.index.duplicated(keep="last")]
             return frame[columns].tail(HISTORY_LOOKBACK_BARS)
-        except Exception:
-            # Benchmark context is optional; keep stock persistence working and
-            # let the existing feature-readiness gate force low-readiness HOLD.
-            return empty
+
+        for source, loader in candidates:
+            try:
+                frame = normalize_candidate(loader())
+                latest = frame.index.max().isoformat() if not frame.empty else None
+                attempts.append({
+                    "source": source,
+                    "status": "OK" if not frame.empty else "NO_FRESH_CURRENT_SESSION_CANDLES",
+                    "rows": int(len(frame)),
+                    "latest_candle_ist": latest,
+                })
+                if not frame.empty:
+                    frame.attrs["market_context_source"] = source
+                    AllNSEMinutePredictor._log(
+                        "all_nse_nifty_context_fetch",
+                        status="OK",
+                        source=source,
+                        rows=int(len(frame)),
+                        latest_candle_ist=latest,
+                        cutoff_ist=cutoff.isoformat(),
+                        attempts=attempts,
+                    )
+                    return frame
+            except Exception as exc:
+                attempts.append({
+                    "source": source,
+                    "status": "ERROR",
+                    "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                })
+
+        try:
+            import yfinance as yf
+            raw = yf.download(
+                "^NSEI",
+                period="1d",
+                interval="1m",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=10,
+            )
+            frame = normalize_candidate(raw)
+            latest = frame.index.max().isoformat() if not frame.empty else None
+            attempts.append({
+                "source": "yfinance_direct",
+                "status": "OK" if not frame.empty else "NO_FRESH_CURRENT_SESSION_CANDLES",
+                "rows": int(len(frame)),
+                "latest_candle_ist": latest,
+            })
+            if not frame.empty:
+                frame.attrs["market_context_source"] = "yfinance_direct"
+                AllNSEMinutePredictor._log(
+                    "all_nse_nifty_context_fetch",
+                    status="OK",
+                    source="yfinance_direct",
+                    rows=int(len(frame)),
+                    latest_candle_ist=latest,
+                    cutoff_ist=cutoff.isoformat(),
+                    attempts=attempts,
+                )
+                return frame
+        except Exception as exc:
+            attempts.append({
+                "source": "yfinance_direct",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+
+        AllNSEMinutePredictor._log(
+            "all_nse_nifty_context_fetch",
+            status="UNAVAILABLE",
+            source="none",
+            rows=0,
+            cutoff_ist=cutoff.isoformat(),
+            attempts=attempts,
+            action="keep_market_features_missing_and_hold_low_readiness_rows",
+        )
+        return empty
 
     @staticmethod
     def _previous_trading_date(value: date) -> date:
