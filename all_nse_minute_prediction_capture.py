@@ -866,6 +866,49 @@ class AllNSEMinutePredictor:
                 from delivery_training_universe import official_nse_symbols
                 from indstocks_client import _request, configured
 
+                # NIFTY is independent of the INDstocks equity instrument master.
+                # Fetch benchmark history first so an INDstocks token failure cannot
+                # suppress market-context features for otherwise valid stock quotes.
+                market_now = pd.Timestamp.now(tz=IST)
+                market_cutoff = market_now.floor("min")
+                with self._lock:
+                    cached_market = self._market_history.copy()
+                market_needs_refresh = cached_market.empty
+                if not cached_market.empty and isinstance(cached_market.index, pd.DatetimeIndex):
+                    latest_market = _as_ist_timestamp(cached_market.index.max())
+                    market_age = (market_cutoff - latest_market).total_seconds() / 60.0
+                    market_needs_refresh = (
+                        latest_market.date() != market_cutoff.date()
+                        or market_age > MAX_HISTORY_CANDLE_AGE_MINUTES
+                    )
+                if market_needs_refresh:
+                    try:
+                        nifty_frame = self._fetch_yahoo_nifty_history(market_cutoff)
+                        if not nifty_frame.empty:
+                            with self._lock:
+                                combined_market = pd.concat(
+                                    [self._market_history, nifty_frame]
+                                ).sort_index()
+                                combined_market = combined_market.loc[
+                                    ~combined_market.index.duplicated(keep="last")
+                                ]
+                                self._market_history = combined_market.tail(HISTORY_LOOKBACK_BARS)
+                            self._log(
+                                "all_nse_nifty_seed_before_provider_auth",
+                                status="OK",
+                                rows=int(len(nifty_frame)),
+                                latest_candle_ist=nifty_frame.index.max().isoformat(),
+                                cutoff_ist=market_cutoff.isoformat(),
+                            )
+                    except Exception as nifty_exc:
+                        # NIFTY is optional context; this must never prevent stock
+                        # quotes, history recovery, or snapshot persistence.
+                        self._log(
+                            "all_nse_nifty_seed_before_provider_auth",
+                            status="UNAVAILABLE",
+                            error_type=type(nifty_exc).__name__,
+                        )
+
                 if not configured():
                     raise RuntimeError("INDstocks credentials are not configured")
                 # Load the validated provider instrument master first. If the NSE
@@ -1240,14 +1283,33 @@ class AllNSEMinutePredictor:
                 )
                 return
             except Exception as exc:
+                error_text = f"{type(exc).__name__}: {str(exc)[:240]}"
+                auth_deferred = _is_auth_recovery_error(error_text)
                 with self._lock:
-                    self._seed_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    self._seed_error = error_text
                     self._seed_ready = bool(self._history)
                     self._seed_complete = False
-                    self._seed_status = (
-                        "READY_PARTIAL" if self._seed_ready else "WARMING_HISTORY_ERROR"
+                    if auth_deferred:
+                        remaining_symbols = max(0, len(self._symbols) - self._seed_coverage)
+                        self._seed_deferred_batches = int(
+                            np.ceil(remaining_symbols / max(1, HISTORY_BATCH_SIZE))
+                        )
+                        self._seed_status = "AUTH_DEFERRED"
+                    else:
+                        self._seed_status = (
+                            "READY_PARTIAL" if self._seed_ready else "WARMING_HISTORY_ERROR"
+                        )
+                if auth_deferred:
+                    self._log(
+                        "all_nse_history_seed_auth_deferred",
+                        stage="bootstrap",
+                        auth_error=error_text,
+                        history_symbols_ready=self._seed_coverage,
+                        deferred_batches=self._seed_deferred_batches,
+                        action="stop_attempt_and_retry_on_next_scheduled_tick",
                     )
-                self._log("all_nse_history_seed_failed", error=self._seed_error)
+                    return
+                self._log("all_nse_history_seed_failed", error=error_text)
                 time.sleep(120)
 
     @staticmethod
