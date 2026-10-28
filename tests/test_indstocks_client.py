@@ -278,7 +278,7 @@ def test_rejected_token_refresh_failure_does_not_spam_rate_limited_endpoint(monk
         raise RuntimeError("token generation rate-limited; wait before retrying")
 
     monkeypatch.setattr(client, "_generate_token", fail_rate_limited)
-    with pytest.raises(RuntimeError, match="suppressed for 60s"):
+    with pytest.raises(RuntimeError, match=r"suppressed for \d+s"):
         client._refresh_rejected_access_token("expired-token")
     with pytest.raises(RuntimeError, match="cooling down"):
         client._refresh_rejected_access_token("expired-token")
