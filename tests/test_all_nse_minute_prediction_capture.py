@@ -767,6 +767,100 @@ def test_nifty_context_is_fetched_before_indstocks_instrument_auth(tmp_path, mon
     assert status["history_seed_complete"] is False
     assert "token generation failed" in status["history_seed_error"]
 
+
+def test_daily_fno_context_is_point_in_time_and_reaches_model_features():
+    import all_nse_intraday_model as model
+
+    decision_date = date(2026, 10, 28)
+    daily = pd.DataFrame([
+        {
+            "symbol": "RELIANCE",
+            "date": "2026-10-26",
+            "fno_pcr": 1.10,
+            "fno_oi_change": 1200.0,
+            "fno_fut_return": 0.012,
+            "fno_fut_oi": 125000.0,
+            "fno_fut_basis": 0.003,
+        },
+        {
+            # Latest completed F&O row must win over the older one.
+            "symbol": "RELIANCE",
+            "date": "2026-10-27",
+            "fno_pcr": 1.25,
+            "fno_oi_change": 1400.0,
+            "fno_fut_return": 0.015,
+            "fno_fut_oi": 130000.0,
+            "fno_fut_basis": 0.004,
+        },
+        {
+            # Same-day EOD data must not leak into an intraday decision.
+            "symbol": "RELIANCE",
+            "date": "2026-10-28",
+            "fno_pcr": 9.99,
+            "fno_oi_change": 999999.0,
+            "fno_fut_return": 0.99,
+            "fno_fut_oi": 9999999.0,
+            "fno_fut_basis": 0.99,
+        },
+        {
+            # Eight calendar days old is outside the allowed freshness window.
+            "symbol": "SBIN",
+            "date": "2026-10-20",
+            "fno_pcr": 0.8,
+            "fno_oi_change": -10.0,
+            "fno_fut_return": -0.01,
+            "fno_fut_oi": 1000.0,
+            "fno_fut_basis": -0.002,
+        },
+        {
+            # A symbol with only a same-day row has no eligible prior context.
+            "symbol": "INFY",
+            "date": "2026-10-28",
+            "fno_pcr": 1.0,
+            "fno_oi_change": 10.0,
+            "fno_fut_return": 0.01,
+            "fno_fut_oi": 2000.0,
+            "fno_fut_basis": 0.001,
+        },
+    ])
+
+    context = capture._latest_completed_fno_context(daily, decision_date)
+
+    assert set(context) == {"RELIANCE"}
+    assert context["RELIANCE"]["source_date"] == "2026-10-27"
+    assert context["RELIANCE"]["pcr"] == pytest.approx(1.25)
+    assert context["RELIANCE"]["oi_change"] == pytest.approx(1400.0)
+    assert context["RELIANCE"]["fut_return"] == pytest.approx(0.015)
+    assert context["RELIANCE"]["fut_oi"] == pytest.approx(130000.0)
+    assert context["RELIANCE"]["basis"] == pytest.approx(0.004)
+
+    idx = pd.date_range(
+        "2026-10-28 09:15:00",
+        periods=30,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    prices = np.linspace(100.0, 103.0, len(idx))
+    price_frame = pd.DataFrame({
+        "Open": prices - 0.1,
+        "High": prices + 0.2,
+        "Low": prices - 0.2,
+        "Close": prices,
+        "Volume": np.arange(1000, 1030, dtype=float),
+    }, index=idx)
+    features = model._latest_features(
+        price_frame,
+        fno=context["RELIANCE"],
+        decision_timestamp=idx[-1],
+    )
+    assert features["fno_pcr"] == pytest.approx(1.25)
+    assert features["fno_oi_change"] == pytest.approx(1400.0)
+    assert features["fno_fut_return"] == pytest.approx(0.015)
+    assert features["fno_fut_oi"] == pytest.approx(130000.0)
+    assert features["fno_basis"] == pytest.approx(0.004)
+    assert features["fno_available"] == 1.0
+
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     predictor._symbols = ["AAA", "BBB", "CCC"]
