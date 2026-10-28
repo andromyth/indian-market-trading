@@ -477,25 +477,107 @@ class AllNSEMinutePredictor:
         def normalize_candidate(candidate: Any) -> pd.DataFrame:
             if candidate is None or getattr(candidate, "empty", True):
                 return empty.copy()
-            frame = (
-                _normalize_historical_frame(candidate)
-                if _normalize_historical_frame is not None
-                else candidate.copy()
-            )
+
+            # yfinance 1.x returns MultiIndex columns even for one ticker,
+            # commonly (Price, Ticker). Passing that shape through the older
+            # repository normalizer can raise TypeError or collapse all OHLCV
+            # fields to the ticker label. Select OHLCV fields BEFORE normalizing.
+            frame = candidate.copy()
+            field_aliases = {
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "adj close": "Adj Close",
+                "adj_close": "Adj Close",
+                "volume": "Volume",
+                "vol": "Volume",
+            }
+
+            if isinstance(frame.columns, pd.MultiIndex):
+                picked: dict[str, int] = {}
+                column_tokens = [
+                    [str(part).strip().lower() for part in column]
+                    for column in frame.columns
+                ]
+                # Prefer a real Close over Adj Close; the latter is only a
+                # fallback for chart adapters that omit the unadjusted field.
+                for field in ("Open", "High", "Low", "Close", "Volume"):
+                    matches = [
+                        i for i, tokens in enumerate(column_tokens)
+                        if field.lower() in tokens
+                    ]
+                    if not matches and field == "Close":
+                        matches = [
+                            i for i, tokens in enumerate(column_tokens)
+                            if any(token in {"adj close", "adj_close"} for token in tokens)
+                        ]
+                    if matches:
+                        picked[field] = matches[0]
+                if "Close" not in picked:
+                    return empty.copy()
+                ordered_fields = [field for field in columns if field in picked]
+                frame = frame.iloc[:, [picked[field] for field in ordered_fields]].copy()
+                frame.columns = ordered_fields
+            else:
+                # Keep support for the repository's flat-column historical
+                # normalizer, but don't feed it yfinance's MultiIndex frame.
+                if _normalize_historical_frame is not None:
+                    try:
+                        normalized = _normalize_historical_frame(frame)
+                        if normalized is not None and not normalized.empty:
+                            frame = normalized.copy()
+                    except (TypeError, ValueError, KeyError):
+                        # This fallback parser is intentionally narrow and
+                        # deterministic; it only accepts named OHLCV columns.
+                        frame = candidate.copy()
+
+                if isinstance(frame.columns, pd.MultiIndex):
+                    # Some adapters wrap their result in MultiIndex columns.
+                    picked: dict[str, int] = {}
+                    tokens_by_column = [
+                        [str(part).strip().lower() for part in column]
+                        for column in frame.columns
+                    ]
+                    for field in ("Open", "High", "Low", "Close", "Volume"):
+                        matches = [
+                            i for i, tokens in enumerate(tokens_by_column)
+                            if field.lower() in tokens
+                        ]
+                        if not matches and field == "Close":
+                            matches = [
+                                i for i, tokens in enumerate(tokens_by_column)
+                                if any(token in {"adj close", "adj_close"} for token in tokens)
+                            ]
+                        if matches:
+                            picked[field] = matches[0]
+                    if "Close" not in picked:
+                        return empty.copy()
+                    ordered_fields = [field for field in columns if field in picked]
+                    frame = frame.iloc[:, [picked[field] for field in ordered_fields]].copy()
+                    frame.columns = ordered_fields
+                else:
+                    rename: dict[Any, str] = {}
+                    for col in frame.columns:
+                        token = str(col).strip().lower()
+                        mapped = field_aliases.get(token)
+                        if mapped:
+                            # Preserve an existing unadjusted Close if both
+                            # Close and Adj Close are supplied.
+                            if mapped != "Adj Close":
+                                rename[col] = mapped
+                            elif "Close" not in {
+                                field_aliases.get(str(existing).strip().lower(), str(existing))
+                                for existing in frame.columns
+                            }:
+                                rename[col] = "Close"
+                    frame = frame.rename(columns=rename)
+
             if frame is None or frame.empty:
                 return empty.copy()
-            frame = frame.copy()
-            if isinstance(frame.columns, pd.MultiIndex):
-                frame.columns = [str(value).strip() for value in frame.columns.get_level_values(-1)]
-            aliases = {
-                "open": "Open", "high": "High", "low": "Low",
-                "close": "Close", "adj close": "Close", "adj_close": "Close",
-                "volume": "Volume", "vol": "Volume",
-            }
-            frame = frame.rename(columns={
-                col: aliases.get(str(col).strip().lower(), col)
-                for col in frame.columns
-            })
+            # Drop duplicate normalized names rather than allowing frame["Close"]
+            # to produce a DataFrame (which breaks boolean masks in pandas 3.x).
+            frame = frame.loc[:, ~pd.Index(frame.columns).duplicated(keep="first")].copy()
             raw_index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
             if raw_index.tz is None:
                 raw_index = raw_index.tz_localize(IST)
