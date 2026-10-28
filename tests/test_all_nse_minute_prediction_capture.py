@@ -232,6 +232,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     assert result["status"] == "OK"
     assert result["row_count"] == 2
     assert result["prediction_count"] == 2
+    assert result["prediction_status_counts"] == {"PASS": 2}
     assert result["quality_gate_pass"] is True
 
     written = pd.read_parquet(
@@ -860,6 +861,37 @@ def test_daily_fno_context_is_point_in_time_and_reaches_model_features():
     assert features["fno_fut_oi"] == pytest.approx(130000.0)
     assert features["fno_basis"] == pytest.approx(0.004)
     assert features["fno_available"] == 1.0
+
+
+def test_fno_drive_failure_keeps_cached_context_status_visible(tmp_path, monkeypatch):
+    import all_nse_intraday_model as model
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    predictor._fno_context_raw = pd.DataFrame([{
+        "symbol": "RELIANCE",
+        "date": "2026-10-27",
+        "fno_pcr": 1.2,
+        "fno_oi_change": 12.0,
+        "fno_fut_return": 0.01,
+        "fno_fut_oi": 1000.0,
+        "fno_fut_basis": 0.002,
+    }])
+    predictor._fno_context_status = "LOADED"
+    monkeypatch.setattr(
+        model,
+        "_drive_download",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Drive temporarily unavailable")),
+    )
+
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    first, first_status, first_date = predictor._load_completed_fno_context(minute)
+    second, second_status, second_date = predictor._load_completed_fno_context(minute)
+
+    assert first_status == "STALE_CACHE_FALLBACK"
+    assert second_status == "STALE_CACHE_FALLBACK"
+    assert first_date == second_date == "2026-10-27"
+    assert first["RELIANCE"]["pcr"] == pytest.approx(1.2)
+    assert second["RELIANCE"]["pcr"] == pytest.approx(1.2)
 
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
