@@ -1433,7 +1433,12 @@ class AllNSEMinutePredictor:
         if cached_date == decision_date and cached_context:
             source_dates = [row["source_date"] for row in cached_context.values() if row.get("source_date")]
             latest_source_date = max(source_dates) if source_dates else None
-            return cached_context, "OK", latest_source_date
+            cached_status = (
+                "STALE_CACHE_FALLBACK"
+                if self._fno_context_status == "STALE_CACHE_FALLBACK"
+                else "OK"
+            )
+            return cached_context, cached_status, latest_source_date
         if cached_date == decision_date and now_mono < retry_after:
             status = "STALE_CACHE_FALLBACK" if cached_context else self._fno_context_status
             source_dates = [row["source_date"] for row in cached_context.values() if row.get("source_date")]
@@ -2391,6 +2396,11 @@ class AllNSEMinutePredictor:
                 }
             records.append(row)
 
+        prediction_status_counts: dict[str, int] = {}
+        for row in records:
+            status_key = str(row.get("prediction_status") or "UNKNOWN")
+            prediction_status_counts[status_key] = prediction_status_counts.get(status_key, 0) + 1
+
         prediction_count = sum(
             1 for row in records
             if row.get("probability_up_30m") is not None
@@ -2463,7 +2473,9 @@ class AllNSEMinutePredictor:
             "missing_quote_count": missing_quotes,
             "prediction_count": prediction_count,
             "prediction_coverage_pct": round(100 * prediction_coverage, 3),
+            "prediction_status_counts": prediction_status_counts,
             "data_limited_count": data_limited_count,
+            "data_limited_fraction_pct": round(100 * data_limited_fraction, 3),
             "feature_quality_diagnostics": feature_quality_diagnostics,
             "model_failure_count": model_failures,
             "untrained_symbol_count": untrained_symbol_count,
@@ -2547,6 +2559,7 @@ class AllNSEMinutePredictor:
             prediction_count=prediction_count,
             missing_quote_count=missing_quotes,
             data_limited_count=data_limited_count,
+            prediction_status_counts=prediction_status_counts,
             feature_quality_diagnostics=feature_quality_diagnostics,
             history_ready=history_ready,
             history_seed_complete=history_seed_complete,
@@ -2567,6 +2580,7 @@ class AllNSEMinutePredictor:
             "prediction_count": prediction_count,
             "missing_quote_count": missing_quotes,
             "data_limited_count": data_limited_count,
+            "prediction_status_counts": prediction_status_counts,
             "quality_gate_pass": manifest["quality_gate_pass"],
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,
