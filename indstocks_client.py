@@ -32,6 +32,7 @@ TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS = 60
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
 _CACHED_TOKEN_EXPIRES_AT = 0.0
+_CACHED_TOKEN_GENERATED_AT = 0.0
 _TOKEN_GENERATION_RETRY_AFTER = 0.0
 _TOKEN_GENERATION_LAST_ERROR: str | None = None
 _INSTRUMENTS: dict[str, tuple[float, pd.DataFrame]] = {}
@@ -193,7 +194,7 @@ def _generate_token() -> str:
 
 def _generate_and_cache_token_locked() -> str:
     """Generate/cache one token while holding _TOKEN_LOCK, with failure cooldown."""
-    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
+    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT, _CACHED_TOKEN_GENERATED_AT
     global _TOKEN_GENERATION_RETRY_AFTER, _TOKEN_GENERATION_LAST_ERROR
 
     now = time.time()
@@ -220,7 +221,8 @@ def _generate_and_cache_token_locked() -> str:
         ) from None
 
     _CACHED_TOKEN = token
-    _CACHED_TOKEN_EXPIRES_AT = time.time() + 23 * 3600
+    _CACHED_TOKEN_GENERATED_AT = time.time()
+    _CACHED_TOKEN_EXPIRES_AT = _CACHED_TOKEN_GENERATED_AT + 23 * 3600
     _TOKEN_GENERATION_RETRY_AFTER = 0.0
     _TOKEN_GENERATION_LAST_ERROR = None
     return token
@@ -280,7 +282,8 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
     are serialized, and failed token generation is cooled down to prevent each
     concurrent history batch from hammering a rate-limited token endpoint.
     """
-    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
+    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT, _CACHED_TOKEN_GENERATED_AT
+    global _TOKEN_GENERATION_RETRY_AFTER, _TOKEN_GENERATION_LAST_ERROR
     if not _has_totp_credentials():
         raise RuntimeError("INDstocks automatic authentication is not configured")
 
@@ -295,8 +298,28 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
         ):
             return _CACHED_TOKEN
 
+        # The just-issued TOTP token may be rejected immediately by the API.
+        # Do not mint a second account-wide token in the same minute: INDstocks
+        # rate-limits token issuance, and another login can invalidate the shared
+        # token while still being rejected. Quarantine this token and defer the
+        # next login attempt until the provider cooldown expires.
+        generated_at = _CACHED_TOKEN_GENERATED_AT
         _CACHED_TOKEN = None
         _CACHED_TOKEN_EXPIRES_AT = 0.0
+        _CACHED_TOKEN_GENERATED_AT = 0.0
+        if generated_at and 0 <= now - generated_at < TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS:
+            _TOKEN_GENERATION_RETRY_AFTER = max(
+                _TOKEN_GENERATION_RETRY_AFTER,
+                generated_at + TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS,
+            )
+            _TOKEN_GENERATION_LAST_ERROR = (
+                "freshly generated token was rejected; waiting for provider cooldown"
+            )
+            remaining = max(1, int(_TOKEN_GENERATION_RETRY_AFTER - now))
+            raise RuntimeError(
+                "freshly generated INDstocks token was rejected; "
+                f"further token generation is suppressed for {remaining}s"
+            )
         return _generate_and_cache_token_locked()
 
 
