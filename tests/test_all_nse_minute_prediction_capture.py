@@ -367,6 +367,59 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
 
 
 
+
+def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, tmp_path):
+    import hashlib
+    import json
+    import all_nse_intraday_model as model
+
+    local_manifest = tmp_path / "manifest.json"
+    local_classifier = tmp_path / "classifier.joblib"
+    local_regressor = tmp_path / "regressor.joblib"
+    monkeypatch.setattr(model, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(model, "LOCAL_MANIFEST", local_manifest)
+    monkeypatch.setattr(model, "LOCAL_CLASSIFIER", local_classifier)
+    monkeypatch.setattr(model, "LOCAL_REGRESSOR", local_regressor)
+
+    classifier_bytes = b"verified-current-classifier"
+    regressor_bytes = b"verified-current-regressor"
+    manifest = {
+        "status": "REPLACEMENT",
+        "model_version": "unit-test",
+        "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
+        "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
+        "training_symbols": ["AAA"],
+        "training_symbol_count": 1,
+    }
+    local_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    local_classifier.write_bytes(b"stale-classifier")
+    local_regressor.write_bytes(b"stale-regressor")
+
+    downloads = []
+    payloads = {
+        model.REMOTE_MANIFEST: json.dumps(manifest).encode("utf-8"),
+        model.REMOTE_CLASSIFIER: classifier_bytes,
+        model.REMOTE_REGRESSOR: regressor_bytes,
+    }
+
+    def fake_drive_download(remote, local):
+        downloads.append(remote)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(payloads[remote])
+
+    monkeypatch.setattr(model, "_drive_download", fake_drive_download)
+
+    status = model.model_status()
+
+    assert status["manifest_sha256_match"] is True
+    assert local_classifier.read_bytes() == classifier_bytes
+    assert local_regressor.read_bytes() == regressor_bytes
+    assert downloads == [
+        model.REMOTE_MANIFEST,
+        model.REMOTE_CLASSIFIER,
+        model.REMOTE_REGRESSOR,
+    ]
+
 @pytest.mark.parametrize(
     "column_order",
     [
