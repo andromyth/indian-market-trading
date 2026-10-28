@@ -9,6 +9,7 @@ on:
       - ".github/workflows/verify_all_nse_minute_capture.yml"
       - "autonomous_intraday_worker_service.py"
       - "all_nse_minute_prediction_capture.py"
+      - "indstocks_client.py"
 
 permissions:
   contents: read
@@ -50,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py all_nse_minute_prediction_capture.py)"
+          DEPLOY_SHA="$(git log -1 --format=%H -- autonomous_intraday_worker_service.py all_nse_minute_prediction_capture.py indstocks_client.py)"
           CODE_COMMIT_TIME="$(git show -s --format=%cI "$DEPLOY_SHA")"
           echo "SERVICE_CODE_COMMIT=$DEPLOY_SHA"
           echo "SERVICE_CODE_COMMIT_TIME=$CODE_COMMIT_TIME"
@@ -102,7 +103,18 @@ jobs:
           fi
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
-          HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/")" || HTTP_CODE=000
+          HTTP_CODE=000
+          for attempt in 1 2 3 4; do
+            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/")" || HTTP_CODE=000
+            echo "WORKER_HEALTH_HTTP_STATUS_ATTEMPT=$attempt:$HTTP_CODE"
+            # A Cloud Run 429 can be a transient concurrency response while a
+            # scheduled /tick is using the single production instance. Retry
+            # those transport/throttling responses before judging Drive readiness.
+            if [[ "$HTTP_CODE" != "429" && "$HTTP_CODE" != "000" ]]; then
+              break
+            fi
+            sleep 5
+          done
           echo "WORKER_HEALTH_HTTP_STATUS=$HTTP_CODE"
           python - "$RESPONSE" "$HTTP_CODE" <<'PY'
           import json, sys
