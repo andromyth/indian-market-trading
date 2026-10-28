@@ -29,6 +29,9 @@ import calibration_overlay as calibration_overlay_module
 
 IST = ZoneInfo("Asia/Kolkata")
 REMOTE_ROOT = "production_data/all_nse_minute_predictions"
+FNO_DAILY_REMOTE = "production_data/nse_official/fno/fno_daily_features_2026.parquet"
+FNO_CONTEXT_MAX_AGE_DAYS = 7
+FNO_CONTEXT_RETRY_SECONDS = 900
 HISTORY_LOOKBACK_BARS = 120
 HISTORY_BATCH_SIZE = 5
 HISTORY_REQUEST_PAUSE_SECONDS = 0.22
@@ -101,6 +104,64 @@ def _history_seed_universe(
     raise RuntimeError(
         "Neither the official NSE equity roster nor the INDstocks NSE instrument master yielded symbols"
     )
+
+
+def _latest_completed_fno_context(
+    frame: pd.DataFrame | None,
+    decision_date: date,
+    *,
+    max_age_days: int = FNO_CONTEXT_MAX_AGE_DAYS,
+) -> dict[str, dict[str, Any]]:
+    """Select latest completed-session F&O data per symbol, never same-day EOD data.
+
+    The persisted NSE F&O bhavcopy is a daily close/settlement source, not a
+    minute feed. For an intraday decision on D, only rows with date < D are
+    eligible. Stale rows are omitted instead of being carried forward forever.
+    """
+    if frame is None or frame.empty:
+        return {}
+    x = frame.copy()
+    x.columns = [str(c).strip().lower() for c in x.columns]
+    if not {"symbol", "date"}.issubset(x.columns):
+        return {}
+    x["symbol"] = x["symbol"].astype(str).str.strip().str.upper().str.replace(
+        r"\.NS$", "", regex=True
+    )
+    parsed = pd.to_datetime(x["date"], errors="coerce", utc=True)
+    x["_fno_date"] = parsed.dt.tz_convert(IST).dt.date
+    x = x.loc[
+        x["symbol"].ne("")
+        & x["_fno_date"].notna()
+        & (x["_fno_date"] < decision_date)
+        & x["_fno_date"].map(
+            lambda value: (decision_date - value).days <= max_age_days
+        )
+    ].copy()
+    if x.empty:
+        return {}
+    x = x.sort_values(["symbol", "_fno_date"]).drop_duplicates(
+        "symbol", keep="last"
+    )
+
+    def first_value(row: pd.Series, *names: str) -> float | None:
+        for name in names:
+            if name in row.index:
+                value = _safe_float(row.get(name))
+                if value is not None:
+                    return value
+        return None
+
+    out: dict[str, dict[str, Any]] = {}
+    for _, row in x.iterrows():
+        out[str(row["symbol"])] = {
+            "pcr": first_value(row, "fno_pcr", "pcr"),
+            "oi_change": first_value(row, "fno_oi_change", "oi_change"),
+            "fut_return": first_value(row, "fno_fut_return", "fut_return"),
+            "fut_oi": first_value(row, "fno_fut_oi", "fut_oi"),
+            "basis": first_value(row, "fno_fut_basis", "fno_basis", "basis"),
+            "source_date": row["_fno_date"].isoformat(),
+        }
+    return out
 
 
 def _safe_float(value: Any) -> float | None:
@@ -319,6 +380,13 @@ class AllNSEMinutePredictor:
             columns=["Open", "High", "Low", "Close", "Volume"],
             index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         )
+        self._fno_context_raw: pd.DataFrame | None = None
+        self._fno_context_loaded = False
+        self._fno_context_last_attempt = 0.0
+        self._fno_context_retry_after = 0.0
+        self._fno_context_status = "NOT_LOADED"
+        self._fno_context_error: str | None = None
+        self._fno_context_source_max_date: str | None = None
         self._calibration = None
         self._calibration_init_error_logged = False
         self._history_request_lock = threading.Lock()
