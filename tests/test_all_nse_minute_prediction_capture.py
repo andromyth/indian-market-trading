@@ -670,6 +670,52 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
     assert summary["auth_error"]
 
 
+
+def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypatch):
+    import all_universe_minute_capture
+    import delivery_training_universe
+    import indstocks_client
+
+    symbols = [f"STOCK{i}" for i in range(15)]
+    codes = {symbol: f"NSE_{i}" for i, symbol in enumerate(symbols)}
+    requests = []
+
+    monkeypatch.setattr(all_universe_minute_capture, "_instrument_map", lambda: codes)
+    monkeypatch.setattr(
+        delivery_training_universe,
+        "official_nse_symbols",
+        lambda force_refresh=False: symbols,
+    )
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+
+    def rejected_request(*args, **kwargs):
+        requests.append((args, kwargs))
+        raise RuntimeError(
+            "INDstocks token generation failed: HTTP 400; provider_response=message"
+        )
+
+    monkeypatch.setattr(indstocks_client, "_request", rejected_request)
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    monkeypatch.setattr(predictor, "_nifty_instrument_code", lambda: None)
+    monkeypatch.setattr(
+        predictor,
+        "_fetch_yahoo_nifty_history",
+        lambda minute: pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        ),
+    )
+
+    predictor._seed_history()
+
+    status = predictor.status()
+    assert len(requests) == 1, "a shared token failure must stop all remaining seed batches"
+    assert status["history_seed_complete"] is False
+    assert status["history_seed_failed_batches"] == 1
+    assert status["history_seed_deferred_batches"] == 2
+    assert status["status"] == "AUTH_DEFERRED"
+    assert "token generation failed" in status["history_seed_error"]
+
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     predictor._symbols = ["AAA", "BBB", "CCC"]
