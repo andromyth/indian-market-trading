@@ -459,6 +459,11 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
     empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
     monkeypatch.setattr(data_fetcher, "_yahoo_chart_history", lambda *args, **kwargs: empty)
     monkeypatch.setattr(data_fetcher, "get_historical", lambda *args, **kwargs: empty)
+    monkeypatch.setattr(
+        yf,
+        "Ticker",
+        lambda *args, **kwargs: type("FakeTicker", (), {"history": lambda self, **kw: empty})(),
+    )
     monkeypatch.setattr(yf, "download", lambda *args, **kwargs: frame)
 
     result = capture.AllNSEMinutePredictor._fetch_yahoo_nifty_history(minute)
@@ -469,6 +474,54 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
     assert result.index.max() == minute - pd.Timedelta(minutes=1)
     assert result["Close"].tolist() == [100.5, 101.5]
     assert result["Volume"].tolist() == [10.0, 12.0]
+
+
+def test_yfinance_ticker_history_is_preferred_before_download(monkeypatch):
+    import data_fetcher
+    import yfinance as yf
+
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    idx = pd.date_range(
+        minute - pd.Timedelta(minutes=2),
+        periods=5,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    ticker_frame = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "High": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "Low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "Close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "Volume": [10.0, 12.0, 11.0, 13.0, 14.0],
+        },
+        index=idx,
+    )
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    monkeypatch.setattr(data_fetcher, "_yahoo_chart_history", lambda *args, **kwargs: empty)
+    monkeypatch.setattr(data_fetcher, "get_historical", lambda *args, **kwargs: empty)
+    calls = []
+
+    class FakeTicker:
+        def history(self, **kwargs):
+            calls.append(("ticker", kwargs))
+            return ticker_frame
+
+    monkeypatch.setattr(yf, "Ticker", lambda symbol: FakeTicker())
+
+    def forbidden_download(*args, **kwargs):
+        raise AssertionError("download fallback should not run when Ticker.history succeeds")
+
+    monkeypatch.setattr(yf, "download", forbidden_download)
+
+    result = capture.AllNSEMinutePredictor._fetch_yahoo_nifty_history(minute)
+
+    assert len(result) == 2
+    assert result["Close"].tolist() == [100.5, 101.5]
+    assert str(result.index.tz) == "Asia/Kolkata"
+    assert len(calls) == 1
+    assert calls[0][1]["interval"] == "1m"
 
 def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
     assert capture.AllNSEMinutePredictor._nifty_instrument_code() is None
