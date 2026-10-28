@@ -853,6 +853,72 @@ class AllNSEMinutePredictor:
             return empty
         return before
 
+    def _fresh_market_history_before(
+        self,
+        market_history: pd.DataFrame | None,
+        minute: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Return fresh pre-decision NIFTY candles, refreshing stale cache independently.
+
+        Equity seeding/refresh can be delayed by provider authentication or quota
+        errors. Keep the market-context feed independent so a stale NIFTY cache does
+        not remove ten market/relative-return features from every stock at once.
+        The fallback only accepts real, current-session one-minute candles strictly
+        before the decision minute; it never fabricates index OHLC or uses future bars.
+        """
+        before = self._market_history_before(market_history, minute)
+        if not before.empty:
+            return before
+
+        try:
+            refreshed = self._fetch_yahoo_nifty_history(minute)
+            fresh_before = self._market_history_before(refreshed, minute)
+        except Exception as exc:
+            fresh_before = pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+            )
+            self._log(
+                "all_nse_nifty_context_fast_refresh",
+                status="UNAVAILABLE",
+                cutoff_ist=_as_ist_timestamp(minute).isoformat(),
+                error=f"{type(exc).__name__}: {str(exc)[:180]}",
+            )
+            return fresh_before
+
+        if fresh_before.empty:
+            self._log(
+                "all_nse_nifty_context_fast_refresh",
+                status="UNAVAILABLE",
+                cutoff_ist=_as_ist_timestamp(minute).isoformat(),
+                reason="no fresh real current-session candles returned",
+            )
+            return before
+
+        with self._lock:
+            existing = self._market_history.copy()
+            if isinstance(existing.index, pd.DatetimeIndex) and not existing.empty:
+                idx = existing.index
+                existing.index = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+                # Keep only candles at or before the cutoff; the cache must never
+                # retain an accidentally future-dated row as context for this slot.
+                existing = existing.loc[existing.index < _as_ist_timestamp(minute)]
+            else:
+                existing = fresh_before.iloc[0:0].copy()
+            merged = pd.concat([existing, fresh_before]).sort_index()
+            merged = merged.loc[~merged.index.duplicated(keep="last")]
+            self._market_history = merged.tail(HISTORY_LOOKBACK_BARS)
+
+        self._log(
+            "all_nse_nifty_context_fast_refresh",
+            status="OK",
+            source=str(refreshed.attrs.get("market_context_source") or "verified_yahoo_fallback"),
+            cutoff_ist=_as_ist_timestamp(minute).isoformat(),
+            latest_candle_ist=fresh_before.index.max().isoformat(),
+            row_count=len(fresh_before),
+        )
+        return fresh_before
+
     @staticmethod
     def _parse_candles(candles: list[dict[str, Any]]) -> pd.DataFrame:
         if not candles:
@@ -1563,13 +1629,15 @@ class AllNSEMinutePredictor:
         self,
         minute: pd.Timestamp,
     ) -> dict[str, Any]:
-        """Refresh history in the background so the five-minute tick can persist promptly.
+        """Refresh already-seeded history in the background for the next slot.
 
         The full-universe quote capture already takes roughly two minutes. Running
         another 500+ provider requests synchronously after capture can push the
-        whole Scheduler request past its 300-second deadline. This refresh updates
-        the cache for the next slot; the current forecast uses only cached candles
-        strictly before its decision minute and rejects stale history.
+        whole Scheduler request past its 300-second deadline. During bootstrap,
+        refresh only instruments whose history is already cached; the seed thread
+        continues filling the remaining universe. Both paths use the same locked
+        request-spacing limiter, and inference still enforces strict timestamp and
+        freshness checks before any signal can be actionable.
         """
         minute = _as_ist_timestamp(minute).floor("min")
         minute_key = minute.isoformat()
@@ -1586,9 +1654,10 @@ class AllNSEMinutePredictor:
                     "updated_symbols": 0,
                     "current_session_candle_rows": 0,
                 }
-            # Initial seeding is already fetching a full history range. Do not
-            # compete with it for provider quota; let the seeder finish first.
-            if not self._seed_ready or not self._seed_complete or not self._codes:
+            # A partial seed is usable for maintenance: the refresh worker itself
+            # restricts requests to cached symbols until bootstrap is complete.
+            # Seed and refresh requests share the same request-spacing lock.
+            if not self._seed_ready or not self._codes:
                 return {
                     "status": "WARMING_SEED",
                     "minute": minute_key,
@@ -1702,6 +1771,8 @@ class AllNSEMinutePredictor:
             auth_failure_event = threading.Event()
             auth_failure_lock = threading.Lock()
             auth_failure_detail: list[str | None] = [None]
+            missing_candle_lock = threading.Lock()
+            missing_fresh_candle_symbols: set[str] = set()
 
             def fetch_batch(batch):
                 last_error = None
@@ -1739,6 +1810,7 @@ class AllNSEMinutePredictor:
                             raise RuntimeError("historical refresh response did not report success")
                         data = body.get("data") or {}
                         result = {}
+                        missing_in_batch = []
                         for symbol, code in batch:
                             frame = self._parse_candles((data.get(code) or {}).get("candles") or [])
                             if not frame.empty:
@@ -1746,8 +1818,17 @@ class AllNSEMinutePredictor:
                                     (pd.Index(frame.index.date) == batch_end.date())
                                     & (frame.index < batch_end)
                                 ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
-                                if not frame.empty:
-                                    result[symbol] = frame
+                            if not frame.empty:
+                                result[symbol] = frame
+                            elif symbol != "__NIFTY50__":
+                                # A successful HTTP response without a fresh candle is
+                                # not a fresh-history success for that equity. Keep it
+                                # pending so the next cycle retries instead of leaving
+                                # a stale cache row untracked.
+                                missing_in_batch.append(symbol)
+                        if missing_in_batch:
+                            with missing_candle_lock:
+                                missing_fresh_candle_symbols.update(missing_in_batch)
                         return result, None, False
                     except Exception as exc:
                         last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
@@ -1790,6 +1871,17 @@ class AllNSEMinutePredictor:
 
             updated_symbols = set(updated) - {"__NIFTY50__"}
             equity_symbols = set(codes)
+            with missing_candle_lock:
+                missing_candle_symbols = set(missing_fresh_candle_symbols)
+            if missing_candle_symbols:
+                failed_symbols.extend(sorted(missing_candle_symbols))
+                self._log(
+                    "all_nse_history_refresh_missing_fresh_candles",
+                    minute=minute_key,
+                    symbol_count=len(missing_candle_symbols),
+                    symbols=sorted(missing_candle_symbols)[:20],
+                    action="queue_for_next_refresh_and_keep_prediction_freshness_guard",
+                )
             with self._lock:
                 if auth_failure_event.is_set():
                     # Every stock not refreshed successfully remains explicitly
@@ -1845,10 +1937,12 @@ class AllNSEMinutePredictor:
                 summary = {
                     "status": (
                         "AUTH_DEFERRED" if auth_failure_event.is_set()
-                        else "OK" if not errors else "PARTIAL"
+                        else "OK" if not errors and not missing_candle_symbols else "PARTIAL"
                     ),
                     "minute": minute_key, "batch_count": len(batches),
                     "failed_batches": len(errors), "failed_symbols": sorted(set(failed_symbols)),
+                    "missing_fresh_candle_symbols": len(missing_candle_symbols),
+                    "missing_fresh_candle_symbol_samples": sorted(missing_candle_symbols)[:20],
                     "updated_symbols": len(updated_symbols),
                     "deferred_batches": deferred_batches,
                     "pending_symbol_count": len(self._history_refresh_pending_symbols),
@@ -2023,7 +2117,7 @@ class AllNSEMinutePredictor:
             seed_universe_source = self._seed_universe_source
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
             market_history = self._market_history.copy()
-        market_history_before_minute = self._market_history_before(
+        market_history_before_minute = self._fresh_market_history_before(
             market_history,
             minute,
         )

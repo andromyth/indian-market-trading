@@ -332,6 +332,53 @@ def test_stale_market_history_is_excluded_from_feature_context():
     assert str(before.index.tz) == "Asia/Kolkata"
 
 
+def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_path, monkeypatch):
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    stale_idx = pd.date_range(
+        end=minute - pd.Timedelta(minutes=8),
+        periods=4,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    fresh_idx = pd.date_range(
+        end=minute - pd.Timedelta(minutes=1),
+        periods=30,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+
+    def bars(index, offset=0.0):
+        close = np.linspace(100.0, 103.0, len(index)) + offset
+        return pd.DataFrame({
+            "Open": close - 0.1,
+            "High": close + 0.2,
+            "Low": close - 0.2,
+            "Close": close,
+            "Volume": np.arange(1000, 1000 + len(index), dtype=float),
+        }, index=index)
+
+    predictor._market_history = bars(stale_idx)
+    fresh = bars(fresh_idx, offset=1.0)
+    fresh.attrs["market_context_source"] = "fake_yahoo_current_session"
+    calls = []
+    monkeypatch.setattr(
+        predictor,
+        "_fetch_yahoo_nifty_history",
+        lambda cutoff: calls.append(cutoff) or fresh,
+    )
+
+    before = predictor._fresh_market_history_before(predictor._market_history.copy(), minute)
+
+    assert calls == [minute]
+    assert not before.empty
+    assert before.index.max() == minute - pd.Timedelta(minutes=1)
+    assert (before.index < minute).all()
+    assert predictor._market_history.index.max() == minute - pd.Timedelta(minutes=1)
+
+
 def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeypatch):
     import data_fetcher
 
@@ -550,7 +597,7 @@ def test_nifty_quote_uses_a_fresh_real_candle_when_no_rest_index_token_exists(tm
     assert error is None
 
 
-def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tmp_path, monkeypatch):
+def test_session_history_refresh_is_nonblocking_during_partial_seed(tmp_path, monkeypatch):
     import threading
 
     predictor = capture.AllNSEMinutePredictor(tmp_path)
@@ -558,13 +605,17 @@ def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tm
     calls = []
     completed = threading.Event()
     execution_context = []
+    predictor._seed_ready = True
+    predictor._seed_complete = False
+    predictor._codes = {"AAA": "NSE_100"}
+    predictor._history = {"AAA": pd.DataFrame({"Close": [100.0]})}
 
     def fake_refresh(target):
         calls.append(target)
         execution_context.append(threading.current_thread() is not threading.main_thread())
         completed.set()
         return {
-            "status": "OK",
+            "status": "PARTIAL",
             "minute": target.isoformat(),
             "batch_count": 1,
             "failed_batches": 0,
@@ -575,15 +626,6 @@ def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tm
         }
 
     monkeypatch.setattr(predictor, "_refresh_current_session_history", fake_refresh)
-
-    # Bootstrap must not compete with its own full-universe history seeding.
-    waiting = predictor._schedule_current_session_history_refresh(minute)
-    assert waiting["status"] == "WARMING_SEED"
-    assert calls == []
-
-    predictor._seed_ready = True
-    predictor._seed_complete = True
-    predictor._codes = {"AAA": "NSE_100"}
     scheduled = predictor._schedule_current_session_history_refresh(minute)
 
     assert scheduled["status"] == "SCHEDULED_ASYNC"
@@ -592,6 +634,116 @@ def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tm
     assert len(calls) == 1
     assert execution_context == [True]
 
+
+
+def test_partial_seed_refresh_only_requests_symbols_with_cached_history(tmp_path, monkeypatch):
+    import indstocks_client
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    minute = pd.Timestamp("2026-10-27 10:20:00", tz=IST)
+    predictor._seed_ready = True
+    predictor._seed_complete = False
+    predictor._symbols = ["AAA", "BBB"]
+    predictor._codes = {"AAA": "NSE_100", "BBB": "NSE_101"}
+    idx = pd.date_range(
+        end=minute - pd.Timedelta(minutes=1),
+        periods=20,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    predictor._history = {
+        "AAA": pd.DataFrame({
+            "Open": np.full(20, 100.0),
+            "High": np.full(20, 101.0),
+            "Low": np.full(20, 99.0),
+            "Close": np.full(20, 100.5),
+            "Volume": np.arange(20, dtype=float),
+        }, index=idx)
+    }
+    monkeypatch.setattr(predictor, "_reserve_history_request_slot", lambda: None)
+    monkeypatch.setattr(
+        predictor,
+        "_fetch_yahoo_nifty_history",
+        lambda _minute: pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        ),
+    )
+    requests = []
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "NSE_100": {"candles": [{
+                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
+                    }]}
+                },
+            }
+
+    def fake_request(method, path, *, params=None):
+        requests.append((method, path, params))
+        return FakeResponse()
+
+    monkeypatch.setattr(indstocks_client, "_request", fake_request)
+
+    summary = predictor._refresh_current_session_history(minute)
+
+    assert summary["status"] == "OK"
+    assert summary["updated_symbols"] == 1
+    assert len(requests) == 1
+    assert requests[0][2]["scrip-codes"] == "NSE_100"
+    assert "NSE_101" not in requests[0][2]["scrip-codes"]
+
+
+def test_successful_refresh_without_fresh_candle_keeps_symbol_pending(tmp_path, monkeypatch):
+    import indstocks_client
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    minute = pd.Timestamp("2026-10-27 10:20:00", tz=IST)
+    predictor._seed_ready = True
+    predictor._seed_complete = True
+    predictor._symbols = ["AAA", "BBB"]
+    predictor._codes = {"AAA": "NSE_100", "BBB": "NSE_101"}
+    monkeypatch.setattr(predictor, "_reserve_history_request_slot", lambda: None)
+    monkeypatch.setattr(
+        predictor,
+        "_fetch_yahoo_nifty_history",
+        lambda _minute: pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        ),
+    )
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "NSE_100": {"candles": [{
+                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
+                    }]},
+                    "NSE_101": {"candles": []},
+                },
+            }
+
+    monkeypatch.setattr(
+        indstocks_client,
+        "_request",
+        lambda method, path, *, params=None: FakeResponse(),
+    )
+
+    summary = predictor._refresh_current_session_history(minute)
+
+    assert summary["status"] == "PARTIAL"
+    assert summary["updated_symbols"] == 1
+    assert summary["missing_fresh_candle_symbols"] == 1
+    assert summary["failed_symbols"] == ["BBB"]
+    assert predictor._history_refresh_pending_symbols == {"BBB"}
 
 
 def test_auth_recovery_errors_are_classified_without_masking_data_errors():
