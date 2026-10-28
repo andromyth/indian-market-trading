@@ -205,17 +205,57 @@ def _drive_download(remote: str, local: Path) -> None:
     local.parent.mkdir(parents=True,exist_ok=True); local.write_bytes(buf.getvalue())
 
 
-def _ensure_artifacts() -> None:
-    CACHE_ROOT.mkdir(parents=True,exist_ok=True)
-    for remote,local in [(REMOTE_MANIFEST,LOCAL_MANIFEST),(REMOTE_CLASSIFIER,LOCAL_CLASSIFIER),(REMOTE_REGRESSOR,LOCAL_REGRESSOR)]:
-        if not local.exists() or local.stat().st_size==0:
-            _drive_download(remote,local)
+def _download_artifact_atomically(remote: str, local: Path) -> None:
+    """Refresh one cached artifact without leaving a half-written model file."""
+    local.parent.mkdir(parents=True, exist_ok=True)
+    staging = local.with_name(local.name + ".download")
+    try:
+        staging.unlink(missing_ok=True)
+        _drive_download(remote, staging)
+        if not staging.is_file() or staging.stat().st_size == 0:
+            raise RuntimeError(f"Downloaded model artifact is empty: {remote}")
+        staging.replace(local)
+    finally:
+        staging.unlink(missing_ok=True)
 
 
-def _manifest() -> dict[str,Any]:
+def _artifact_hashes_match(manifest: dict[str, Any]) -> bool:
+    expected_classifier = str(manifest.get("classifier_sha256") or "")
+    expected_regressor = str(manifest.get("regressor_sha256") or "")
+    return bool(
+        expected_classifier
+        and expected_regressor
+        and LOCAL_CLASSIFIER.is_file()
+        and LOCAL_REGRESSOR.is_file()
+        and _sha256(LOCAL_CLASSIFIER) == expected_classifier
+        and _sha256(LOCAL_REGRESSOR) == expected_regressor
+    )
+
+
+def _ensure_artifacts(force_refresh: bool = False) -> None:
+    """Download missing artifacts, or atomically refresh all when hashes disagree."""
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    artifacts = [
+        (REMOTE_MANIFEST, LOCAL_MANIFEST),
+        (REMOTE_CLASSIFIER, LOCAL_CLASSIFIER),
+        (REMOTE_REGRESSOR, LOCAL_REGRESSOR),
+    ]
+    for remote, local in artifacts:
+        if force_refresh or not local.exists() or local.stat().st_size == 0:
+            _download_artifact_atomically(remote, local)
+
+
+def _manifest() -> dict[str, Any]:
     _ensure_artifacts()
-    return json.loads(LOCAL_MANIFEST.read_text(encoding="utf-8"))
-
+    manifest = json.loads(LOCAL_MANIFEST.read_text(encoding="utf-8"))
+    # A container image can contain older local model files while Drive already
+    # has a newer manifest. Previously these cached files were never refreshed,
+    # so valid forecasts could be blocked indefinitely by a hash mismatch.
+    # Refresh the manifest and both estimators once; never bypass the hash gate.
+    if not _artifact_hashes_match(manifest):
+        _ensure_artifacts(force_refresh=True)
+        manifest = json.loads(LOCAL_MANIFEST.read_text(encoding="utf-8"))
+    return manifest
 
 _MODEL_CACHE = {}
 
