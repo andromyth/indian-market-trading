@@ -1413,6 +1413,86 @@ class AllNSEMinutePredictor:
                 for s in (status.get("training_symbols") or [])
             }
 
+    def _load_completed_fno_context(
+        self,
+        decision_minute: pd.Timestamp,
+    ) -> tuple[dict[str, dict[str, Any]], str, str | None]:
+        """Load daily F&O data once and expose only rows from a completed prior date."""
+        with self._lock:
+            raw = (
+                self._fno_context_raw.copy()
+                if self._fno_context_raw is not None
+                else None
+            )
+            retry_after = self._fno_context_retry_after
+        if raw is None:
+            now_mono = time.monotonic()
+            if now_mono < retry_after:
+                return {}, self._fno_context_status, self._fno_context_source_max_date
+
+            cache_path = self.root / "fno_daily_features_2026.parquet"
+            staging_path = cache_path.with_suffix(".download")
+            try:
+                if not cache_path.is_file() or cache_path.stat().st_size == 0:
+                    import all_nse_intraday_model as model
+
+                    staging_path.unlink(missing_ok=True)
+                    model._drive_download(FNO_DAILY_REMOTE, staging_path)
+                    if not staging_path.is_file() or staging_path.stat().st_size == 0:
+                        raise RuntimeError("Drive F&O feature download was empty")
+                    staging_path.replace(cache_path)
+                raw = pd.read_parquet(cache_path)
+                if raw.empty or not {"symbol", "date"}.issubset(
+                    {str(c).strip().lower() for c in raw.columns}
+                ):
+                    raise RuntimeError("Daily F&O feature parquet has no usable symbol/date rows")
+                with self._lock:
+                    self._fno_context_raw = raw.copy()
+                    self._fno_context_loaded = True
+                    self._fno_context_status = "LOADED"
+                    self._fno_context_error = None
+                    self._fno_context_retry_after = 0.0
+            except Exception as exc:
+                staging_path.unlink(missing_ok=True)
+                message = f"{type(exc).__name__}: {str(exc)[:200]}"
+                with self._lock:
+                    self._fno_context_status = "UNAVAILABLE"
+                    self._fno_context_error = message
+                    self._fno_context_retry_after = time.monotonic() + FNO_CONTEXT_RETRY_SECONDS
+                self._log(
+                    "all_nse_fno_context_load",
+                    status="UNAVAILABLE",
+                    remote_path=FNO_DAILY_REMOTE,
+                    error=message,
+                    retry_after_seconds=FNO_CONTEXT_RETRY_SECONDS,
+                )
+                return {}, "UNAVAILABLE", None
+
+        context = _latest_completed_fno_context(raw, decision_minute.date())
+        source_dates = [
+            row.get("source_date")
+            for row in context.values()
+            if row.get("source_date")
+        ]
+        latest_source_date = max(source_dates) if source_dates else None
+        status = "OK" if context else "NO_FRESH_PRIOR_SESSION_ROWS"
+        with self._lock:
+            self._fno_context_status = status
+            self._fno_context_source_max_date = latest_source_date
+            self._fno_context_error = None if context else (
+                "No F&O feature rows from the previous seven calendar days before decision date"
+            )
+        self._log(
+            "all_nse_fno_context_ready",
+            status=status,
+            decision_date=decision_minute.date().isoformat(),
+            source_max_date=latest_source_date,
+            symbols_with_context=len(context),
+            max_age_days=FNO_CONTEXT_MAX_AGE_DAYS,
+            point_in_time_rule="source date strictly before decision date",
+        )
+        return context, status, latest_source_date
+
     def _fetch_current_nifty_quote(self) -> tuple[float | None, pd.Timestamp | None, str | None]:
         """Return a fresh market-context close; never treat an index ID as an equity token."""
         quote_error = "INDstocks source=index IDs are not supported REST scrip-codes"
