@@ -246,6 +246,29 @@ def _signal(probability_up: float, readiness: float) -> tuple[str, str]:
     return raw, raw if readiness >= MIN_SIGNAL_READINESS else "HOLD"
 
 
+def _is_auth_recovery_error(error: Any) -> bool:
+    """Identify errors that mean the shared provider token is unusable.
+
+    This deliberately targets authentication/token-generation failures rather
+    than ordinary per-symbol no-data responses, which should still be retried
+    and audited per batch.
+    """
+    detail = str(error or "").lower()
+    return any(marker in detail for marker in (
+        "token generation is cooling down",
+        "token generation failed",
+        "automatic re-authentication failed",
+        "automatic reauthentication failed",
+        "please wait a min",
+        "access token may have expired",
+        "invalid access token",
+        "access_token is either incorrect",
+        "access token is either incorrect",
+        "http 401; the access token",
+        "http 403; authentication or endpoint permissions",
+    ))
+
+
 def _primary_signal_with_readiness_guard(
     prediction_status: Any,
     data_limited: Any,
@@ -302,6 +325,9 @@ class AllNSEMinutePredictor:
         self._history_refresh_scheduled = False
         self._last_history_refresh_minute: str | None = None
         self._last_history_refresh_summary: dict[str, Any] = {}
+        # Symbols left stale by a provider/auth interruption are retried first
+        # on the next history refresh rather than repeatedly falling at the tail.
+        self._history_refresh_pending_symbols: set[str] = set()
         self._last_health: dict[str, Any] = {
             "status": "NOT_STARTED",
             "history_ready": False,
@@ -338,6 +364,7 @@ class AllNSEMinutePredictor:
                 "history_seed_failed_batches": self._seed_errors,
                 "history_seed_error": self._seed_error,
                 "history_seed_universe_source": self._seed_universe_source,
+                "history_refresh_pending_symbols": len(self._history_refresh_pending_symbols),
                 "trained_symbol_count": len(self._trained_symbols),
             })
 
@@ -1093,6 +1120,7 @@ class AllNSEMinutePredictor:
                 codes = dict(self._codes)
                 nifty_code = self._nifty_code
                 history_symbols = set(self._history)
+                pending_history_symbols = set(self._history_refresh_pending_symbols)
                 if not seed_complete:
                     # Do not run hundreds of refresh requests concurrently with
                     # initial bootstrap. Refresh only symbols already seeded; the
@@ -1114,18 +1142,36 @@ class AllNSEMinutePredictor:
             window_start = max(session_open, minute - pd.Timedelta(minutes=HISTORY_REFRESH_WINDOW_MINUTES))
             start_ms, end_ms = int(window_start.timestamp() * 1000), int(minute.timestamp() * 1000)
             entries = sorted((str(s), str(c)) for s, c in codes.items() if str(c).strip())
+            # Retry prior interruptions first. Successful symbols remain in the
+            # cache; the pending set only carries unresolved refresh work forward.
+            if pending_history_symbols:
+                entries = (
+                    [entry for entry in entries if entry[0] in pending_history_symbols]
+                    + [entry for entry in entries if entry[0] not in pending_history_symbols]
+                )
             if nifty_code:
-                entries.append(("__NIFTY50__", str(nifty_code)))
+                entries.insert(0, ("__NIFTY50__", str(nifty_code)))
             batches = [entries[i:i + HISTORY_BATCH_SIZE] for i in range(0, len(entries), HISTORY_BATCH_SIZE)]
 
             def rate_limit_start() -> None:
                 self._reserve_history_request_slot()
 
+            auth_failure_event = threading.Event()
+            auth_failure_lock = threading.Lock()
+            auth_failure_detail: list[str | None] = [None]
+
             def fetch_batch(batch):
                 last_error = None
+                if auth_failure_event.is_set():
+                    return {}, "AUTH_CIRCUIT_OPEN", True
                 for attempt in range(3):
+                    if auth_failure_event.is_set():
+                        return {}, "AUTH_CIRCUIT_OPEN", True
                     try:
                         rate_limit_start()
+                        # Do not send queued requests into a known-bad token state.
+                        if auth_failure_event.is_set():
+                            return {}, "AUTH_CIRCUIT_OPEN", True
                         body = _request("GET", "/market/historical/1minute", params={
                             "scrip-codes": ",".join(code for _, code in batch),
                             "start_time": start_ms, "end_time": end_ms,
@@ -1147,25 +1193,59 @@ class AllNSEMinutePredictor:
                                 ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
                                 if not frame.empty:
                                     result[symbol] = frame
-                        return result, None
+                        return result, None, False
                     except Exception as exc:
                         last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                        if _is_auth_recovery_error(last_error):
+                            # One auth/token failure invalidates the shared client
+                            # for every queued batch. Fail fast; retries belong to
+                            # the next scheduled cycle, after the provider cooldown.
+                            with auth_failure_lock:
+                                if auth_failure_detail[0] is None:
+                                    auth_failure_detail[0] = last_error
+                                auth_failure_event.set()
+                            return {}, last_error, True
                         if attempt < 2:
                             time.sleep(0.25 * (attempt + 1))
-                return {}, last_error or "historical refresh failed"
+                return {}, last_error or "historical refresh failed", False
 
             started = time.monotonic()
             updated, failed_symbols, errors, candle_rows = {}, [], [], 0
+            deferred_batches = 0
             with ThreadPoolExecutor(max_workers=HISTORY_REFRESH_WORKERS) as pool:
                 futures = {pool.submit(fetch_batch, batch): batch for batch in batches}
                 for future in as_completed(futures):
-                    result, error = future.result()
+                    batch = futures[future]
+                    try:
+                        result, error, auth_blocked = future.result()
+                    except Exception as exc:
+                        result, error, auth_blocked = {}, f"{type(exc).__name__}: {str(exc)[:180]}", False
                     if error:
-                        errors.append(error)
-                        failed_symbols.extend(s for s, _ in futures[future] if s != "__NIFTY50__")
+                        if auth_blocked and error == "AUTH_CIRCUIT_OPEN":
+                            deferred_batches += 1
+                        else:
+                            errors.append(error)
+                            failed_symbols.extend(s for s, _ in batch if s != "__NIFTY50__")
+                            if auth_blocked:
+                                # Other active workers can observe the same cooldown.
+                                deferred_batches += 1
                     for symbol, frame in result.items():
                         updated[symbol] = frame
                         candle_rows += len(frame)
+
+            updated_symbols = set(updated) - {"__NIFTY50__"}
+            equity_symbols = set(codes)
+            with self._lock:
+                if auth_failure_event.is_set():
+                    # Every stock not refreshed successfully remains explicitly
+                    # pending and will be attempted first on the next scheduled
+                    # pass. Do not label it fresh merely because the batch ran.
+                    self._history_refresh_pending_symbols = equity_symbols - updated_symbols
+                else:
+                    pending = set(self._history_refresh_pending_symbols)
+                    pending.difference_update(updated_symbols)
+                    pending.update(failed_symbols)
+                    self._history_refresh_pending_symbols = pending
 
             nifty_history_source = "INDSTOCKS_HISTORICAL_1M" if "__NIFTY50__" in updated else None
             if "__NIFTY50__" not in updated or updated["__NIFTY50__"].empty:
@@ -1206,10 +1286,17 @@ class AllNSEMinutePredictor:
                 if "__NIFTY50__" in updated:
                     self._market_history = merge_history(self._market_history, updated["__NIFTY50__"])
                 summary = {
-                    "status": "OK" if not errors else "PARTIAL",
+                    "status": (
+                        "AUTH_DEFERRED" if auth_failure_event.is_set()
+                        else "OK" if not errors else "PARTIAL"
+                    ),
                     "minute": minute_key, "batch_count": len(batches),
                     "failed_batches": len(errors), "failed_symbols": sorted(set(failed_symbols)),
-                    "updated_symbols": len([s for s in updated if s != "__NIFTY50__"]),
+                    "updated_symbols": len(updated_symbols),
+                    "deferred_batches": deferred_batches,
+                    "pending_symbol_count": len(self._history_refresh_pending_symbols),
+                    "auth_circuit_open": auth_failure_event.is_set(),
+                    "auth_error": auth_failure_detail[0],
                     "current_session_candle_rows": candle_rows,
                     "nifty_history_source": nifty_history_source,
                     "nifty_history_rows": int(len(updated.get("__NIFTY50__", pd.DataFrame()))),
@@ -1497,9 +1584,64 @@ class AllNSEMinutePredictor:
                 current_rows.append(quote_info)
 
         prediction_count = 0
+        feature_quality_diagnostics: dict[str, Any] = {
+            "feature_row_count": len(feature_rows),
+            "mean_feature_coverage_pct": None,
+            "p10_feature_coverage_pct": None,
+            "feature_group_coverage_pct": {},
+            "missing_count_by_feature": {},
+        }
+        inference_frame = pd.DataFrame(
+            feature_rows, columns=self._model_api.FEATURES
+        ) if feature_rows and self._model_api is not None else pd.DataFrame()
+        if not inference_frame.empty:
+            row_coverage = inference_frame.notna().mean(axis=1) * 100.0
+            feature_quality_diagnostics.update({
+                "mean_feature_coverage_pct": round(float(row_coverage.mean()), 3),
+                "p10_feature_coverage_pct": round(float(np.quantile(row_coverage, 0.10)), 3),
+                "feature_group_coverage_pct": {
+                    "price_technical": round(float(
+                        inference_frame[[name for name in inference_frame.columns if name in {
+                            "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
+                            "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
+                            "ma50_ratio", "range_pct", "body_pct", "volume_ratio",
+                            "volume_z20", "tod_sin", "tod_cos",
+                        }]].notna().mean(axis=1).mean() * 100.0
+                    ), 3) if any(name in inference_frame.columns for name in (
+                        "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
+                        "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
+                        "ma50_ratio", "range_pct", "body_pct", "volume_ratio", "volume_z20",
+                        "tod_sin", "tod_cos",
+                    )) else None,
+                    "market_context": round(float(
+                        inference_frame[[name for name in inference_frame.columns if name in {
+                            "market_ret_1", "market_ret_3", "market_ret_5", "market_ret_10",
+                            "market_ret_15", "market_ret_30", "market_rsi14",
+                            "relative_ret_1", "relative_ret_5", "relative_ret_15",
+                        }]].notna().mean(axis=1).mean() * 100.0
+                    ), 3) if any(name in inference_frame.columns for name in (
+                        "market_ret_1", "market_ret_3", "market_ret_5", "market_ret_10",
+                        "market_ret_15", "market_ret_30", "market_rsi14",
+                        "relative_ret_1", "relative_ret_5", "relative_ret_15",
+                    )) else None,
+                    "fno_context": round(float(
+                        inference_frame[[name for name in inference_frame.columns if name in {
+                            "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi",
+                            "fno_basis", "fno_available",
+                        }]].notna().mean(axis=1).mean() * 100.0
+                    ), 3) if any(name in inference_frame.columns for name in (
+                        "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi",
+                        "fno_basis", "fno_available",
+                    )) else None,
+                },
+                "missing_count_by_feature": {
+                    str(name): int(inference_frame[name].isna().sum())
+                    for name in inference_frame.columns
+                },
+            })
         if feature_rows and not model_error and history_ready:
             try:
-                x = pd.DataFrame(feature_rows, columns=self._model_api.FEATURES)
+                x = inference_frame
                 probs = np.clip(self._classifier.predict_proba(x)[:, 1], 0, 1)
                 expected_returns = np.asarray(self._regressor.predict(x), dtype=float)
                 record_by_symbol = {str(row["symbol"]): row for row in current_rows}
@@ -1752,6 +1894,7 @@ class AllNSEMinutePredictor:
             "prediction_count": prediction_count,
             "prediction_coverage_pct": round(100 * prediction_coverage, 3),
             "data_limited_count": data_limited_count,
+            "feature_quality_diagnostics": feature_quality_diagnostics,
             "model_failure_count": model_failures,
             "untrained_symbol_count": untrained_symbol_count,
             "trained_symbol_manifest_available": trained_symbol_manifest_available,
@@ -1830,6 +1973,7 @@ class AllNSEMinutePredictor:
             prediction_count=prediction_count,
             missing_quote_count=missing_quotes,
             data_limited_count=data_limited_count,
+            feature_quality_diagnostics=feature_quality_diagnostics,
             history_ready=history_ready,
             history_seed_complete=history_seed_complete,
             history_seed_coverage_symbols=seed_coverage_symbols,
