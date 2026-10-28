@@ -174,6 +174,7 @@ def test_recently_generated_rejected_token_waits_for_cooldown(monkeypatch):
     monkeypatch.setattr(client, "_CACHED_TOKEN", "fresh-rejected-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", generated_at + 20 * 3600)
     monkeypatch.setattr(client, "_CACHED_TOKEN_GENERATED_AT", generated_at)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_GENERATED_VALUE", "fresh-rejected-token")
     monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
     monkeypatch.setattr(client, "_TOKEN_GENERATION_LAST_ERROR", None)
     calls = []
