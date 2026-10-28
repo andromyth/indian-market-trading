@@ -116,6 +116,14 @@ jobs:
             sleep 5
           done
           echo "WORKER_HEALTH_HTTP_STATUS=$HTTP_CODE"
+          if [[ "$HTTP_CODE" == "429" ]]; then
+            # Cloud Run may reject the health probe while the single-concurrency
+            # production instance is busy with an all-universe capture/history task.
+            # Do not treat that transport response as proof that Drive auth failed;
+            # continue to the scheduled-tick and worker-log diagnostics below.
+            echo "WORKER_HEALTH_STATUS=DEFERRED_INSTANCE_BUSY"
+            echo "DRIVE_WRITE_PREFLIGHT=NOT_VERIFIED_ROOT_HTTP_429"
+          else
           python - "$RESPONSE" "$HTTP_CODE" <<'PY'
           import json, sys
           path, code = sys.argv[1:]
@@ -142,6 +150,7 @@ jobs:
               sys.exit(1)
           print("DRIVE_WRITE_PREFLIGHT=PASS")
           PY
+          fi
 
       - name: Wait for the next naturally scheduled capture tick after deployment
         shell: bash
