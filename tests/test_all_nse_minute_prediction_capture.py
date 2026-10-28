@@ -143,6 +143,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     predictor = AllNSEMinutePredictor(tmp_path)
     predictor.start = lambda: None
     predictor._seed_ready = True
+    predictor._seed_complete = True
     predictor._seed_status = "READY"
     predictor._symbols = ["AAA", "BBB"]
     predictor._codes = {"AAA": "NSE_1", "BBB": "NSE_2"}
@@ -154,9 +155,11 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
         "trained_until": "2026-10-20T09:15:00+00:00",
         "manifest_sha256_match": True,
     }
-    predictor._refresh_current_session_history = lambda _minute: {
-        "status": "OK", "batch_count": 1, "failed_batches": 0,
+    predictor._schedule_current_session_history_refresh = lambda _minute: {
+        "status": "OK", "minute": _minute.isoformat(),
+        "batch_count": 1, "failed_batches": 0,
         "failed_symbols": [], "updated_symbols": 2, "elapsed_seconds": 0.1,
+        "pending_symbol_count": 0,
     }
 
     idx = pd.date_range(

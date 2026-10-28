@@ -2620,6 +2620,7 @@ class AllNSEMinutePredictor:
             and model_artifact_verified
             and trained_symbol_manifest_available
             and history_ready
+            and history_seed_complete
             and seed_coverage_fraction >= MIN_HISTORY_SEED_COVERAGE
             and seed_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
             and refresh_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
