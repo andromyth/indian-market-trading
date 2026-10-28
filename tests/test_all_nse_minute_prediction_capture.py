@@ -366,6 +366,57 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
     assert result["Close"].tolist() == [100.5, 101.5]
 
 
+
+@pytest.mark.parametrize(
+    "column_order",
+    [
+        [("Open", "^NSEI"), ("High", "^NSEI"), ("Low", "^NSEI"), ("Close", "^NSEI"), ("Volume", "^NSEI")],
+        [("^NSEI", "Open"), ("^NSEI", "High"), ("^NSEI", "Low"), ("^NSEI", "Close"), ("^NSEI", "Volume")],
+    ],
+)
+def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
+    monkeypatch, column_order
+):
+    import data_fetcher
+    import yfinance as yf
+
+    minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
+    idx = pd.date_range(
+        minute - pd.Timedelta(minutes=2),
+        periods=5,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    values_by_field = {
+        "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "High": [101.0, 102.0, 103.0, 104.0, 105.0],
+        "Low": [99.0, 100.0, 101.0, 102.0, 103.0],
+        "Close": [100.5, 101.5, 102.5, 103.5, 104.5],
+        "Volume": [10.0, 12.0, 11.0, 13.0, 14.0],
+    }
+    frame = pd.DataFrame(
+        {
+            col: values_by_field[col[0] if col[0] != "^NSEI" else col[1]]
+            for col in column_order
+        },
+        index=idx,
+    )
+    frame.columns = pd.MultiIndex.from_tuples(column_order, names=["Price", "Ticker"])
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    monkeypatch.setattr(data_fetcher, "_yahoo_chart_history", lambda *args, **kwargs: empty)
+    monkeypatch.setattr(data_fetcher, "get_historical", lambda *args, **kwargs: empty)
+    monkeypatch.setattr(yf, "download", lambda *args, **kwargs: frame)
+
+    result = capture.AllNSEMinutePredictor._fetch_yahoo_nifty_history(minute)
+
+    assert len(result) == 2
+    assert list(result.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert str(result.index.tz) == "Asia/Kolkata"
+    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result["Close"].tolist() == [100.5, 101.5]
+    assert result["Volume"].tolist() == [10.0, 12.0]
+
 def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
     assert capture.AllNSEMinutePredictor._nifty_instrument_code() is None
 
