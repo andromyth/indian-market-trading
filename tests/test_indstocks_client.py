@@ -161,6 +161,37 @@ def test_rejected_cached_token_refreshes_once_with_totp_credentials(monkeypatch)
     assert client._CACHED_TOKEN == "refreshed-token"
 
 
+
+def test_recently_generated_rejected_token_waits_for_cooldown(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
+    generated_at = client.time.time()
+    monkeypatch.setattr(client, "_CACHED_TOKEN", "fresh-rejected-token")
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", generated_at + 20 * 3600)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_GENERATED_AT", generated_at)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_LAST_ERROR", None)
+    calls = []
+
+    def forbidden_second_login():
+        calls.append("generate")
+        raise AssertionError("must not mint a second TOTP token inside the one-minute window")
+
+    monkeypatch.setattr(client, "_generate_token", forbidden_second_login)
+    with pytest.raises(RuntimeError, match="freshly generated INDstocks token was rejected"):
+        client._refresh_rejected_access_token("fresh-rejected-token")
+    with pytest.raises(RuntimeError, match="cooling down"):
+        client.access_token()
+
+    assert calls == []
+    assert client._CACHED_TOKEN is None
+    assert client._TOKEN_GENERATION_RETRY_AFTER >= generated_at + 60
+
 def test_endpoint_permission_403_does_not_trigger_token_refresh(monkeypatch):
     for name, value in (
         ("INDSTOCKS_CLIENT_ID", "test-client-id"),
