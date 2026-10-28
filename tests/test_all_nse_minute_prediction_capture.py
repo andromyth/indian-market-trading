@@ -716,6 +716,57 @@ def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypa
     assert status["status"] == "AUTH_DEFERRED"
     assert "token generation failed" in status["history_seed_error"]
 
+
+def test_nifty_context_is_fetched_before_indstocks_instrument_auth(tmp_path, monkeypatch):
+    import all_universe_minute_capture
+    import indstocks_client
+
+    def rejected_instrument_master():
+        raise RuntimeError(
+            "INDstocks token generation failed: HTTP 400; provider_response=message=Please wait a minute"
+        )
+
+    monkeypatch.setattr(
+        all_universe_minute_capture, "_instrument_map", rejected_instrument_master
+    )
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    cutoff = pd.Timestamp.now(tz=IST).floor("min")
+    idx = pd.date_range(
+        end=cutoff - pd.Timedelta(minutes=1),
+        periods=30,
+        freq="min",
+        tz=IST,
+        name="Datetime",
+    )
+    nifty = pd.DataFrame(
+        {
+            "Open": np.linspace(24970, 25000, len(idx)),
+            "High": np.linspace(24975, 25005, len(idx)),
+            "Low": np.linspace(24965, 24995, len(idx)),
+            "Close": np.linspace(24972, 25002, len(idx)),
+            "Volume": np.arange(1, len(idx) + 1, dtype=float),
+        },
+        index=idx,
+    )
+    nifty.attrs["market_context_source"] = "test_yahoo"
+    monkeypatch.setattr(predictor, "_fetch_yahoo_nifty_history", lambda minute: nifty)
+    monkeypatch.setattr(
+        capture.time,
+        "sleep",
+        lambda seconds: (_ for _ in ()).throw(AssertionError("auth failures must not sleep-loop")),
+    )
+
+    predictor._seed_history()
+
+    assert len(predictor._market_history) == len(nifty)
+    assert predictor._market_history["Close"].notna().all()
+    status = predictor.status()
+    assert status["status"] == "AUTH_DEFERRED"
+    assert status["history_seed_complete"] is False
+    assert "token generation failed" in status["history_seed_error"]
+
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     predictor._symbols = ["AAA", "BBB", "CCC"]
