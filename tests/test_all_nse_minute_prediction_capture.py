@@ -260,6 +260,8 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     )
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
     assert saved_manifest["model_version"] == expected_base_version
+    assert saved_manifest["feature_quality_diagnostics"]["mean_feature_coverage_pct"] == 100.0
+    assert saved_manifest["feature_quality_diagnostics"]["feature_group_coverage_pct"]["price_technical"] is None
 
 
 
@@ -431,6 +433,84 @@ def test_session_history_refresh_is_nonblocking_and_waits_for_seed_completion(tm
     assert completed.wait(timeout=2.0)
     assert len(calls) == 1
     assert execution_context == [True]
+
+
+
+def test_auth_recovery_errors_are_classified_without_masking_data_errors():
+    assert capture._is_auth_recovery_error(
+        "RuntimeError: INDstocks token generation failed: HTTP 400; provider_response=Please wait a min"
+    )
+    assert capture._is_auth_recovery_error(
+        "INDstocks token generation is cooling down for another 55s"
+    )
+    assert not capture._is_auth_recovery_error(
+        "historical refresh response did not report success"
+    )
+    assert not capture._is_auth_recovery_error(
+        "No candles returned for inactive instrument"
+    )
+
+
+def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
+    tmp_path, monkeypatch
+):
+    import indstocks_client
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    minute = pd.Timestamp("2026-10-27 10:20:00", tz=IST)
+    symbols = [f"STOCK{i:02d}" for i in range(15)]
+    predictor._seed_ready = True
+    predictor._seed_complete = True
+    predictor._codes = {symbol: f"NSE_{i}" for i, symbol in enumerate(symbols, start=1)}
+    predictor._nifty_code = None
+    monkeypatch.setattr(capture, "HISTORY_REFRESH_WORKERS", 1)
+    monkeypatch.setattr(predictor, "_reserve_history_request_slot", lambda: None)
+    monkeypatch.setattr(
+        predictor,
+        "_fetch_yahoo_nifty_history",
+        lambda _minute: pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+        ),
+    )
+    candle_ts = int((minute - pd.Timedelta(minutes=1)).timestamp())
+    requests = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    def fake_request(method, path, *, params=None):
+        requests.append((method, path, params))
+        if len(requests) == 2:
+            raise RuntimeError(
+                "INDstocks token generation failed: HTTP 400; provider_response=Please wait a min"
+            )
+        codes = (params or {}).get("scrip-codes", "").split(",")
+        return FakeResponse({
+            "success": True,
+            "data": {
+                code: {"candles": [{
+                    "ts": candle_ts, "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
+                }]}
+                for code in codes
+            },
+        })
+
+    monkeypatch.setattr(indstocks_client, "_request", fake_request)
+    summary = predictor._refresh_current_session_history(minute)
+
+    assert summary["status"] == "AUTH_DEFERRED"
+    assert summary["auth_circuit_open"] is True
+    assert summary["pending_symbol_count"] == 10
+    assert summary["updated_symbols"] == 5
+    assert summary["deferred_batches"] >= 1
+    assert len(requests) == 2, "No further history batches should be sent after auth failure"
+    assert predictor._history_refresh_pending_symbols == set(symbols[5:])
+    assert summary["auth_error"]
 
 
 def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_path):
