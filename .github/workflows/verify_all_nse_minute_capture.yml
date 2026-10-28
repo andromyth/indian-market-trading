@@ -193,6 +193,74 @@ jobs:
           echo "ERROR: no new natural Cloud Scheduler attempt occurred within 6 minutes."
           exit 1
 
+
+      - name: Diagnose Cloud Run capture errors and Scheduler delivery
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "=== Intraday Cloud Scheduler state ==="
+          for JOB in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530 intraday-worker-finalize-1532; do
+            if JOB_JSON="$(gcloud scheduler jobs describe "$JOB" --project="$PROJECT_ID" --location="$REGION" --format=json 2>&1)"; then
+              printf '%s' "$JOB_JSON" | python -c '
+          import json,sys
+          j=json.load(sys.stdin)
+          st=j.get("status") or {}
+          print(json.dumps({
+            "job":j.get("name","").rsplit("/",1)[-1],
+            "state":j.get("state"),
+            "schedule":j.get("schedule"),
+            "timeZone":j.get("timeZone"),
+            "lastAttemptTime":j.get("lastAttemptTime"),
+            "lastAttemptCode":st.get("code"),
+            "lastAttemptMessage":str(st.get("message") or "")[:300],
+          },sort_keys=True))
+          '
+            else
+              echo "SCHEDULER_DESCRIBE_FAILED job=$JOB detail=$JOB_JSON"
+            fi
+          done
+
+          echo "=== Cloud Run worker logs from today's NSE session (UTC >= 03:40) ==="
+          FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-10-28T03:40:00Z"'
+          if gcloud logging read "$FILTER" --project="$PROJECT_ID" --limit=500 --order=desc --format=json > /tmp/intraday-worker-logs.json 2>/tmp/intraday-worker-logs.err; then
+            python - <<'PY'
+          import json,re
+          from pathlib import Path
+          entries=json.loads(Path("/tmp/intraday-worker-logs.json").read_text(encoding="utf-8") or "[]")
+          pattern=re.compile(r"all.?universe|all.?nse|minute.?tick|capture|prediction|drive|persist|quote|traceback|exception|error|failed|degraded|blocked",re.I)
+          keys=("event","message","error","reason","status","capture_status","prediction_status",
+                "cycle_minute_ist","expected_symbol_count","row_count","quoted_symbol_count",
+                "missing_quote_count","snapshot_drive_path","remote_path","manifest_drive_path",
+                "quality_gate_pass","history_ready","attempts","drive_preflight_status")
+          selected=[]
+          for e in entries:
+              jp=e.get("jsonPayload") or {}
+              msg=str(jp.get("message") or e.get("textPayload") or "")
+              event=str(jp.get("event") or "")
+              extras={k:jp[k] for k in keys if k in jp and k not in ("message","event")}
+              if pattern.search(event+" "+msg) or any(pattern.search(str(v)) for v in extras.values()):
+                  selected.append({
+                    "timestamp":e.get("timestamp"),
+                    "severity":e.get("severity"),
+                    "revision":(e.get("resource") or {}).get("labels",{}).get("revision_name"),
+                    "event":event or None,
+                    "message":msg[:700] or None,
+                    **extras,
+                  })
+          selected.sort(key=lambda x:str(x.get("timestamp") or ""))
+          print("CLOUD_RUN_LOG_ENTRY_COUNT="+str(len(entries)))
+          print("CLOUD_RUN_RELEVANT_ENTRY_COUNT="+str(len(selected)))
+          for item in selected[-100:]:
+              print("CLOUD_RUN_DIAGNOSTIC: "+json.dumps(item,sort_keys=True,default=str))
+          if not selected:
+              print("NO_MATCHING_WORKER_DIAGNOSTIC_LINES_FOUND")
+          PY
+          else
+            echo "CLOUD_RUN_LOG_READ_FAILED"
+            cat /tmp/intraday-worker-logs.err
+          fi
+
       - name: Probe private quote and prediction diagnostics without overstating off-session readiness
         shell: bash
         run: |
