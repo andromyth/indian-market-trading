@@ -33,6 +33,7 @@ _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
 _CACHED_TOKEN_EXPIRES_AT = 0.0
 _CACHED_TOKEN_GENERATED_AT = 0.0
+_CACHED_TOKEN_GENERATED_VALUE: str | None = None
 _TOKEN_GENERATION_RETRY_AFTER = 0.0
 _TOKEN_GENERATION_LAST_ERROR: str | None = None
 _INSTRUMENTS: dict[str, tuple[float, pd.DataFrame]] = {}
@@ -195,6 +196,7 @@ def _generate_token() -> str:
 def _generate_and_cache_token_locked() -> str:
     """Generate/cache one token while holding _TOKEN_LOCK, with failure cooldown."""
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT, _CACHED_TOKEN_GENERATED_AT
+    global _CACHED_TOKEN_GENERATED_VALUE
     global _TOKEN_GENERATION_RETRY_AFTER, _TOKEN_GENERATION_LAST_ERROR
 
     now = time.time()
@@ -222,6 +224,7 @@ def _generate_and_cache_token_locked() -> str:
 
     _CACHED_TOKEN = token
     _CACHED_TOKEN_GENERATED_AT = time.time()
+    _CACHED_TOKEN_GENERATED_VALUE = token
     _CACHED_TOKEN_EXPIRES_AT = _CACHED_TOKEN_GENERATED_AT + 23 * 3600
     _TOKEN_GENERATION_RETRY_AFTER = 0.0
     _TOKEN_GENERATION_LAST_ERROR = None
@@ -283,6 +286,7 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
     concurrent history batch from hammering a rate-limited token endpoint.
     """
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT, _CACHED_TOKEN_GENERATED_AT
+    global _CACHED_TOKEN_GENERATED_VALUE
     global _TOKEN_GENERATION_RETRY_AFTER, _TOKEN_GENERATION_LAST_ERROR
     if not _has_totp_credentials():
         raise RuntimeError("INDstocks automatic authentication is not configured")
@@ -304,10 +308,16 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
         # token while still being rejected. Quarantine this token and defer the
         # next login attempt until the provider cooldown expires.
         generated_at = _CACHED_TOKEN_GENERATED_AT
+        generated_value = _CACHED_TOKEN_GENERATED_VALUE
         _CACHED_TOKEN = None
         _CACHED_TOKEN_EXPIRES_AT = 0.0
         _CACHED_TOKEN_GENERATED_AT = 0.0
-        if generated_at and 0 <= now - generated_at < TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS:
+        _CACHED_TOKEN_GENERATED_VALUE = None
+        if (
+            generated_value == rejected_token
+            and generated_at
+            and 0 <= now - generated_at < TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS
+        ):
             _TOKEN_GENERATION_RETRY_AFTER = max(
                 _TOKEN_GENERATION_RETRY_AFTER,
                 generated_at + TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS,
