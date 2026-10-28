@@ -1140,7 +1140,12 @@ class AllNSEMinutePredictor:
             from indstocks_client import _request
             session_open = pd.Timestamp(datetime.combine(minute.date(), wall_time(9, 15), tzinfo=IST))
             window_start = max(session_open, minute - pd.Timedelta(minutes=HISTORY_REFRESH_WINDOW_MINUTES))
-            start_ms, end_ms = int(window_start.timestamp() * 1000), int(minute.timestamp() * 1000)
+            # A refresh can take several minutes. Pull each batch up to the most
+            # recent completed-minute boundary available when that batch starts,
+            # so this cache is useful at the *next* scheduled slot. Inference
+            # still filters history strictly before its own decision timestamp.
+            batch_end_minutes: list[pd.Timestamp] = [minute]
+            batch_end_lock = threading.Lock()
             entries = sorted((str(s), str(c)) for s, c in codes.items() if str(c).strip())
             # Retry prior interruptions first. Successful symbols remain in the
             # cache; the pending set only carries unresolved refresh work forward.
@@ -1172,9 +1177,21 @@ class AllNSEMinutePredictor:
                         # Do not send queued requests into a known-bad token state.
                         if auth_failure_event.is_set():
                             return {}, "AUTH_CIRCUIT_OPEN", True
+                        current_floor = pd.Timestamp.now(tz=IST).floor("min")
+                        batch_end = max(
+                            minute,
+                            min(current_floor, minute + pd.Timedelta(minutes=5)),
+                        )
+                        batch_start = max(
+                            session_open,
+                            batch_end - pd.Timedelta(minutes=HISTORY_REFRESH_WINDOW_MINUTES),
+                        )
+                        with batch_end_lock:
+                            batch_end_minutes.append(batch_end)
                         body = _request("GET", "/market/historical/1minute", params={
                             "scrip-codes": ",".join(code for _, code in batch),
-                            "start_time": start_ms, "end_time": end_ms,
+                            "start_time": int(batch_start.timestamp() * 1000),
+                            "end_time": int(batch_end.timestamp() * 1000),
                         }).json()
                         successful = isinstance(body, dict) and (
                             body.get("success") is True
@@ -1188,8 +1205,8 @@ class AllNSEMinutePredictor:
                             frame = self._parse_candles((data.get(code) or {}).get("candles") or [])
                             if not frame.empty:
                                 frame = frame.loc[
-                                    (pd.Index(frame.index.date) == minute.date())
-                                    & (frame.index < minute)
+                                    (pd.Index(frame.index.date) == batch_end.date())
+                                    & (frame.index < batch_end)
                                 ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
                                 if not frame.empty:
                                     result[symbol] = frame
@@ -1301,7 +1318,11 @@ class AllNSEMinutePredictor:
                     "nifty_history_source": nifty_history_source,
                     "nifty_history_rows": int(len(updated.get("__NIFTY50__", pd.DataFrame()))),
                     "window_start_ist": window_start.isoformat(),
-                    "window_end_ist": minute.isoformat(),
+                    "window_end_ist": max(batch_end_minutes).isoformat(),
+                    "batch_end_minute_span": {
+                        "earliest": min(batch_end_minutes).isoformat(),
+                        "latest": max(batch_end_minutes).isoformat(),
+                    },
                     "elapsed_seconds": round(time.monotonic() - started, 2),
                     "error_examples": errors[:5],
                 }
