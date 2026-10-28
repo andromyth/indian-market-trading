@@ -196,7 +196,7 @@ def access_token() -> str:
     TOTP-generated token per account, so this adapter serializes generation.
     """
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
-    auto = all(_setting(k) for k in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET"))
+    auto = _has_totp_credentials()
     if not auto:
         manual = _setting("INDSTOCKS_ACCESS_TOKEN")
         if not manual:
@@ -213,10 +213,68 @@ def access_token() -> str:
         return token
 
 
-def _request(method: str, path: str, *, params: dict[str, Any] | None = None) -> requests.Response:
-    token = access_token()
+def _has_totp_credentials() -> bool:
+    """Return True only when unattended token regeneration is configured."""
+    return all(
+        _setting(name)
+        for name in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET")
+    )
+
+
+def _is_rejected_access_token(response: requests.Response) -> bool:
+    """Detect explicit invalid/expired access-token responses, not generic 403s."""
+    if response.status_code not in (401, 403):
+        return False
+    detail = _safe_provider_error_detail(response).lower()
+    names_access_token = "access_token" in detail or "access token" in detail
+    signals_invalidity = any(
+        marker in detail
+        for marker in (
+            "incorrect", "expired", "revoked", "re-authenticate",
+            "reauthenticate", "invalid token", "token is invalid",
+        )
+    )
+    return names_access_token and signals_invalidity
+
+
+def _refresh_rejected_access_token(rejected_token: str) -> str:
+    """Refresh a TOTP token rejected before its nominal 24-hour lifetime.
+
+    INDstocks may revoke a token early when a new session is created. Serializing
+    refreshes prevents concurrent requests using the same rejected token from
+    repeatedly generating new sessions.
+    """
+    global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
+    if not _has_totp_credentials():
+        raise RuntimeError("INDstocks automatic authentication is not configured")
+
+    with _TOKEN_LOCK:
+        now = time.time()
+        # Another request may already have repaired the shared cache while this
+        # response was in flight. Reuse that newer token rather than log in again.
+        if (
+            _CACHED_TOKEN
+            and _CACHED_TOKEN != rejected_token
+            and _CACHED_TOKEN_EXPIRES_AT > now
+        ):
+            return _CACHED_TOKEN
+
+        _CACHED_TOKEN = None
+        _CACHED_TOKEN_EXPIRES_AT = 0.0
+        refreshed = _generate_token()
+        _CACHED_TOKEN = refreshed
+        _CACHED_TOKEN_EXPIRES_AT = time.time() + 23 * 3600
+        return refreshed
+
+
+def _send_authenticated_request(
+    method: str,
+    path: str,
+    params: dict[str, Any] | None,
+    token: str,
+) -> requests.Response:
     try:
-        response = requests.request(
+        return requests.request(
             method,
             f"{API_BASE}{path}",
             headers={
@@ -229,9 +287,29 @@ def _request(method: str, path: str, *, params: dict[str, Any] | None = None) ->
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"INDstocks request failed: {type(exc).__name__}") from None
+
+
+def _request(method: str, path: str, *, params: dict[str, Any] | None = None) -> requests.Response:
+    token = access_token()
+    response = _send_authenticated_request(method, path, params, token)
+
+    # Retry exactly once only when the provider explicitly says this access token
+    # is invalid/expired/revoked. Do not turn ordinary endpoint-permission 403s
+    # into repeated authentication attempts or use this path for manual tokens.
+    if _has_totp_credentials() and _is_rejected_access_token(response):
+        try:
+            refreshed_token = _refresh_rejected_access_token(token)
+        except Exception as exc:
+            raise RuntimeError(
+                "INDstocks rejected the current access token and automatic "
+                f"re-authentication failed: {type(exc).__name__}: {str(exc)[:240]}"
+            ) from None
+        if refreshed_token:
+            response = _send_authenticated_request(method, path, params, refreshed_token)
+
     if response.status_code >= 400:
         if response.status_code == 401:
-            detail = "HTTP 401; the manual token may have expired, or authentication failed"
+            detail = "HTTP 401; the access token may have expired, or authentication failed"
         elif response.status_code == 403:
             detail = "HTTP 403; authentication or endpoint permissions were rejected"
         elif response.status_code == 429:

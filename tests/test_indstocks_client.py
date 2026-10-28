@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 import indstocks_client as client
 
@@ -110,3 +111,90 @@ def test_provider_error_detail_redacts_inline_credentials():
     assert "123456" not in detail
     assert "bearer-secret" not in detail
 
+
+
+def test_rejected_cached_token_refreshes_once_with_totp_credentials(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", "expired-token")
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
+
+    generated = []
+    monkeypatch.setattr(
+        client,
+        "_generate_token",
+        lambda: generated.append("generated") or "refreshed-token",
+    )
+    sent_tokens = []
+
+    class FakeResponse:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_request(method, url, *, headers, params, timeout):
+        sent_tokens.append(headers["Authorization"])
+        if headers["Authorization"] == "expired-token":
+            return FakeResponse(403, {
+                "success": False,
+                "message": (
+                    "The provided access_token is either incorrect, expired, "
+                    "or has been revoked. The user needs to re-authenticate."
+                ),
+            })
+        return FakeResponse(200, {"success": True, "data": {"ok": True}})
+
+    monkeypatch.setattr(client.requests, "request", fake_request)
+    response = client._request("GET", "/market/quotes/full", params={"scrip-codes": "NSE_2885"})
+
+    assert response.status_code == 200
+    assert sent_tokens == ["expired-token", "refreshed-token"]
+    assert generated == ["generated"]
+    assert client._CACHED_TOKEN == "refreshed-token"
+
+
+def test_endpoint_permission_403_does_not_trigger_token_refresh(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", "current-token")
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
+    monkeypatch.setattr(
+        client,
+        "_generate_token",
+        lambda: (_ for _ in ()).throw(AssertionError("Must not refresh for endpoint permissions")),
+    )
+
+    class FakeResponse:
+        status_code = 403
+
+        def json(self):
+            return {
+                "success": False,
+                "error_type": "UserException",
+                "code": "MARKET_DATA_PERMISSION_DENIED",
+                "message": "This account cannot access this quote endpoint",
+            }
+
+    sent_tokens = []
+    monkeypatch.setattr(
+        client.requests,
+        "request",
+        lambda *args, **kwargs: (sent_tokens.append(kwargs["headers"]["Authorization"]) or FakeResponse()),
+    )
+
+    with pytest.raises(RuntimeError, match="MARKET_DATA_PERMISSION_DENIED"):
+        client._request("GET", "/market/quotes/full", params={"scrip-codes": "NSE_2885"})
+    assert sent_tokens == ["current-token"]
