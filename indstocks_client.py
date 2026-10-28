@@ -210,6 +210,12 @@ def _generate_and_cache_token_locked() -> str:
     try:
         token = _generate_token()
     except Exception as exc:
+        # The previous cached token is expired or has already been rejected.
+        # Never leave it available as a fallback when refresh fails.
+        _CACHED_TOKEN = None
+        _CACHED_TOKEN_EXPIRES_AT = 0.0
+        _CACHED_TOKEN_GENERATED_AT = 0.0
+        _CACHED_TOKEN_GENERATED_VALUE = None
         _TOKEN_GENERATION_RETRY_AFTER = (
             time.time() + TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS
         )
