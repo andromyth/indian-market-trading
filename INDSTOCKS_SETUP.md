@@ -26,6 +26,8 @@ Complete the site's Setup TOTP flow. Securely save the TOTP secret when it is sh
 
 Do not keep the token-generation secret in GitHub. The app computes the six-digit TOTP locally and calls the documented token-generation endpoint. The client caches the resulting token in process memory and refreshes it before the 24-hour expiry; it does not write credentials or tokens to disk.
 
+**Token ownership:** the Streamlit dashboard is forced into manual-token mode and must not mint TOTP tokens. Its existing `INDSTOCKS_ACCESS_TOKEN` setting is left untouched. Cloud Run explicitly uses `INDSTOCKS_AUTH_MODE=totp` and is the only deployed process allowed to generate tokens. In every other process, the default mode is `manual`; merely having TOTP secrets present cannot trigger token generation.
+
 Important token constraint: INDstocks documents that only one TOTP-generated token can be live per account. A successful token-generation call invalidates the previous TOTP token. Do not configure multiple independent applications to generate tokens for the same account; use one application/process to own token generation.
 
 ## Verify the connection
