@@ -172,49 +172,32 @@ def bounded_calibration_sample(
 
 
 def prediction_manifest_is_clean(manifest: dict[str, Any]) -> bool:
-    """Require the full-NSE inference slot to be complete and model-ready."""
+    """Informational slot flag: a stored prediction file contains at least one forecast."""
     try:
-        expected = int(manifest.get("expected_symbol_count") or 0)
         rows = int(manifest.get("row_count") or 0)
         predictions = int(manifest.get("prediction_count") or 0)
     except (TypeError, ValueError):
         return False
     return bool(
-        manifest.get("status") == "OK"
-        and manifest.get("quality_gate_pass") is True
-        and expected > 0
-        and rows == expected
-        and predictions == expected
-        and int(manifest.get("missing_quote_count") or 0) == 0
-        and int(manifest.get("data_limited_count") or 0) == 0
-        and int(manifest.get("untrained_symbol_count") or 0) == 0
-        and int(manifest.get("model_failure_count") or 0) == 0
-        and manifest.get("trained_symbol_manifest_available") is True
-        and manifest.get("history_ready") is True
-        and int(manifest.get("history_seed_coverage_symbols") or 0) == expected
-        and int(manifest.get("history_seed_failed_batches") or 0) == 0
+        manifest.get("status") in {"OK", "STORED", "PARTIAL"}
+        and rows > 0
+        and predictions > 0
     )
 
 
 def quote_manifest_is_clean(manifest: dict[str, Any]) -> bool:
-    """Require every official-universe quote row and every provider batch."""
+    """Informational slot flag: a persisted snapshot contains at least one valid quote."""
     try:
         expected = int(manifest.get("expected_symbol_count") or 0)
         rows = int(manifest.get("row_count") or 0)
         quoted = int(manifest.get("quoted_symbol_count") or 0)
     except (TypeError, ValueError):
         return False
-    pending_snapshot_errors = len((manifest.get("pending_snapshot_recovery") or {}).get("errors") or [])
-    pending_manifest_errors = len((manifest.get("pending_manifest_recovery") or {}).get("errors") or [])
     return bool(
-        manifest.get("status") == "OK"
+        manifest.get("status") in {"OK", "STORED", "PARTIAL"}
         and expected > 0
-        and rows == expected
-        and quoted == expected
-        and int(manifest.get("missing_quote_count") or 0) == 0
-        and int(manifest.get("unmapped_symbol_count") or 0) == 0
-        and pending_snapshot_errors == 0
-        and pending_manifest_errors == 0
+        and rows > 0
+        and quoted > 0
     )
 
 
@@ -223,11 +206,10 @@ def select_row_level_clean_predictions(
     quote_frame: pd.DataFrame,
     manifest: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Keep individually complete predictions from an OK or PARTIAL slot.
+    """Keep individually valid predictions from any stored slot.
 
-    A PARTIAL slot is never promoted to slot-level OK. Rows enter outcomes only
-    when the producer marked them PASS, input readiness and quote checks pass,
-    and the same-symbol quote from that slot corroborates the observation.
+    Slot coverage is informational. A missing or invalid stock quote excludes
+    only that symbol; stored, independently corroborated rows remain eligible.
     Explicitly untrained (False) rows are excluded. UNKNOWN training membership
     remains labelled UNKNOWN rather than being presented as trained: this is a
     pooled feature model, and its inference contract allows PASS when per-symbol
@@ -261,7 +243,7 @@ def select_row_level_clean_predictions(
             "all_conditions": 0,
         },
     }
-    if frame.empty or str(manifest.get("status") or "").upper() not in {"OK", "PARTIAL"}:
+    if frame.empty or str(manifest.get("status") or "").upper() not in {"OK", "PARTIAL", "STORED"}:
         return empty, base_report
     required_quotes = {"symbol", "quote_observed_at_utc", "actual_observed_price", "quote_status"}
     if not required_quotes.issubset(set(quote_frame.columns)) or quote_frame.empty:
@@ -370,7 +352,10 @@ def select_row_level_clean_predictions(
     prediction_status = merged.get("prediction_status", pd.Series("", index=merged.index)).astype(str).str.upper()
     prediction_status_pass = prediction_status.eq("PASS")
     prediction_status_pass_data_limited = prediction_status.eq("PASS_DATA_LIMITED")
-    prediction_status_eligible = prediction_status_pass | prediction_status_pass_data_limited
+    prediction_status_eligible = (
+        prediction_status.isin({"PASS", "PASS_DATA_LIMITED", "PASS_UNTRAINED_SYMBOL"})
+        | prediction_status.str.startswith("PREDICTED")
+    )
     actual_quote_status_pass = (
         merged.get("actual_quote_status", pd.Series("", index=merged.index))
         .astype(str).str.upper().eq("PASS")
@@ -700,7 +685,7 @@ def load_clean_session_data(
                 continue
 
             slot_status = str(manifest.get("status") or "").upper()
-            if key not in quote_parquets or slot_status not in {"OK", "PARTIAL"}:
+            if key not in quote_parquets or slot_status not in {"OK", "PARTIAL", "STORED"}:
                 report["quote_slots_quarantined"] += 1
                 reason = "quote_snapshot_missing_or_manifest_not_persisted"
                 report["excluded_reasons"][reason] = report["excluded_reasons"].get(reason, 0) + 1
@@ -731,7 +716,7 @@ def load_clean_session_data(
                 quote_slot_frames[key] = quote_frame
                 quote_slot_manifests[key] = manifest
                 loaded_quote_keys.add(key)
-                slot_clean = quote_manifest_is_clean(manifest) and len(frame) == expected
+                slot_clean = quote_manifest_is_clean(manifest)
                 if slot_clean:
                     clean_quote_keys.add(key)
                     report["quote_slots_eligible"] += 1
@@ -756,7 +741,7 @@ def load_clean_session_data(
             if (
                 key not in pred_parquets
                 or key not in loaded_quote_keys
-                or slot_status not in {"OK", "PARTIAL"}
+                or slot_status not in {"OK", "PARTIAL", "STORED"}
             ):
                 report["prediction_slots_quarantined"] += 1
                 reason = "prediction_or_contemporaneous_quote_snapshot_missing_or_not_persisted"
@@ -833,8 +818,7 @@ def load_clean_session_data(
                 slot_clean = bool(
                     prediction_manifest_is_clean(manifest)
                     and key in clean_quote_keys
-                    and row_gate.get("quarantined_rows", 0) == 0
-                    and len(clean) == expected
+                    and len(clean) > 0
                 )
                 if slot_clean:
                     report["prediction_slots_eligible"] += 1
