@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 import os
 
+from snapshot_5m_features import SNAPSHOT_CADENCE_MINUTES
+
 import calibration_overlay as calibration_overlay_module
 
 IST = ZoneInfo("Asia/Kolkata")
