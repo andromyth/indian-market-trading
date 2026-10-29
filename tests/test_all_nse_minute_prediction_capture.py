@@ -372,7 +372,7 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
 def test_stale_market_history_is_excluded_from_feature_context():
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=8),
+        minute - pd.Timedelta(minutes=13),
         periods=3,
         freq="min",
         tz=IST,
@@ -400,7 +400,7 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     stale_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=12),
         periods=4,
         freq="min",
         tz=IST,
@@ -502,6 +502,9 @@ def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, 
         "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
         "training_symbols": ["AAA"],
         "training_symbol_count": 1,
+        "feature_schema_version": model.FEATURE_SCHEMA_VERSION,
+        "input_cadence_minutes": model.SNAPSHOT_CADENCE_MINUTES,
+        "features": model.FEATURES,
     }
     local_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     local_classifier.write_bytes(b"stale-classifier")
