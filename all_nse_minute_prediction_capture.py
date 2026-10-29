@@ -33,12 +33,13 @@ FNO_DAILY_REMOTE = "production_data/nse_official/fno/fno_daily_features_2026.par
 FNO_CONTEXT_MAX_AGE_DAYS = 7
 FNO_CONTEXT_RETRY_SECONDS = 900
 HISTORY_LOOKBACK_BARS = 120
+HISTORY_BAR_INTERVAL_MINUTES = 5
 HISTORY_BATCH_SIZE = 5
 HISTORY_REQUEST_PAUSE_SECONDS = 0.22
 HISTORY_REFRESH_REQUEST_SPACING_SECONDS = 0.24
 HISTORY_REFRESH_WINDOW_MINUTES = 90
 HISTORY_REFRESH_WORKERS = 8
-MIN_SESSION_CANDLES_FOR_PREDICTION = 16
+MIN_SESSION_CANDLES_FOR_PREDICTION = 3
 MAX_HISTORY_CANDLE_AGE_MINUTES = 5
 MIN_SIGNAL_READINESS = 0.70
 MAX_QUOTE_AGE_SECONDS = 120
@@ -611,7 +612,7 @@ class AllNSEMinutePredictor:
 
         The source=index instrument master exposes index underlyings, not a
         documented NSE cash-equity token accepted by /market/quotes/full or
-        /market/historical/1minute. The old NSE_<SECURITY_ID> conversion caused
+        /market/historical/5minute. The old NSE_<SECURITY_ID> conversion caused
         HTTP 400 on both REST paths. NIFTY context uses verified one-minute Yahoo
         candles as a fallback instead; no WebSocket token or fabricated OHLC is used.
         """
@@ -625,7 +626,7 @@ class AllNSEMinutePredictor:
             columns=columns,
             index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         )
-        cutoff = _as_ist_timestamp(minute).floor("min")
+        cutoff = _as_ist_timestamp(minute).floor("5min")
         attempts: list[dict[str, Any]] = []
 
         # Try the existing direct Yahoo chart adapter first, then the repository's
@@ -648,12 +649,12 @@ class AllNSEMinutePredictor:
         if _yahoo_chart_history is not None:
             candidates.append((
                 "yahoo_chart",
-                lambda: _yahoo_chart_history("^NSEI", "5d", "1m"),
+                lambda: _yahoo_chart_history("^NSEI", "5d", "5m"),
             ))
         if get_historical is not None:
             candidates.append((
                 "get_historical",
-                lambda: get_historical("^NSEI", period="5d", interval="1m", force_refresh=True),
+                lambda: get_historical("^NSEI", period="5d", interval="5m", force_refresh=True),
             ))
 
         def normalize_candidate(candidate: Any) -> pd.DataFrame:
@@ -765,6 +766,10 @@ class AllNSEMinutePredictor:
                 raw_index = raw_index.tz_localize(IST)
             else:
                 raw_index = raw_index.tz_convert(IST)
+            # Provider timestamps label the start of each 5-minute candle.
+            # Convert to its close timestamp so training, inference and freshness
+            # checks use the same point-in-time convention.
+            raw_index = raw_index + pd.Timedelta(minutes=HISTORY_BAR_INTERVAL_MINUTES)
             frame.index = raw_index
             frame.index.name = "Datetime"
             frame = frame.loc[~frame.index.isna()]
@@ -774,7 +779,7 @@ class AllNSEMinutePredictor:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
             frame = frame.loc[
                 (pd.Index(frame.index.date) == cutoff.date())
-                & (frame.index < cutoff)
+                & (frame.index <= cutoff)
                 & frame["Close"].notna()
                 & frame["Close"].gt(0)
             ].sort_index()
@@ -846,7 +851,7 @@ class AllNSEMinutePredictor:
                     "yfinance_ticker_history",
                     lambda: ticker_history(
                         period="1d",
-                        interval="1m",
+                        interval="5m",
                         auto_adjust=False,
                         actions=False,
                         timeout=10,
@@ -886,7 +891,7 @@ class AllNSEMinutePredictor:
                 lambda: yf.download(
                     "^NSEI",
                     period="1d",
-                    interval="1m",
+                    interval="5m",
                     auto_adjust=False,
                     progress=False,
                     threads=False,
@@ -946,8 +951,8 @@ class AllNSEMinutePredictor:
         market = market_history.copy()
         idx = market.index
         market.index = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
-        decision_minute = _as_ist_timestamp(minute).floor("min")
-        before = market.loc[market.index < decision_minute].copy()
+        decision_minute = _as_ist_timestamp(minute).floor("5min")
+        before = market.loc[market.index <= decision_minute].copy()
         if before.empty:
             return empty
         # Market context is as time-sensitive as the individual stock candle.
@@ -968,8 +973,8 @@ class AllNSEMinutePredictor:
         Equity seeding/refresh can be delayed by provider authentication or quota
         errors. Keep the market-context feed independent so a stale NIFTY cache does
         not remove ten market/relative-return features from every stock at once.
-        The fallback only accepts real, current-session one-minute candles strictly
-        before the decision minute; it never fabricates index OHLC or uses future bars.
+        The fallback only accepts real, completed five-minute candles at or before
+        the decision time; it never fabricates index OHLC or uses future bars.
         """
         before = self._market_history_before(market_history, minute)
         if not before.empty:
@@ -1007,7 +1012,7 @@ class AllNSEMinutePredictor:
                 existing.index = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
                 # Keep only candles at or before the cutoff; the cache must never
                 # retain an accidentally future-dated row as context for this slot.
-                existing = existing.loc[existing.index < _as_ist_timestamp(minute)]
+                existing = existing.loc[existing.index <= _as_ist_timestamp(minute).floor("5min")]
             else:
                 existing = fresh_before.iloc[0:0].copy()
             merged = pd.concat([existing, fresh_before]).sort_index()
@@ -1037,7 +1042,7 @@ class AllNSEMinutePredictor:
             unit="s",
             utc=True,
             errors="coerce",
-        ).dt.tz_convert(IST)
+        ).dt.tz_convert(IST) + pd.Timedelta(minutes=HISTORY_BAR_INTERVAL_MINUTES)
         out = pd.DataFrame(
             {
                 "Open": pd.to_numeric(frame["o"], errors="coerce").to_numpy(),
@@ -1109,7 +1114,7 @@ class AllNSEMinutePredictor:
                 # Fetch benchmark history first so an INDstocks token failure cannot
                 # suppress market-context features for otherwise valid stock quotes.
                 market_now = pd.Timestamp.now(tz=IST)
-                market_cutoff = market_now.floor("min")
+                market_cutoff = market_now.floor("5min")
                 with self._lock:
                     cached_market = self._market_history.copy()
                 market_needs_refresh = cached_market.empty
@@ -1239,7 +1244,7 @@ class AllNSEMinutePredictor:
                             self._reserve_history_request_slot()
                             body = _request(
                                 "GET",
-                                "/market/historical/1minute",
+                                "/market/historical/5minute",
                                 params={
                                     "scrip-codes": ",".join(code_list),
                                     "start_time": start_ms,
@@ -1294,7 +1299,7 @@ class AllNSEMinutePredictor:
                             if not frame.empty:
                                 # Do not seed a still-forming candle; the live quote is
                                 # appended as a separately timestamped partial row.
-                                frame = frame.loc[frame.index < now.floor("min")]
+                                frame = frame.loc[frame.index <= now.floor("5min")]
                                 if not frame.empty:
                                     histories[symbol] = frame.tail(HISTORY_LOOKBACK_BARS)
                     # Publish each successful batch as soon as it returns. Waiting
@@ -1354,7 +1359,7 @@ class AllNSEMinutePredictor:
                         self._reserve_history_request_slot()
                         retry_body = _request(
                             "GET",
-                            "/market/historical/1minute",
+                            "/market/historical/5minute",
                             params={
                                 "scrip-codes": code,
                                 "start_time": start_ms,
@@ -1374,7 +1379,7 @@ class AllNSEMinutePredictor:
                         )
                         if not retry_frame.empty:
                             retry_frame = retry_frame.loc[
-                                retry_frame.index < now.floor("min")
+                                retry_frame.index <= now.floor("5min")
                             ]
                         if not retry_frame.empty:
                             histories[symbol] = retry_frame.tail(HISTORY_LOOKBACK_BARS)
@@ -1413,7 +1418,7 @@ class AllNSEMinutePredictor:
                 # use genuine Yahoo NIFTY 50 one-minute OHLCV candles for context.
                 # This does not alter the stock history-coverage counter.
                 if "__NIFTY50__" not in histories or histories["__NIFTY50__"].empty:
-                    nifty_history = self._fetch_yahoo_nifty_history(now.floor("min"))
+                    nifty_history = self._fetch_yahoo_nifty_history(now.floor("5min"))
                     if not nifty_history.empty:
                         histories["__NIFTY50__"] = nifty_history
                     self._log(
@@ -1937,18 +1942,16 @@ class AllNSEMinutePredictor:
                         # Do not send queued requests into a known-bad token state.
                         if auth_failure_event.is_set():
                             return {}, "AUTH_CIRCUIT_OPEN", True
-                        current_floor = pd.Timestamp.now(tz=IST).floor("min")
-                        batch_end = max(
-                            minute,
-                            min(current_floor, minute + pd.Timedelta(minutes=5)),
-                        )
+                        current_floor = pd.Timestamp.now(tz=IST).floor("5min")
+                        # Only fetch through the latest completed five-minute boundary.
+                        batch_end = min(_as_ist_timestamp(minute).floor("5min"), current_floor)
                         batch_start = max(
                             session_open,
                             batch_end - pd.Timedelta(minutes=HISTORY_REFRESH_WINDOW_MINUTES),
                         )
                         with batch_end_lock:
                             batch_end_minutes.append(batch_end)
-                        body = _request("GET", "/market/historical/1minute", params={
+                        body = _request("GET", "/market/historical/5minute", params={
                             "scrip-codes": ",".join(code for _, code in batch),
                             "start_time": int(batch_start.timestamp() * 1000),
                             "end_time": int(batch_end.timestamp() * 1000),
@@ -1967,7 +1970,7 @@ class AllNSEMinutePredictor:
                             if not frame.empty:
                                 frame = frame.loc[
                                     (pd.Index(frame.index.date) == batch_end.date())
-                                    & (frame.index < batch_end)
+                                    & (frame.index <= batch_end)
                                 ].tail(HISTORY_REFRESH_WINDOW_MINUTES)
                             if not frame.empty:
                                 result[symbol] = frame
@@ -2046,7 +2049,7 @@ class AllNSEMinutePredictor:
                     self._history_refresh_pending_symbols = pending
 
             refresh_cutoff = max(batch_end_minutes)
-            nifty_history_source = "INDSTOCKS_HISTORICAL_1M" if "__NIFTY50__" in updated else None
+            nifty_history_source = "INDSTOCKS_HISTORICAL_5M" if "__NIFTY50__" in updated else None
             if "__NIFTY50__" not in updated or updated["__NIFTY50__"].empty:
                 # Benchmark refresh follows the same current-time cutoff as the
                 # equity batches. The next prediction still applies its own
@@ -2060,7 +2063,7 @@ class AllNSEMinutePredictor:
                     if not fallback.empty:
                         updated["__NIFTY50__"] = fallback
                         candle_rows += len(fallback)
-                        nifty_history_source = "YAHOO_FINANCE_1M_FALLBACK"
+                        nifty_history_source = "YAHOO_FINANCE_5M_FALLBACK"
                 if nifty_history_source is None:
                     nifty_history_source = "MISSING"
 
@@ -2352,7 +2355,7 @@ class AllNSEMinutePredictor:
             # Point-in-time safety: the actual quote and derived volume delta may
             # only use completed historical candles strictly before the slot.
             if not hist.empty and isinstance(hist.index, pd.DatetimeIndex):
-                hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
+                hist = hist.loc[hist.index <= minute.floor("5min")].tail(HISTORY_LOOKBACK_BARS)
             elif not hist.empty:
                 hist = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
             history_age_minutes = None
@@ -2395,7 +2398,7 @@ class AllNSEMinutePredictor:
                 )
             elif symbol in failed_refresh_symbols:
                 quote_info["prediction_status"] = "HISTORY_REFRESH_FAILED"
-                quote_info["error"] = "Current-session one-minute candle refresh failed for this symbol."
+                quote_info["error"] = "Current-session five-minute candle refresh failed for this symbol."
             elif not history_ready or hist.empty:
                 quote_info["prediction_status"] = (
                     "INSUFFICIENT_HISTORY" if history_seed_complete else "WARMING_HISTORY"
@@ -2744,6 +2747,8 @@ class AllNSEMinutePredictor:
             "audit_name": "all-nse-minute-prediction-actual-capture",
             "schema_version": "all-nse-minute-prediction-v1",
             "capture_interval_minutes": 5,
+            "history_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
+            "feature_bar_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "cycle_minute_ist": minute.isoformat(),
             "model_version": self._production_model_version(),
             "calibration_versioning": "per-row readiness segment; READINESS_LOW primary action remains HOLD",
@@ -2780,15 +2785,17 @@ class AllNSEMinutePredictor:
             "history_refresh_failure_fraction": round(refresh_failure_fraction, 6),
             "history_refresh_elapsed_seconds": history_refresh.get("elapsed_seconds"),
             "min_session_candles_for_prediction": MIN_SESSION_CANDLES_FOR_PREDICTION,
+            "history_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
+            "feature_bar_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "model_coverage_symbols": (
                 self._model_status.get("training_symbol_count") or len(self._trained_symbols)
             ),
             "nifty_context_status": (
-                "HISTORICAL_ONE_MINUTE_CANDLES"
+                "HISTORICAL_FIVE_MINUTE_CANDLES"
                 if not market_history_before_minute.empty else "HISTORY_OR_MISSING"
             ),
             "nifty_context_source": (
-                "YAHOO_FINANCE_1M_FALLBACK"
+                "YAHOO_FINANCE_5M_FALLBACK"
                 if self._nifty_code is None and not market_history_before_minute.empty
                 else "INDSTOCKS_REST" if self._nifty_code
                 else "MISSING"
