@@ -131,6 +131,8 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
     )
 
     assert result["status"] == "STORED"
+    assert result["snapshot_persisted"] is True
+    assert result["coverage_is_informational"] is True
     assert result["expected_symbol_count"] == 2
     assert result["quoted_symbol_count"] == 1
     assert result["missing_quote_count"] == 1
