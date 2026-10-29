@@ -1,14 +1,11 @@
-"""All-NSE minute-level prediction plus contemporaneous actual-price persistence.
+"""All-NSE five-minute snapshot prediction plus contemporaneous actual-price persistence.
 
-The existing full-universe collector supplies real-time LTP snapshots. This module
-adds a pooled 30-minute prediction for every NSE symbol in that snapshot and
-persists a single auditable row per symbol. It does not submit or place orders.
-
-Historical OHLCV is seeded in batches of at most five instruments per request.
-For the current, still-forming minute, the actual LTP and cumulative-volume delta
-are real; current-minute open/high/low are deliberately left missing because a
-single REST quote is not an exchange OHLC candle. Low-readiness predictions are
-saved for analysis but their actionable signal is forced to HOLD.
+The full-universe collector persists one quote snapshot per NSE symbol every five
+minutes. This module builds a shared 30-minute forecast from the prior snapshot
+archive plus the same-slot snapshot that triggered inference, then persists one
+auditable row per symbol. Live prediction does not call the one-minute candle
+history endpoint. Sampled LTP is never represented as exchange OHLC; low-readiness
+predictions may be recorded for analysis but the actionable signal remains HOLD.
 """
 from __future__ import annotations
 
