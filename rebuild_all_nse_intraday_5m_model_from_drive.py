@@ -190,6 +190,7 @@ def main() -> int:
     parser.add_argument("--work-root", required=True)
     parser.add_argument("--min-symbol-coverage", type=float, default=0.50)
     parser.add_argument("--min-trainable-symbols", type=int, default=100)
+    parser.add_argument("--min-seed-universe-symbols", type=int, default=500)
     args = parser.parse_args()
 
     if not os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip():
@@ -200,7 +201,6 @@ def main() -> int:
     ):
         raise RuntimeError("Google Drive root folder ID is not configured.")
 
-    from delivery_training_universe import official_nse_symbols
     from persistent_store import GoogleDriveStore, drive_status
     from all_nse_intraday_model import FEATURES, model_target_contract
 
@@ -218,16 +218,39 @@ def main() -> int:
     output = root / "trained_model"
     output.mkdir(parents=True, exist_ok=True)
 
-    universe = {
-        str(symbol).strip().upper().replace(".NS", "").replace(".BO", "")
-        for symbol in official_nse_symbols(force_refresh=True)
-        if str(symbol).strip()
-    }
-    if not universe:
-        raise RuntimeError("Official NSE training universe is empty.")
-    print(f"OFFICIAL_NSE_UNIVERSE_SIZE={len(universe)}")
-
     store = GoogleDriveStore()
+    symbols_folder = _resolve_folder(store, SEED_REMOTE)
+    if not symbols_folder:
+        raise FileNotFoundError(
+            f"Required historical training seed folder is missing in Drive: {SEED_REMOTE}"
+        )
+    seed_children = _list_children(store, symbols_folder)
+    universe = {
+        str(item.get("name", "")).split("=", 1)[1].upper().replace(".NS", "").replace(".BO", "")
+        for item in seed_children
+        if item.get("mimeType") == "application/vnd.google-apps.folder"
+        and str(item.get("name", "")).startswith("symbol=")
+        and str(item.get("name", "")).split("=", 1)[1].strip()
+    }
+    universe.update(
+        Path(str(item.get("name", ""))).stem.upper().replace(".NS", "").replace(".BO", "")
+        for item in seed_children
+        if item.get("mimeType") != "application/vnd.google-apps.folder"
+        and str(item.get("name", "")).lower().endswith(".parquet")
+    )
+    universe = {s for s in universe if s and s not in {"NAN", "NONE"}}
+    if len(universe) < args.min_seed_universe_symbols:
+        raise RuntimeError(
+            f"Historical Drive seed universe is too small for all-NSE recovery: "
+            f"{len(universe)} symbols; minimum is {args.min_seed_universe_symbols}. "
+            "No model was trained or uploaded."
+        )
+    print("TRAINING_UNIVERSE=" + json.dumps({
+        "symbol_count": len(universe),
+        "source": "GOOGLE_DRIVE_HISTORICAL_SEED_SYMBOL_PARTITIONS",
+        "official_current_roster_refresh": "UNAVAILABLE_IN_THIS_RUN",
+    }, sort_keys=True))
+
     seed_symbols, seed_files, seed_bytes = _download_seed(store, root, universe)
     coverage = seed_symbols / len(universe)
     print("SEED_INPUT_SUMMARY=" + json.dumps({
@@ -256,6 +279,9 @@ def main() -> int:
     # The canonical builder imports the 34-feature runtime contract and performs
     # the chronological holdout. Train locally first; do not write into the live
     # Drive model folder until every validation below has passed.
+    universe_json = root / "intraday_training_universe.json"
+    universe_json.write_text(json.dumps(sorted(universe)), encoding="utf-8")
+    os.environ["ALL_NSE_INTRADAY_TRAINING_UNIVERSE_JSON"] = str(universe_json)
     from colab_build_all_nse_intraday_multifactor import main as train_main
     original_argv = sys.argv[:]
     try:
@@ -348,6 +374,7 @@ def main() -> int:
         "universe_size": manifest.get("universe_size"),
         "training_symbol_count": manifest.get("training_symbol_count"),
         "coverage_pct": manifest.get("coverage_pct"),
+        "universe_source": manifest.get("universe_source"),
         "training_rows": manifest.get("training_rows"),
         "holdout_rows": manifest.get("holdout_rows"),
         "trained_until": manifest.get("trained_until"),
