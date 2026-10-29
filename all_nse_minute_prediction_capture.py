@@ -2360,6 +2360,7 @@ class AllNSEMinutePredictor:
                 quote_info["prediction_status"] = "MODEL_UNAVAILABLE"
                 quote_info["error"] = model_error
                 model_failures += 1
+                current_rows.append(quote_info)
             elif price_row is not None:
                 try:
                     current_quote_frame = pd.DataFrame(
