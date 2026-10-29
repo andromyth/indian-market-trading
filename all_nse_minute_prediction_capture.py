@@ -38,8 +38,8 @@ HISTORY_REQUEST_PAUSE_SECONDS = 0.22
 HISTORY_REFRESH_REQUEST_SPACING_SECONDS = 0.24
 HISTORY_REFRESH_WINDOW_MINUTES = 90
 HISTORY_REFRESH_WORKERS = 8
-MIN_SESSION_CANDLES_FOR_PREDICTION = 16
-MAX_HISTORY_CANDLE_AGE_MINUTES = 5
+MIN_SESSION_CANDLES_FOR_PREDICTION = 3
+MAX_HISTORY_CANDLE_AGE_MINUTES = 10
 MIN_SIGNAL_READINESS = 0.70
 MAX_QUOTE_AGE_SECONDS = 120
 MIN_PREDICTION_COVERAGE = 0.95
@@ -49,6 +49,7 @@ MAX_UNTRAINED_SYMBOL_FRACTION = 0.10
 MAX_MODEL_FAILURE_FRACTION = 0.01
 MIN_HISTORY_SEED_COVERAGE = 0.95
 MAX_HISTORY_FAILURE_FRACTION = 0.05
+SNAPSHOT_HISTORY_LOOKBACK_BARS = 50
 
 
 def _history_seed_batches(
@@ -265,10 +266,14 @@ def _current_minute_row(
         same_day_history = prior_history.loc[
             pd.Index(prior_history.index.date) == snapshot_date
         ] if not prior_history.empty else pd.DataFrame()
-        history_volume = (
-            pd.to_numeric(same_day_history.get("Volume"), errors="coerce").sum(min_count=1)
-            if not same_day_history.empty and "Volume" in same_day_history else np.nan
-        )
+        if not same_day_history.empty and "day_volume" in same_day_history:
+            day_volume_values = pd.to_numeric(same_day_history["day_volume"], errors="coerce").dropna()
+            history_volume = day_volume_values.iloc[-1] if not day_volume_values.empty else np.nan
+        else:
+            history_volume = (
+                pd.to_numeric(same_day_history.get("Volume"), errors="coerce").sum(min_count=1)
+                if not same_day_history.empty and "Volume" in same_day_history else np.nan
+            )
         volume_delta = (
             raw_day_volume - float(history_volume)
             if raw_day_volume is not None and pd.notna(history_volume)
@@ -459,6 +464,9 @@ class AllNSEMinutePredictor:
         self._lock = threading.RLock()
         self._seed_started = False
         self._seed_thread: threading.Thread | None = None
+        self._snapshot_seed_minute: pd.Timestamp | None = None
+        self._snapshot_seed_root: Path | None = None
+        self._history_snapshot_slot_count = 0
         self._seed_ready = False
         # Readiness is progressive; completion is tracked separately so the
         # worker can forecast eligible symbols while remaining history is seeded.
@@ -524,9 +532,11 @@ class AllNSEMinutePredictor:
             self._seed_status = (
                 "RESUMING_HISTORY" if self._seed_ready else "WARMING_HISTORY"
             )
+            decision_minute = self._snapshot_seed_minute or pd.Timestamp.now(tz=IST).floor("5min")
             thread = threading.Thread(
-                target=self._seed_history,
-                name="all-nse-minute-history-seed",
+                target=self._seed_snapshot_history,
+                args=(decision_minute,),
+                name="all-nse-five-minute-snapshot-history-seed",
                 daemon=True,
             )
             self._seed_thread = thread
@@ -1556,6 +1566,275 @@ class AllNSEMinutePredictor:
                 time.sleep(120)
 
     @staticmethod
+    def _snapshot_filename_minute(name: str) -> pd.Timestamp | None:
+        try:
+            parsed = datetime.strptime(Path(name).stem, "snapshot_%Y%m%d_%H%M")
+            return pd.Timestamp(parsed, tz=IST)
+        except (TypeError, ValueError):
+            return None
+
+    def _snapshot_archive_paths(self, decision_minute: pd.Timestamp) -> list[Path]:
+        """Load only persisted five-minute snapshots; no live one-minute history endpoint."""
+        root = Path(self._snapshot_seed_root or self.worker_root)
+        local_dir = root / "all_universe_minute_snapshots"
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        def prior_local_paths() -> list[Path]:
+            found = []
+            for path in local_dir.glob("snapshot_*.parquet"):
+                slot = self._snapshot_filename_minute(path.name)
+                if slot is not None and slot < decision_minute:
+                    found.append((slot, path))
+            return [path for _, path in sorted(found, key=lambda item: item[0])]
+
+        local = prior_local_paths()
+        if len(local) >= SNAPSHOT_HISTORY_LOOKBACK_BARS:
+            return local[-SNAPSHOT_HISTORY_LOOKBACK_BARS:]
+
+        try:
+            from persistent_store import GoogleDriveStore
+            from googleapiclient.http import MediaIoBaseDownload
+
+            store = GoogleDriveStore()
+            candidates: dict[str, tuple[pd.Timestamp, str]] = {}
+            day_cursor = decision_minute.date()
+            for _ in range(6):
+                parent = store.root_id
+                parts = [
+                    "production_data", "all_universe_minute_snapshots",
+                    f"{day_cursor:%Y}", f"{day_cursor:%m}", f"{day_cursor:%d}",
+                ]
+                try:
+                    for part in parts:
+                        found = store._find_child(parent, part, "application/vnd.google-apps.folder")
+                        if not found:
+                            parent = None
+                            break
+                        parent = found["id"]
+                    if parent:
+                        listing = store.service.files().list(
+                            q=f"'{parent}' in parents and trashed = false",
+                            spaces="drive",
+                            fields="files(id,name,mimeType)",
+                            pageSize=100,
+                            includeItemsFromAllDrives=True,
+                            supportsAllDrives=True,
+                        ).execute()
+                        for item in listing.get("files", []):
+                            name = str(item.get("name") or "")
+                            slot = self._snapshot_filename_minute(name)
+                            if name.endswith(".parquet") and name.startswith("snapshot_") and slot is not None and slot < decision_minute:
+                                candidates[name] = (slot, str(item["id"]))
+                except Exception as exc:
+                    self._log(
+                        "all_nse_snapshot_history_folder_list_failed",
+                        date=day_cursor.isoformat(),
+                        error=f"{type(exc).__name__}: {str(exc)[:160]}",
+                    )
+                day_cursor = self._previous_trading_date(day_cursor)
+
+            local_names = {path.name for path in local_dir.glob("snapshot_*.parquet")}
+            need = max(0, SNAPSHOT_HISTORY_LOOKBACK_BARS - len(local))
+            remote_order = sorted(candidates.items(), key=lambda item: item[1][0], reverse=True)
+            downloaded = 0
+            for name, (slot, file_id) in remote_order:
+                if need <= 0:
+                    break
+                if name in local_names:
+                    continue
+                destination = local_dir / name
+                buffer_path = destination.with_suffix(".download")
+                request = store.service.files().get_media(fileId=file_id)
+                with buffer_path.open("wb") as fh:
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                if buffer_path.stat().st_size == 0:
+                    buffer_path.unlink(missing_ok=True)
+                    continue
+                buffer_path.replace(destination)
+                downloaded += 1
+                need -= 1
+            self._log(
+                "all_nse_snapshot_history_archive_loaded",
+                local_prior_snapshots=len(local),
+                remote_snapshots_downloaded=downloaded,
+                requested_lookback=SNAPSHOT_HISTORY_LOOKBACK_BARS,
+            )
+        except Exception as exc:
+            self._log(
+                "all_nse_snapshot_history_archive_unavailable",
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                action="use_only_already_persisted_local_five_minute_snapshots",
+            )
+
+        return prior_local_paths()[-SNAPSHOT_HISTORY_LOOKBACK_BARS:]
+
+    def _seed_snapshot_history(self, decision_minute: pd.Timestamp) -> None:
+        """Seed per-symbol history from the persisted five-minute snapshot archive only."""
+        minute = _as_ist_timestamp(decision_minute).floor("5min")
+        started = time.monotonic()
+        try:
+            paths = self._snapshot_archive_paths(minute)
+            frames = []
+            universe_symbols: set[str] = set()
+            for path in paths:
+                try:
+                    frame = pd.read_parquet(path)
+                except Exception as exc:
+                    self._log(
+                        "all_nse_snapshot_history_file_read_failed",
+                        path=str(path),
+                        error=f"{type(exc).__name__}: {str(exc)[:120]}",
+                    )
+                    continue
+                required = {"symbol", "cycle_minute_ist", "quote_status", "actual_observed_price"}
+                if not required.issubset(frame.columns):
+                    continue
+                frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+                universe_symbols.update(frame.loc[frame["symbol"].ne(""), "symbol"].tolist())
+                frame["_snapshot_ts"] = pd.to_datetime(
+                    frame["cycle_minute_ist"], errors="coerce", utc=True
+                ).dt.tz_convert(IST)
+                frame = frame.loc[frame["_snapshot_ts"].notna() & (frame["_snapshot_ts"] < minute)].copy()
+                if frame.empty:
+                    continue
+                for col in ("day_volume", "day_open", "day_high", "day_low"):
+                    if col not in frame:
+                        frame[col] = np.nan
+                    frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                frame["actual_observed_price"] = pd.to_numeric(frame["actual_observed_price"], errors="coerce")
+                frames.append(frame[[
+                    "symbol", "_snapshot_ts", "quote_status", "actual_observed_price",
+                    "day_volume", "day_open", "day_high", "day_low",
+                ]])
+            if not frames:
+                raise RuntimeError("No prior persisted five-minute snapshots could be loaded")
+            all_rows = pd.concat(frames, ignore_index=True)
+            slot_count = int(all_rows["_snapshot_ts"].nunique())
+            valid = all_rows.loc[
+                all_rows["quote_status"].astype(str).str.upper().eq("PASS")
+                & all_rows["actual_observed_price"].gt(0)
+            ].copy()
+            valid = valid.sort_values(["symbol", "_snapshot_ts"])
+            valid["_session_date"] = valid["_snapshot_ts"].dt.date
+            valid["Close"] = valid["actual_observed_price"]
+            valid["Volume"] = valid.groupby(["symbol", "_session_date"])["day_volume"].diff()
+            valid.loc[valid["Volume"] < 0, "Volume"] = np.nan
+
+            histories: dict[str, pd.DataFrame] = {}
+            for symbol, group in valid.groupby("symbol", sort=False):
+                history = group.set_index("_snapshot_ts")[
+                    ["Close", "Volume", "day_open", "day_high", "day_low", "day_volume"]
+                ].sort_index()
+                history.index.name = "Datetime"
+                histories[str(symbol)] = history.tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
+
+            coverage = len(histories)
+            coverage_target = int(np.ceil(len(universe_symbols) * MIN_HISTORY_SEED_COVERAGE))
+            complete = bool(
+                slot_count >= SNAPSHOT_HISTORY_LOOKBACK_BARS
+                and len(universe_symbols) > 0
+                and coverage >= coverage_target
+            )
+            with self._lock:
+                # Do not drop a newer slot appended while archive I/O was running.
+                for symbol, old in self._history.items():
+                    if old is not None and not old.empty:
+                        merged = pd.concat([histories[symbol], old]).sort_index() if symbol in histories else old.copy()
+                        histories[symbol] = merged.loc[~merged.index.duplicated(keep="last")].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
+                self._history = histories
+                self._symbols = sorted(set(self._symbols) | universe_symbols)
+                self._seed_coverage = sum(1 for frame in histories.values() if frame is not None and not frame.empty)
+                self._seed_errors = 0
+                self._seed_deferred_batches = 0
+                self._seed_universe_source = "PERSISTED_FIVE_MINUTE_SNAPSHOT_ARCHIVE"
+                self._seed_ready = bool(histories)
+                self._seed_complete = bool(
+                    complete and self._seed_coverage >= int(np.ceil(len(self._symbols) * MIN_HISTORY_SEED_COVERAGE))
+                )
+                self._seed_status = (
+                    "READY" if self._seed_complete
+                    else "READY_PARTIAL" if self._seed_ready
+                    else "WARMING_HISTORY_ERROR"
+                )
+                self._seed_error = None if self._seed_complete else (
+                    f"Five-minute snapshot seed incomplete: slots={slot_count}, "
+                    f"symbols_with_history={self._seed_coverage}/{len(self._symbols)}, "
+                    f"required_slots={SNAPSHOT_HISTORY_LOOKBACK_BARS}"
+                )
+                self._history_snapshot_slot_count = slot_count
+            self._log(
+                "all_nse_five_minute_snapshot_history_seed_completed",
+                cutoff_ist=minute.isoformat(),
+                snapshot_slots_loaded=slot_count,
+                universe_symbols=len(self._symbols),
+                history_symbols=self._seed_coverage,
+                required_history_slots=SNAPSHOT_HISTORY_LOOKBACK_BARS,
+                status=self._seed_status,
+                history_source=self._seed_universe_source,
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            with self._lock:
+                self._seed_error = error
+                self._seed_ready = bool(self._history)
+                self._seed_complete = False
+                self._seed_status = "READY_PARTIAL" if self._seed_ready else "WARMING_HISTORY_ERROR"
+            self._log(
+                "all_nse_five_minute_snapshot_history_seed_failed",
+                cutoff_ist=minute.isoformat(),
+                error=error,
+            )
+
+    def _append_five_minute_snapshot(self, quote_frame: pd.DataFrame, minute: pd.Timestamp) -> None:
+        """Append the current captured row only after inference for use at the next slot."""
+        current: dict[str, dict[str, Any]] = {}
+        for row in quote_frame.to_dict(orient="records"):
+            symbol = str(row.get("symbol") or "").strip().upper()
+            price = _safe_float(row.get("actual_observed_price"))
+            if not symbol or str(row.get("quote_status") or "").upper() != "PASS" or not np.isfinite(price) or price <= 0:
+                continue
+            day_volume = _safe_float(row.get("day_volume"))
+            with self._lock:
+                old = self._history.get(symbol)
+                same_day = old.loc[pd.Index(old.index.date) == minute.date()] if old is not None and not old.empty and "day_volume" in old else pd.DataFrame()
+                volume_values = pd.to_numeric(same_day["day_volume"], errors="coerce").dropna() if not same_day.empty and "day_volume" in same_day else pd.Series(dtype=float)
+                previous_day_volume = volume_values.iloc[-1] if not volume_values.empty else np.nan
+            delta = day_volume - float(previous_day_volume) if np.isfinite(day_volume) and np.isfinite(previous_day_volume) else np.nan
+            if not np.isfinite(delta) or delta < 0:
+                delta = np.nan
+            current[symbol] = {
+                "Close": price, "Volume": delta, "day_open": _safe_float(row.get("day_open")),
+                "day_high": _safe_float(row.get("day_high")), "day_low": _safe_float(row.get("day_low")),
+                "day_volume": day_volume,
+            }
+        with self._lock:
+            for symbol, values in current.items():
+                row = pd.DataFrame([values], index=pd.DatetimeIndex([minute], tz=IST, name="Datetime"))
+                old = self._history.get(symbol)
+                combined = pd.concat([old, row]).sort_index() if old is not None and not old.empty else row
+                self._history[symbol] = combined.loc[~combined.index.duplicated(keep="last")].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
+            quote_symbols = set(quote_frame["symbol"].astype(str).str.strip().str.upper()) if "symbol" in quote_frame else set()
+            self._symbols = sorted(set(self._symbols) | {s for s in quote_symbols if s})
+            self._history_snapshot_slot_count = max(
+                self._history_snapshot_slot_count,
+                len({ts for frame in self._history.values() if frame is not None for ts in frame.index}),
+            )
+            coverage_target = int(np.ceil(len(self._symbols) * MIN_HISTORY_SEED_COVERAGE))
+            if (
+                self._history_snapshot_slot_count >= SNAPSHOT_HISTORY_LOOKBACK_BARS
+                and len(self._symbols) > 0
+                and sum(1 for frame in self._history.values() if frame is not None and not frame.empty) >= coverage_target
+            ):
+                self._seed_ready = True
+                self._seed_complete = True
+                self._seed_status = "READY"
+                self._seed_error = None
+
+    @staticmethod
     def _log(event: str, **fields: Any) -> None:
         print(
             "[ALL_NSE_MINUTE_PREDICTOR] "
@@ -2289,19 +2568,28 @@ class AllNSEMinutePredictor:
             for row in quote_frame.to_dict(orient="records")
         }
 
+        self._snapshot_seed_minute = minute
+        self._snapshot_seed_root = source_root
         self.start()
         if self._last_minute == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "cycle_minute_ist": minute_key}
 
-        # Validate the quote dependency before scheduling additional source refresh work.
-        refresh_target = minute
-        history_refresh = self._schedule_current_session_history_refresh(refresh_target)
-        if str(history_refresh.get("status") or "").upper() in {"IN_PROGRESS", "SCHEDULED_ASYNC"}:
-            history_refresh = self._wait_for_current_session_history_refresh(
-                refresh_target,
-                timeout_seconds=45.0,
-            )
-        failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
+        # Seed and refresh from the exact persisted five-minute quote snapshots.
+        # The live prediction path does not request one-minute stock candles.
+        seed_thread = self._seed_thread
+        if seed_thread is not None and seed_thread.is_alive():
+            seed_thread.join(timeout=18.0)
+        history_refresh = {
+            "status": "SNAPSHOT_HISTORY_ONLY",
+            "minute": minute_key,
+            "batch_count": 0,
+            "failed_batches": 0,
+            "failed_symbols": [],
+            "updated_symbols": len(self._history),
+            "pending_symbol_count": 0,
+            "elapsed_seconds": 0.0,
+        }
+        failed_refresh_symbols: set[str] = set()
         with self._lock:
             symbols = sorted(quote_by_symbol)
             history_ready = self._seed_ready
@@ -2312,12 +2600,12 @@ class AllNSEMinutePredictor:
             seed_deferred_batches = self._seed_deferred_batches
             seed_universe_source = self._seed_universe_source
             histories = {symbol: frame.copy() for symbol, frame in self._history.items()}
-            market_history = self._market_history.copy()
-        market_history_before_minute = self._fresh_market_history_before(
-            market_history,
-            minute,
+        market_history_before_minute = pd.DataFrame(
+            columns=["Close"],
+            index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         )
-        nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
+        nifty_price, nifty_observed_at, nifty_error = None, None, None
+
         try:
             if history_ready:
                 self._ensure_model()
@@ -2395,7 +2683,7 @@ class AllNSEMinutePredictor:
                 )
             elif symbol in failed_refresh_symbols:
                 quote_info["prediction_status"] = "HISTORY_REFRESH_FAILED"
-                quote_info["error"] = "Current-session one-minute candle refresh failed for this symbol."
+                quote_info["error"] = "Five-minute snapshot history refresh failed for this symbol."
             elif not history_ready or hist.empty:
                 quote_info["prediction_status"] = (
                     "INSUFFICIENT_HISTORY" if history_seed_complete else "WARMING_HISTORY"
@@ -2414,7 +2702,7 @@ class AllNSEMinutePredictor:
                     elif history_age_minutes is None or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
                         quote_info["prediction_status"] = "STALE_HISTORY"
                         quote_info["error"] = (
-                            "Latest completed stock candle is missing or older than "
+                            "Latest prior five-minute snapshot is missing or older than "
                             f"{MAX_HISTORY_CANDLE_AGE_MINUTES} minutes at the decision slot."
                         )
                     else:
@@ -2455,16 +2743,16 @@ class AllNSEMinutePredictor:
                 "feature_group_coverage_pct": {
                     "price_technical": round(float(
                         inference_frame[[name for name in inference_frame.columns if name in {
-                            "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
-                            "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
-                            "ma50_ratio", "range_pct", "body_pct", "volume_ratio",
-                            "volume_z20", "tod_sin", "tod_cos",
+                            "ret_5m", "ret_15m", "ret_25m", "ret_50m", "ret_75m", "ret_150m",
+                            "rsi_70m", "ma_25m_ratio", "ma_50m_ratio", "ma_100m_ratio",
+                            "ma_250m_ratio", "volume_ratio_100m", "volume_z_100m",
+                            "session_return", "day_high_ratio", "day_low_ratio", "tod_sin", "tod_cos",
                         }]].notna().mean(axis=1).mean() * 100.0
                     ), 3) if any(name in inference_frame.columns for name in (
-                        "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
-                        "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
-                        "ma50_ratio", "range_pct", "body_pct", "volume_ratio", "volume_z20",
-                        "tod_sin", "tod_cos",
+                        "ret_5m", "ret_15m", "ret_25m", "ret_50m", "ret_75m", "ret_150m",
+                        "rsi_70m", "ma_25m_ratio", "ma_50m_ratio", "ma_100m_ratio",
+                        "ma_250m_ratio", "volume_ratio_100m", "volume_z_100m",
+                        "session_return", "day_high_ratio", "day_low_ratio", "tod_sin", "tod_cos",
                     )) else None,
                     "market_context": round(float(
                         inference_frame[[name for name in inference_frame.columns if name in {
@@ -2626,8 +2914,10 @@ class AllNSEMinutePredictor:
                             "error": f"{type(exc).__name__}: {str(exc)[:240]}",
                         })
 
-        # Update the in-memory minute bar cache only after inference used the
-        # preceding bars. The current LTP is real; missing OHLC fields stay NaN.
+        # Append the current slot only after inference so predictions never use
+        # their own decision-slot observation as historical input.
+        self._append_five_minute_snapshot(quote_frame, minute)
+
         with self._lock:
             for symbol, item in quote_actuals.items():
                 if item["day_volume"] is not None:
@@ -2721,7 +3011,7 @@ class AllNSEMinutePredictor:
             refresh_failed_batches / refresh_batch_count
             if refresh_batch_count
             else 0.0 if history_refresh.get("status") in {
-                "SCHEDULED_ASYNC", "IN_PROGRESS", "WARMING_SEED"
+                "SCHEDULED_ASYNC", "IN_PROGRESS", "WARMING_SEED", "SNAPSHOT_HISTORY_ONLY"
             } else 1.0
         )
         model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
@@ -2767,32 +3057,27 @@ class AllNSEMinutePredictor:
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,
             "history_seed_universe_source": seed_universe_source,
+            "history_snapshot_source": "PERSISTED_FIVE_MINUTE_SNAPSHOTS",
             "history_seed_coverage_symbols": seed_coverage_symbols,
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
             "history_seed_failed_batches": seed_failed_batches,
             "history_seed_deferred_batches": seed_deferred_batches,
             "history_seed_failure_fraction": round(seed_failure_fraction, 6),
             "history_refresh_status": history_refresh.get("status"),
-            "history_refresh_mode": "BACKGROUND_NONBLOCKING",
+            "history_refresh_mode": "SNAPSHOT_ONLY",
             "history_refresh_batch_count": refresh_batch_count,
             "history_refresh_failed_batches": refresh_failed_batches,
             "history_refresh_failed_symbols": len(failed_refresh_symbols),
             "history_refresh_failure_fraction": round(refresh_failure_fraction, 6),
             "history_refresh_elapsed_seconds": history_refresh.get("elapsed_seconds"),
             "min_session_candles_for_prediction": MIN_SESSION_CANDLES_FOR_PREDICTION,
+            "snapshot_history_cadence_minutes": SNAPSHOT_CADENCE_MINUTES,
+            "snapshot_history_slots_loaded": self._history_snapshot_slot_count,
             "model_coverage_symbols": (
                 self._model_status.get("training_symbol_count") or len(self._trained_symbols)
             ),
-            "nifty_context_status": (
-                "HISTORICAL_ONE_MINUTE_CANDLES"
-                if not market_history_before_minute.empty else "HISTORY_OR_MISSING"
-            ),
-            "nifty_context_source": (
-                "YAHOO_FINANCE_1M_FALLBACK"
-                if self._nifty_code is None and not market_history_before_minute.empty
-                else "INDSTOCKS_REST" if self._nifty_code
-                else "MISSING"
-            ),
+            "nifty_context_status": "NOT_USED_SNAPSHOT_ONLY",
+            "nifty_context_source": "NONE_SNAPSHOT_ONLY",
             "fno_context_status": fno_context_status,
             "fno_context_source_max_date": fno_context_source_max_date,
             "fno_context_symbol_count": len(fno_context_by_symbol),
