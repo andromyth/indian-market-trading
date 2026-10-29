@@ -51,6 +51,7 @@ jobs:
           all_nse_delivery_model.py
           all_nse_intraday_model.py
           colab_build_all_nse_intraday_multifactor.py
+          rebuild_all_nse_intraday_5m_model_from_drive.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
