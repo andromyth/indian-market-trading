@@ -242,8 +242,12 @@ def test_core_readiness_does_not_penalize_expected_missing_fno_fields():
         "day_volume": day_volume,
     }, index=idx)
 
+    feature_frame = make_snapshot_feature_frame(frame)
     row = latest_snapshot_features(frame)
     readiness = pd.Series(row).reindex(READINESS_FEATURES).notna().mean()
+    five_minute_slot_readiness = feature_frame.loc[
+        pd.Timestamp("2026-10-28 09:20", tz=IST), list(READINESS_FEATURES)
+    ].notna().mean()
 
     assert len(READINESS_FEATURES) == 19
     assert all(name not in READINESS_FEATURES for name in (
@@ -251,3 +255,4 @@ def test_core_readiness_does_not_penalize_expected_missing_fno_fields():
     ))
     assert row["fno_available"] == 0.0
     assert readiness >= 0.70
+    assert five_minute_slot_readiness >= 0.70
