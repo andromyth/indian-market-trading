@@ -122,7 +122,7 @@ jobs:
           )
           if ok:
               with open(env_path, "a", encoding="utf-8") as env:
-                  env.write("GOOGLE_DRIVE_ROOT_ID=" + root_id + "\\n")
+                  env.write("GOOGLE_DRIVE_ROOT_ID=" + root_id + "\n")
               print("EXISTING_WORKER_DRIVE_PREFLIGHT=PASS write_ready=true")
               sys.exit(0)
           sys.exit(1)
