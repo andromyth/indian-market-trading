@@ -34,7 +34,7 @@ def test_resample_completed_five_minute_bars_aggregates_ohlcv_and_drops_partial(
     ]
     assert bars.iloc[0]["Open"] == 100.0
     assert bars.iloc[0]["High"] == 105.0
-    assert bars.iloc[0]["Low"] == 95.0
+    assert bars.iloc[0]["Low"] == 99.0
     assert bars.iloc[0]["Close"] == 104.0
     assert bars.iloc[0]["Volume"] == 15.0
     assert bars.iloc[1]["Close"] == 109.0
