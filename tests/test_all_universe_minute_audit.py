@@ -64,6 +64,7 @@ def _prediction_snapshot_link(session_date, key):
         ),
         "quote_snapshot_cycle_minute_ist": minute.isoformat(),
         "quote_snapshot_capture_status": "OK",
+        "quote_snapshot_expected_symbol_count": 2,
         "quote_snapshot_rows_validated": True,
     }
 

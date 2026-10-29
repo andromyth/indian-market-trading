@@ -145,7 +145,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     predictor._seed_ready = True
     predictor._seed_complete = True
     predictor._seed_status = "READY"
-    predictor._symbols = ["AAA", "BBB"]
+    predictor._symbols = ["AAA", "BBB", "CCC"]
     predictor._codes = {"AAA": "NSE_1", "BBB": "NSE_2"}
     predictor._seed_coverage = 2
     predictor._seed_errors = 0

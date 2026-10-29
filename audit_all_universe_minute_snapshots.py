@@ -504,6 +504,7 @@ def build_prediction_audit(
             manifest.get("quote_snapshot_rows_validated") is True
             and manifest.get("quote_snapshot_cycle_minute_ist") == expected_snapshot_minute.isoformat()
             and manifest.get("quote_snapshot_drive_path") == expected_snapshot_path
+            and manifest.get("quote_snapshot_expected_symbol_count") == expected_int
             and manifest.get("quote_snapshot_capture_status") in {"OK", "PARTIAL"}
         )
         if not snapshot_link_ok:

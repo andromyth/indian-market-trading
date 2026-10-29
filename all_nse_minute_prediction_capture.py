@@ -2220,11 +2220,6 @@ class AllNSEMinutePredictor:
                 "status": "NOT_RUN",
                 "reason": "This worker tick did not produce a live full-universe quote capture.",
             }
-        if not capture_manifest.get("cycle_minute_ist"):
-            return {
-                "status": "NOT_RUN",
-                "reason": "This worker tick did not produce a live full-universe quote capture.",
-            }
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
             fallback=pd.Timestamp.now(tz=IST).floor("min"),
@@ -2308,7 +2303,7 @@ class AllNSEMinutePredictor:
             )
         failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
         with self._lock:
-            symbols = list(self._symbols) or sorted(quote_by_symbol)
+            symbols = sorted(quote_by_symbol)
             history_ready = self._seed_ready
             history_seed_complete = self._seed_complete
             seed_status = self._seed_status
@@ -2322,11 +2317,6 @@ class AllNSEMinutePredictor:
             market_history,
             minute,
         )
-        # Capture every symbol in the official universe even if quote data is missing.
-        for symbol in sorted(set(quote_by_symbol) - set(symbols)):
-            symbols.append(symbol)
-        symbols = sorted(set(symbols))
-
         nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
         try:
             if history_ready:
