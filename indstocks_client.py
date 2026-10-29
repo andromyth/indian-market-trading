@@ -606,3 +606,10 @@ def historical_1m(symbol: str, days: int = 3) -> pd.DataFrame:
     days = max(1, min(7, int(days)))
     end = datetime.now(IST)
     return historical(symbol, end - timedelta(days=days), end, "1minute", max_calls=2)
+
+
+def historical_5m(symbol: str, days: int = 3) -> pd.DataFrame:
+    """Convenience wrapper for five-minute OHLCV input used by production inference."""
+    days = max(1, min(7, int(days)))
+    end = datetime.now(IST)
+    return historical(symbol, end - timedelta(days=days), end, "5m", max_calls=2)
