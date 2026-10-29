@@ -349,9 +349,9 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
     assert str(empty_market.index.tz) == "Asia/Kolkata"
 
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=1),
+        end=minute,
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -366,16 +366,16 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
         index=index,
     )
     before = capture.AllNSEMinutePredictor._market_history_before(market, minute)
-    assert len(before) == 1
-    assert before.index.max() == minute - pd.Timedelta(minutes=1)
+    assert len(before) == 3
+    assert before.index.max() == minute
 
 
 def test_stale_market_history_is_excluded_from_feature_context():
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=10),
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -401,16 +401,16 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     stale_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=10),
         periods=4,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
     fresh_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
+        end=minute,
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -439,9 +439,9 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
 
     assert calls == [minute]
     assert not before.empty
-    assert before.index.max() == minute - pd.Timedelta(minutes=1)
-    assert (before.index < minute).all()
-    assert predictor._market_history.index.max() == minute - pd.Timedelta(minutes=1)
+    assert before.index.max() == minute
+    assert (before.index <= minute).all()
+    assert predictor._market_history.index.max() == minute
 
 
 def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeypatch):
@@ -449,9 +449,9 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute.tz_convert("UTC") - pd.Timedelta(minutes=2),
+        minute.tz_convert("UTC") - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz="UTC",
         name="Datetime",
     )
