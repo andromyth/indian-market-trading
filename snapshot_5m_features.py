@@ -14,6 +14,13 @@ FEATURES = [
     "volume_ratio_100m", "volume_z_100m", "session_return", "day_high_ratio", "day_low_ratio",
     "tod_sin", "tod_cos", "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis", "fno_available",
 ]
+OPTIONAL_FNO_FEATURES = (
+    "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis",
+)
+# Readiness means core five-minute price/technical/context availability.
+# F&O fields are optional for most NSE cash equities and must not make a
+# healthy cash snapshot look data-limited when fno_available is explicitly 0.
+READINESS_FEATURES = tuple(name for name in FEATURES if name not in OPTIONAL_FNO_FEATURES)
 RETURN_LAGS = {"ret_5m": 1, "ret_15m": 3, "ret_25m": 5, "ret_50m": 10, "ret_75m": 15, "ret_150m": 30}
 
 
