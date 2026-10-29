@@ -20,6 +20,8 @@ permissions:
 
 jobs:
   verify-live-capture:
+    # Live verification runs only after an explicitly initiated deployment.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
