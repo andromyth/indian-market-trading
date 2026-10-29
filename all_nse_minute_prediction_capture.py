@@ -337,10 +337,13 @@ def _primary_signal_with_readiness_guard(
     data_limited: Any,
     candidate_signal: Any,
 ) -> str:
-    """Never expose BUY/SELL as the primary action for a limited/unknown row."""
+    """Keep limited per-symbol forecasts non-actionable without a global PASS gate."""
     status = str(prediction_status or "").strip().upper()
+    prediction_exists = status in {
+        "PREDICTED", "PREDICTED_DATA_LIMITED", "PREDICTED_UNTRAINED_SYMBOL"
+    }
     ready_flag = isinstance(data_limited, (bool, np.bool_)) and not bool(data_limited)
-    if status != "PASS" or not ready_flag:
+    if not prediction_exists or not ready_flag:
         return "HOLD"
     signal = str(candidate_signal or "HOLD").strip().upper()
     return signal if signal in {"BUY", "SELL", "HOLD"} else "HOLD"
@@ -2482,11 +2485,11 @@ class AllNSEMinutePredictor:
                         else "HOLD"
                     )
                     if data_limited:
-                        prediction_status = "PASS_DATA_LIMITED"
+                        prediction_status = "PREDICTED_DATA_LIMITED"
                     elif trained_for_symbol is False:
-                        prediction_status = "PASS_UNTRAINED_SYMBOL"
+                        prediction_status = "PREDICTED_UNTRAINED_SYMBOL"
                     else:
-                        prediction_status = "PASS"
+                        prediction_status = "PREDICTED"
                     row.update({
                         "prediction_status": prediction_status,
                         "raw_model_signal": raw_signal,
@@ -2582,7 +2585,10 @@ class AllNSEMinutePredictor:
             except Exception as exc:
                 model_failures += len(feature_rows)
                 for row in current_rows:
-                    if row.get("prediction_status") in {"WARMING_HISTORY", "PASS", "PASS_DATA_LIMITED"}:
+                    if row.get("prediction_status") in {
+                        "WARMING_HISTORY", "PREDICTION_QUEUED",
+                        "PREDICTED", "PREDICTED_DATA_LIMITED", "PREDICTED_UNTRAINED_SYMBOL",
+                    }:
                         row.update({
                             "prediction_status": "MODEL_INFERENCE_ERROR",
                             "signal": "HOLD",
@@ -2612,15 +2618,11 @@ class AllNSEMinutePredictor:
             prediction_status_counts[status_key] = prediction_status_counts.get(status_key, 0) + 1
 
         prediction_count = sum(
-            1 for row in records
-            if row.get("probability_up_30m") is not None
-            and row.get("prediction_status") in {
-                "PASS", "PASS_DATA_LIMITED", "PASS_UNTRAINED_SYMBOL"
-            }
+            1 for row in records if _safe_float(row.get("probability_up_30m")) is not None
         )
         data_limited_count = sum(
             1 for row in records
-            if row.get("prediction_status") == "PASS_DATA_LIMITED"
+            if row.get("prediction_status") == "PREDICTED_DATA_LIMITED"
         )
         untrained_symbol_count = sum(
             1 for row in records if row.get("trained_for_symbol") is False
