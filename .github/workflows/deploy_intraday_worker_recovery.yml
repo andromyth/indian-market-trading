@@ -36,8 +36,8 @@ concurrency:
 
 jobs:
   deploy-and-verify:
-    # Production rollout is manual; merging code must not change the live worker.
-    if: github.event_name == 'workflow_dispatch'
+    # Deploy only by explicit dispatch or a clearly tagged, CI-gated main commit.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy-intraday]'))
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -87,6 +87,59 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
+
+      - name: Install runtime dependencies for model and Drive preflight
+        shell: bash
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Verify five-minute model bundle and Drive write readiness before deployment
+        shell: bash
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          export GOOGLE_DRIVE_ROOT_ID="$(gcloud secrets versions access latest --secret=google-drive-root-id --project="$PROJECT_ID")"
+          export GOOGLE_OAUTH_TOKEN_JSON="$(gcloud secrets versions access latest --secret=google-oauth-token-json --project="$PROJECT_ID")"
+          python - <<'PY'
+          import json
+          import sys
+          import all_nse_intraday_model as model
+          from persistent_store import drive_status
+
+          status = model.model_status()
+          manifest = model._manifest()
+          drive = drive_status(require_write=True)
+          features_match = manifest.get("features") == model.FEATURES
+          checks = {
+              "model_status": status.get("status"),
+              "bar_interval_minutes": manifest.get("bar_interval_minutes"),
+              "target": manifest.get("target"),
+              "feature_count_manifest": manifest.get("feature_count"),
+              "feature_count_runtime": len(model.FEATURES),
+              "feature_list_matches_runtime": features_match,
+              "training_symbol_count": manifest.get("training_symbol_count"),
+              "manifest_sha256_match": status.get("manifest_sha256_match"),
+              "drive_configured": drive.get("configured"),
+              "drive_reachable": drive.get("reachable"),
+              "drive_write_ready": drive.get("write_ready"),
+              "drive_write_auth_method": drive.get("write_auth_method") or drive.get("auth_method"),
+          }
+          print("MODEL_DRIVE_PREFLIGHT=" + json.dumps(checks, sort_keys=True))
+          valid = all([
+              status.get("manifest_sha256_match") is True,
+              manifest.get("bar_interval_minutes") == 5,
+              manifest.get("target") == "target_30m",
+              manifest.get("feature_count") == len(model.FEATURES),
+              features_match,
+              int(manifest.get("training_symbol_count") or 0) > 0,
+              drive.get("configured") is True,
+              drive.get("reachable") is True,
+              drive.get("write_ready") is True,
+          ])
+          if not valid:
+              sys.exit("Deployment blocked: five-minute model artifacts or Drive write readiness failed preflight.")
+          print("FIVE_MINUTE_MODEL_AND_DRIVE_PREFLIGHT=PASS")
+          PY
 
       - name: Deploy the tested worker using existing project infrastructure
         shell: bash
