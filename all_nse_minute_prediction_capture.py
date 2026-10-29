@@ -339,11 +339,8 @@ def _primary_signal_with_readiness_guard(
 ) -> str:
     """Keep limited per-symbol forecasts non-actionable without a global PASS gate."""
     status = str(prediction_status or "").strip().upper()
-    prediction_exists = status in {
-        "PREDICTED", "PREDICTED_DATA_LIMITED", "PREDICTED_UNTRAINED_SYMBOL"
-    }
     ready_flag = isinstance(data_limited, (bool, np.bool_)) and not bool(data_limited)
-    if not prediction_exists or not ready_flag:
+    if status != "PREDICTED" or not ready_flag:
         return "HOLD"
     signal = str(candidate_signal or "HOLD").strip().upper()
     return signal if signal in {"BUY", "SELL", "HOLD"} else "HOLD"
@@ -2260,6 +2257,39 @@ class AllNSEMinutePredictor:
             0, int(capture_manifest.get("expected_symbol_count") or len(snapshot_symbols))
         )
         missing_quotes = max(0, expected_universe_count - len(quote_by_symbol))
+
+        if not quote_by_symbol:
+            with self._lock:
+                self._last_minute = minute_key
+                self._last_health = {
+                    "status": "NO_ELIGIBLE_SYMBOLS",
+                    "last_capture_minute_ist": minute_key,
+                    "last_prediction_count": 0,
+                    "last_persistence_status": "SOURCE_SNAPSHOT_STORED",
+                    "universe_symbols": expected_universe_count,
+                    "history_symbols": len(self._history),
+                }
+            self._log(
+                "all_nse_minute_prediction_skipped_no_eligible_symbols",
+                cycle_minute_ist=minute_key,
+                expected_symbol_count=expected_universe_count,
+                snapshot_symbol_count=len(snapshot_symbols),
+                skipped_missing_quote_count=len(skipped_quote_symbols),
+                source_snapshot_drive_path=capture_manifest.get("snapshot_drive_path"),
+                status="NO_ELIGIBLE_SYMBOLS",
+            )
+            return {
+                "status": "NO_ELIGIBLE_SYMBOLS",
+                "cycle_minute_ist": minute_key,
+                "expected_symbol_count": expected_universe_count,
+                "snapshot_symbol_count": len(snapshot_symbols),
+                "eligible_symbol_count": 0,
+                "skipped_missing_quote_count": len(skipped_quote_symbols),
+                "prediction_count": 0,
+                "prediction_status_counts": {},
+                "source_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
+                "prediction_policy": "PER_SYMBOL_STORED_QUOTE",
+            }
 
         self.start()
         if self._last_minute == minute_key:
