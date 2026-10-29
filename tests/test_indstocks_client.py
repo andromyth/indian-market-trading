@@ -19,10 +19,56 @@ def test_root_symbol_and_exchange_normalization():
 def test_manual_access_token_is_read_without_network(monkeypatch):
     for name in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("INDSTOCKS_AUTH_MODE", raising=False)
     monkeypatch.setenv("INDSTOCKS_ACCESS_TOKEN", "unit-test-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN", None)
+    assert client._auth_mode() == "manual"
     assert client.configured()
     assert client.access_token() == "unit-test-token"
+
+
+def test_default_mode_never_mints_a_totp_token_when_credentials_are_present(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_ACCESS_TOKEN", "streamlit-manual-token")
+    monkeypatch.delenv("INDSTOCKS_AUTH_MODE", raising=False)
+    monkeypatch.setattr(client, "_CACHED_TOKEN", None)
+    monkeypatch.setattr(
+        client, "_generate_token",
+        lambda: pytest.fail("Default/manual mode must never mint a TOTP token"),
+    )
+
+    assert client._auth_mode() == "manual"
+    assert client.configured()
+    assert not client._has_totp_credentials()
+    assert client.access_token() == "streamlit-manual-token"
+
+
+def test_totp_token_generation_requires_explicit_mode_even_with_manual_token(monkeypatch):
+    for name, value in (
+        ("INDSTOCKS_CLIENT_ID", "test-client-id"),
+        ("INDSTOCKS_MPIN", "test-mpin"),
+        ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_ACCESS_TOKEN", "streamlit-manual-token")
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
+    monkeypatch.setattr(client, "_CACHED_TOKEN", None)
+    monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", 0.0)
+    monkeypatch.setattr(client, "_TOKEN_GENERATION_RETRY_AFTER", 0.0)
+    generated = []
+    monkeypatch.setattr(
+        client, "_generate_token",
+        lambda: generated.append(True) or "cloud-run-generated-token",
+    )
+
+    assert client.configured()
+    assert client.access_token() == "cloud-run-generated-token"
+    assert generated == [True]
 
 
 def test_resolve_scrip_code_prefers_ordinary_nse_equity(monkeypatch):
@@ -120,6 +166,7 @@ def test_rejected_cached_token_refreshes_once_with_totp_credentials(monkeypatch)
         ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
     ):
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
     monkeypatch.setattr(client, "_CACHED_TOKEN", "expired-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
@@ -169,6 +216,7 @@ def test_recently_generated_rejected_token_waits_for_cooldown(monkeypatch):
         ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
     ):
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
     generated_at = client.time.time()
     monkeypatch.setattr(client, "_CACHED_TOKEN", "fresh-rejected-token")
@@ -200,6 +248,7 @@ def test_endpoint_permission_403_does_not_trigger_token_refresh(monkeypatch):
         ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
     ):
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
     monkeypatch.setattr(client, "_CACHED_TOKEN", "current-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
@@ -239,6 +288,7 @@ def test_token_generation_failure_starts_cooldown_and_prevents_repeated_calls(mo
         ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
     ):
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
     monkeypatch.setattr(client, "_CACHED_TOKEN", "stale-expired-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", 0.0)
@@ -273,6 +323,7 @@ def test_rejected_token_refresh_failure_does_not_spam_rate_limited_endpoint(monk
         ("INDSTOCKS_TOTP_SECRET", "JBSWY3DPEHPK3PXP"),
     ):
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("INDSTOCKS_AUTH_MODE", "totp")
     monkeypatch.delenv("INDSTOCKS_ACCESS_TOKEN", raising=False)
     monkeypatch.setattr(client, "_CACHED_TOKEN", "expired-token")
     monkeypatch.setattr(client, "_CACHED_TOKEN_EXPIRES_AT", client.time.time() + 20 * 3600)
