@@ -540,7 +540,7 @@ def capture_all_universe_minute_snapshot(
 
     now_ts = pd.Timestamp(now)
     now_ts = now_ts.tz_localize(IST) if now_ts.tzinfo is None else now_ts.tz_convert(IST)
-    cycle_minute = now_ts.floor("min")
+    cycle_minute = now_ts.floor("5min")
     local_dir = Path(worker_root) / "all_universe_minute_snapshots"
     local_dir.mkdir(parents=True, exist_ok=True)
     remote_day = cycle_minute.strftime("%Y/%m/%d")
