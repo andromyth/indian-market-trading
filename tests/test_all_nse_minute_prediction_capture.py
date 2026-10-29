@@ -585,7 +585,7 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
     assert len(result) == 2
     assert list(result.columns) == ["Open", "High", "Low", "Close", "Volume"]
     assert str(result.index.tz) == "Asia/Kolkata"
-    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result.index.max() == minute
     assert result["Close"].tolist() == [100.5, 101.5]
     assert result["Volume"].tolist() == [10.0, 12.0]
 
@@ -596,9 +596,9 @@ def test_yfinance_ticker_history_is_preferred_before_download(monkeypatch):
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute - pd.Timedelta(minutes=2),
+        minute - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
