@@ -325,6 +325,65 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
 
 
 
+
+def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
+    """Validate the five-minute model and Drive writes using the runtime identity."""
+    checked_at = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "probe": "five_minute_model_bundle",
+        "checked_at_utc": checked_at,
+        "status": "degraded",
+        "checks": {},
+    }
+    try:
+        import all_nse_intraday_model as model
+        from persistent_store import drive_status
+
+        status = model.model_status()
+        manifest = model._manifest()
+        drive = drive_status(require_write=True)
+        features_match = manifest.get("features") == model.FEATURES
+        checks = {
+            "model_status": status.get("status"),
+            "bar_interval_minutes": manifest.get("bar_interval_minutes"),
+            "target": manifest.get("target"),
+            "feature_count_manifest": manifest.get("feature_count"),
+            "feature_count_runtime": len(model.FEATURES),
+            "feature_list_matches_runtime": features_match,
+            "training_symbol_count": manifest.get("training_symbol_count"),
+            "artifact_hashes_match": status.get("manifest_sha256_match") is True,
+            "drive_configured": drive.get("configured") is True,
+            "drive_reachable": drive.get("reachable") is True,
+            "drive_write_ready": drive.get("write_ready") is True,
+            "drive_auth_method": drive.get("write_auth_method") or drive.get("auth_method"),
+        }
+        payload["checks"] = checks
+        valid = all([
+            status.get("manifest_sha256_match") is True,
+            manifest.get("bar_interval_minutes") == 5,
+            manifest.get("target") == "target_30m",
+            manifest.get("feature_count") == len(model.FEATURES),
+            features_match,
+            int(manifest.get("training_symbol_count") or 0) > 0,
+            drive.get("configured") is True,
+            drive.get("reachable") is True,
+            drive.get("write_ready") is True,
+        ])
+        if valid:
+            # Verify deserialization too; hashes alone do not prove joblib.load works.
+            model._models()
+            payload["status"] = "ok"
+            return 200, payload
+
+        payload["reason"] = "Five-minute model contract, artifact hashes, or Drive write readiness failed."
+        return 503, payload
+    except Exception as exc:
+        # Safe diagnostic only: never return tokens, OAuth JSON, root IDs, or full provider responses.
+        payload["error_type"] = type(exc).__name__
+        payload["reason"] = str(exc).replace("\\n", " ")[:240]
+        return 503, payload
+
+
 def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
     """Verify the worker's own read-only market-data credentials without exposing secrets."""
     from indstocks_client import (
@@ -470,6 +529,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/modelz":
+            code, payload = _model_bundle_diagnostic()
+            self._send_json(code, payload)
+            return
         if self.path == "/providerz":
             code, payload = _indstocks_provider_diagnostic()
             self._send_json(code, payload)
