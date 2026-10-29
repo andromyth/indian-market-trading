@@ -386,14 +386,14 @@ def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
         candles = historical_5m("RELIANCE.NS", days=3)
         if candles is None or candles.empty:
             raise RuntimeError("no five-minute history returned")
-        payload["checks"]["five_minute_history"] = "PASS"
+        payload["checks"]["five_minute_history"] = "AVAILABLE_OPTIONAL"
         payload["five_minute_history_rows"] = int(len(candles))
         payload["latest_five_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
     except Exception as exc:
-        payload["checks"]["five_minute_history"] = "FAIL"
-        payload["failed_check"] = "five_minute_history"
-        payload["error_type"] = type(exc).__name__
-        return 503, payload
+        # Current stored quotes can still be evaluated with quote-only features.
+        # Missing history is per-symbol context, not a whole-provider failure.
+        payload["checks"]["five_minute_history"] = "UNAVAILABLE_OPTIONAL"
+        payload["history_warning_type"] = type(exc).__name__
 
     payload["status"] = "ok"
     return 200, payload
