@@ -381,7 +381,10 @@ def _capture_snapshot_validation_error(
 ) -> str | None:
     """Check that the same-slot persisted snapshot has the columns needed for per-symbol selection."""
     status = str(capture_manifest.get("status") or "").strip().upper()
-    if status not in {"STORED", "OK", "PARTIAL"}:
+    snapshot_persisted = capture_manifest.get("snapshot_persisted") is True or status in {
+        "STORED", "OK", "PARTIAL"
+    }
+    if not snapshot_persisted:
         return f"Snapshot persistence is not confirmed (status={status or 'MISSING'})."
     expected_remote_path = (
         "production_data/all_universe_minute_snapshots/"
@@ -2178,7 +2181,10 @@ class AllNSEMinutePredictor:
         ).floor("5min")
         minute_key = minute.isoformat()
         capture_status = str(capture_manifest.get("status") or "").strip().upper()
-        if capture_status not in {"STORED", "OK", "PARTIAL"} or not capture_manifest.get("snapshot_drive_path"):
+        snapshot_persisted = capture_manifest.get("snapshot_persisted") is True or capture_status in {
+            "STORED", "OK", "PARTIAL"
+        }
+        if not snapshot_persisted or not capture_manifest.get("snapshot_drive_path"):
             error = (
                 "Prediction blocked: the same-slot market snapshot was not confirmed "
                 f"persisted to Drive (capture_status={capture_status or 'MISSING'})."
@@ -2703,6 +2709,7 @@ class AllNSEMinutePredictor:
             "quote_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
             "quote_snapshot_cycle_minute_ist": minute.isoformat(),
             "quote_snapshot_capture_status": capture_status,
+            "quote_snapshot_persisted": snapshot_persisted,
             "capture_eligibility_policy": "PER_SYMBOL_STORED_QUOTE",
             "prediction_eligibility_policy": "VALID_QUOTE_IN_SAME_STORED_FIVE_MINUTE_SLOT",
             "quote_snapshot_expected_symbol_count": int(capture_manifest.get("expected_symbol_count") or 0),
