@@ -76,9 +76,14 @@ def main() -> None:
         raise SystemExit("ALL-NSE Delivery adapter has no trainable-universe gate")
     checks.append("OK active ALL-NSE Delivery adapter import / universe gate / 59-feature runtime contract")
 
-    if len(legacy_intraday.FEATURES) != 34:
-        raise SystemExit("Legacy/compatibility Intraday adapter feature contract changed unexpectedly")
-    checks.append("OK compatibility Intraday adapter remains 34-feature and isolated")
+    legacy_contract = legacy_intraday.model_target_contract()
+    if len(legacy_intraday.FEATURES) != 24:
+        raise SystemExit("Five-minute snapshot Intraday feature contract is not 24")
+    if legacy_contract.get("feature_schema_version") != "nse_5m_snapshot_close_v1":
+        raise SystemExit("Five-minute snapshot Intraday feature schema version is missing")
+    if legacy_contract.get("input_cadence_minutes") != 5:
+        raise SystemExit("Five-minute snapshot Intraday input cadence is not five minutes")
+    checks.append("OK live Intraday adapter uses 24-feature five-minute snapshot contract")
     if len(intraday_5m.FEATURES) != 49:
         raise SystemExit("5-minute Intraday V2 adapter feature contract is not 49")
     if tuple(intraday_5m.HORIZONS) != (5, 10, 15, 20, 25, 30):
