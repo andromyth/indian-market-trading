@@ -140,7 +140,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
 
     from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 
-    minute = pd.Timestamp.now(tz=IST).floor("min")
+    minute = pd.Timestamp.now(tz=IST).floor("5min")
     predictor = AllNSEMinutePredictor(tmp_path)
     predictor.start = lambda: None
     predictor._seed_ready = True
@@ -164,9 +164,9 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     }
 
     idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
+        end=minute,
         periods=60,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
