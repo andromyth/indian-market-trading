@@ -18,7 +18,7 @@ import pandas as pd
 
 from snapshot_5m_features import (
     FEATURES, FEATURE_SCHEMA_VERSION, SNAPSHOT_CADENCE_MINUTES,
-    latest_snapshot_features,
+    READINESS_FEATURES, latest_snapshot_features,
 )
 
 DRIVE_MODEL_ROOT = "models/all_nse_intraday_multifactor_replacement_2026"
@@ -314,7 +314,7 @@ def predict_symbol(symbol: str, price_df: pd.DataFrame, market_df: pd.DataFrame 
     p=float(np.clip(clf.predict_proba(frame)[:,1][0],0,1))
     expected=_safe(reg.predict(frame)[0])
     signal="BUY" if p>=BUY_P else ("SELL" if p<=SELL_P else "HOLD")
-    readiness=float(frame.notna().mean(axis=1).iloc[0])
+    readiness=float(frame.reindex(columns=READINESS_FEATURES).notna().mean(axis=1).iloc[0])
     return {
         "prediction_status":"PASS",
         "symbol":str(symbol),
