@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 import pytest
 
+import colab_build_all_nse_intraday_multifactor as snapshot_trainer
 from snapshot_5m_features import (
     FEATURES,
     FEATURE_SCHEMA_VERSION,
@@ -110,3 +112,82 @@ def test_missing_five_minute_snapshot_stays_a_gap_in_return_features():
     features = make_snapshot_feature_frame(frame)
 
     assert pd.isna(features.loc[pd.Timestamp("2026-10-28 09:30", tz=IST), "ret_5m"])
+
+
+
+def test_training_cache_reads_only_persisted_five_minute_snapshots_and_preserves_gaps(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    snapshot_root = root / "production_data" / "all_universe_minute_snapshots" / "2026" / "10" / "28"
+    snapshot_root.mkdir(parents=True)
+    slots = [
+        pd.Timestamp("2026-10-28 09:15", tz=IST),
+        pd.Timestamp("2026-10-28 09:20", tz=IST),
+        # Deliberately omit 09:25 to verify interval gaps are not filled.
+        pd.Timestamp("2026-10-28 09:30", tz=IST),
+    ]
+    for i, slot in enumerate(slots):
+        rows = [
+            {
+                "symbol": "RELIANCE",
+                "cycle_minute_ist": slot.isoformat(),
+                "quote_status": "PASS",
+                "actual_observed_price": 100.0 + i,
+                "day_volume": 1000.0 + i * 100,
+                "day_open": 99.0,
+                "day_high": 101.0 + i,
+                "day_low": 98.0,
+            },
+            {
+                "symbol": "SBIN",
+                "cycle_minute_ist": slot.isoformat(),
+                "quote_status": "QUOTE_REQUEST_ERROR" if i == 1 else "PASS",
+                "actual_observed_price": None if i == 1 else 500.0 + i,
+                "day_volume": None if i == 1 else 2000.0 + i * 50,
+                "day_open": 499.0 if i != 1 else None,
+                "day_high": 501.0 + i if i != 1 else None,
+                "day_low": 498.0 if i != 1 else None,
+            },
+        ]
+        pd.DataFrame(rows).to_parquet(
+            snapshot_root / f"snapshot_{slot:%Y%m%d_%H%M}.parquet",
+            index=False,
+        )
+
+    cache_root = tmp_path / "snapshot-training-cache"
+    manifest = snapshot_trainer.build_snapshot_training_cache(root, cache_root)
+    monkeypatch.setattr(snapshot_trainer, "_SNAPSHOT_CACHE_ROOT", cache_root, raising=False)
+    reliance = snapshot_trainer.load_symbol(root, "RELIANCE")
+    sbin = snapshot_trainer.load_symbol(root, "SBIN")
+
+    assert manifest["training_input_source"] == "PERSISTED_FIVE_MINUTE_NSE_QUOTE_SNAPSHOTS_ONLY"
+    assert manifest["snapshot_cadence_minutes"] == 5
+    assert manifest["snapshot_file_count"] == 3
+    assert list(reliance.index.strftime("%H:%M")) == ["09:15", "09:20", "09:30"]
+    assert reliance["Close"].tolist() == [100.0, 101.0, 102.0]
+    assert np.isnan(reliance.loc[pd.Timestamp("2026-10-28 09:30", tz=IST), "Volume"])
+    assert pd.isna(sbin.loc[pd.Timestamp("2026-10-28 09:20", tz=IST), "Close"])
+    assert pd.isna(sbin.loc[pd.Timestamp("2026-10-28 09:30", tz=IST), "Volume"])
+    assert reliance["Open"].isna().all()
+    assert reliance["High"].isna().all()
+    assert reliance["Low"].isna().all()
+
+
+def test_training_features_use_five_minute_rows_without_resampling_minute_candles():
+    idx = pd.date_range("2026-10-27 09:15", periods=15, freq="5min", tz=IST, name="Datetime")
+    close = np.linspace(100.0, 105.0, len(idx))
+    frame = pd.DataFrame({
+        "Close": close,
+        "Volume": np.full(len(idx), 100.0),
+        "day_open": 99.0,
+        "day_high": close + 1.0,
+        "day_low": close - 1.0,
+        "day_volume": np.arange(len(idx), dtype=float) * 100.0,
+    }, index=idx)
+
+    out = snapshot_trainer.make_features(frame)
+
+    assert out.index.equals(idx)
+    assert "ret_5m" in out.columns
+    assert "target_30m" in out.columns
+    assert out.loc[idx[0], "ret_5m"] != out.loc[idx[-1], "ret_5m"]
+    assert np.isnan(out.loc[idx[-1], "target_30m"])
