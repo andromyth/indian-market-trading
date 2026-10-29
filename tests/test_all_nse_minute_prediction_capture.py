@@ -130,6 +130,7 @@ def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
     ])
     assert len(frame) == 2
     assert str(frame.index.tz) == "Asia/Kolkata"
+    assert frame.index.tolist() == [pd.Timestamp("2026-10-21 10:05:00", tz=IST), pd.Timestamp("2026-10-21 10:06:00", tz=IST)]
     assert frame.iloc[-1]["Close"] == 102
     assert frame.iloc[-1]["Volume"] == 18
 
@@ -474,7 +475,7 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
 
     assert len(result) == 2
     assert str(result.index.tz) == "Asia/Kolkata"
-    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result.index.max() == minute
     assert result["Close"].tolist() == [100.5, 101.5]
 
 
@@ -498,6 +499,7 @@ def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, 
     manifest = {
         "status": "REPLACEMENT",
         "model_version": "unit-test",
+        "bar_interval_minutes": 5,
         "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
         "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
         "training_symbols": ["AAA"],
@@ -547,9 +549,9 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute - pd.Timedelta(minutes=2),
+        minute - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -633,7 +635,7 @@ def test_yfinance_ticker_history_is_preferred_before_download(monkeypatch):
     assert result["Close"].tolist() == [100.5, 101.5]
     assert str(result.index.tz) == "Asia/Kolkata"
     assert len(calls) == 1
-    assert calls[0][1]["interval"] == "1m"
+    assert calls[0][1]["interval"] == "5m"
 
 def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
     assert capture.AllNSEMinutePredictor._nifty_instrument_code() is None
@@ -641,8 +643,8 @@ def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
 
 def test_nifty_quote_uses_a_fresh_real_candle_when_no_rest_index_token_exists(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
-    now = pd.Timestamp.now(tz=IST)
-    latest = now.floor("min") - pd.Timedelta(minutes=1)
+    now = pd.Timestamp.now(tz=IST).floor("5min")
+    latest = now
     predictor._market_history = pd.DataFrame(
         {
             "Open": [24990.0],
