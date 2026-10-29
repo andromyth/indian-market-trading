@@ -34,8 +34,8 @@ PREDICTION_ROOT = "production_data/all_nse_minute_predictions"
 QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 LEARNING_ROOT = f"{PREDICTION_ROOT}/learning"
 MIME_FOLDER = "application/vnd.google-apps.folder"
-MAX_TARGET_QUOTE_DISTANCE_SECONDS = 300
-MAX_INPUT_AGE_SECONDS = 300
+MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
+MAX_INPUT_AGE_SECONDS = 120
 MIN_DATA_READINESS = 0.70
 # Data-limited probabilities can be assessed in their own segment; almost-empty rows remain excluded.
 MIN_LEARNING_READINESS = 0.35
