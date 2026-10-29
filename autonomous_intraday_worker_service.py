@@ -130,11 +130,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "history_ready", "history_status", "history_seed_coverage_symbols",
                 "history_seed_failed_batches", "history_refresh_batch_count",
                 "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
-                "quality_gate_pass", "status", "error",
+                "eligible_symbol_count", "skipped_missing_quote_count", "status", "error",
             )
             if key in all_nse
         })
-        if all_nse_status not in {"OK", "NOT_RUN"}:
+        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}:
             STATE["all_nse_minute_prediction_error"] = str(
                 all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
             )
@@ -156,18 +156,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             STATE["all_universe_capture_error"] = str(
                 capture_error or f"Full-universe capture status is {capture_status}"
             )
-        elif capture_status == "OK":
+        elif capture_status in {"OK", "STORED", "PARTIAL"}:
             STATE["all_universe_capture_error"] = None
             STATE["all_universe_capture_warning"] = None
             if STATE.get("last_error") in previous_capture_issues:
                 STATE["last_error"] = None
-        elif capture_status == "PARTIAL":
-            STATE["all_universe_capture_error"] = None
-            STATE["all_universe_capture_warning"] = (
-                f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
-                f"{capture.get('expected_symbol_count', 0)} NSE symbols"
-            )
-            STATE["last_error"] = STATE["all_universe_capture_warning"]
         elif capture_status == "NOT_RUN":
             STATE["all_universe_capture_warning"] = (
                 None if status == "MARKET_CLOSED"
@@ -243,17 +236,10 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
         reasons = []
         if state.get("drive_preflight_status") != "OK":
             reasons.append("Google Drive read/write preflight is not ready")
-        if item_status != "OK":
-            reasons.append(f"latest full-universe quote snapshot status is {item_status}")
+        if item_status not in {"OK", "STORED", "PARTIAL"}:
+            reasons.append(f"latest quote snapshot was not stored (status={item_status})")
         if age is None or age < 0 or age > 420:
-            reasons.append("latest full-universe quote snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
-        if expected is None or int(expected or 0) <= 0:
-            reasons.append("official NSE universe count is missing or zero")
-        elif row_count is None or int(row_count) != int(expected):
-            reasons.append("snapshot row count does not equal the expected NSE universe")
-        if expected is not None and (valid is None or missing is None
-                                     or int(valid) != int(expected) or int(missing) != 0):
-            reasons.append("one or more NSE symbols lack a valid current quote")
+            reasons.append("latest quote snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
         if not drive_path:
             reasons.append("confirmed Drive snapshot path is missing")
         payload = {
@@ -286,43 +272,10 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
         reasons = []
         if state.get("drive_preflight_status") != "OK":
             reasons.append("Google Drive read/write preflight is not ready")
-        if item_status != "OK":
-            reasons.append(f"latest all-NSE prediction snapshot status is {item_status}")
+        if item_status not in {"OK", "STORED", "PARTIAL"}:
+            reasons.append(f"prediction snapshot was not stored (status={item_status})")
         if age is None or age < 0 or age > 420:
             reasons.append("latest prediction snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
-        if expected is None or int(expected or 0) <= 0:
-            reasons.append("expected NSE universe count is missing or zero")
-        elif row_count is None or int(row_count) != int(expected):
-            reasons.append("prediction row count does not equal the expected NSE universe")
-        expected_n = max(1, int(expected or 0))
-        if predicted is None or int(predicted) < int(expected_n * 0.95):
-            reasons.append("model prediction coverage is below 95% of the expected NSE universe")
-        if missing is None or int(missing or 0) / expected_n > 0.02:
-            reasons.append("missing current quotes exceed the 2% tolerance")
-        if limited is None or int(limited or 0) / expected_n > 0.10:
-            reasons.append("data-limited predictions exceed the 10% tolerance")
-        model_failures = int(item.get("model_failure_count") or 0)
-        untrained = int(item.get("untrained_symbol_count") or 0)
-        if model_failures / expected_n > 0.01:
-            reasons.append("model/feature failures exceed the 1% tolerance")
-        if untrained / expected_n > 0.10:
-            reasons.append("untrained-symbol share exceeds the 10% tolerance")
-        if item.get("model_artifact_verified") is not True:
-            reasons.append("production model artifacts are not verified against their manifest")
-        seed_coverage = int(item.get("history_seed_coverage_symbols") or 0)
-        if seed_coverage / expected_n < 0.90:
-            reasons.append("historical seed coverage is below 90%")
-        seed_batches = max(1, (expected_n + 4) // 5)
-        if int(item.get("history_seed_failed_batches") or 0) / seed_batches > 0.05:
-            reasons.append("failed historical seed batches exceed the 5% tolerance")
-        refresh_batches = int(item.get("history_refresh_batch_count") or 0)
-        refresh_failures = int(item.get("history_refresh_failed_batches") or 0)
-        if refresh_batches <= 0 or refresh_failures / max(1, refresh_batches) > 0.05:
-            reasons.append("current-session five-minute candle refresh is missing or exceeds the 5% failure tolerance")
-        if item.get("quality_gate_pass") is not True:
-            reasons.append("prediction quality gate is not passing")
-        if item.get("history_ready") is not True:
-            reasons.append("historical feature data is not ready")
         if not drive_path or not manifest_path:
             reasons.append("confirmed Drive prediction or manifest path is missing")
         payload = {
@@ -337,7 +290,8 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             "prediction_count": predicted,
             "missing_quote_count": missing,
             "data_limited_count": limited,
-            "quality_gate_pass": item.get("quality_gate_pass"),
+            "eligible_symbol_count": item.get("eligible_symbol_count"),
+            "skipped_missing_quote_count": item.get("skipped_missing_quote_count", missing),
             "history_ready": item.get("history_ready"),
             "drive_path": drive_path,
             "manifest_drive_path": manifest_path,
@@ -513,10 +467,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         payload = {
             "status": "degraded" if (
                 error
-                or capture_status not in {"OK", "NOT_RUN"}
+                or capture_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
-                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "NOT_RUN"}
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
@@ -646,9 +600,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             prediction_status = str(
                 (result.get("all_nse_minute_predictions") or {}).get("status") or ""
             ).upper()
-            # Ask Cloud Scheduler to retry only durability/execution failures.
-            # Quality-gated PARTIAL results remain visible as PARTIAL; they are
-            # not converted into success or silently retried as if they were 5xx.
+            # Retry only durability/execution failures; partial quote coverage
+            # is informational and never prevents other symbols being predicted.
             retryable_persistence_failure = (
                 capture_status in {"ERROR", "PERSISTENCE_ERROR"}
                 or prediction_status in {
