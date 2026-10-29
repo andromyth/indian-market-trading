@@ -316,9 +316,9 @@ def main():
             coverage.append((sym, len(raw), "EXCLUDED_FEATURE_BUILD"))
             continue
 
-        # Build minute-level price/market features first, then sample. This
-        # preserves rolling information from 1-minute history while reducing
-        # the rows entering the daily F&O PIT join.
+        # Features are already computed on the shared five-minute endpoint
+        # grid. Keep the explicit cadence sampler as a contract check before the
+        # daily point-in-time F&O join; no minute-cadence inference features remain.
         feat = sample_decisions(feat, args.sample_minutes)
         feat = fno_join_features(feat, fno, sym)
         feat = feat.replace([np.inf, -np.inf], np.nan)
