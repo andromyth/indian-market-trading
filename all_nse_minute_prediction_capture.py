@@ -1715,25 +1715,40 @@ class AllNSEMinutePredictor:
                 raise RuntimeError("No prior persisted five-minute snapshots could be loaded")
             all_rows = pd.concat(frames, ignore_index=True)
             slot_count = int(all_rows["_snapshot_ts"].nunique())
-            valid = all_rows.loc[
-                all_rows["quote_status"].astype(str).str.upper().eq("PASS")
-                & all_rows["actual_observed_price"].gt(0)
-            ].copy()
-            valid = valid.sort_values(["symbol", "_snapshot_ts"])
-            valid["_session_date"] = valid["_snapshot_ts"].dt.date
-            valid["Close"] = valid["actual_observed_price"]
-            valid["Volume"] = valid.groupby(["symbol", "_session_date"])["day_volume"].diff()
-            valid.loc[valid["Volume"] < 0, "Volume"] = np.nan
+            rows = all_rows.sort_values(["symbol", "_snapshot_ts"]).copy()
+            rows["_session_date"] = rows["_snapshot_ts"].dt.date
+            rows["_quote_valid"] = (
+                rows["quote_status"].astype(str).str.upper().eq("PASS")
+                & rows["actual_observed_price"].gt(0)
+            )
+            rows["Close"] = rows["actual_observed_price"].where(rows["_quote_valid"])
+            previous_ts = rows.groupby("symbol")["_snapshot_ts"].shift(1)
+            previous_close = rows.groupby("symbol")["Close"].shift(1)
+            previous_day_volume = rows.groupby("symbol")["day_volume"].shift(1)
+            contiguous = (
+                rows["_snapshot_ts"].sub(previous_ts).eq(pd.Timedelta(minutes=SNAPSHOT_CADENCE_MINUTES))
+                & rows["_session_date"].eq(previous_ts.dt.date)
+                & rows["_quote_valid"]
+                & previous_close.notna()
+            )
+            volume_delta = rows["day_volume"] - previous_day_volume
+            rows["Volume"] = volume_delta.where(
+                contiguous & volume_delta.ge(0) & rows["day_volume"].notna()
+            )
 
             histories: dict[str, pd.DataFrame] = {}
-            for symbol, group in valid.groupby("symbol", sort=False):
+            for symbol, group in rows.groupby("symbol", sort=False):
                 history = group.set_index("_snapshot_ts")[
                     ["Close", "Volume", "day_open", "day_high", "day_low", "day_volume"]
                 ].sort_index()
+                history = history.loc[~history.index.duplicated(keep="last")]
                 history.index.name = "Datetime"
                 histories[str(symbol)] = history.tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
 
-            coverage = len(histories)
+            coverage = sum(
+                1 for history in histories.values()
+                if not history.empty and history["Close"].notna().any()
+            )
             coverage_target = int(np.ceil(len(universe_symbols) * MIN_HISTORY_SEED_COVERAGE))
             complete = bool(
                 slot_count >= SNAPSHOT_HISTORY_LOOKBACK_BARS
@@ -1748,7 +1763,10 @@ class AllNSEMinutePredictor:
                         histories[symbol] = merged.loc[~merged.index.duplicated(keep="last")].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
                 self._history = histories
                 self._symbols = sorted(set(self._symbols) | universe_symbols)
-                self._seed_coverage = sum(1 for frame in histories.values() if frame is not None and not frame.empty)
+                self._seed_coverage = sum(
+                    1 for frame in histories.values()
+                    if frame is not None and not frame.empty and "Close" in frame and frame["Close"].notna().any()
+                )
                 self._seed_errors = 0
                 self._seed_deferred_batches = 0
                 self._seed_universe_source = "PERSISTED_FIVE_MINUTE_SNAPSHOT_ARCHIVE"
@@ -1792,44 +1810,73 @@ class AllNSEMinutePredictor:
             )
 
     def _append_five_minute_snapshot(self, quote_frame: pd.DataFrame, minute: pd.Timestamp) -> None:
-        """Append the current captured row only after inference for use at the next slot."""
+        """Append every symbol row at the five-minute slot, preserving missing quotes as gaps."""
         current: dict[str, dict[str, Any]] = {}
-        for row in quote_frame.to_dict(orient="records"):
-            symbol = str(row.get("symbol") or "").strip().upper()
-            price = _safe_float(row.get("actual_observed_price"))
-            if not symbol or str(row.get("quote_status") or "").upper() != "PASS" or not np.isfinite(price) or price <= 0:
+        expected_previous = minute - pd.Timedelta(minutes=SNAPSHOT_CADENCE_MINUTES)
+        for item in quote_frame.to_dict(orient="records"):
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if not symbol:
                 continue
-            day_volume = _safe_float(row.get("day_volume"))
+            price = _safe_float(item.get("actual_observed_price"))
+            quote_good = (
+                str(item.get("quote_status") or "").strip().upper() == "PASS"
+                and price is not None and price > 0
+            )
+            day_volume = _safe_float(item.get("day_volume")) if quote_good else np.nan
+            day_open = _safe_float(item.get("day_open")) if quote_good else np.nan
+            day_high = _safe_float(item.get("day_high")) if quote_good else np.nan
+            day_low = _safe_float(item.get("day_low")) if quote_good else np.nan
+            previous_day_volume = np.nan
             with self._lock:
                 old = self._history.get(symbol)
-                same_day = old.loc[pd.Index(old.index.date) == minute.date()] if old is not None and not old.empty and "day_volume" in old else pd.DataFrame()
-                volume_values = pd.to_numeric(same_day["day_volume"], errors="coerce").dropna() if not same_day.empty and "day_volume" in same_day else pd.Series(dtype=float)
-                previous_day_volume = volume_values.iloc[-1] if not volume_values.empty else np.nan
-            delta = day_volume - float(previous_day_volume) if np.isfinite(day_volume) and np.isfinite(previous_day_volume) else np.nan
+                if old is not None and not old.empty and "day_volume" in old:
+                    last_ts = _as_ist_timestamp(old.index.max())
+                    if last_ts == expected_previous and last_ts.date() == minute.date():
+                        previous_day_volume = _safe_float(old.iloc[-1].get("day_volume"))
+            delta = (
+                day_volume - previous_day_volume
+                if np.isfinite(day_volume) and np.isfinite(previous_day_volume)
+                else np.nan
+            )
             if not np.isfinite(delta) or delta < 0:
                 delta = np.nan
             current[symbol] = {
-                "Close": price, "Volume": delta, "day_open": _safe_float(row.get("day_open")),
-                "day_high": _safe_float(row.get("day_high")), "day_low": _safe_float(row.get("day_low")),
+                "Close": price if quote_good else np.nan,
+                "Volume": delta,
+                "day_open": day_open,
+                "day_high": day_high,
+                "day_low": day_low,
                 "day_volume": day_volume,
             }
         with self._lock:
             for symbol, values in current.items():
-                row = pd.DataFrame([values], index=pd.DatetimeIndex([minute], tz=IST, name="Datetime"))
+                row = pd.DataFrame(
+                    [values],
+                    index=pd.DatetimeIndex([minute], tz=IST, name="Datetime"),
+                )
                 old = self._history.get(symbol)
                 combined = pd.concat([old, row]).sort_index() if old is not None and not old.empty else row
-                self._history[symbol] = combined.loc[~combined.index.duplicated(keep="last")].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
-            quote_symbols = set(quote_frame["symbol"].astype(str).str.strip().str.upper()) if "symbol" in quote_frame else set()
+                self._history[symbol] = combined.loc[
+                    ~combined.index.duplicated(keep="last")
+                ].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
+            quote_symbols = (
+                set(quote_frame["symbol"].astype(str).str.strip().str.upper())
+                if "symbol" in quote_frame else set()
+            )
             self._symbols = sorted(set(self._symbols) | {s for s in quote_symbols if s})
             self._history_snapshot_slot_count = max(
                 self._history_snapshot_slot_count,
                 len({ts for frame in self._history.values() if frame is not None for ts in frame.index}),
             )
+            self._seed_coverage = sum(
+                1 for frame in self._history.values()
+                if frame is not None and not frame.empty and "Close" in frame and frame["Close"].notna().any()
+            )
             coverage_target = int(np.ceil(len(self._symbols) * MIN_HISTORY_SEED_COVERAGE))
             if (
                 self._history_snapshot_slot_count >= SNAPSHOT_HISTORY_LOOKBACK_BARS
                 and len(self._symbols) > 0
-                and sum(1 for frame in self._history.values() if frame is not None and not frame.empty) >= coverage_target
+                and self._seed_coverage >= coverage_target
             ):
                 self._seed_ready = True
                 self._seed_complete = True
