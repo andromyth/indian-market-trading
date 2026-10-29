@@ -612,4 +612,9 @@ def historical_5m(symbol: str, days: int = 3) -> pd.DataFrame:
     """Convenience wrapper for five-minute OHLCV input used by production inference."""
     days = max(1, min(7, int(days)))
     end = datetime.now(IST)
-    return historical(symbol, end - timedelta(days=days), end, "5m", max_calls=2)
+    frame = historical(symbol, end - timedelta(days=days), end, "5m", max_calls=2)
+    if not frame.empty:
+        frame = frame.copy()
+        frame.index = pd.DatetimeIndex(frame.index) + pd.Timedelta(minutes=5)
+        frame.index.name = "Datetime"
+    return frame
