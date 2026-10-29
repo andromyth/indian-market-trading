@@ -289,8 +289,16 @@ def _sha256(path: Path)->str:
 
 def _models():
     if _MODEL_CACHE: return _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]
-    s=model_status()
-    if not s.get("manifest_sha256_match"): raise RuntimeError("ALL-NSE Intraday model hashes do not match manifest")
+    s = model_status()
+    if not s.get("artifact_hashes_match"):
+        raise RuntimeError("ALL-NSE Intraday classifier/regressor hashes do not match the manifest")
+    if not s.get("feature_schema_match"):
+        raise RuntimeError(
+            "ALL-NSE Intraday model is not trained for the five-minute snapshot feature schema "
+            f"{FEATURE_SCHEMA_VERSION} at cadence={SNAPSHOT_CADENCE_MINUTES}m; retraining is required"
+        )
+    if not s.get("manifest_sha256_match"):
+        raise RuntimeError("ALL-NSE Intraday model manifest integrity validation failed")
     clf=joblib.load(LOCAL_CLASSIFIER); reg=joblib.load(LOCAL_REGRESSOR)
     _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]=clf,reg
     return clf,reg
