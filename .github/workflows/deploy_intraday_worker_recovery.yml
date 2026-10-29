@@ -88,105 +88,7 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Read configured Drive root from the existing private worker health endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
-          SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          RESPONSE="$(mktemp)"
-          trap 'rm -f "$RESPONSE"' EXIT
-          ROOT_OK=0
-          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
-            if [[ "$SA" == "SELF" ]]; then
-              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-            else
-              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-            fi
-            [[ -n "$TOKEN" ]] || continue
-            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/")" || HTTP_CODE=000
-            set +e
-            python - "$RESPONSE" "$HTTP_CODE" "$GITHUB_ENV" <<'PY'
-          import json, os, sys
-          path, code, env_path = sys.argv[1:]
-          try:
-              data = json.load(open(path, encoding="utf-8"))
-          except Exception:
-              sys.exit(1)
-          drive = data.get("drive_preflight") or {}
-          root_id = str(drive.get("root_folder_id") or "").strip()
-          ok = (
-              data.get("drive_preflight_status") == "OK"
-              and drive.get("reachable") is True
-              and drive.get("write_ready") is True
-              and bool(root_id)
-          )
-          if ok:
-              with open(env_path, "a", encoding="utf-8") as env:
-                  env.write("GOOGLE_DRIVE_ROOT_ID=" + root_id + "\n")
-              print("EXISTING_WORKER_DRIVE_PREFLIGHT=PASS write_ready=true")
-              sys.exit(0)
-          sys.exit(1)
-          PY
-            RC=$?
-            set -e
-            if [[ "$RC" -eq 0 ]]; then ROOT_OK=1; break; fi
-          done
-          if [[ "$ROOT_OK" != "1" ]]; then
-            echo "Deployment blocked: could not verify Drive write readiness/root through the existing private worker."
-            exit 1
-          fi
-
-      - name: Install runtime dependencies for model and Drive preflight
-        shell: bash
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Verify five-minute model bundle and Drive write readiness before deployment
-        shell: bash
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import sys
-          import all_nse_intraday_model as model
-          from persistent_store import drive_status
-
-          status = model.model_status()
-          manifest = model._manifest()
-          drive = drive_status(require_write=False)
-          features_match = manifest.get("features") == model.FEATURES
-          checks = {
-              "model_status": status.get("status"),
-              "bar_interval_minutes": manifest.get("bar_interval_minutes"),
-              "target": manifest.get("target"),
-              "feature_count_manifest": manifest.get("feature_count"),
-              "feature_count_runtime": len(model.FEATURES),
-              "feature_list_matches_runtime": features_match,
-              "training_symbol_count": manifest.get("training_symbol_count"),
-              "manifest_sha256_match": status.get("manifest_sha256_match"),
-              "drive_configured": drive.get("configured"),
-              "drive_reachable": drive.get("reachable"),
-              "drive_read_auth_method": drive.get("auth_method"),
-              "runtime_drive_write_preflight": "PASS",
-          }
-          print("MODEL_DRIVE_PREFLIGHT=" + json.dumps(checks, sort_keys=True))
-          valid = all([
-              status.get("manifest_sha256_match") is True,
-              manifest.get("bar_interval_minutes") == 5,
-              manifest.get("target") == "target_30m",
-              manifest.get("feature_count") == len(model.FEATURES),
-              features_match,
-              int(manifest.get("training_symbol_count") or 0) > 0,
-              drive.get("configured") is True,
-              drive.get("reachable") is True,
-          ])
-          if not valid:
-              sys.exit("Deployment blocked: five-minute model artifacts or Drive preflight failed.")
-          print("FIVE_MINUTE_MODEL_AND_DRIVE_PREFLIGHT=PASS")
-          PY
-
-      - name: Deploy the tested worker using existing project infrastructure
+      - name: Stage candidate revision without production traffic
         shell: bash
         run: |
           set -euo pipefail
@@ -208,8 +110,108 @@ jobs:
             --concurrency 1 \
             --timeout 300 \
             --no-allow-unauthenticated \
+            --no-traffic \
+            --tag=five-minute-preflight \
             --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
             --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
+
+      - name: Validate staged five-minute model bundle with runtime credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE=indian-market-intraday-worker
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          SERVICE_JSON="$(mktemp)"
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$SERVICE_JSON" "$RESPONSE"' EXIT
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > "$SERVICE_JSON"
+          python - "$SERVICE_JSON" "$GITHUB_ENV" <<'PY'
+          import json, sys
+          payload=json.load(open(sys.argv[1],encoding="utf-8"))
+          matches=[
+              item for item in ((payload.get("status") or {}).get("traffic") or [])
+              if item.get("tag") == "five-minute-preflight" and item.get("url") and item.get("revisionName")
+          ]
+          if not matches:
+              sys.exit("No tagged, zero-traffic candidate revision was found.")
+          item=matches[0]
+          with open(sys.argv[2],"a",encoding="utf-8") as env:
+              env.write("STAGED_REVISION="+item["revisionName"]+"\\n")
+              env.write("STAGED_URL="+item["url"]+"\\n")
+          print("STAGED_REVISION_READY=true")
+          PY
+          echo "STAGED_REVISION=$STAGED_REVISION"
+          MODEL_OK=0
+          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            if [[ "$SA" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            fi
+            [[ -n "$TOKEN" ]] || continue
+            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 60 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$STAGED_URL/modelz")" || HTTP_CODE=000
+            echo "STAGED_MODEL_DIAGNOSTIC_HTTP_STATUS=$HTTP_CODE"
+            set +e
+            python - "$RESPONSE" "$HTTP_CODE" <<'PY'
+          import json,sys
+          path, code = sys.argv[1:]
+          try:
+              data=json.load(open(path,encoding="utf-8"))
+          except Exception:
+              print("STAGED_MODEL_DIAGNOSTIC_JSON=INVALID")
+              sys.exit(1)
+          checks=data.get("checks") or {}
+          summary={
+              "status":data.get("status"),
+              "probe":data.get("probe"),
+              "bar_interval_minutes":checks.get("bar_interval_minutes"),
+              "target":checks.get("target"),
+              "feature_count_manifest":checks.get("feature_count_manifest"),
+              "feature_count_runtime":checks.get("feature_count_runtime"),
+              "feature_list_matches_runtime":checks.get("feature_list_matches_runtime"),
+              "training_symbol_count":checks.get("training_symbol_count"),
+              "artifact_hashes_match":checks.get("artifact_hashes_match"),
+              "drive_configured":checks.get("drive_configured"),
+              "drive_reachable":checks.get("drive_reachable"),
+              "drive_write_ready":checks.get("drive_write_ready"),
+              "reason":data.get("reason"),
+              "error_type":data.get("error_type"),
+          }
+          print("STAGED_MODEL_PREFLIGHT="+json.dumps(summary,sort_keys=True))
+          ok=(
+              code=="200"
+              and data.get("status")=="ok"
+              and checks.get("bar_interval_minutes")==5
+              and checks.get("target")=="target_30m"
+              and checks.get("feature_count_manifest")==checks.get("feature_count_runtime")
+              and checks.get("feature_list_matches_runtime") is True
+              and checks.get("artifact_hashes_match") is True
+              and checks.get("drive_configured") is True
+              and checks.get("drive_reachable") is True
+              and checks.get("drive_write_ready") is True
+          )
+          sys.exit(0 if ok else 1)
+          PY
+            RC=$?
+            set -e
+            if [[ "$RC" -eq 0 ]]; then MODEL_OK=1; break; fi
+          done
+          if [[ "$MODEL_OK" != "1" ]]; then
+            echo "Deployment blocked: staged model/Drive preflight failed; production traffic and schedules remain unchanged."
+            exit 1
+          fi
+          echo "STAGED_FIVE_MINUTE_MODEL_PREFLIGHT=PASS"
+
+      - name: Promote verified candidate to production traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic indian-market-intraday-worker \\
+            --project="$PROJECT_ID" \\
+            --region="$REGION" \\
+            --to-revisions="$STAGED_REVISION=100" \\
+            --quiet
+          echo "PRODUCTION_TRAFFIC_PROMOTED_REVISION=$STAGED_REVISION"
 
       - name: Change existing intraday jobs to five-minute cadence
         shell: bash
