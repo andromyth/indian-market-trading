@@ -113,13 +113,13 @@ def test_actionable_signal_abstains_when_feature_readiness_is_low():
 
 def test_active_calibration_never_overrides_data_readiness_hold():
     guard = capture._primary_signal_with_readiness_guard
-    assert guard("PASS", False, "BUY") == "BUY"
-    assert guard("PASS", False, "SELL") == "SELL"
-    assert guard("PASS_DATA_LIMITED", True, "BUY") == "HOLD"
-    assert guard("PASS", True, "BUY") == "HOLD"
-    assert guard("PASS_UNTRAINED_SYMBOL", False, "SELL") == "HOLD"
-    assert guard("PASS", None, "BUY") == "HOLD"
-    assert guard("PASS", False, "ABSTAIN") == "HOLD"
+    assert guard("PREDICTED", False, "BUY") == "BUY"
+    assert guard("PREDICTED", False, "SELL") == "SELL"
+    assert guard("PREDICTED_DATA_LIMITED", True, "BUY") == "HOLD"
+    assert guard("PREDICTED", True, "BUY") == "HOLD"
+    assert guard("PREDICTED_UNTRAINED_SYMBOL", False, "SELL") == "SELL"
+    assert guard("PREDICTED", None, "BUY") == "HOLD"
+    assert guard("PREDICTED", False, "ABSTAIN") == "HOLD"
 
 
 def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
@@ -227,7 +227,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     assert result["expected_symbol_count"] == 3
     assert result["eligible_symbol_count"] == 1
     assert result["prediction_count"] == 1
-    assert result["prediction_status_counts"] == {"PASS": 1}
+    assert result["prediction_status_counts"] == {"PREDICTED": 1}
     assert "quality_gate_pass" not in result
 
     written = pd.read_parquet(
