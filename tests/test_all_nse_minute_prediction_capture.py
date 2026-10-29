@@ -744,7 +744,7 @@ def test_partial_seed_refresh_only_requests_symbols_with_cached_history(tmp_path
                 "success": True,
                 "data": {
                     "NSE_100": {"candles": [{
-                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "ts": int((minute - pd.Timedelta(minutes=5)).timestamp()),
                         "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
                     }]}
                 },
@@ -790,7 +790,7 @@ def test_successful_refresh_without_fresh_candle_keeps_symbol_pending(tmp_path, 
                 "success": True,
                 "data": {
                     "NSE_100": {"candles": [{
-                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "ts": int((minute - pd.Timedelta(minutes=15)).timestamp()),
                         "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
                     }]},
                     "NSE_101": {"candles": []},
