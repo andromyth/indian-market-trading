@@ -107,6 +107,9 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 STATE.get("all_universe_capture_status") or capture.get("status") or "NOT_RUN"
             ).upper()
             capture_error = STATE.get("all_universe_capture_error")
+        if capture.get("snapshot_persisted") is True:
+            capture_status = "STORED"
+            capture_error = None
         if all_nse_status == "NOT_SCHEDULED":
             all_nse = STATE.get("all_nse_minute_prediction_last_result") or {}
             all_nse_status = str(
@@ -146,7 +149,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "cycle_minute_ist", "expected_symbol_count", "row_count", "quoted_symbol_count",
                 "missing_quote_count", "unmapped_symbol_count", "forecast_symbol_count",
                 "matched_outcome_count", "snapshot_drive_path", "remote_snapshot_path",
-                "status", "error",
+                "snapshot_persisted", "status", "error",
             )
             if key in capture
         })
@@ -602,8 +605,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
             ).upper()
             # Retry only durability/execution failures; partial quote coverage
             # is informational and never prevents other symbols being predicted.
+            capture_snapshot_persisted = (
+                (result.get("all_universe_capture") or {}).get("snapshot_persisted") is True
+            )
             retryable_persistence_failure = (
-                capture_status in {"ERROR", "PERSISTENCE_ERROR"}
+                (capture_status in {"ERROR", "PERSISTENCE_ERROR"} and not capture_snapshot_persisted)
                 or prediction_status in {
                     "ERROR", "PERSISTENCE_ERROR",
                     "BLOCKED_SNAPSHOT_CAPTURE", "BLOCKED_SNAPSHOT_VALIDATION",
