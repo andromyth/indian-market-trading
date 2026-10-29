@@ -117,7 +117,7 @@ def test_active_calibration_never_overrides_data_readiness_hold():
     assert guard("PREDICTED", False, "SELL") == "SELL"
     assert guard("PREDICTED_DATA_LIMITED", True, "BUY") == "HOLD"
     assert guard("PREDICTED", True, "BUY") == "HOLD"
-    assert guard("PREDICTED_UNTRAINED_SYMBOL", False, "SELL") == "SELL"
+    assert guard("PREDICTED_UNTRAINED_SYMBOL", False, "SELL") == "HOLD"
     assert guard("PREDICTED", None, "BUY") == "HOLD"
     assert guard("PREDICTED", False, "ABSTAIN") == "HOLD"
 
@@ -1177,3 +1177,37 @@ def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp
     assert set(second["SYMBOL"]) == {"AAA", "BBB"}
     assert second["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
 
+
+
+def test_empty_snapshot_slot_skips_prediction_without_failing_other_slots(tmp_path):
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: pytest.fail("No symbol is eligible; history seeding must not run")
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "No symbol is eligible; history refresh must not run"
+    )
+    snapshot_dir = tmp_path / "all_universe_minute_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    pd.DataFrame([{
+        "symbol": "AAA",
+        "instrument_code": "NSE_1",
+        "cycle_minute_ist": minute.isoformat(),
+        "quote_status": "MISSING_QUOTE",
+        "actual_observed_price": None,
+        "quote_observed_at_ist": None,
+    }]).to_parquet(snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet", index=False)
+
+    result = predictor.run_for_capture({
+        "cycle_minute_ist": minute.isoformat(),
+        "status": "PERSISTENCE_ERROR",
+        "snapshot_persisted": True,
+        "expected_symbol_count": 1,
+        "snapshot_drive_path": (
+            "production_data/all_universe_minute_snapshots/"
+            f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+        ),
+    }, worker_root=tmp_path)
+
+    assert result["status"] == "NO_ELIGIBLE_SYMBOLS"
+    assert result["prediction_count"] == 0
+    assert not list((tmp_path / "all_nse_minute_predictions").rglob("predictions_*.parquet"))
