@@ -269,8 +269,12 @@ def _current_minute_row(
             pd.Index(prior_history.index.date) == snapshot_date
         ] if not prior_history.empty else pd.DataFrame()
         if not same_day_history.empty and "day_volume" in same_day_history:
-            day_volume_values = pd.to_numeric(same_day_history["day_volume"], errors="coerce").dropna()
-            history_volume = day_volume_values.iloc[-1] if not day_volume_values.empty else np.nan
+            latest_history_ts = _as_ist_timestamp(same_day_history.index.max())
+            if latest_history_ts == snapshot_minute - pd.Timedelta(minutes=SNAPSHOT_CADENCE_MINUTES):
+                day_volume_values = pd.to_numeric(same_day_history["day_volume"], errors="coerce").dropna()
+                history_volume = day_volume_values.iloc[-1] if not day_volume_values.empty else np.nan
+            else:
+                history_volume = np.nan
         else:
             history_volume = (
                 pd.to_numeric(same_day_history.get("Volume"), errors="coerce").sum(min_count=1)
@@ -2692,21 +2696,24 @@ class AllNSEMinutePredictor:
                 hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
             elif not hist.empty:
                 hist = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+            previous_snapshot_volume = None
+            previous_snapshot_date = None
+            if not hist.empty and isinstance(hist.index, pd.DatetimeIndex) and "day_volume" in hist:
+                previous_ts = _as_ist_timestamp(hist.index.max())
+                if (
+                    previous_ts == minute - pd.Timedelta(minutes=SNAPSHOT_CADENCE_MINUTES)
+                    and previous_ts.date() == minute.date()
+                ):
+                    previous_snapshot_volume = _safe_float(hist.iloc[-1].get("day_volume"))
+                    if np.isfinite(previous_snapshot_volume):
+                        previous_snapshot_date = minute.date()
             quote_info, price_row, raw_day_volume = _current_minute_row(
                 symbol=symbol,
                 snapshot_minute=minute,
                 quote=quote,
                 prior_history=hist,
-                previous_day_volume=(
-                    self._last_day_volume.get(symbol, (date.min, 0.0))[1]
-                    if symbol in self._last_day_volume
-                    and self._last_day_volume[symbol][0] == minute.date()
-                    else None
-                ),
-                previous_volume_date=(
-                    self._last_day_volume.get(symbol, (date.min, 0.0))[0]
-                    if symbol in self._last_day_volume else None
-                ),
+                previous_day_volume=previous_snapshot_volume,
+                previous_volume_date=previous_snapshot_date,
                 snapshot_date=minute.date(),
             )
             actual_price = quote_info.get("actual_market_value")
