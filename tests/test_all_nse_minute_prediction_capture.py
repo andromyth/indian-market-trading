@@ -1231,3 +1231,42 @@ def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp
     assert set(second["SYMBOL"]) == {"AAA", "BBB"}
     assert second["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
 
+
+
+
+def test_old_one_minute_model_manifest_is_rejected_when_hashes_match(monkeypatch, tmp_path):
+    import hashlib
+    import json
+    import all_nse_intraday_model as model
+
+    monkeypatch.setattr(model, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(model, "LOCAL_MANIFEST", tmp_path / "manifest.json")
+    monkeypatch.setattr(model, "LOCAL_CLASSIFIER", tmp_path / "classifier.joblib")
+    monkeypatch.setattr(model, "LOCAL_REGRESSOR", tmp_path / "regressor.joblib")
+    monkeypatch.setattr(model, "_MODEL_CACHE", {})
+
+    classifier_bytes = b"old-one-minute-classifier"
+    regressor_bytes = b"old-one-minute-regressor"
+    model.LOCAL_CLASSIFIER.write_bytes(classifier_bytes)
+    model.LOCAL_REGRESSOR.write_bytes(regressor_bytes)
+    old_manifest = {
+        "status": "REPLACEMENT",
+        "model_version": "legacy-one-minute",
+        "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
+        "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
+        "training_symbols": ["AAA"],
+        "training_symbol_count": 1,
+        "feature_count": 34,
+        "features": ["ret_1", "ret_3", "ret_5"],
+        "input_cadence_minutes": 1,
+        "feature_schema_version": "legacy_one_minute",
+    }
+    model.LOCAL_MANIFEST.write_text(json.dumps(old_manifest), encoding="utf-8")
+
+    status = model.model_status()
+
+    assert status["artifact_hashes_match"] is True
+    assert status["feature_schema_match"] is False
+    assert status["manifest_sha256_match"] is False
+    with pytest.raises(RuntimeError, match="hashes do not match manifest"):
+        model._models()
