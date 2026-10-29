@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -50,6 +51,22 @@ def _complete_day_files(session_date):
             "pending_snapshot_recovery": {"errors": []},
         }
     return files, manifests, snapshots
+
+
+def _prediction_snapshot_link(session_date, key):
+    minute = datetime.strptime(key, "%Y%m%d_%H%M").replace(
+        tzinfo=ZoneInfo("Asia/Kolkata")
+    )
+    return {
+        "quote_snapshot_drive_path": (
+            "production_data/all_universe_minute_snapshots/"
+            f"{session_date:%Y/%m/%d}/snapshot_{key}.parquet"
+        ),
+        "quote_snapshot_cycle_minute_ist": minute.isoformat(),
+        "quote_snapshot_capture_status": "OK",
+        "quote_snapshot_expected_symbol_count": 2,
+        "quote_snapshot_rows_validated": True,
+    }
 
 
 def test_expected_minutes_cover_open_through_last_five_minute_slot():
@@ -267,6 +284,7 @@ def test_prediction_audit_requires_all_slot_files_and_full_predictions_after_war
             "model_artifact_verified": True,
             "trained_symbol_manifest_available": True,
             "quality_gate_pass": True,
+            **_prediction_snapshot_link(session_date, key),
         }
     report = build_prediction_audit(
         keys, files, lambda file_id: manifests[file_id], session_date=session_date
@@ -282,6 +300,50 @@ def test_prediction_audit_requires_all_slot_files_and_full_predictions_after_war
     )
     assert report["prediction_quality_gate_pass"] is False
     assert missing_key in report["missing_prediction_minutes"]
+
+
+def test_prediction_audit_fails_when_prediction_is_not_linked_to_its_exact_snapshot():
+    session_date = date(2026, 10, 16)
+    keys = expected_minutes(session_date)
+    files = []
+    manifests = {}
+    for key in keys:
+        manifest_id = f"prediction-manifest-{key}"
+        files.extend([
+            {"id": f"predictions-{key}", "name": f"predictions_{key}.parquet"},
+            {"id": manifest_id, "name": f"manifest_{key}.json"},
+        ])
+        manifests[manifest_id] = {
+            "status": "OK",
+            "expected_symbol_count": 2,
+            "row_count": 2,
+            "prediction_count": 2,
+            "missing_quote_count": 0,
+            "data_limited_count": 0,
+            "untrained_symbol_count": 0,
+            "model_failure_count": 0,
+            "history_ready": True,
+            "history_seed_coverage_symbols": 2,
+            "history_seed_failed_batches": 0,
+            "history_refresh_batch_count": 1,
+            "history_refresh_failed_batches": 0,
+            "model_artifact_verified": True,
+            "trained_symbol_manifest_available": True,
+            "quality_gate_pass": True,
+            **_prediction_snapshot_link(session_date, key),
+        }
+
+    broken_key = "20261016_0915"
+    manifests[f"prediction-manifest-{broken_key}"]["quote_snapshot_drive_path"] = (
+        "production_data/all_universe_minute_snapshots/2026/10/16/"
+        "snapshot_20261016_0910.parquet"
+    )
+    report = build_prediction_audit(
+        keys, files, lambda file_id: manifests[file_id], session_date=session_date
+    )
+
+    assert report["prediction_quality_gate_pass"] is False
+    assert broken_key in report["prediction_snapshot_link_failures"]
 
 
 def test_prediction_audit_fails_when_a_required_slot_is_partial():
@@ -313,6 +375,7 @@ def test_prediction_audit_fails_when_a_required_slot_is_partial():
             "model_artifact_verified": True,
             "trained_symbol_manifest_available": True,
             "quality_gate_pass": True,
+            **_prediction_snapshot_link(session_date, key),
         }
     manifests[f"prediction-manifest-{bad_key}"]["status"] = "PARTIAL"
     manifests[f"prediction-manifest-{bad_key}"]["quality_gate_pass"] = False

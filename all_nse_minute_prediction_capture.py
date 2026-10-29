@@ -225,6 +225,19 @@ def _as_ist_timestamp(value: Any, fallback: pd.Timestamp | None = None) -> pd.Ti
     return ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
 
 
+def _parse_ist_timestamp(value: Any) -> pd.Timestamp | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        stamp = pd.Timestamp(parsed)
+        return stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _current_minute_row(
     *,
     symbol: str,
@@ -290,9 +303,7 @@ def _current_minute_row(
         "actual_quote_status": quote_status,
         # Model execution follows Drive persistence. Measure collection lag from
         # the intended slot, not from the later processing time.
-        "actual_quote_age_seconds": max(
-            0.0, (observed_at - snapshot_minute).total_seconds()
-        ),
+        "actual_quote_age_seconds": abs((observed_at - snapshot_minute).total_seconds()),
         "day_volume": raw_day_volume,
         "minute_volume_delta": volume_delta,
         "current_minute_ohlc_complete": False,
@@ -362,6 +373,80 @@ def _primary_signal_with_readiness_guard(
         return "HOLD"
     signal = str(candidate_signal or "HOLD").strip().upper()
     return signal if signal in {"BUY", "SELL", "HOLD"} else "HOLD"
+
+
+def _snapshot_quote_error(
+    quote: dict[str, Any] | None,
+    expected_minute: pd.Timestamp,
+) -> str | None:
+    """Validate one symbol's own quote against the exact capture slot."""
+    quote = quote or {}
+    if not str(quote.get("symbol") or "").strip():
+        return "Symbol is blank."
+    if not str(quote.get("instrument_code") or "").strip():
+        return "Instrument code is missing."
+    cycle_minute = _parse_ist_timestamp(quote.get("cycle_minute_ist"))
+    if cycle_minute is None or cycle_minute != expected_minute:
+        return "Quote does not belong to the requested snapshot minute."
+    if str(quote.get("quote_status") or "").strip().upper() != "PASS":
+        return "Quote status is not PASS."
+    price = _safe_float(quote.get("actual_observed_price"))
+    if price is None or price <= 0:
+        return "Quote price is missing or invalid."
+    observed_at = _parse_ist_timestamp(
+        quote.get("quote_observed_at_ist") or quote.get("quote_observed_at_utc")
+    )
+    if observed_at is None:
+        return "Quote observation timestamp is missing or invalid."
+    if abs((observed_at - expected_minute).total_seconds()) > MAX_QUOTE_AGE_SECONDS:
+        return "Quote observation timestamp is outside the freshness window."
+    return None
+
+
+def _capture_snapshot_validation_error(
+    capture_manifest: dict[str, Any],
+    quote_frame: pd.DataFrame,
+    minute: pd.Timestamp,
+) -> str | None:
+    """Reject predictions unless the same-slot source snapshot was persisted and is structurally sound."""
+    status = str(capture_manifest.get("status") or "").strip().upper()
+    if status not in {"OK", "PARTIAL"}:
+        return f"Capture status {status or 'MISSING'} is not eligible for prediction."
+    expected_remote_path = (
+        "production_data/all_universe_minute_snapshots/"
+        f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+    )
+    if capture_manifest.get("snapshot_drive_path") != expected_remote_path:
+        return "Same-slot snapshot Drive persistence was not confirmed."
+    try:
+        expected_count = int(capture_manifest.get("expected_symbol_count") or 0)
+        manifest_rows = int(capture_manifest.get("row_count") or 0)
+    except (TypeError, ValueError):
+        expected_count = manifest_rows = 0
+    if expected_count <= 0 or manifest_rows != expected_count or len(quote_frame) != expected_count:
+        return (
+            "Snapshot row count does not match the capture manifest: "
+            f"expected={expected_count}, manifest={manifest_rows}, actual={len(quote_frame)}."
+        )
+    required = {
+        "symbol", "instrument_code", "cycle_minute_ist", "quote_status",
+        "actual_observed_price", "quote_observed_at_ist",
+    }
+    missing = sorted(required - set(quote_frame.columns))
+    if missing:
+        return f"Snapshot is missing required columns: {', '.join(missing)}."
+    symbols = quote_frame["symbol"].astype(str).str.strip().str.upper()
+    if symbols.eq("").any() or symbols.duplicated().any():
+        return "Snapshot has blank or duplicate symbol identities."
+    slot_times = quote_frame["cycle_minute_ist"].map(_parse_ist_timestamp)
+    if slot_times.isna().any() or not slot_times.eq(minute).all():
+        return "Snapshot contains rows from a different or unparseable capture minute."
+    if not any(
+        _snapshot_quote_error(row, minute) is None
+        for row in quote_frame.to_dict(orient="records")
+    ):
+        return "Snapshot contains no individually valid symbol quotes."
+    return None
 
 
 class AllNSEMinutePredictor:
@@ -2135,20 +2220,80 @@ class AllNSEMinutePredictor:
                 "status": "NOT_RUN",
                 "reason": "This worker tick did not produce a live full-universe quote capture.",
             }
-        self.start()
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
             fallback=pd.Timestamp.now(tz=IST).floor("min"),
         ).floor("min")
         minute_key = minute.isoformat()
+        capture_status = str(capture_manifest.get("status") or "").strip().upper()
+        if capture_status not in {"OK", "PARTIAL"} or not capture_manifest.get("snapshot_drive_path"):
+            error = (
+                "Prediction blocked: the same-slot market snapshot was not confirmed "
+                f"persisted to Drive (capture_status={capture_status or 'MISSING'})."
+            )
+            self._log(
+                "all_nse_minute_prediction_capture_blocked",
+                cycle_minute_ist=minute_key,
+                status="BLOCKED_SNAPSHOT_CAPTURE",
+                capture_status=capture_status or "MISSING",
+                error=error,
+            )
+            return {
+                "status": "BLOCKED_SNAPSHOT_CAPTURE",
+                "cycle_minute_ist": minute_key,
+                "prediction_count": 0,
+                "quality_gate_pass": False,
+                "error": error,
+            }
+
+        source_root = Path(worker_root or self.worker_root)
+        snapshot_name = f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
+        local_quote_path = source_root / "all_universe_minute_snapshots" / snapshot_name
+        try:
+            quote_frame = (
+                pd.read_parquet(local_quote_path)
+                if local_quote_path.is_file()
+                else pd.DataFrame()
+            )
+        except Exception as exc:
+            quote_frame = pd.DataFrame()
+            read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        else:
+            read_error = None
+        snapshot_error = (
+            read_error
+            or (f"Same-slot local snapshot is missing or empty: {local_quote_path}" if quote_frame.empty else None)
+            or _capture_snapshot_validation_error(capture_manifest, quote_frame, minute)
+        )
+        if snapshot_error:
+            error = f"Prediction blocked: {snapshot_error}"
+            self._log(
+                "all_nse_minute_prediction_capture_blocked",
+                cycle_minute_ist=minute_key,
+                status="BLOCKED_SNAPSHOT_VALIDATION",
+                snapshot_path=str(local_quote_path),
+                error=error,
+            )
+            return {
+                "status": "BLOCKED_SNAPSHOT_VALIDATION",
+                "cycle_minute_ist": minute_key,
+                "prediction_count": 0,
+                "quality_gate_pass": False,
+                "error": error,
+                "snapshot_path": str(local_quote_path),
+            }
+
+        quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.strip().str.upper()
+        quote_by_symbol = {
+            str(row["symbol"]): row
+            for row in quote_frame.to_dict(orient="records")
+        }
+
+        self.start()
         if self._last_minute == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "cycle_minute_ist": minute_key}
 
-        # Do not put hundreds of history API requests on the prediction
-        # critical path. Schedule a fresh candle cache for the next slot.
-        # Capture is timestamp-aligned; prediction below filters every input
-        # candle to strictly before this minute and rejects data older than the
-        # explicit freshness threshold.
+        # Validate the quote dependency before scheduling additional source refresh work.
         refresh_target = minute
         history_refresh = self._schedule_current_session_history_refresh(refresh_target)
         if str(history_refresh.get("status") or "").upper() in {"IN_PROGRESS", "SCHEDULED_ASYNC"}:
@@ -2157,28 +2302,8 @@ class AllNSEMinutePredictor:
                 timeout_seconds=45.0,
             )
         failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
-        source_root = Path(worker_root or self.worker_root)
-        snapshot_name = f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
-        local_quote_path = source_root / "all_universe_minute_snapshots" / snapshot_name
-        try:
-            quote_frame = pd.read_parquet(local_quote_path) if local_quote_path.is_file() else pd.DataFrame()
-        except Exception as exc:
-            quote_frame = pd.DataFrame()
-            read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-        else:
-            read_error = None
-        if not quote_frame.empty and "symbol" in quote_frame:
-            quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.strip().str.upper()
-            quote_frame = quote_frame.drop_duplicates("symbol", keep="last")
-            quote_by_symbol = {
-                str(row["symbol"]): row
-                for row in quote_frame.to_dict(orient="records")
-            }
-        else:
-            quote_by_symbol = {}
-
         with self._lock:
-            symbols = list(self._symbols) or sorted(quote_by_symbol)
+            symbols = sorted(quote_by_symbol)
             history_ready = self._seed_ready
             history_seed_complete = self._seed_complete
             seed_status = self._seed_status
@@ -2192,11 +2317,6 @@ class AllNSEMinutePredictor:
             market_history,
             minute,
         )
-        # Capture every symbol in the official universe even if quote data is missing.
-        for symbol in sorted(set(quote_by_symbol) - set(symbols)):
-            symbols.append(symbol)
-        symbols = sorted(set(symbols))
-
         nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
         try:
             if history_ready:
@@ -2264,12 +2384,7 @@ class AllNSEMinutePredictor:
                 fallback=minute,
             )
             quote_age = quote_info.get("actual_quote_age_seconds")
-            quote_good = (
-                actual_price is not None
-                and str(quote_info.get("actual_quote_status") or "").upper() == "PASS"
-                and quote_age is not None
-                and quote_age <= MAX_QUOTE_AGE_SECONDS
-            )
+            quote_good = _snapshot_quote_error(quote, minute) is None
             if quote_good and raw_day_volume is not None:
                 quote_actuals[symbol] = {"day_volume": raw_day_volume, "date": minute.date()}
             if not quote_good:
@@ -2683,6 +2798,11 @@ class AllNSEMinutePredictor:
             "fno_context_symbol_count": len(fno_context_by_symbol),
             "nifty_context_error": nifty_error,
             "quote_source_snapshot": str(local_quote_path),
+            "quote_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
+            "quote_snapshot_cycle_minute_ist": minute.isoformat(),
+            "quote_snapshot_capture_status": capture_status,
+            "quote_snapshot_expected_symbol_count": int(capture_manifest.get("expected_symbol_count") or 0),
+            "quote_snapshot_rows_validated": True,
             "quote_snapshot_read_error": read_error,
             "current_minute_ohlc_complete": False,
             "quality_gate_thresholds": {

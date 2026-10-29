@@ -454,6 +454,7 @@ def build_prediction_audit(
     duplicate_files = 0
     duplicate_manifests = 0
     row_count_failures: list[str] = []
+    prediction_snapshot_link_failures: list[str] = []
     model_quality_failures: list[str] = []
     total_expected_rows = 0
     total_persisted_rows = 0
@@ -494,6 +495,20 @@ def build_prediction_audit(
             pass
         if expected_int <= 0 or row_count_int != expected_int:
             row_count_failures.append(key)
+        expected_snapshot_minute = datetime.strptime(key, "%Y%m%d_%H%M").replace(tzinfo=IST)
+        expected_snapshot_path = (
+            "production_data/all_universe_minute_snapshots/"
+            f"{session_date:%Y/%m/%d}/snapshot_{key}.parquet"
+        )
+        snapshot_link_ok = (
+            manifest.get("quote_snapshot_rows_validated") is True
+            and manifest.get("quote_snapshot_cycle_minute_ist") == expected_snapshot_minute.isoformat()
+            and manifest.get("quote_snapshot_drive_path") == expected_snapshot_path
+            and manifest.get("quote_snapshot_expected_symbol_count") == expected_int
+            and manifest.get("quote_snapshot_capture_status") in {"OK", "PARTIAL"}
+        )
+        if not snapshot_link_ok:
+            prediction_snapshot_link_failures.append(key)
         if key < first_prediction_key:
             continue  # Model history warm-up; the all-symbol rows must still be persisted.
         n = max(1, expected_int)
@@ -511,7 +526,8 @@ def build_prediction_audit(
             if refresh_batches else 1.0
         )
         quality_ok = (
-            status == "OK"
+            snapshot_link_ok
+            and status == "OK"
             and manifest.get("quality_gate_pass") is True
             and prediction_count is not None
             and prediction_fraction >= 0.95
@@ -537,6 +553,7 @@ def build_prediction_audit(
         and duplicate_manifests == 0
         and len(corrupt_manifests) == 0
         and len(row_count_failures) == 0
+        and len(prediction_snapshot_link_failures) == 0
         and len(model_quality_failures) == 0
     )
     return {
@@ -549,6 +566,7 @@ def build_prediction_audit(
         "duplicate_prediction_files": duplicate_files,
         "duplicate_prediction_manifests": duplicate_manifests,
         "prediction_row_count_failures": row_count_failures,
+        "prediction_snapshot_link_failures": prediction_snapshot_link_failures,
         "prediction_model_quality_failures": model_quality_failures,
         "prediction_status_counts": status_counts,
         "total_expected_prediction_symbol_rows": total_expected_rows,
