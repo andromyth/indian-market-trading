@@ -179,8 +179,11 @@ def make_snapshot_feature_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
         moving_average = close.rolling(window, min_periods=window).mean()
         out[f"ma_{minutes}m_ratio"] = close / moving_average - 1.0
 
-    volume_mean = volume.rolling(20, min_periods=20).mean()
-    volume_std = volume.rolling(20, min_periods=20).std()
+    # A window can contain the single expected missing first-session-slot
+    # delta; require at least 15 of 20 observed intervals instead of withholding
+    # both volume features for an entire session warm-up.
+    volume_mean = volume.rolling(20, min_periods=15).mean()
+    volume_std = volume.rolling(20, min_periods=15).std()
     out["volume_ratio_100m"] = volume / volume_mean
     out["volume_z_100m"] = (volume - volume_mean) / volume_std.replace(0, np.nan)
 
