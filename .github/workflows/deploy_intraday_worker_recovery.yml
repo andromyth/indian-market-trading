@@ -208,7 +208,7 @@ jobs:
           set -euo pipefail
           gcloud run services update-traffic indian-market-intraday-worker \
             --project="$PROJECT_ID" \
-            --region="$REGION" \\
+            --region="$REGION" \
             --to-revisions="$STAGED_REVISION=100" \
             --quiet
           echo "PRODUCTION_TRAFFIC_PROMOTED_REVISION=$STAGED_REVISION"
