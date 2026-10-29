@@ -613,14 +613,14 @@ class AllNSEMinutePredictor:
         The source=index instrument master exposes index underlyings, not a
         documented NSE cash-equity token accepted by /market/quotes/full or
         /market/historical/5minute. The old NSE_<SECURITY_ID> conversion caused
-        HTTP 400 on both REST paths. NIFTY context uses verified one-minute Yahoo
+        HTTP 400 on both REST paths. NIFTY context uses verified five-minute Yahoo
         candles as a fallback instead; no WebSocket token or fabricated OHLC is used.
         """
         return None
 
     @staticmethod
     def _fetch_yahoo_nifty_history(minute: pd.Timestamp) -> pd.DataFrame:
-        """Fetch genuine, fresh one-minute NIFTY 50 candles with fallback diagnostics."""
+        """Fetch genuine, fresh five-minute NIFTY 50 candles with fallback diagnostics."""
         columns = ["Open", "High", "Low", "Close", "Volume"]
         empty = pd.DataFrame(
             columns=columns,
@@ -1415,7 +1415,7 @@ class AllNSEMinutePredictor:
                 )
 
                 # If INDstocks cannot provide a documented REST index token,
-                # use genuine Yahoo NIFTY 50 one-minute OHLCV candles for context.
+                # use genuine Yahoo NIFTY 50 five-minute OHLCV candles for context.
                 # This does not alter the stock history-coverage counter.
                 if "__NIFTY50__" not in histories or histories["__NIFTY50__"].empty:
                     nifty_history = self._fetch_yahoo_nifty_history(now.floor("5min"))
@@ -1423,7 +1423,7 @@ class AllNSEMinutePredictor:
                         histories["__NIFTY50__"] = nifty_history
                     self._log(
                         "all_nse_nifty_yahoo_history_seed",
-                        source="YAHOO_FINANCE_1M",
+                        source="YAHOO_FINANCE_5M",
                         row_count=int(len(nifty_history)),
                         latest_candle_ist=(
                             nifty_history.index.max().isoformat()
@@ -1717,8 +1717,8 @@ class AllNSEMinutePredictor:
             except Exception as exc:
                 quote_error = f"{type(exc).__name__}: {str(exc)[:160]}"
 
-        # This fallback is the close of a real one-minute benchmark candle, not
-        # an exchange-stamped live tick. Require a fresh candle.
+        # This fallback is the close of a real five-minute benchmark candle, not
+        # an exchange-stamped live tick. Require a fresh completed candle.
         with self._lock:
             market = self._market_history.copy()
         if isinstance(market.index, pd.DatetimeIndex) and not market.empty and "Close" in market:
@@ -1753,7 +1753,7 @@ class AllNSEMinutePredictor:
         request-spacing limiter, and inference still enforces strict timestamp and
         freshness checks before any signal can be actionable.
         """
-        minute = _as_ist_timestamp(minute).floor("min")
+        minute = _as_ist_timestamp(minute).floor("5min")
         minute_key = minute.isoformat()
         with self._lock:
             if self._last_history_refresh_minute == minute_key:
@@ -1841,7 +1841,7 @@ class AllNSEMinutePredictor:
         a slow provider request to hang Cloud Scheduler. If the wait expires, the
         stale-history guard still rejects outdated inputs.
         """
-        minute = _as_ist_timestamp(minute).floor("min")
+        minute = _as_ist_timestamp(minute).floor("5min")
         minute_key = minute.isoformat()
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         while True:
@@ -1871,8 +1871,8 @@ class AllNSEMinutePredictor:
             time.sleep(min(0.25, remaining))
 
     def _refresh_current_session_history(self, minute: pd.Timestamp) -> dict[str, Any]:
-        """Refresh genuine one-minute candles; never turn LTP snapshots into OHLC bars."""
-        minute = _as_ist_timestamp(minute).floor("min")
+        """Refresh genuine five-minute candles; never turn LTP snapshots into OHLC bars."""
+        minute = _as_ist_timestamp(minute).floor("5min")
         minute_key = minute.isoformat()
         with self._history_refresh_run_lock:
             if self._last_history_refresh_minute == minute_key:
@@ -2225,8 +2225,8 @@ class AllNSEMinutePredictor:
             }
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
-            fallback=pd.Timestamp.now(tz=IST).floor("min"),
-        ).floor("min")
+            fallback=pd.Timestamp.now(tz=IST).floor("5min"),
+        ).floor("5min")
         minute_key = minute.isoformat()
         capture_status = str(capture_manifest.get("status") or "").strip().upper()
         if capture_status not in {"OK", "PARTIAL"} or not capture_manifest.get("snapshot_drive_path"):
