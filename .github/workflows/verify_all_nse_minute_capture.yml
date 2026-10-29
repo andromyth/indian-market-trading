@@ -306,6 +306,7 @@ jobs:
           trap 'rm -f "$RESPONSE"' EXIT
           CAPTURE_OK=0
           PREDICTION_OK=0
+          PREDICTION_NO_DATA=0
           PROVIDER_OK=0
           CAPTURE_DIAGNOSTIC_OK=0
           PREDICTION_DIAGNOSTIC_OK=0
@@ -355,7 +356,9 @@ jobs:
           for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct","checks","failed_check","error_type","nse_instrument_count","five_minute_history_rows","latest_five_minute_candle_at","reason"):
               if key in payload:
                   print(f"{label}_{key.upper()}={payload.get(key)}")
-          if code == "200" and payload.get("status") == "ok":
+          if code == "200" and payload.get("status") in {"ok", "no_data"}:
+              if payload.get("status") == "no_data":
+                  print(f"{label}_NO_DATA_EXPECTED_FOR_THIS_SLOT")
               sys.exit(0)
           # Valid authenticated diagnostic response, but not a live-ready result.
           sys.exit(1)
@@ -367,7 +370,21 @@ jobs:
                 elif [[ $RC -eq 1 ]]; then CAPTURE_DIAGNOSTIC_OK=1
                 fi
               elif [[ "$PATH_PART" == "predictionz" ]]; then
-                if [[ $RC -eq 0 ]]; then PREDICTION_DIAGNOSTIC_OK=1; [[ "$SESSION_ACTIVE" == "true" ]] && PREDICTION_OK=1
+                if [[ $RC -eq 0 ]]; then
+                  PREDICTION_DIAGNOSTIC_OK=1
+                  if [[ "$SESSION_ACTIVE" == "true" ]]; then
+                    SLOT_STATUS="$(python - "$RESPONSE" <<'PY'
+          import json,sys
+          try:
+              print(json.load(open(sys.argv[1], encoding="utf-8")).get("status", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+                    if [[ "$SLOT_STATUS" == "ok" ]]; then PREDICTION_OK=1
+                    elif [[ "$SLOT_STATUS" == "no_data" ]]; then PREDICTION_NO_DATA=1
+                    fi
+                  fi
                 elif [[ $RC -eq 1 ]]; then PREDICTION_DIAGNOSTIC_OK=1
                 fi
               else
@@ -382,10 +399,12 @@ jobs:
           done
 
           if [[ "$SESSION_ACTIVE" == "true" ]]; then
-            if [[ "$CAPTURE_OK" == "1" ]]; then echo "QUOTE_CAPTURE_VERDICT=PASS"; else echo "QUOTE_CAPTURE_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
-            if [[ "$PREDICTION_OK" == "1" ]]; then echo "PREDICTION_ACTUAL_VERDICT=PASS"; else echo "PREDICTION_ACTUAL_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
-            if [[ "$PROVIDER_OK" == "1" ]]; then echo "INDSTOCKS_PROVIDER_VERDICT=PASS"; else echo "INDSTOCKS_PROVIDER_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
-            [[ "$CAPTURE_OK" == "1" && "$PREDICTION_OK" == "1" && "$PROVIDER_OK" == "1" ]]
+            if [[ "$CAPTURE_OK" == "1" ]]; then echo "QUOTE_CAPTURE_RESULT=STORED"; else echo "QUOTE_CAPTURE_RESULT=NOT_STORED"; fi
+            if [[ "$PREDICTION_OK" == "1" ]]; then echo "PREDICTION_ACTUAL_RESULT=STORED_FOR_ELIGIBLE_STOCKS"
+            elif [[ "$PREDICTION_NO_DATA" == "1" ]]; then echo "PREDICTION_ACTUAL_RESULT=NO_ELIGIBLE_QUOTES_NO_PREDICTION_EXPECTED"
+            else echo "PREDICTION_ACTUAL_RESULT=NO_PREDICTION_STORED"; fi
+            if [[ "$PROVIDER_OK" == "1" ]]; then echo "INDSTOCKS_PROVIDER_RESULT=AVAILABLE"; else echo "INDSTOCKS_PROVIDER_RESULT=UNAVAILABLE"; fi
+            [[ "$CAPTURE_OK" == "1" && ( "$PREDICTION_OK" == "1" || "$PREDICTION_NO_DATA" == "1" ) && "$PROVIDER_OK" == "1" ]]
           else
             if [[ "$CAPTURE_DIAGNOSTIC_OK" == "1" ]]; then echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "QUOTE_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
             if [[ "$PREDICTION_DIAGNOSTIC_OK" == "1" ]]; then echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=PASS"; else echo "PREDICTION_DIAGNOSTIC_AUTH_VERDICT=FAIL_OR_UNVERIFIABLE"; fi
