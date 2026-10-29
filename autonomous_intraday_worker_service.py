@@ -318,7 +318,7 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
         refresh_batches = int(item.get("history_refresh_batch_count") or 0)
         refresh_failures = int(item.get("history_refresh_failed_batches") or 0)
         if refresh_batches <= 0 or refresh_failures / max(1, refresh_batches) > 0.05:
-            reasons.append("current-session one-minute candle refresh is missing or exceeds the 5% failure tolerance")
+            reasons.append("current-session five-minute candle refresh is missing or exceeds the 5% failure tolerance")
         if item.get("quality_gate_pass") is not True:
             reasons.append("prediction quality gate is not passing")
         if item.get("history_ready") is not True:
@@ -353,7 +353,7 @@ def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
     """Verify the worker's own read-only market-data credentials without exposing secrets."""
     from indstocks_client import (
         configured,
-        historical_1m,
+        historical_5m,
         latest_quote,
         profile,
         _load_instruments,
@@ -407,15 +407,15 @@ def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
         return 503, payload
 
     try:
-        candles = historical_1m("RELIANCE.NS", days=3)
+        candles = historical_5m("RELIANCE.NS", days=3)
         if candles is None or candles.empty:
-            raise RuntimeError("no one-minute history returned")
-        payload["checks"]["one_minute_history"] = "PASS"
-        payload["one_minute_history_rows"] = int(len(candles))
-        payload["latest_one_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
+            raise RuntimeError("no five-minute history returned")
+        payload["checks"]["five_minute_history"] = "PASS"
+        payload["five_minute_history_rows"] = int(len(candles))
+        payload["latest_five_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
     except Exception as exc:
-        payload["checks"]["one_minute_history"] = "FAIL"
-        payload["failed_check"] = "one_minute_history"
+        payload["checks"]["five_minute_history"] = "FAIL"
+        payload["failed_check"] = "five_minute_history"
         payload["error_type"] = type(exc).__name__
         return 503, payload
 
