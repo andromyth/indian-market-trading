@@ -136,8 +136,8 @@ jobs:
               sys.exit("No tagged, zero-traffic candidate revision was found.")
           item=matches[0]
           with open(sys.argv[2],"a",encoding="utf-8") as env:
-              env.write("STAGED_REVISION="+item["revisionName"]+"\\n")
-              env.write("STAGED_URL="+item["url"]+"\\n")
+              env.write("STAGED_REVISION="+item["revisionName"]+"\n")
+              env.write("STAGED_URL="+item["url"]+"\n")
           print(item["revisionName"])
           print(item["url"])
           PY
