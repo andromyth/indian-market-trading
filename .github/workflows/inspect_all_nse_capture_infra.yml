@@ -1,7 +1,7 @@
 name: Inspect all-NSE capture infrastructure
 # Follow-up read-only inspection after worker revision rollout.
 # A push to this workflow requests a fresh read-only capture/scheduler diagnostics run.
-# Post-staging diagnostic request: 2026-10-29; verify revision traffic, private invokers, and scheduler state without mutations.
+# Post-current-deploy diagnostic request: 2026-10-29; verify staged revision, traffic, private invokers, and scheduler state without mutations.
 
 on:
   workflow_dispatch:
