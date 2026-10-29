@@ -26,6 +26,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repair-intraday-5m-model]')
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    # The seed-derived universe is used only when the live NSE roster endpoint is unavailable.
     env:
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
