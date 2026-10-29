@@ -46,6 +46,8 @@ Open Google Cloud Console → **Security → Secret Manager**. Create the requir
 
 The worker can use the OAuth user token for both Google Drive reads and writes. A valid service-account JSON is optional; when present and valid, it can be used for Drive read/list operations while OAuth handles writes to the owner's My Drive. The deployment script validates this optional secret silently and falls back to OAuth-only access if it is missing or malformed.
 
+The deployment explicitly sets `INDSTOCKS_AUTH_MODE=totp` only on Cloud Run when all three TOTP secrets are present. Streamlit is forced to `manual` mode in `app.py`, so an existing dashboard token can remain configured without triggering token generation or replacing Cloud Run's token.
+
 The deployment preflight checks actual Google Drive read/write access and refuses to run if it fails. JSON formatting alone is not proof that the account can access the configured Drive folder.
 
 For the required full-universe minute-quote archive, provision **either** a valid `indstocks-access-token` secret (manual token, expires after 24 hours) **or all three** secrets `indstocks-client-id`, `indstocks-mpin` and `indstocks-totp-secret` for automatic read-only authentication. The deploy script maps these secrets into the Cloud Run worker when they exist. Without an available INDstocks authentication method, full-universe snapshots will be marked `BLOCKED_PROVIDER_CREDENTIALS` and the service health will be degraded; a collection attempt is not proof that Drive data was written.
