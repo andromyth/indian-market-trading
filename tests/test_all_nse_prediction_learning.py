@@ -100,48 +100,98 @@ def test_versioned_artifact_with_readiness_suffix_is_fit_eligible():
     assert is_usable_model_version("all_nse_intraday__2026-10-22__abc__READINESS_READY")
 
 
-def test_complete_full_nse_prediction_manifest_is_eligible():
+def test_complete_prediction_manifest_is_eligible():
     assert prediction_manifest_is_clean(prediction_manifest())
 
 
+def test_partial_stored_prediction_slot_is_eligible_without_universe_coverage():
+    manifest = prediction_manifest(
+        status="STORED",
+        quality_gate_pass=False,
+        expected_symbol_count=2620,
+        row_count=1,
+        prediction_count=1,
+        missing_quote_count=2619,
+        data_limited_count=1,
+        untrained_symbol_count=1,
+        model_failure_count=4,
+        history_ready=False,
+        history_seed_coverage_symbols=1,
+        history_seed_failed_batches=10,
+    )
+    assert prediction_manifest_is_clean(manifest)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
-        {"status": "PARTIAL"},
-        {"quality_gate_pass": False},
-        {"row_count": 1},
-        {"prediction_count": 1},
-        {"missing_quote_count": 1},
-        {"data_limited_count": 1},
-        {"untrained_symbol_count": 1},
-        {"model_failure_count": 1},
-        {"history_ready": False},
-        {"history_seed_coverage_symbols": 1},
-        {"history_seed_failed_batches": 1},
+        {"status": "PERSISTENCE_ERROR"},
+        {"row_count": 0},
+        {"prediction_count": 0},
     ],
 )
-def test_partial_or_low_readiness_prediction_slot_is_quarantined(changes):
+def test_prediction_manifest_requires_persisted_prediction_rows(changes):
     assert not prediction_manifest_is_clean(prediction_manifest(**changes))
 
 
-def test_complete_quote_manifest_is_eligible():
-    assert quote_manifest_is_clean(quote_manifest())
+def test_partial_stored_quote_slot_is_eligible_without_universe_coverage():
+    manifest = quote_manifest(
+        status="STORED",
+        expected_symbol_count=2620,
+        row_count=2620,
+        quoted_symbol_count=1,
+        missing_quote_count=2619,
+        unmapped_symbol_count=100,
+    )
+    assert quote_manifest_is_clean(manifest)
 
 
 @pytest.mark.parametrize(
     "changes",
     [
-        {"status": "PARTIAL"},
-        {"row_count": 1},
-        {"quoted_symbol_count": 1},
-        {"missing_quote_count": 1},
-        {"unmapped_symbol_count": 1},
-        {"pending_snapshot_recovery": {"errors": ["upload failed"]}},
-        {"pending_manifest_recovery": {"errors": ["upload failed"]}},
+        {"status": "PERSISTENCE_ERROR"},
+        {"row_count": 0},
+        {"quoted_symbol_count": 0},
+        {"expected_symbol_count": 0},
     ],
 )
-def test_partial_quote_slot_is_quarantined(changes):
+def test_quote_manifest_requires_at_least_one_stored_quote(changes):
     assert not quote_manifest_is_clean(quote_manifest(**changes))
+
+
+def test_stored_per_symbol_prediction_is_consumed_from_partial_slot():
+    pred = _prediction(target="2026-10-01T04:30:00Z")
+    pred.update({
+        "symbol": "AAA",
+        "actual_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_market_value": 100.0,
+        "actual_quote_age_seconds": 5.0,
+        "prediction_status": "PREDICTED",
+        "trained_for_symbol": True,
+        "data_limited": False,
+        "data_readiness_score": 0.95,
+    })
+    quote = pd.DataFrame([{
+        "symbol": "AAA",
+        "quote_observed_at_utc": "2026-10-01T04:00:00Z",
+        "actual_observed_price": 100.0,
+        "quote_status": "PASS",
+    }])
+    manifest = prediction_manifest(
+        status="STORED",
+        quality_gate_pass=False,
+        expected_symbol_count=2620,
+        row_count=1,
+        prediction_count=1,
+        missing_quote_count=2619,
+        data_limited_count=1,
+    )
+    clean, gate = select_row_level_clean_predictions(
+        pd.DataFrame([pred]), quote, manifest
+    )
+    assert clean["symbol"].tolist() == ["AAA"]
+    assert gate["condition_counts"]["prediction_status_eligible"] == 1
+    assert gate["condition_counts"]["all_conditions"] == 1
 
 
 def _prediction(target="2026-10-01T04:30:00Z"):
