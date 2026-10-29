@@ -90,3 +90,23 @@ def test_snapshot_feature_adapter_uses_supplied_day_context_not_fake_candle_ohlc
     assert latest["fno_pcr"] == pytest.approx(1.2)
     assert latest["fno_oi_change"] == pytest.approx(200.0)
     assert latest["fno_available"] == 1.0
+
+
+def test_missing_five_minute_snapshot_stays_a_gap_in_return_features():
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2026-10-28 09:15", tz=IST),
+        pd.Timestamp("2026-10-28 09:20", tz=IST),
+        pd.Timestamp("2026-10-28 09:30", tz=IST),
+    ], name="Datetime")
+    frame = pd.DataFrame({
+        "Close": [100.0, 101.0, 103.0],
+        "Volume": [100.0, 200.0, 500.0],
+        "day_open": [100.0, 100.0, 100.0],
+        "day_high": [100.0, 101.0, 103.0],
+        "day_low": [100.0, 100.0, 100.0],
+        "day_volume": [100.0, 300.0, 800.0],
+    }, index=idx)
+
+    features = make_snapshot_feature_frame(frame)
+
+    assert pd.isna(features.loc[pd.Timestamp("2026-10-28 09:30", tz=IST), "ret_5m"])
