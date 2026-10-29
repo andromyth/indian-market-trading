@@ -849,7 +849,7 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
             index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         ),
     )
-    candle_ts = int((minute - pd.Timedelta(minutes=1)).timestamp())
+    candle_ts = int((minute - pd.Timedelta(minutes=5)).timestamp())
     requests = []
 
     class FakeResponse:
