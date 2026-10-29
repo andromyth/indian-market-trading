@@ -118,7 +118,8 @@ def build_snapshot_training_cache(root: Path, cache_root: Path) -> dict[str, Any
         "'" + str(path.resolve()).replace("\\", "/").replace("'", "''") + "'"
         for path in files
     ) + "]"
-    destination = str(cache_root.resolve()).replace("\\", "/").replace("'", "''")
+    partition_root = cache_root / "by_symbol"
+    destination = str(partition_root.resolve()).replace("\\", "/").replace("'", "''")
     query = f"""
         COPY (
             WITH raw AS (
@@ -208,7 +209,7 @@ def build_snapshot_training_cache(root: Path, cache_root: Path) -> dict[str, Any
 def load_symbol(root: Path, sym: str) -> pd.DataFrame:
     """Read one symbol's ordered history from the one-pass snapshot-only cache."""
     cache_root = _SNAPSHOT_CACHE_ROOT or (Path(root) / "snapshot_training_cache")
-    symbol_dir = cache_root / f"symbol={str(sym).strip().upper()}"
+    symbol_dir = cache_root / "by_symbol" / f"symbol={str(sym).strip().upper()}"
     if not symbol_dir.exists():
         return pd.DataFrame()
     parts = []
