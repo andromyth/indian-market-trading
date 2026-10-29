@@ -24,7 +24,7 @@ The prediction folder also receives `manifest_YYYYMMDD_HHMM.json` and `latest_ma
 
 - Forecast target: 30 minutes ahead (`target_30m`).
 - Live features use schema `nse_5m_snapshot_close_v1`, with a declared input cadence of five minutes. Low-readiness forecasts may be recorded for analysis, but their actionable manual signal remains `HOLD` when feature readiness is below 70% or the symbol is outside the training-symbol manifest.
-- The training candidate uses the same five-minute endpoint alignment and feature schema. Historical one-minute OHLCV is aggregated to completed five-minute endpoints only as an offline training source; it is not a live inference dependency.
+- The training candidate reads the persisted full-universe five-minute snapshot archive itself and uses the same feature schema as live inference. It refuses to fall back to the one-minute candle archive if the saved five-minute snapshots are missing.
 - The previous one-minute-trained artifact is intentionally rejected unless its manifest contains the exact five-minute schema version, cadence, feature list, and matching artifact hashes. Retrain and verify a compatible bundle before promoting or deploying this change.
 - The worker writes a row even when quote/history/inference is unavailable. Failed fields remain null and the row status records why; missing values are never fabricated.
 - The prediction manifest is `OK` only when coverage, model/schema integrity, feature readiness and persistence quality gates pass. Otherwise it remains `PARTIAL` or `PERSISTENCE_ERROR`. The minimum prediction-coverage gate remains 95%.
