@@ -2692,12 +2692,6 @@ class AllNSEMinutePredictor:
                 hist = hist.loc[hist.index < minute].tail(HISTORY_LOOKBACK_BARS)
             elif not hist.empty:
                 hist = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-            history_age_minutes = None
-            if not hist.empty and isinstance(hist.index, pd.DatetimeIndex):
-                latest_history_at = _as_ist_timestamp(hist.index.max())
-                history_age_minutes = max(
-                    0.0, (minute - latest_history_at).total_seconds() / 60.0
-                )
             quote_info, price_row, raw_day_volume = _current_minute_row(
                 symbol=symbol,
                 snapshot_minute=minute,
@@ -2743,20 +2737,39 @@ class AllNSEMinutePredictor:
                 model_failures += 1
             elif price_row is not None:
                 try:
-                    session_hist = hist.loc[pd.Index(hist.index.date) == minute.date()] if not hist.empty else hist
+                    snapshot_values = {
+                        **price_row,
+                        "day_open": _safe_float(quote.get("day_open")),
+                        "day_high": _safe_float(quote.get("day_high")),
+                        "day_low": _safe_float(quote.get("day_low")),
+                        "day_volume": _safe_float(quote.get("day_volume")),
+                    }
+                    current_feature_row = pd.DataFrame(
+                        [snapshot_values],
+                        index=pd.DatetimeIndex([minute], tz=IST, name="Datetime"),
+                    )
+                    feature_history = pd.concat([hist, current_feature_row]).sort_index()
+                    feature_history = feature_history.loc[
+                        ~feature_history.index.duplicated(keep="last")
+                    ].tail(SNAPSHOT_HISTORY_LOOKBACK_BARS)
+                    session_hist = feature_history.loc[
+                        pd.Index(feature_history.index.date) == minute.date()
+                    ]
+                    latest_feature_slot = _as_ist_timestamp(feature_history.index.max())
+                    feature_age_minutes = max(
+                        0.0, (minute - latest_feature_slot).total_seconds() / 60.0
+                    )
                     if len(session_hist) < MIN_SESSION_CANDLES_FOR_PREDICTION:
                         quote_info["prediction_status"] = "INSUFFICIENT_SESSION_HISTORY"
-                    elif hist.empty:
-                        quote_info["prediction_status"] = "INSUFFICIENT_HISTORY"
-                    elif history_age_minutes is None or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
+                    elif feature_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
                         quote_info["prediction_status"] = "STALE_HISTORY"
                         quote_info["error"] = (
-                            "Latest prior five-minute snapshot is missing or older than "
+                            "Latest five-minute snapshot input is missing or older than "
                             f"{MAX_HISTORY_CANDLE_AGE_MINUTES} minutes at the decision slot."
                         )
                     else:
                         model_feature_row = self._model_api._latest_features(
-                            hist,
+                            feature_history,
                             market_df=market_history_before_minute,
                             fno=fno_context_by_symbol.get(symbol),
                             decision_timestamp=actual_ts,
