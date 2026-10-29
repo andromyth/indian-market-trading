@@ -181,12 +181,15 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     )
     predictor._history = {"AAA": history.copy(), "BBB": history.copy()}
     predictor._market_history = history.copy()
+    feature_input_timestamps = []
+
+    def fake_latest_features(price_df, market_df=None, fno=None, decision_timestamp=None):
+        feature_input_timestamps.append(pd.Timestamp(price_df.index.max()))
+        return {"f1": 1.0, "f2": 0.5}
+
     predictor._model_api = SimpleNamespace(
         FEATURES=["f1", "f2"],
-        _latest_features=lambda price_df, market_df=None, fno=None, decision_timestamp=None: {
-            "f1": 1.0,
-            "f2": 0.5,
-        },
+        _latest_features=fake_latest_features,
     )
     predictor._classifier = SimpleNamespace(
         predict_proba=lambda frame: np.array([[0.2, 0.8], [0.8, 0.2]])
@@ -250,6 +253,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     assert result["prediction_count"] == 2
     assert result["prediction_status_counts"] == {"PASS": 2}
     assert result["quality_gate_pass"] is True
+    assert feature_input_timestamps == [minute, minute], "inference must consume the same-slot persisted snapshot"
 
     written = pd.read_parquet(
         tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
