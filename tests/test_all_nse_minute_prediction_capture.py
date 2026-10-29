@@ -712,9 +712,9 @@ def test_partial_seed_refresh_only_requests_symbols_with_cached_history(tmp_path
     predictor._symbols = ["AAA", "BBB"]
     predictor._codes = {"AAA": "NSE_100", "BBB": "NSE_101"}
     idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
+        end=minute - pd.Timedelta(minutes=5),
         periods=20,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -970,11 +970,11 @@ def test_nifty_context_is_fetched_before_indstocks_instrument_auth(tmp_path, mon
     monkeypatch.setattr(indstocks_client, "configured", lambda: True)
 
     predictor = capture.AllNSEMinutePredictor(tmp_path)
-    cutoff = pd.Timestamp.now(tz=IST).floor("min")
+    cutoff = pd.Timestamp.now(tz=IST).floor("5min")
     idx = pd.date_range(
-        end=cutoff - pd.Timedelta(minutes=1),
+        end=cutoff,
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -1075,7 +1075,7 @@ def test_daily_fno_context_is_point_in_time_and_reaches_model_features():
     idx = pd.date_range(
         "2026-10-28 09:15:00",
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -1136,7 +1136,7 @@ def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_pa
     idx = pd.date_range(
         "2026-10-26 15:20:00",
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
