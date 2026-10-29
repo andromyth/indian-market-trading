@@ -17,14 +17,19 @@ First, open the official INDstocks API access page:
 
 https://www.indstocks.com/app/api-trading/access-tokens
 
-Complete the site's Setup TOTP flow. Securely save the TOTP secret when it is shown; it is not retrievable later. Record the Client ID shown after setup and use your INDstocks account MPIN. Then replace the manual-token setting in Streamlit Secrets with:
+Complete the site's Setup TOTP flow. Securely save the TOTP secret when it is shown; it is not retrievable later. Record the Client ID shown after setup and use your INDstocks account MPIN.
 
-    INDSTOCKS_CLIENT_ID = "YOUR_CLIENT_ID"
-    INDSTOCKS_MPIN = "YOUR_ACCOUNT_MPIN"
-    INDSTOCKS_TOTP_SECRET = "YOUR_BASE32_TOTP_SECRET"
-    INDSTOCKS_TIMEOUT_SECONDS = "12"
+**Configure TOTP credentials in Google Cloud Secret Manager for Cloud Run only:**
 
-Do not keep the token-generation secret in GitHub. The app computes the six-digit TOTP locally and calls the documented token-generation endpoint. The client caches the resulting token in process memory and refreshes it before the 24-hour expiry; it does not write credentials or tokens to disk.
+| Secret Manager name | Value |
+|---|---|
+| `indstocks-client-id` | INDstocks Client ID |
+| `indstocks-mpin` | INDstocks account MPIN |
+| `indstocks-totp-secret` | Base32 TOTP secret |
+
+Do not add these three credentials to Streamlit Secrets or run TOTP authentication from a local script or GitHub Actions job. The Streamlit app is intentionally pinned to manual-token mode. The Cloud Run deployment maps these Secret Manager values to the corresponding environment variables and explicitly selects `INDSTOCKS_AUTH_MODE=totp`.
+
+The Cloud Run process computes the six-digit TOTP locally and calls the documented token-generation endpoint. The client caches the resulting token in process memory and refreshes it before the 24-hour expiry; it does not write credentials or tokens to disk.
 
 **Token ownership:** the Streamlit dashboard is forced into manual-token mode and must not mint TOTP tokens. Its existing `INDSTOCKS_ACCESS_TOKEN` setting is left untouched. Cloud Run explicitly uses `INDSTOCKS_AUTH_MODE=totp` and is the only deployed process allowed to generate tokens. In every other process, the default mode is `manual`; merely having TOTP secrets present cannot trigger token generation.
 
@@ -32,13 +37,13 @@ Important token constraint: INDstocks documents that only one TOTP-generated tok
 
 ## Verify the connection
 
-From a local terminal where credentials are supplied as environment variables, run:
+To test a **manual token** from a local terminal, set `INDSTOCKS_AUTH_MODE=manual` and `INDSTOCKS_ACCESS_TOKEN`, then run:
 
     python indstocks_smoke_test.py
 
-The test checks API authentication without printing profile details, requests one live quote for RELIANCE, and retrieves recent one-minute candles. It reports success/failure and the row count, not your credentials.
+The test checks API authentication without printing profile details, requests one live quote for RELIANCE, and retrieves recent one-minute candles. It reports success/failure and the row count, not your credentials. Do not run a local TOTP-mode smoke test while Cloud Run owns the account token: generating another token can invalidate Cloud Run's token.
 
-If testing inside Streamlit Community Cloud, configure Secrets first; the production dashboard automatically uses the provider on its next run. Confirm the data source label shows INDSTOCKS_API for the live one-minute feed while the market is open. Outside market hours, the quote may be the last available quote; do not interpret it as a live tradable price without checking its timestamp/market status.
+The Streamlit dashboard continues using its existing manual token and does not mint TOTP tokens. If the token expires or is invalidated, Streamlit requests may fail; it still will not generate a replacement. Cloud Run is the sole TOTP-token owner.
 
 ## Static IP
 
