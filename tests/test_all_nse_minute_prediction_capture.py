@@ -1268,5 +1268,5 @@ def test_old_one_minute_model_manifest_is_rejected_when_hashes_match(monkeypatch
     assert status["artifact_hashes_match"] is True
     assert status["feature_schema_match"] is False
     assert status["manifest_sha256_match"] is False
-    with pytest.raises(RuntimeError, match="hashes do not match manifest"):
+    with pytest.raises(RuntimeError, match="five-minute snapshot feature schema"):
         model._models()
