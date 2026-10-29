@@ -125,7 +125,7 @@ jobs:
           RESPONSE="$(mktemp)"
           trap 'rm -f "$SERVICE_JSON" "$RESPONSE"' EXIT
           gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > "$SERVICE_JSON"
-          python - "$SERVICE_JSON" "$GITHUB_ENV" <<'PY'
+          STAGED_VALUES="$(python - "$SERVICE_JSON" "$GITHUB_ENV" <<'PY'
           import json, sys
           payload=json.load(open(sys.argv[1],encoding="utf-8"))
           matches=[
@@ -136,10 +136,20 @@ jobs:
               sys.exit("No tagged, zero-traffic candidate revision was found.")
           item=matches[0]
           with open(sys.argv[2],"a",encoding="utf-8") as env:
-              env.write("STAGED_REVISION="+item["revisionName"]+"\n")
-              env.write("STAGED_URL="+item["url"]+"\n")
-          print("STAGED_REVISION_READY=true")
+              env.write("STAGED_REVISION="+item["revisionName"]+"\\n")
+              env.write("STAGED_URL="+item["url"]+"\\n")
+          print(item["revisionName"])
+          print(item["url"])
           PY
+          )"
+          mapfile -t STAGED_INFO <<< "$STAGED_VALUES"
+          STAGED_REVISION="${STAGED_INFO[0]:-}"
+          STAGED_URL="${STAGED_INFO[1]:-}"
+          [[ -n "$STAGED_REVISION" && -n "$STAGED_URL" ]] || {
+            echo "Staged candidate revision metadata is incomplete." >&2
+            exit 1
+          }
+          echo "STAGED_REVISION_READY=true"
           echo "STAGED_REVISION=$STAGED_REVISION"
           MODEL_OK=0
           for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
