@@ -1211,3 +1211,74 @@ def test_empty_snapshot_slot_skips_prediction_without_failing_other_slots(tmp_pa
     assert result["status"] == "NO_ELIGIBLE_SYMBOLS"
     assert result["prediction_count"] == 0
     assert not list((tmp_path / "all_nse_minute_predictions").rglob("predictions_*.parquet"))
+
+
+def _fake_model_drive_store(folder_names, complete_folder_names):
+    import all_nse_intraday_model as model
+
+    folders = [
+        {
+            "id": f"folder-{name}",
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        for name in folder_names
+    ]
+    files_by_parent = {}
+    for name in complete_folder_names:
+        files_by_parent[f"folder-{name}"] = {
+            filename: {"id": f"{name}-{filename}", "name": filename}
+            for filename in model.MODEL_BUNDLE_FILES
+        }
+
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def execute(self):
+            return self.payload
+
+    class Files:
+        def list(self, **kwargs):
+            parent_id = kwargs["q"].split("'")[1]
+            return Request({"files": folders if parent_id == "models-id" else []})
+
+    class Store:
+        service = type("Service", (), {"files": lambda _self: Files()})()
+
+        def _find_child(self, parent_id, name, **_kwargs):
+            return files_by_parent.get(parent_id, {}).get(name)
+
+    return Store()
+
+
+def test_model_drive_path_resolves_one_complete_sibling_bundle():
+    import all_nse_intraday_model as model
+
+    store = _fake_model_drive_store(
+        ["legacy_delivery", "intraday_candidate_2026"],
+        ["intraday_candidate_2026"],
+    )
+    assert model._discover_model_bundle_folder(store, "models-id") == "folder-intraday_candidate_2026"
+
+
+def test_model_drive_path_rejects_ambiguous_sibling_bundles():
+    import all_nse_intraday_model as model
+
+    store = _fake_model_drive_store(
+        ["intraday_candidate_a", "intraday_candidate_b"],
+        ["intraday_candidate_a", "intraday_candidate_b"],
+    )
+    with pytest.raises(RuntimeError, match="Multiple complete five-minute model bundles"):
+        model._discover_model_bundle_folder(store, "models-id")
+
+
+def test_model_drive_path_fails_closed_when_no_complete_bundle_exists():
+    import all_nse_intraday_model as model
+
+    store = _fake_model_drive_store(
+        ["legacy_delivery", "intraday_training_logs"],
+        [],
+    )
+    with pytest.raises(FileNotFoundError, match="no sibling contains the exact manifest"):
+        model._discover_model_bundle_folder(store, "models-id")
