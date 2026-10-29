@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import os
 
-from snapshot_5m_features import SNAPSHOT_CADENCE_MINUTES
+from snapshot_5m_features import READINESS_FEATURES, SNAPSHOT_CADENCE_MINUTES
 
 import calibration_overlay as calibration_overlay_module
 
@@ -328,8 +328,9 @@ def _current_minute_row(
         "model_target": "target_30m",
         "model_coverage_symbols": None,
         "trained_for_symbol": None,
-        "feature_count": 34,
+        "feature_count": len(READINESS_FEATURES) + 5,
         "non_missing_feature_count": 0,
+        "readiness_feature_count": len(READINESS_FEATURES),
         "data_readiness_score": 0.0,
         "data_limited": True,
         "forecast_target_timestamp_utc": None,
@@ -2860,7 +2861,7 @@ class AllNSEMinutePredictor:
                     row = record_by_symbol[symbol]
                     probability = float(probs[idx])
                     expected_return = float(expected_returns[idx]) if np.isfinite(expected_returns[idx]) else None
-                    readiness = float(x.iloc[idx].notna().mean())
+                    readiness = float(x.iloc[idx].reindex(READINESS_FEATURES).notna().mean())
                     decision_ts = _as_ist_timestamp(
                         row.get("actual_observed_at_ist"),
                         fallback=minute,
@@ -2902,6 +2903,7 @@ class AllNSEMinutePredictor:
                         ),
                         "feature_count": len(self._model_api.FEATURES),
                         "non_missing_feature_count": int(x.iloc[idx].notna().sum()),
+                        "readiness_feature_count": len(READINESS_FEATURES),
                         "data_readiness_score": readiness if np.isfinite(readiness) else None,
                         "data_limited": data_limited,
                         "forecast_target_timestamp_utc": (
@@ -3026,8 +3028,9 @@ class AllNSEMinutePredictor:
                     "model_target": "target_30m",
                     "model_coverage_symbols": None,
                     "trained_for_symbol": None,
-                    "feature_count": 34,
+                    "feature_count": len(READINESS_FEATURES) + 5,
                     "non_missing_feature_count": 0,
+                    "readiness_feature_count": len(READINESS_FEATURES),
                     "data_readiness_score": 0.0,
                     "data_limited": True,
                     "forecast_target_timestamp_utc": None,
