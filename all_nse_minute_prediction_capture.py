@@ -292,7 +292,7 @@ def _current_minute_row(
 
     output = {
         "record_type": "all_nse_minute_prediction_actual",
-        "schema_version": "all-nse-minute-prediction-v1",
+        "schema_version": "all-nse-5m-prediction-v2",
         "snapshot_minute_ist": snapshot_minute.isoformat(),
         "symbol": symbol,
         "exchange": "NSE",
@@ -2644,7 +2644,7 @@ class AllNSEMinutePredictor:
             if row is None:
                 row = {
                     "record_type": "all_nse_minute_prediction_actual",
-                    "schema_version": "all-nse-minute-prediction-v1",
+                    "schema_version": "all-nse-5m-prediction-v2",
                     "snapshot_minute_ist": minute.isoformat(),
                     "symbol": symbol,
                     "exchange": "NSE",
@@ -2744,8 +2744,8 @@ class AllNSEMinutePredictor:
             and refresh_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
         )
         manifest = {
-            "audit_name": "all-nse-minute-prediction-actual-capture",
-            "schema_version": "all-nse-minute-prediction-v1",
+            "audit_name": "all-nse-5m-prediction-actual-capture",
+            "schema_version": "all-nse-5m-prediction-v2",
             "capture_interval_minutes": 5,
             "history_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "feature_bar_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
