@@ -6,11 +6,11 @@ Each worker five-minute slot stores its observed quote snapshot at:
 
 `production_data/all_universe_minute_snapshots/YYYY/MM/DD/snapshot_YYYYMMDD_HHMM.parquet`
 
-The corresponding prediction file is stored at:
+When at least one symbol has a valid stored quote, its per-stock prediction rows are stored at:
 
 `production_data/all_nse_minute_predictions/YYYY/MM/DD/predictions_YYYYMMDD_HHMM.parquet`
 
-The prediction folder also receives `manifest_YYYYMMDD_HHMM.json` and the `latest_manifest.json` pointer. Upload receipts are retained locally when Drive confirms writes.
+The prediction folder also receives `manifest_YYYYMMDD_HHMM.json` and the `latest_manifest.json` pointer for slots that run prediction. If no symbol has a valid quote, no prediction rows are generated; the source quote snapshot remains the record for that slot. Upload receipts are retained locally when Drive confirms writes.
 
 ## Per-stock eligibility
 
