@@ -250,6 +250,8 @@ def model_status() -> dict[str,Any]:
         "target":m.get("target"),
         "model_version":str(artifact_version or "unversioned"),
         "feature_count":len(FEATURES),
+        "feature_schema_version":m.get("feature_schema_version"),
+        "input_cadence_minutes":m.get("input_cadence_minutes"),
         "training_symbols":m.get("training_symbols",[]),
         "training_symbol_count":m.get("training_symbol_count"),
         "universe_size":m.get("universe_size"),
