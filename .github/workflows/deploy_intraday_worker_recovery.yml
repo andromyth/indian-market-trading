@@ -136,8 +136,8 @@ jobs:
               sys.exit("No tagged, zero-traffic candidate revision was found.")
           item=matches[0]
           with open(sys.argv[2],"a",encoding="utf-8") as env:
-              env.write("STAGED_REVISION="+item["revisionName"]+"\\n")
-              env.write("STAGED_URL="+item["url"]+"\\n")
+              env.write("STAGED_REVISION="+item["revisionName"]+"\n")
+              env.write("STAGED_URL="+item["url"]+"\n")
           print("STAGED_REVISION_READY=true")
           PY
           echo "STAGED_REVISION=$STAGED_REVISION"
@@ -206,10 +206,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gcloud run services update-traffic indian-market-intraday-worker \\
-            --project="$PROJECT_ID" \\
+          gcloud run services update-traffic indian-market-intraday-worker \
+            --project="$PROJECT_ID" \
             --region="$REGION" \\
-            --to-revisions="$STAGED_REVISION=100" \\
+            --to-revisions="$STAGED_REVISION=100" \
             --quiet
           echo "PRODUCTION_TRAFFIC_PROMOTED_REVISION=$STAGED_REVISION"
 
