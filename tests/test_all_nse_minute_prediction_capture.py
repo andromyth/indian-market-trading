@@ -181,12 +181,15 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     )
     predictor._history = {"AAA": history.copy(), "BBB": history.copy()}
     predictor._market_history = history.copy()
+    feature_input_timestamps = []
+
+    def fake_latest_features(price_df, market_df=None, fno=None, decision_timestamp=None):
+        feature_input_timestamps.append(pd.Timestamp(price_df.index.max()))
+        return {"f1": 1.0, "f2": 0.5}
+
     predictor._model_api = SimpleNamespace(
         FEATURES=["f1", "f2"],
-        _latest_features=lambda price_df, market_df=None, fno=None, decision_timestamp=None: {
-            "f1": 1.0,
-            "f2": 0.5,
-        },
+        _latest_features=fake_latest_features,
     )
     predictor._classifier = SimpleNamespace(
         predict_proba=lambda frame: np.array([[0.2, 0.8], [0.8, 0.2]])
@@ -250,6 +253,7 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     assert result["prediction_count"] == 2
     assert result["prediction_status_counts"] == {"PASS": 2}
     assert result["quality_gate_pass"] is True
+    assert feature_input_timestamps == [minute, minute], "inference must consume the same-slot persisted snapshot"
 
     written = pd.read_parquet(
         tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
@@ -372,7 +376,7 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
 def test_stale_market_history_is_excluded_from_feature_context():
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=8),
+        minute - pd.Timedelta(minutes=13),
         periods=3,
         freq="min",
         tz=IST,
@@ -400,7 +404,7 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     stale_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=12),
         periods=4,
         freq="min",
         tz=IST,
@@ -502,6 +506,9 @@ def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, 
         "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
         "training_symbols": ["AAA"],
         "training_symbol_count": 1,
+        "feature_schema_version": model.FEATURE_SCHEMA_VERSION,
+        "input_cadence_minutes": model.SNAPSHOT_CADENCE_MINUTES,
+        "features": model.FEATURES,
     }
     local_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     local_classifier.write_bytes(b"stale-classifier")
@@ -1224,3 +1231,42 @@ def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp
     assert set(second["SYMBOL"]) == {"AAA", "BBB"}
     assert second["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
 
+
+
+
+def test_old_one_minute_model_manifest_is_rejected_when_hashes_match(monkeypatch, tmp_path):
+    import hashlib
+    import json
+    import all_nse_intraday_model as model
+
+    monkeypatch.setattr(model, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(model, "LOCAL_MANIFEST", tmp_path / "manifest.json")
+    monkeypatch.setattr(model, "LOCAL_CLASSIFIER", tmp_path / "classifier.joblib")
+    monkeypatch.setattr(model, "LOCAL_REGRESSOR", tmp_path / "regressor.joblib")
+    monkeypatch.setattr(model, "_MODEL_CACHE", {})
+
+    classifier_bytes = b"old-one-minute-classifier"
+    regressor_bytes = b"old-one-minute-regressor"
+    model.LOCAL_CLASSIFIER.write_bytes(classifier_bytes)
+    model.LOCAL_REGRESSOR.write_bytes(regressor_bytes)
+    old_manifest = {
+        "status": "REPLACEMENT",
+        "model_version": "legacy-one-minute",
+        "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
+        "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
+        "training_symbols": ["AAA"],
+        "training_symbol_count": 1,
+        "feature_count": 34,
+        "features": ["ret_1", "ret_3", "ret_5"],
+        "input_cadence_minutes": 1,
+        "feature_schema_version": "legacy_one_minute",
+    }
+    model.LOCAL_MANIFEST.write_text(json.dumps(old_manifest), encoding="utf-8")
+
+    status = model.model_status()
+
+    assert status["artifact_hashes_match"] is True
+    assert status["feature_schema_match"] is False
+    assert status["manifest_sha256_match"] is False
+    with pytest.raises(RuntimeError, match="five-minute snapshot feature schema"):
+        model._models()
