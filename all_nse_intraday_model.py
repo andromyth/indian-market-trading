@@ -16,14 +16,10 @@ import joblib
 import numpy as np
 import pandas as pd
 
-FEATURES = [
-    "ret_1","ret_3","ret_5","ret_10","ret_15","ret_30",
-    "rsi14","atr14_pct","ma5_ratio","ma10_ratio","ma20_ratio","ma50_ratio",
-    "range_pct","body_pct","volume_ratio","volume_z20","tod_sin","tod_cos",
-    "market_ret_1","market_ret_3","market_ret_5","market_ret_10","market_ret_15","market_ret_30",
-    "market_rsi14","relative_ret_1","relative_ret_5","relative_ret_15",
-    "fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis","fno_available",
-]
+from snapshot_5m_features import (
+    FEATURES, FEATURE_SCHEMA_VERSION, SNAPSHOT_CADENCE_MINUTES,
+    latest_snapshot_features,
+)
 
 DRIVE_MODEL_ROOT = "models/all_nse_intraday_multifactor_replacement_2026"
 REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_MULTIFACTOR_2026_MODEL_MANIFEST.json"
@@ -133,58 +129,15 @@ def _market_series(market_df: pd.DataFrame | None) -> pd.Series:
     return pd.to_numeric(m["Close"], errors="coerce") if not m.empty else pd.Series(dtype=float)
 
 
-def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = None,
-                     fno: dict[str, Any] | None = None,
-                     decision_timestamp: Any = None) -> dict[str, float]:
-    x = _norm(price_df)
-    if x.empty or x["Close"].dropna().empty:
-        raise ValueError("No usable intraday OHLC data")
-    c,h,l,o,v = x["Close"],x["High"],x["Low"],x["Open"],x["Volume"]
-    close = _safe(c.iloc[-1]); open_ = _safe(o.iloc[-1])
-    vals = {
-        "ret_1":_session_aware_returns(c,1),"ret_3":_session_aware_returns(c,3),"ret_5":_session_aware_returns(c,5),
-        "ret_10":_session_aware_returns(c,10),"ret_15":_session_aware_returns(c,15),"ret_30":_session_aware_returns(c,30),
-        "rsi14":_rsi(c),"atr14_pct":_atr_pct(x),
-        "ma5_ratio":_safe(close/c.rolling(5,min_periods=5).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(5,min_periods=5).mean().iloc[-1] else np.nan,
-        "ma10_ratio":_safe(close/c.rolling(10,min_periods=10).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(10,min_periods=10).mean().iloc[-1] else np.nan,
-        "ma20_ratio":_safe(close/c.rolling(20,min_periods=20).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(20,min_periods=20).mean().iloc[-1] else np.nan,
-        "ma50_ratio":_safe(close/c.rolling(50,min_periods=50).mean().iloc[-1]-1) if np.isfinite(close) and c.rolling(50,min_periods=50).mean().iloc[-1] else np.nan,
-        "range_pct":_safe((h.iloc[-1]-l.iloc[-1])/close) if np.isfinite(close) and close else np.nan,
-        "body_pct":_safe((close-open_)/open_) if np.isfinite(close) and np.isfinite(open_) and open_ else np.nan,
-    }
-    vma = v.rolling(20,min_periods=20).mean().iloc[-1]
-    vsd = v.rolling(20,min_periods=20).std().iloc[-1]
-    vals["volume_ratio"] = _safe(v.iloc[-1]/vma) if np.isfinite(v.iloc[-1]) and np.isfinite(vma) and vma else np.nan
-    vals["volume_z20"] = _safe((v.iloc[-1]-vma)/vsd) if np.isfinite(v.iloc[-1]) and np.isfinite(vma) and np.isfinite(vsd) and vsd else np.nan
-    ts = x.index[-1]
-    if decision_timestamp is not None:
-        q = pd.Timestamp(decision_timestamp)
-        if q.tzinfo is None: q=q.tz_localize("Asia/Kolkata")
-        ts=q.tz_convert("Asia/Kolkata")
-    minutes = ts.hour*60+ts.minute
-    vals["tod_sin"]=float(np.sin(2*np.pi*minutes/390.0))
-    vals["tod_cos"]=float(np.cos(2*np.pi*minutes/390.0))
-
-    mc = _market_series(market_df)
-    vals["market_ret_1"]=_session_aware_returns(mc,1)
-    vals["market_ret_3"]=_session_aware_returns(mc,3)
-    vals["market_ret_5"]=_session_aware_returns(mc,5)
-    vals["market_ret_10"]=_session_aware_returns(mc,10)
-    vals["market_ret_15"]=_session_aware_returns(mc,15)
-    vals["market_ret_30"]=_session_aware_returns(mc,30)
-    vals["market_rsi14"]=_rsi(mc)
-    vals["relative_ret_1"] = _safe(vals["ret_1"]-vals["market_ret_1"]) if np.isfinite(vals["ret_1"]) and np.isfinite(vals["market_ret_1"]) else np.nan
-    vals["relative_ret_5"] = _safe(vals["ret_5"]-vals["market_ret_5"]) if np.isfinite(vals["ret_5"]) and np.isfinite(vals["market_ret_5"]) else np.nan
-    vals["relative_ret_15"] = _safe(vals["ret_15"]-vals["market_ret_15"]) if np.isfinite(vals["ret_15"]) and np.isfinite(vals["market_ret_15"]) else np.nan
-
-    fno = fno or {}
-    vals["fno_pcr"]=_safe(fno.get("pcr", fno.get("fno_pcr")))
-    vals["fno_oi_change"]=_safe(fno.get("oi_change", fno.get("fno_oi_change")))
-    vals["fno_fut_return"]=_safe(fno.get("fut_return", fno.get("fno_fut_return")))
-    vals["fno_fut_oi"]=_safe(fno.get("fut_oi", fno.get("fno_fut_oi")))
-    vals["fno_basis"]=_safe(fno.get("basis", fno.get("fno_basis")))
-    vals["fno_available"]=1.0 if any(pd.notna(vals[k]) for k in ["fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis"]) else 0.0
-    return {k:_safe(vals.get(k)) for k in FEATURES}
+def _latest_features(
+    price_df: pd.DataFrame,
+    market_df: pd.DataFrame | None = None,
+    fno: dict[str, Any] | None = None,
+    decision_timestamp: Any = None,
+) -> dict[str, float]:
+    """Build features from five-minute snapshots; no one-minute history feed is used."""
+    del market_df, decision_timestamp
+    return latest_snapshot_features(price_df, fno=fno)
 
 
 def _drive_download(remote: str, local: Path) -> None:
@@ -271,6 +224,8 @@ def model_target_contract() -> dict[str, Any]:
         "signal_policy": "BUY if p>=0.60, SELL if p<=0.40, otherwise HOLD",
         "feature_count": len(FEATURES),
         "features": FEATURES,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "input_cadence_minutes": SNAPSHOT_CADENCE_MINUTES,
     }
 
 
@@ -302,10 +257,24 @@ def model_status() -> dict[str,Any]:
         "trained_until":m.get("trained_until"),
         "classifier_sha256":classifier_sha or None,
         "regressor_sha256":regressor_sha or None,
-        "manifest_sha256_match": all([
+        "artifact_hashes_match": all([
             LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
             LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
         ]),
+        "feature_schema_match": (
+            m.get("feature_schema_version") == FEATURE_SCHEMA_VERSION
+            and int(m.get("input_cadence_minutes") or 0) == SNAPSHOT_CADENCE_MINUTES
+            and list(m.get("features") or []) == FEATURES
+        ),
+        "manifest_sha256_match": bool(
+            all([
+                LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
+                LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
+            ])
+            and m.get("feature_schema_version") == FEATURE_SCHEMA_VERSION
+            and int(m.get("input_cadence_minutes") or 0) == SNAPSHOT_CADENCE_MINUTES
+            and list(m.get("features") or []) == FEATURES
+        ),
         "model_path_classifier":str(LOCAL_CLASSIFIER),
         "model_path_regressor":str(LOCAL_REGRESSOR),
     }
