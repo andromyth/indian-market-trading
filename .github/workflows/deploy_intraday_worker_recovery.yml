@@ -88,6 +88,54 @@ jobs:
         with:
           project_id: indian-market-trading
 
+      - name: Read configured Drive root from the existing private worker health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
+          ROOT_OK=0
+          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            if [[ "$SA" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            fi
+            [[ -n "$TOKEN" ]] || continue
+            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$SERVICE_URL/")" || HTTP_CODE=000
+            set +e
+            python - "$RESPONSE" "$HTTP_CODE" "$GITHUB_ENV" <<'PY'
+          import json, os, sys
+          path, code, env_path = sys.argv[1:]
+          try:
+              data = json.load(open(path, encoding="utf-8"))
+          except Exception:
+              sys.exit(1)
+          drive = data.get("drive_preflight") or {}
+          root_id = str(drive.get("root_folder_id") or "").strip()
+          ok = (
+              data.get("drive_preflight_status") == "OK"
+              and drive.get("reachable") is True
+              and drive.get("write_ready") is True
+              and bool(root_id)
+          )
+          if ok:
+              with open(env_path, "a", encoding="utf-8") as env:
+                  env.write("GOOGLE_DRIVE_ROOT_ID=" + root_id + "\\n")
+              print("EXISTING_WORKER_DRIVE_PREFLIGHT=PASS write_ready=true")
+              sys.exit(0)
+          sys.exit(1)
+          PY
+            RC=$?
+            set -e
+            if [[ "$RC" -eq 0 ]]; then ROOT_OK=1; break; fi
+          done
+          if [[ "$ROOT_OK" != "1" ]]; then
+            echo "Deployment blocked: could not verify Drive write readiness/root through the existing private worker."
+            exit 1
+          fi
+
       - name: Install runtime dependencies for model and Drive preflight
         shell: bash
         run: python -m pip install --disable-pip-version-check -r requirements.txt
@@ -98,8 +146,6 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-          export GOOGLE_DRIVE_ROOT_ID="$(gcloud secrets versions access latest --secret=google-drive-root-id --project="$PROJECT_ID")"
-          export GOOGLE_OAUTH_TOKEN_JSON="$(gcloud secrets versions access latest --secret=google-oauth-token-json --project="$PROJECT_ID")"
           python - <<'PY'
           import json
           import sys
@@ -108,7 +154,7 @@ jobs:
 
           status = model.model_status()
           manifest = model._manifest()
-          drive = drive_status(require_write=True)
+          drive = drive_status(require_write=False)
           features_match = manifest.get("features") == model.FEATURES
           checks = {
               "model_status": status.get("status"),
@@ -121,8 +167,8 @@ jobs:
               "manifest_sha256_match": status.get("manifest_sha256_match"),
               "drive_configured": drive.get("configured"),
               "drive_reachable": drive.get("reachable"),
-              "drive_write_ready": drive.get("write_ready"),
-              "drive_write_auth_method": drive.get("write_auth_method") or drive.get("auth_method"),
+              "drive_read_auth_method": drive.get("auth_method"),
+              "runtime_drive_write_preflight": "PASS",
           }
           print("MODEL_DRIVE_PREFLIGHT=" + json.dumps(checks, sort_keys=True))
           valid = all([
@@ -134,10 +180,9 @@ jobs:
               int(manifest.get("training_symbol_count") or 0) > 0,
               drive.get("configured") is True,
               drive.get("reachable") is True,
-              drive.get("write_ready") is True,
           ])
           if not valid:
-              sys.exit("Deployment blocked: five-minute model artifacts or Drive write readiness failed preflight.")
+              sys.exit("Deployment blocked: five-minute model artifacts or Drive preflight failed.")
           print("FIVE_MINUTE_MODEL_AND_DRIVE_PREFLIGHT=PASS")
           PY
 
