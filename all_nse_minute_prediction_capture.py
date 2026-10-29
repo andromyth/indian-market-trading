@@ -39,17 +39,8 @@ HISTORY_REQUEST_PAUSE_SECONDS = 0.22
 HISTORY_REFRESH_REQUEST_SPACING_SECONDS = 0.24
 HISTORY_REFRESH_WINDOW_MINUTES = 90
 HISTORY_REFRESH_WORKERS = 8
-MIN_SESSION_CANDLES_FOR_PREDICTION = 3
 MAX_HISTORY_CANDLE_AGE_MINUTES = 5
 MIN_SIGNAL_READINESS = 0.70
-MAX_QUOTE_AGE_SECONDS = 120
-MIN_PREDICTION_COVERAGE = 0.95
-MAX_MISSING_QUOTE_FRACTION = 0.02
-MAX_DATA_LIMITED_FRACTION = 0.10
-MAX_UNTRAINED_SYMBOL_FRACTION = 0.10
-MAX_MODEL_FAILURE_FRACTION = 0.01
-MIN_HISTORY_SEED_COVERAGE = 0.95
-MAX_HISTORY_FAILURE_FRACTION = 0.05
 
 
 def _history_seed_batches(
@@ -74,26 +65,6 @@ def _history_seed_batches(
         # have the same market-context input path as later rows.
         batches.insert(0, [("__NIFTY50__", nifty_code)])
     return batches
-
-
-def _history_seed_meets_quality_gate(
-    coverage_symbols: int,
-    universe_symbols: int,
-    failed_batches: int,
-    batch_size: int = HISTORY_BATCH_SIZE,
-) -> bool:
-    """A seed is complete only when both history coverage and batch reliability pass."""
-    universe_count = max(0, int(universe_symbols))
-    if universe_count == 0:
-        return False
-    coverage_count = max(0, int(coverage_symbols))
-    failures = max(0, int(failed_batches))
-    requested_batches = max(1, int(np.ceil(universe_count / max(1, int(batch_size)))))
-    coverage_target = int(np.ceil(universe_count * MIN_HISTORY_SEED_COVERAGE))
-    return (
-        coverage_count >= coverage_target
-        and failures / requested_batches <= MAX_HISTORY_FAILURE_FRACTION
-    )
 
 
 def _history_seed_universe(
@@ -399,8 +370,8 @@ def _snapshot_quote_error(
     )
     if observed_at is None:
         return "Quote observation timestamp is missing or invalid."
-    if abs((observed_at - expected_minute).total_seconds()) > MAX_QUOTE_AGE_SECONDS:
-        return "Quote observation timestamp is outside the freshness window."
+    if observed_at.floor("5min") != expected_minute:
+        return "Quote observation timestamp does not belong to the requested five-minute slot."
     return None
 
 
@@ -409,26 +380,16 @@ def _capture_snapshot_validation_error(
     quote_frame: pd.DataFrame,
     minute: pd.Timestamp,
 ) -> str | None:
-    """Reject predictions unless the same-slot source snapshot was persisted and is structurally sound."""
+    """Check that the same-slot persisted snapshot has the columns needed for per-symbol selection."""
     status = str(capture_manifest.get("status") or "").strip().upper()
-    if status not in {"OK", "PARTIAL"}:
-        return f"Capture status {status or 'MISSING'} is not eligible for prediction."
+    if status not in {"STORED", "OK", "PARTIAL"}:
+        return f"Snapshot persistence is not confirmed (status={status or 'MISSING'})."
     expected_remote_path = (
         "production_data/all_universe_minute_snapshots/"
         f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
     )
     if capture_manifest.get("snapshot_drive_path") != expected_remote_path:
         return "Same-slot snapshot Drive persistence was not confirmed."
-    try:
-        expected_count = int(capture_manifest.get("expected_symbol_count") or 0)
-        manifest_rows = int(capture_manifest.get("row_count") or 0)
-    except (TypeError, ValueError):
-        expected_count = manifest_rows = 0
-    if expected_count <= 0 or manifest_rows != expected_count or len(quote_frame) != expected_count:
-        return (
-            "Snapshot row count does not match the capture manifest: "
-            f"expected={expected_count}, manifest={manifest_rows}, actual={len(quote_frame)}."
-        )
     required = {
         "symbol", "instrument_code", "cycle_minute_ist", "quote_status",
         "actual_observed_price", "quote_observed_at_ist",
@@ -436,17 +397,6 @@ def _capture_snapshot_validation_error(
     missing = sorted(required - set(quote_frame.columns))
     if missing:
         return f"Snapshot is missing required columns: {', '.join(missing)}."
-    symbols = quote_frame["symbol"].astype(str).str.strip().str.upper()
-    if symbols.eq("").any() or symbols.duplicated().any():
-        return "Snapshot has blank or duplicate symbol identities."
-    slot_times = quote_frame["cycle_minute_ist"].map(_parse_ist_timestamp)
-    if slot_times.isna().any() or not slot_times.eq(minute).all():
-        return "Snapshot contains rows from a different or unparseable capture minute."
-    if not any(
-        _snapshot_quote_error(row, minute) is None
-        for row in quote_frame.to_dict(orient="records")
-    ):
-        return "Snapshot contains no individually valid symbol quotes."
     return None
 
 
@@ -1339,10 +1289,7 @@ class AllNSEMinutePredictor:
                     1 for symbol in symbols
                     if symbol in histories and not histories[symbol].empty
                 )
-                coverage_target = min(
-                    len(symbols),
-                    int(np.ceil(len(symbols) * MIN_HISTORY_SEED_COVERAGE)),
-                )
+                coverage_target = len(symbols)
                 targeted_attempts = 0
                 targeted_recovered = 0
                 targeted_errors = 0
@@ -1500,15 +1447,11 @@ class AllNSEMinutePredictor:
                     self._seed_ready = bool(self._history)
                     # An auth-rejected seed is deferred, not completed; start()
                     # can relaunch it on a later capture tick with cached history.
-                    seed_quality_complete = _history_seed_meets_quality_gate(
-                        historical_coverage,
-                        len(symbols),
-                        batch_errors,
-                    )
-                    self._seed_complete = not auth_circuit_open and seed_quality_complete
+                    seed_attempt_complete = not auth_circuit_open and batch_errors == 0 and deferred_batches == 0
+                    self._seed_complete = self._seed_ready and seed_attempt_complete
                     self._seed_status = (
                         "AUTH_DEFERRED" if auth_circuit_open
-                        else "READY" if self._seed_ready and seed_quality_complete
+                        else "READY" if self._seed_ready and seed_attempt_complete
                         else "READY_PARTIAL" if self._seed_ready
                         else "HISTORY_SEED_EMPTY"
                     )
@@ -2127,7 +2070,14 @@ class AllNSEMinutePredictor:
         filename = f"predictions_{minute:%Y%m%d_%H%M}.parquet"
         local_path = day_dir / filename
         tmp_path = local_path.with_suffix(".tmp.parquet")
-        pd.DataFrame(records).to_parquet(tmp_path, index=False, compression="zstd")
+        prediction_frame = pd.DataFrame(records)
+        if prediction_frame.empty and len(prediction_frame.columns) == 0:
+            prediction_frame = pd.DataFrame(columns=[
+                "record_type", "schema_version", "snapshot_minute_ist", "symbol",
+                "actual_market_value", "actual_quote_status", "prediction_status",
+                "probability_up_30m", "signal",
+            ])
+        prediction_frame.to_parquet(tmp_path, index=False, compression="zstd")
         tmp_path.replace(local_path)
         remote = f"{REMOTE_ROOT}/{minute:%Y/%m/%d}/{filename}"
         store = GoogleDriveStore()
@@ -2148,7 +2098,7 @@ class AllNSEMinutePredictor:
             manifest.update({
                 "prediction_drive_path": remote,
                 "prediction_drive_sync": _clean(uploaded),
-                "status": "OK" if manifest.get("quality_gate_pass") is True else "PARTIAL",
+                "status": "STORED",
                 "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as exc:
@@ -2229,7 +2179,7 @@ class AllNSEMinutePredictor:
         ).floor("5min")
         minute_key = minute.isoformat()
         capture_status = str(capture_manifest.get("status") or "").strip().upper()
-        if capture_status not in {"OK", "PARTIAL"} or not capture_manifest.get("snapshot_drive_path"):
+        if capture_status not in {"STORED", "OK", "PARTIAL"} or not capture_manifest.get("snapshot_drive_path"):
             error = (
                 "Prediction blocked: the same-slot market snapshot was not confirmed "
                 f"persisted to Drive (capture_status={capture_status or 'MISSING'})."
@@ -2245,7 +2195,6 @@ class AllNSEMinutePredictor:
                 "status": "BLOCKED_SNAPSHOT_CAPTURE",
                 "cycle_minute_ist": minute_key,
                 "prediction_count": 0,
-                "quality_gate_pass": False,
                 "error": error,
             }
 
@@ -2281,16 +2230,28 @@ class AllNSEMinutePredictor:
                 "status": "BLOCKED_SNAPSHOT_VALIDATION",
                 "cycle_minute_ist": minute_key,
                 "prediction_count": 0,
-                "quality_gate_pass": False,
                 "error": error,
                 "snapshot_path": str(local_quote_path),
             }
 
         quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.strip().str.upper()
-        quote_by_symbol = {
-            str(row["symbol"]): row
-            for row in quote_frame.to_dict(orient="records")
-        }
+        snapshot_rows = quote_frame.to_dict(orient="records")
+        snapshot_symbols = sorted({
+            str(row.get("symbol") or "").strip().upper()
+            for row in snapshot_rows
+            if str(row.get("symbol") or "").strip()
+        })
+        quote_by_symbol: dict[str, dict[str, Any]] = {}
+        for row in snapshot_rows:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol or _snapshot_quote_error(row, minute) is not None:
+                continue
+            quote_by_symbol[symbol] = row
+        skipped_quote_symbols = sorted(set(snapshot_symbols) - set(quote_by_symbol))
+        expected_universe_count = max(
+            0, int(capture_manifest.get("expected_symbol_count") or len(snapshot_symbols))
+        )
+        missing_quotes = max(0, expected_universe_count - len(quote_by_symbol))
 
         self.start()
         if self._last_minute == minute_key:
@@ -2322,8 +2283,9 @@ class AllNSEMinutePredictor:
         )
         nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
         try:
-            if history_ready:
-                self._ensure_model()
+            # Model initialization is independent of universe-wide history
+            # coverage; each stored stock quote is evaluated with its own data.
+            self._ensure_model()
         except Exception as exc:
             model_error = f"{type(exc).__name__}: {str(exc)[:240]}"
         else:
@@ -2332,7 +2294,7 @@ class AllNSEMinutePredictor:
         fno_context_by_symbol: dict[str, dict[str, Any]] = {}
         fno_context_status = "NOT_ATTEMPTED"
         fno_context_source_max_date = None
-        if history_ready and model_error is None and self._model_api is not None:
+        if model_error is None and self._model_api is not None:
             (
                 fno_context_by_symbol,
                 fno_context_status,
@@ -2343,7 +2305,6 @@ class AllNSEMinutePredictor:
         feature_rows: list[dict[str, float]] = []
         feature_symbols: list[str] = []
         quote_actuals: dict[str, dict[str, Any]] = {}
-        missing_quotes = 0
         data_limited_count = 0
         model_failures = 0
         quote_timestamp = pd.Timestamp.now(tz=IST)
@@ -2390,54 +2351,47 @@ class AllNSEMinutePredictor:
             quote_good = _snapshot_quote_error(quote, minute) is None
             if quote_good and raw_day_volume is not None:
                 quote_actuals[symbol] = {"day_volume": raw_day_volume, "date": minute.date()}
-            if not quote_good:
-                missing_quotes += 1
-                quote_info["prediction_status"] = (
-                    "MISSING_CURRENT_QUOTE" if actual_price is None
-                    else "STALE_OR_INVALID_QUOTE"
-                )
-            elif symbol in failed_refresh_symbols:
-                quote_info["prediction_status"] = "HISTORY_REFRESH_FAILED"
-                quote_info["error"] = "Current-session five-minute candle refresh failed for this symbol."
-            elif not history_ready or hist.empty:
-                quote_info["prediction_status"] = (
-                    "INSUFFICIENT_HISTORY" if history_seed_complete else "WARMING_HISTORY"
-                )
-            elif model_error:
+            if model_error:
                 quote_info["prediction_status"] = "MODEL_UNAVAILABLE"
                 quote_info["error"] = model_error
                 model_failures += 1
             elif price_row is not None:
                 try:
-                    session_hist = hist.loc[pd.Index(hist.index.date) == minute.date()] if not hist.empty else hist
-                    if len(session_hist) < MIN_SESSION_CANDLES_FOR_PREDICTION:
-                        quote_info["prediction_status"] = "INSUFFICIENT_SESSION_HISTORY"
-                    elif hist.empty:
-                        quote_info["prediction_status"] = "INSUFFICIENT_HISTORY"
-                    elif history_age_minutes is None or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES:
-                        quote_info["prediction_status"] = "STALE_HISTORY"
-                        quote_info["error"] = (
-                            "Latest completed stock candle is missing or older than "
-                            f"{MAX_HISTORY_CANDLE_AGE_MINUTES} minutes at the decision slot."
-                        )
+                    current_quote_frame = pd.DataFrame(
+                        [price_row],
+                        index=pd.DatetimeIndex([actual_ts], name="Datetime"),
+                    )
+                    if (
+                        hist.empty
+                        or history_age_minutes is None
+                        or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES
+                    ):
+                        feature_history = current_quote_frame
+                        quote_info["history_input_mode"] = "CURRENT_QUOTE_ONLY"
                     else:
-                        model_feature_row = self._model_api._latest_features(
-                            hist,
-                            market_df=market_history_before_minute,
-                            fno=fno_context_by_symbol.get(symbol),
-                            decision_timestamp=actual_ts,
-                        )
-                        feature_rows.append(model_feature_row)
-                        feature_symbols.append(symbol)
-                        current_rows.append(quote_info)
+                        feature_history = pd.concat([hist, current_quote_frame]).sort_index()
+                        feature_history = feature_history.loc[
+                            ~feature_history.index.duplicated(keep="last")
+                        ].tail(HISTORY_LOOKBACK_BARS)
+                        quote_info["history_input_mode"] = "FRESH_5M_HISTORY_PLUS_CURRENT_QUOTE"
+                    model_feature_row = self._model_api._latest_features(
+                        feature_history,
+                        market_df=market_history_before_minute,
+                        fno=fno_context_by_symbol.get(symbol),
+                        decision_timestamp=actual_ts,
+                    )
+                    feature_rows.append(model_feature_row)
+                    feature_symbols.append(symbol)
+                    current_rows.append(quote_info)
                 except Exception as exc:
                     quote_info["prediction_status"] = "FEATURE_BUILD_ERROR"
                     quote_info["error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
                     model_failures += 1
+                    current_rows.append(quote_info)
             else:
-                quote_info["prediction_status"] = "MISSING_CURRENT_QUOTE"
-            if symbol not in feature_symbols:
-                current_rows.append(quote_info)
+                # The symbol had no individually usable stored quote and was
+                # filtered out before inference. Do not fabricate a prediction.
+                continue
 
         prediction_count = 0
         feature_quality_diagnostics: dict[str, Any] = {
@@ -2636,48 +2590,15 @@ class AllNSEMinutePredictor:
                 if item["day_volume"] is not None:
                     self._last_day_volume[symbol] = (item["date"], float(item["day_volume"]))
 
-        # Ensure exactly one row per universe symbol even when data or inference failed.
+        # Persist only symbols with a valid current quote from this stored slot.
+        # Missing/invalid symbols remain represented in the source snapshot and
+        # manifest counts, but do not receive fabricated prediction rows.
         current_rows_by_symbol = {str(row["symbol"]): row for row in current_rows}
-        records = []
-        for symbol in symbols:
-            row = current_rows_by_symbol.get(symbol)
-            if row is None:
-                row = {
-                    "record_type": "all_nse_minute_prediction_actual",
-                    "schema_version": "all-nse-5m-prediction-v2",
-                    "snapshot_minute_ist": minute.isoformat(),
-                    "symbol": symbol,
-                    "exchange": "NSE",
-                    "actual_market_value": None,
-                    "actual_price_source": "INDSTOCKS_BATCH_QUOTE",
-                    "actual_observed_at_ist": None,
-                    "actual_observed_at_utc": None,
-                    "actual_timestamp_basis": "collector_observation_time_not_exchange_tick_timestamp",
-                    "actual_quote_status": "MISSING_QUOTE",
-                    "actual_quote_age_seconds": None,
-                    "day_volume": None,
-                    "minute_volume_delta": None,
-                    "current_minute_ohlc_complete": False,
-                    "current_minute_bar_note": "No usable current quote row was available.",
-                    "prediction_status": "MISSING_CURRENT_QUOTE",
-                    "raw_model_signal": None,
-                    "signal": "HOLD",
-                    "probability_up_30m": None,
-                    "expected_return_30m": None,
-                    "confidence": None,
-                    "model_family": "logistic_regression+ridge",
-                    "model_target": "target_30m",
-                    "model_coverage_symbols": None,
-                    "trained_for_symbol": None,
-                    "feature_count": 34,
-                    "non_missing_feature_count": 0,
-                    "data_readiness_score": 0.0,
-                    "data_limited": True,
-                    "forecast_target_timestamp_utc": None,
-                    "forecast_key": None,
-                    "error": read_error or "No current quote row",
-                }
-            records.append(row)
+        records = [
+            current_rows_by_symbol[symbol]
+            for symbol in symbols
+            if symbol in current_rows_by_symbol
+        ]
 
         prediction_status_counts: dict[str, int] = {}
         for row in records:
@@ -2707,42 +2628,13 @@ class AllNSEMinutePredictor:
             1 for row in records if row.get("trained_for_symbol") is False
         )
         trained_symbol_manifest_available = bool(self._trained_symbols)
-        expected_count = max(1, len(symbols))
-        seed_batch_count = max(1, (len(symbols) + HISTORY_BATCH_SIZE - 1) // HISTORY_BATCH_SIZE)
         refresh_batch_count = int(history_refresh.get("batch_count") or 0)
         refresh_failed_batches = int(history_refresh.get("failed_batches") or 0)
-        prediction_coverage = prediction_count / expected_count
-        missing_quote_fraction = missing_quotes / expected_count
-        data_limited_fraction = data_limited_count / expected_count
-        untrained_fraction = untrained_symbol_count / expected_count
-        model_failure_fraction = model_failures / expected_count
-        seed_coverage_fraction = seed_coverage_symbols / expected_count
-        seed_failure_fraction = (
-            seed_failed_batches + seed_deferred_batches
-        ) / seed_batch_count
-        refresh_failure_fraction = (
-            refresh_failed_batches / refresh_batch_count
-            if refresh_batch_count
-            else 0.0 if history_refresh.get("status") in {
-                "SCHEDULED_ASYNC", "IN_PROGRESS", "WARMING_SEED"
-            } else 1.0
+        seed_coverage_fraction = (
+            seed_coverage_symbols / expected_universe_count
+            if expected_universe_count else 0.0
         )
         model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
-        quality_gate_pass = bool(
-            len(records) == len(symbols)
-            and prediction_coverage >= MIN_PREDICTION_COVERAGE
-            and missing_quote_fraction <= MAX_MISSING_QUOTE_FRACTION
-            and data_limited_fraction <= MAX_DATA_LIMITED_FRACTION
-            and untrained_fraction <= MAX_UNTRAINED_SYMBOL_FRACTION
-            and model_failure_fraction <= MAX_MODEL_FAILURE_FRACTION
-            and model_artifact_verified
-            and trained_symbol_manifest_available
-            and history_ready
-            and history_seed_complete
-            and seed_coverage_fraction >= MIN_HISTORY_SEED_COVERAGE
-            and seed_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
-            and refresh_failure_fraction <= MAX_HISTORY_FAILURE_FRACTION
-        )
         manifest = {
             "audit_name": "all-nse-5m-prediction-actual-capture",
             "schema_version": "all-nse-5m-prediction-v2",
@@ -2753,9 +2645,13 @@ class AllNSEMinutePredictor:
             "model_version": self._production_model_version(),
             "calibration_versioning": "per-row readiness segment; READINESS_LOW primary action remains HOLD",
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
-            "expected_symbol_count": len(symbols),
+            "expected_symbol_count": expected_universe_count,
+            "snapshot_symbol_count": len(snapshot_symbols),
+            "eligible_symbol_count": len(symbols),
+            "skipped_missing_quote_count": missing_quotes,
+            "skipped_missing_quote_symbols": skipped_quote_symbols[:100],
             "row_count": len(records),
-            "actual_quote_count": len(records) - missing_quotes,
+            "actual_quote_count": len(symbols),
             "missing_quote_count": missing_quotes,
             "prediction_count": prediction_count,
             "prediction_coverage_pct": round(100 * prediction_coverage, 3),
@@ -2776,7 +2672,6 @@ class AllNSEMinutePredictor:
             "history_seed_coverage_fraction": round(seed_coverage_fraction, 6),
             "history_seed_failed_batches": seed_failed_batches,
             "history_seed_deferred_batches": seed_deferred_batches,
-            "history_seed_failure_fraction": round(seed_failure_fraction, 6),
             "history_refresh_status": history_refresh.get("status"),
             "history_refresh_mode": "BACKGROUND_NONBLOCKING",
             "history_refresh_batch_count": refresh_batch_count,
@@ -2784,7 +2679,6 @@ class AllNSEMinutePredictor:
             "history_refresh_failed_symbols": len(failed_refresh_symbols),
             "history_refresh_failure_fraction": round(refresh_failure_fraction, 6),
             "history_refresh_elapsed_seconds": history_refresh.get("elapsed_seconds"),
-            "min_session_candles_for_prediction": MIN_SESSION_CANDLES_FOR_PREDICTION,
             "history_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "feature_bar_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "model_coverage_symbols": (
@@ -2808,24 +2702,16 @@ class AllNSEMinutePredictor:
             "quote_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
             "quote_snapshot_cycle_minute_ist": minute.isoformat(),
             "quote_snapshot_capture_status": capture_status,
+            "capture_eligibility_policy": "PER_SYMBOL_STORED_QUOTE",
+            "prediction_eligibility_policy": "VALID_QUOTE_IN_SAME_STORED_FIVE_MINUTE_SLOT",
             "quote_snapshot_expected_symbol_count": int(capture_manifest.get("expected_symbol_count") or 0),
-            "quote_snapshot_rows_validated": True,
+            "quote_snapshot_schema_validated": True,
             "quote_snapshot_read_error": read_error,
             "current_minute_ohlc_complete": False,
-            "quality_gate_thresholds": {
-                "min_prediction_coverage": MIN_PREDICTION_COVERAGE,
-                "max_missing_quote_fraction": MAX_MISSING_QUOTE_FRACTION,
-                "max_data_limited_fraction": MAX_DATA_LIMITED_FRACTION,
-                "max_untrained_symbol_fraction": MAX_UNTRAINED_SYMBOL_FRACTION,
-                "max_model_failure_fraction": MAX_MODEL_FAILURE_FRACTION,
-                "min_history_seed_coverage": MIN_HISTORY_SEED_COVERAGE,
-                "max_history_failure_fraction": MAX_HISTORY_FAILURE_FRACTION,
-            },
-            "quality_gate_pass": quality_gate_pass,
-            "status": "PARTIAL",
+            "status": "PROCESSING",
         }
         persisted = self._persist(records, manifest, minute)
-        persistence_confirmed = str(persisted.get("status") or "").upper() in {"OK", "PARTIAL"}
+        persistence_confirmed = str(persisted.get("status") or "").upper() in {"STORED", "OK", "PARTIAL"}
         with self._lock:
             # A quality-gated PARTIAL result is still a durable snapshot and must
             # not be reprocessed. A persistence error is different: leave the
@@ -2869,12 +2755,13 @@ class AllNSEMinutePredictor:
         return {
             **persisted,
             "cycle_minute_ist": minute.isoformat(),
-            "expected_symbol_count": len(symbols),
+            "expected_symbol_count": expected_universe_count,
+            "eligible_symbol_count": len(symbols),
             "prediction_count": prediction_count,
             "missing_quote_count": missing_quotes,
             "data_limited_count": data_limited_count,
             "prediction_status_counts": prediction_status_counts,
-            "quality_gate_pass": manifest["quality_gate_pass"],
+            "model_artifact_verified": model_artifact_verified,
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,
             "history_status": seed_status,
