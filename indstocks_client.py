@@ -4,8 +4,9 @@ This module deliberately exposes no order-placement method. It supports:
 - a dashboard-generated access token (manual refresh; 24-hour lifetime), or
 - documented TOTP token generation for unattended read-only data collection.
 
-Credentials are read from environment variables or Streamlit Secrets. Tokens,
-MPINs, and TOTP secrets are never written to the repository or logged.
+Credentials are read from environment variables or Streamlit Secrets. Manual-token
+mode is the safe default; TOTP token generation requires explicit
+INDSTOCKS_AUTH_MODE=totp. Tokens, MPINs, and TOTP secrets are never logged.
 """
 from __future__ import annotations
 
@@ -61,11 +62,22 @@ def _timeout() -> int:
         return DEFAULT_TIMEOUT
 
 
+def _auth_mode() -> str:
+    """Return the explicitly selected token owner mode; never infer TOTP from secrets."""
+    mode = str(_setting("INDSTOCKS_AUTH_MODE", "manual") or "manual").strip().lower()
+    if mode not in {"manual", "totp"}:
+        raise RuntimeError("INDSTOCKS_AUTH_MODE must be either 'manual' or 'totp'")
+    return mode
+
+
 def configured() -> bool:
-    """True when either a dashboard token or a complete TOTP setup is present."""
-    manual = _setting("INDSTOCKS_ACCESS_TOKEN")
-    auto = all(_setting(k) for k in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET"))
-    return bool(manual or auto)
+    """Check credentials for the selected mode without triggering authentication."""
+    if _auth_mode() == "manual":
+        return bool(_setting("INDSTOCKS_ACCESS_TOKEN"))
+    return all(
+        _setting(k)
+        for k in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET")
+    )
 
 
 def _totp(secret: str, at_time: float | None = None) -> str:
@@ -238,21 +250,23 @@ def _generate_and_cache_token_locked() -> str:
 
 
 def access_token() -> str:
-    """Return a cached TOTP-generated token or the configured manual token.
-
-    TOTP tokens are refreshed at most once per process when less than one hour
-    of the 24-hour validity period remains. INDstocks only allows one live
-    TOTP-generated token per account, so this adapter serializes generation and
-    suppresses repeated token-endpoint calls for 60 seconds after a failure.
-    """
+    """Use the explicitly selected credential mode; only TOTP mode can mint tokens."""
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
-    auto = _has_totp_credentials()
-    if not auto:
+    mode = _auth_mode()
+    if mode == "manual":
         manual = _setting("INDSTOCKS_ACCESS_TOKEN")
         if not manual:
-            raise RuntimeError("INDstocks credentials are not configured")
+            raise RuntimeError(
+                "INDstocks manual-token mode is active but INDSTOCKS_ACCESS_TOKEN "
+                "is not configured; TOTP generation is disabled in this process"
+            )
         return manual
 
+    if not _has_totp_credentials():
+        raise RuntimeError(
+            "INDstocks TOTP mode requires INDSTOCKS_CLIENT_ID, INDSTOCKS_MPIN "
+            "and INDSTOCKS_TOTP_SECRET"
+        )
     with _TOKEN_LOCK:
         now = time.time()
         if _CACHED_TOKEN and _CACHED_TOKEN_EXPIRES_AT > now + 3600:
@@ -261,8 +275,8 @@ def access_token() -> str:
 
 
 def _has_totp_credentials() -> bool:
-    """Return True only when unattended token regeneration is configured."""
-    return all(
+    """Return True only when this process is explicitly authorized to mint tokens."""
+    return _auth_mode() == "totp" and all(
         _setting(name)
         for name in ("INDSTOCKS_CLIENT_ID", "INDSTOCKS_MPIN", "INDSTOCKS_TOTP_SECRET")
     )
