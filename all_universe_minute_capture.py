@@ -20,6 +20,16 @@ import pandas as pd
 
 IST = ZoneInfo("Asia/Kolkata")
 BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET URLs.
+MIN_COMPLETE_SYMBOL_COVERAGE = 0.90
+
+
+def _snapshot_coverage_status(complete_symbols: int, expected_symbols: int) -> tuple[str, float]:
+    """Pass once at least 90% of the expected universe has complete quote rows."""
+    expected = int(expected_symbols)
+    complete = max(0, int(complete_symbols))
+    coverage = complete / expected if expected > 0 else 0.0
+    return ("OK" if expected > 0 and coverage >= MIN_COMPLETE_SYMBOL_COVERAGE else "PARTIAL",
+            round(100.0 * coverage, 3))
 QUOTE_REQUEST_MAX_ATTEMPTS = 3
 QUOTE_FALLBACK_BATCH_SIZE = 50
 QUOTE_RETRY_BACKOFF_SECONDS = 0.35
@@ -695,6 +705,12 @@ def capture_all_universe_minute_snapshot(
         manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
         manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
         manifest["row_count"] = int(len(frame))
+        coverage_status, complete_coverage_pct = _snapshot_coverage_status(
+            manifest["quoted_symbol_count"], manifest["expected_symbol_count"]
+        )
+        manifest["complete_quote_symbol_count"] = manifest["quoted_symbol_count"]
+        manifest["complete_quote_symbol_coverage_pct"] = complete_coverage_pct
+        manifest["minimum_complete_quote_symbol_coverage_pct"] = 100.0 * MIN_COMPLETE_SYMBOL_COVERAGE
         manifest["forecast_record_count"] = int(frame["forecast_count"].sum())
         local_path = local_dir / f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
         temp_path = local_path.with_suffix(".tmp.parquet")
@@ -715,7 +731,7 @@ def capture_all_universe_minute_snapshot(
                 }, sort_keys=True),
                 encoding="utf-8",
             )
-            manifest["status"] = "OK" if request_errors == 0 and frame["quote_status"].eq("PASS").all() else "PARTIAL"
+            manifest["status"] = coverage_status
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
             manifest["snapshot_drive_path"] = remote_path
