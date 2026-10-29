@@ -10,6 +10,7 @@ from snapshot_5m_features import (
     FEATURES,
     FEATURE_SCHEMA_VERSION,
     SNAPSHOT_CADENCE_MINUTES,
+    READINESS_FEATURES,
     latest_snapshot_features,
     make_snapshot_feature_frame,
     resample_minute_candles_to_snapshot_5m,
@@ -219,3 +220,34 @@ def test_rolling_indicators_warm_from_prior_snapshots_without_overnight_return()
     assert pd.notna(features.loc[open_slot, "rsi_70m"])
     assert pd.isna(features.loc[open_slot, "ret_5m"])
     assert features.loc[next_slot, "ret_5m"] == pytest.approx(close[-1] / close[-2] - 1.0)
+
+
+
+def test_core_readiness_does_not_penalize_expected_missing_fno_fields():
+    prior_idx = pd.date_range("2026-10-27 09:15", periods=60, freq="5min", tz=IST)
+    current_idx = pd.date_range("2026-10-28 09:15", periods=6, freq="5min", tz=IST)
+    idx = prior_idx.append(current_idx).rename("Datetime")
+    close = np.concatenate([np.linspace(100.0, 159.0, len(prior_idx)), [220.0, 220.5, 221.0, 221.5, 222.0, 222.5]])
+    day_open = np.concatenate([np.full(len(prior_idx), 100.0), np.full(len(current_idx), 219.0)])
+    day_high = np.concatenate([np.linspace(101.0, 160.0, len(prior_idx)), [220.0, 220.5, 221.0, 221.5, 222.0, 223.0]])
+    day_low = np.concatenate([np.linspace(99.0, 158.0, len(prior_idx)), np.full(len(current_idx), 218.0)])
+    volume = np.concatenate([np.full(len(prior_idx), 50.0), [np.nan, 10.0, 12.0, 11.0, 9.0, 10.0]])
+    day_volume = np.concatenate([np.arange(1000.0, 1060.0), [1000.0, 1010.0, 1022.0, 1033.0, 1042.0, 1052.0]])
+    frame = pd.DataFrame({
+        "Close": close,
+        "Volume": volume,
+        "day_open": day_open,
+        "day_high": day_high,
+        "day_low": day_low,
+        "day_volume": day_volume,
+    }, index=idx)
+
+    row = latest_snapshot_features(frame)
+    readiness = pd.Series(row).reindex(READINESS_FEATURES).notna().mean()
+
+    assert len(READINESS_FEATURES) == 19
+    assert all(name not in READINESS_FEATURES for name in (
+        "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"
+    ))
+    assert row["fno_available"] == 0.0
+    assert readiness >= 0.70
