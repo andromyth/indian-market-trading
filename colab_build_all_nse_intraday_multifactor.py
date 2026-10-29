@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import joblib
@@ -343,10 +344,26 @@ def main():
     root = Path(args.drive_root)
     out = Path(args.out)
 
-    from delivery_training_universe import official_nse_symbols
-    universe = sorted(set(official_nse_symbols(force_refresh=True)))
+    # Recovery may provide the historical seed universe from Drive when the
+    # NSE endpoint is unreachable. Normal candidate training still refreshes
+    # the official roster by default; the explicit override is audited in the
+    # emitted manifest and must be a non-empty JSON list of symbols.
+    universe_override = os.getenv("ALL_NSE_INTRADAY_TRAINING_UNIVERSE_JSON", "").strip()
+    if universe_override:
+        override_path = Path(universe_override)
+        if not override_path.is_file():
+            raise RuntimeError("Configured intraday training universe JSON is missing")
+        payload = json.loads(override_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise RuntimeError("Configured intraday training universe must be a JSON list")
+        universe = sorted({str(s).strip().upper().replace(".NS", "").replace(".BO", "") for s in payload if str(s).strip()})
+        universe_source = "GOOGLE_DRIVE_HISTORICAL_SEED_SYMBOL_PARTITIONS"
+    else:
+        from delivery_training_universe import official_nse_symbols
+        universe = sorted(set(official_nse_symbols(force_refresh=True)))
+        universe_source = "NSE_OFFICIAL_CURRENT_EQUITY_UNIVERSE"
     if not universe:
-        raise RuntimeError("Official NSE universe is empty")
+        raise RuntimeError("Intraday training universe is empty")
 
     seed_root = root / SEED_REL
     if not seed_root.exists():
@@ -480,6 +497,7 @@ def main():
         "feature_count": len(FEATURES),
         "features": FEATURES,
         "universe_size": universe_size,
+        "universe_source": universe_source,
         "training_symbols": train_symbols,
         "training_symbol_count": trainable,
         "coverage_pct": round(100 * trainable / universe_size, 4) if universe_size else 0.0,
