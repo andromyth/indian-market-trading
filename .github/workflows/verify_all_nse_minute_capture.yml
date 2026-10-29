@@ -9,6 +9,9 @@ on:
       - ".github/workflows/verify_all_nse_minute_capture.yml"
       - "autonomous_intraday_worker_service.py"
       - "all_nse_minute_prediction_capture.py"
+      - "all_nse_intraday_model.py"
+      - "colab_build_all_nse_intraday_multifactor.py"
+      - "all_universe_minute_capture.py"
       - "indstocks_client.py"
 
 permissions:
@@ -349,7 +352,7 @@ jobs:
               sys.exit(2)
           print(f"{label}_AUTHENTICATED_DIAGNOSTIC=PASS")
           print(f"{label}_STATUS={payload.get('status')}")
-          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct","checks","failed_check","error_type","nse_instrument_count","one_minute_history_rows","latest_one_minute_candle_at","reason"):
+          for key in ("cycle_minute_ist","age_seconds","expected_symbol_count","row_count","quoted_symbol_count","prediction_count","missing_quote_count","data_limited_count","quality_gate_pass","history_ready","drive_path","manifest_drive_path","reasons","model_manifest_hash_ok","artifact_hashes_ok","history_seed_coverage_pct","history_seed_failed_batches_pct","checks","failed_check","error_type","nse_instrument_count","five_minute_history_rows","latest_five_minute_candle_at","reason"):
               if key in payload:
                   print(f"{label}_{key.upper()}={payload.get(key)}")
           if code == "200" and payload.get("status") == "ok":
