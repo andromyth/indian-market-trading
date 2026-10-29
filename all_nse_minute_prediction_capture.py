@@ -1,14 +1,13 @@
-"""All-NSE minute-level prediction plus contemporaneous actual-price persistence.
+"""Per-stock five-minute prediction and contemporaneous actual-price persistence.
 
-The existing full-universe collector supplies real-time LTP snapshots. This module
-adds a pooled 30-minute prediction for every NSE symbol in that snapshot and
-persists a single auditable row per symbol. It does not submit or place orders.
+Only symbols with a valid quote in the stored snapshot for that five-minute slot
+are sent to inference and written as prediction rows. Missing-stock quotes do
+not block eligible stocks. This module never submits or places orders.
 
-Historical OHLCV is seeded in batches of at most five instruments per request.
-For the current, still-forming minute, the actual LTP and cumulative-volume delta
-are real; current-minute open/high/low are deliberately left missing because a
-single REST quote is not an exchange OHLC candle. Low-readiness predictions are
-saved for analysis but their actionable signal is forced to HOLD.
+Historical OHLCV uses five-minute bars. The current quote supplies the observed
+price; unavailable OHLC fields remain missing instead of being fabricated.
+Low-readiness forecasts are still recorded, with the actionable signal held
+conservatively when feature readiness is insufficient.
 """
 from __future__ import annotations
 
@@ -2449,7 +2448,7 @@ class AllNSEMinutePredictor:
                     for name in inference_frame.columns
                 },
             })
-        if feature_rows and not model_error and history_ready:
+        if feature_rows and not model_error:
             try:
                 x = inference_frame
                 probs = np.clip(self._classifier.predict_proba(x)[:, 1], 0, 1)
@@ -2612,14 +2611,6 @@ class AllNSEMinutePredictor:
                 "PASS", "PASS_DATA_LIMITED", "PASS_UNTRAINED_SYMBOL"
             }
         )
-        missing_quotes = sum(
-            1 for row in records
-            if row.get("actual_market_value") is None
-            or row.get("actual_quote_status") != "PASS"
-            or row.get("prediction_status") in {
-                "MISSING_CURRENT_QUOTE", "STALE_OR_INVALID_QUOTE"
-            }
-        )
         data_limited_count = sum(
             1 for row in records
             if row.get("prediction_status") == "PASS_DATA_LIMITED"
@@ -2633,6 +2624,12 @@ class AllNSEMinutePredictor:
         seed_coverage_fraction = (
             seed_coverage_symbols / expected_universe_count
             if expected_universe_count else 0.0
+        )
+        prediction_coverage = prediction_count / max(1, expected_universe_count)
+        data_limited_fraction = data_limited_count / max(1, len(records))
+        refresh_failure_fraction = (
+            refresh_failed_batches / refresh_batch_count
+            if refresh_batch_count else None
         )
         model_artifact_verified = bool(self._model_status.get("manifest_sha256_match"))
         manifest = {
@@ -2655,6 +2652,7 @@ class AllNSEMinutePredictor:
             "missing_quote_count": missing_quotes,
             "prediction_count": prediction_count,
             "prediction_coverage_pct": round(100 * prediction_coverage, 3),
+            "prediction_coverage_is_informational": True,
             "prediction_status_counts": prediction_status_counts,
             "data_limited_count": data_limited_count,
             "data_limited_fraction_pct": round(100 * data_limited_fraction, 3),
@@ -2677,7 +2675,10 @@ class AllNSEMinutePredictor:
             "history_refresh_batch_count": refresh_batch_count,
             "history_refresh_failed_batches": refresh_failed_batches,
             "history_refresh_failed_symbols": len(failed_refresh_symbols),
-            "history_refresh_failure_fraction": round(refresh_failure_fraction, 6),
+            "history_refresh_failure_fraction": (
+                round(refresh_failure_fraction, 6)
+                if refresh_failure_fraction is not None else None
+            ),
             "history_refresh_elapsed_seconds": history_refresh.get("elapsed_seconds"),
             "history_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
             "feature_bar_interval_minutes": HISTORY_BAR_INTERVAL_MINUTES,
@@ -2713,9 +2714,8 @@ class AllNSEMinutePredictor:
         persisted = self._persist(records, manifest, minute)
         persistence_confirmed = str(persisted.get("status") or "").upper() in {"STORED", "OK", "PARTIAL"}
         with self._lock:
-            # A quality-gated PARTIAL result is still a durable snapshot and must
-            # not be reprocessed. A persistence error is different: leave the
-            # minute retryable so a transient Drive failure can recover in-place.
+            # A successfully stored per-stock result must not be reprocessed.
+            # Persistence errors remain retryable so transient Drive failures recover.
             if persistence_confirmed:
                 self._last_minute = minute_key
             self._last_health = {
