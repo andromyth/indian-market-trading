@@ -554,6 +554,7 @@ def capture_all_universe_minute_snapshot(
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "INDSTOCKS_BATCH_QUOTE",
         "status": "STARTING",
+        "snapshot_persisted": False,
         "expected_symbol_count": 0,
         "quoted_symbol_count": 0,
         "missing_quote_count": 0,
@@ -731,6 +732,7 @@ def capture_all_universe_minute_snapshot(
                 encoding="utf-8",
             )
             manifest["status"] = "STORED"
+            manifest["snapshot_persisted"] = True
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
             manifest["snapshot_drive_path"] = remote_path
