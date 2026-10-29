@@ -1901,10 +1901,15 @@ class AllNSEMinutePredictor:
         import all_nse_intraday_model as model
 
         status = model.model_status()
-        if not status.get("manifest_sha256_match"):
+        if not status.get("artifact_hashes_match"):
+            raise RuntimeError("Pooled ALL-NSE intraday model classifier/regressor hashes do not match the manifest")
+        if not status.get("feature_schema_match"):
             raise RuntimeError(
-                "Pooled ALL-NSE intraday model is unavailable or its hashes do not match the manifest"
+                "Pooled ALL-NSE intraday model is incompatible with the five-minute snapshot feature schema "
+                f"{status.get('feature_schema_version') or 'missing'}; retrain and verify before deployment"
             )
+        if not status.get("manifest_sha256_match"):
+            raise RuntimeError("Pooled ALL-NSE intraday model manifest integrity validation failed")
         classifier, regressor = model._models()
         with self._lock:
             self._model_api = model
