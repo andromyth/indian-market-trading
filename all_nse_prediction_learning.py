@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Quality-gated outcome learning for the deployed full-NSE 30-minute predictor.
+"""Per-symbol outcome learning for the deployed full-NSE 30-minute predictor.
 
-Partial capture files remain in Drive for operations/audit and keep their
-PARTIAL status. Individual symbol rows can enter outcome evaluation only when
-their prediction, feature readiness, same-slot quote, and timestamp checks pass;
-a valid row never upgrades its containing slot to OK. This module changes only
-the calibrated probability/return/signal overlay; it does not replace
-classifier/regressor joblib weights or place orders.
+Stored partial slots are evaluated row by row. Universe coverage and slot-level
+quality flags do not exclude other symbols; each learning row still needs a
+same-symbol observation in the appropriate five-minute slot and a valid target.
+This module changes only the calibrated probability/return/signal overlay; it
+does not replace classifier/regressor joblib weights or place orders.
 """
 from __future__ import annotations
 
@@ -35,8 +34,8 @@ PREDICTION_ROOT = "production_data/all_nse_minute_predictions"
 QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 LEARNING_ROOT = f"{PREDICTION_ROOT}/learning"
 MIME_FOLDER = "application/vnd.google-apps.folder"
-MAX_TARGET_QUOTE_DISTANCE_SECONDS = 180
-MAX_INPUT_AGE_SECONDS = 120
+MAX_TARGET_QUOTE_DISTANCE_SECONDS = 300
+MAX_INPUT_AGE_SECONDS = 300
 MIN_DATA_READINESS = 0.70
 # Data-limited probabilities can be assessed in their own segment; almost-empty rows remain excluded.
 MIN_LEARNING_READINESS = 0.35
@@ -899,7 +898,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
             "required_matured_sessions_for_activation": 15,
             "low_readiness_primary_signal_policy": "HOLD",
         },
-        "partial_data_policy": "Preserve every slot's OK/PARTIAL status. Exclude missing/unreadable slots and quarantine rows with missing/stale/unmatched quotes, invalid probability/target, explicitly untrained membership, or near-empty readiness below 0.35. PASS and PASS_DATA_LIMITED rows are evaluated in readiness-scoped model versions; low-readiness calibration may update probability/return fields but the primary action remains HOLD. Pooled-model rows with unknown membership remain labelled UNKNOWN. Individually complete rows from a PARTIAL slot may be evaluated, but never mark that slot as OK.",
+        "partial_data_policy": "Coverage and slot status are informational. Evaluate any individually usable prediction row from a stored slot when the same-symbol quote belongs to the five-minute slot and its target observation is available. Exclude only unreadable artifacts or rows whose symbol/quote, probability, target timestamp, model version, or minimum per-row feature data is unusable. Preserve low-readiness forecasts in their readiness-scoped segment; low-readiness primary signals remain HOLD.",
         "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
