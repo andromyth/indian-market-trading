@@ -4,11 +4,16 @@ The dashboard produces decision-support signals only. It does not place orders.
 """
 from __future__ import annotations
 
+import os
 import pandas as pd
 import numpy as np
 import streamlit as st
 import subprocess
 import sys
+
+# Streamlit is a manual-token consumer only. Keep its existing token intact,
+# but never let this app mint/revoke the shared account's TOTP token.
+os.environ["INDSTOCKS_AUTH_MODE"] = "manual"
 
 from data_fetcher import (
     INDEX_TICKER_MAP,

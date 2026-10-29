@@ -126,6 +126,12 @@ for mapping in "${optional_secrets[@]}"; do
 done
 secrets_arg="$(IFS=,; echo "${secret_mappings[*]}")"
 
+# Cloud Run is the only TOTP-token owner. Manual-token deployments stay manual.
+INDSTOCKS_AUTH_MODE="manual"
+if [[ "$auto_broker_auth" == "true" ]]; then
+  INDSTOCKS_AUTH_MODE="totp"
+fi
+
 # Cloud Scheduler calls /tick during the NSE session. Request-based billing and
 # min-instances=0 let Cloud Run scale down overnight/weekends instead of charging
 # for always-allocated CPU when the market is closed.
@@ -143,7 +149,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --concurrency 1 \
   --timeout 300 \
   --no-allow-unauthenticated \
-  --set-env-vars "AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+  --set-env-vars "INDSTOCKS_AUTH_MODE=${INDSTOCKS_AUTH_MODE},AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
   --set-secrets "$secrets_arg"
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" \
