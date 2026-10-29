@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build the pooled ALL-NSE Intraday 30-minute replacement model in Colab.
+"""Train the ALL-NSE 30-minute model on completed 5-minute OHLCV bars.
 
-Historical training uses the persisted OLO public NSE minute-candle seed plus
-any official NSE incremental 1-minute partitions already accumulated in Drive.
-Live/incremental inference remains NSE-first. No orders are placed.
+Historical minute-candle archives are resampled to complete five-minute bars
+before feature/label creation. Live inference uses the same five-minute bar
+contract. No orders are placed.
 """
 from __future__ import annotations
 
@@ -57,6 +57,44 @@ def _norm(q: pd.DataFrame) -> pd.DataFrame:
     x = x[~x.index.isna()].sort_index()
     x = x[~x.index.duplicated(keep="last")]
     return x
+
+
+def resample_completed_5m_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate genuine one-minute OHLCV to completed, close-timestamped 5m bars.
+
+    Partial bars and bars with fewer than five source closes are dropped. The
+    output index is the bar-close time, matching the live prediction decision
+    timestamp and preventing a just-started candle from entering inference.
+    """
+    x = _norm(frame)
+    if x.empty:
+        return x
+    idx = pd.DatetimeIndex(x.index)
+    regular = (
+        (idx.time >= pd.Timestamp("09:15").time())
+        & (idx.time < pd.Timestamp("15:30").time())
+    )
+    x = x.loc[regular].copy()
+    parts = []
+    for _, session in x.groupby(pd.Index(x.index.date), sort=True):
+        session = session.sort_index()
+        grouped = session.resample(
+            "5min", origin="start_day", closed="left", label="left"
+        )
+        bars = grouped.agg({
+            "Open": "first", "High": "max", "Low": "min", "Close": "last"
+        })
+        source_counts = grouped["Close"].count()
+        bars["Volume"] = grouped["Volume"].sum(min_count=5)
+        bars = bars.loc[source_counts.eq(5) & bars[["Open", "High", "Low", "Close"]].notna().all(axis=1)]
+        if bars.empty:
+            continue
+        bars.index = bars.index + pd.Timedelta(minutes=5)
+        parts.append(bars)
+    if not parts:
+        return x.iloc[0:0].copy()
+    result = pd.concat(parts).sort_index()
+    return result.loc[~result.index.duplicated(keep="last")]
 
 
 def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
@@ -296,9 +334,9 @@ def sample_decisions(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drive-root", default="/content/drive/MyDrive/Indian_Market_Research")
-    ap.add_argument("--out", default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_intraday_multifactor_replacement_2026")
+    ap.add_argument("--out", default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_intraday_5mbar_multifactor_replacement_2026")
     ap.add_argument("--min-rows-symbol", type=int, default=300)
-    ap.add_argument("--sample-minutes", type=int, default=15)
+    ap.add_argument("--sample-minutes", type=int, default=5)
     ap.add_argument("--max-train-rows-per-symbol", type=int, default=2000)
     args = ap.parse_args()
 
@@ -316,10 +354,10 @@ def main():
             "Historical intraday seed not found. Run seed_nse_intraday_history.py first."
         )
 
-    market = load_market(root)
+    market = resample_completed_5m_bars(load_market(root))
     fno = load_fno(root)
 
-    # Colab RAM is limited, so never accumulate the complete minute-derived
+    # Colab RAM is limited, so never accumulate the complete five-minute-derived
     # feature frame for all symbols. Each symbol is sampled evenly across its
     # available decision history and only a bounded per-symbol quota is retained.
     # This keeps all-NSE symbol coverage while bounding the pooled training matrix.
@@ -335,7 +373,7 @@ def main():
     retained_rows = 0
 
     for i, sym in enumerate(universe, 1):
-        raw = load_symbol(root, sym)
+        raw = resample_completed_5m_bars(load_symbol(root, sym))
         if len(raw) < args.min_rows_symbol:
             coverage.append((sym, len(raw), "EXCLUDED_INSUFFICIENT_HISTORY"))
             continue
@@ -345,9 +383,8 @@ def main():
             coverage.append((sym, len(raw), "EXCLUDED_FEATURE_BUILD"))
             continue
 
-        # Build minute-level price/market features first, then sample. This
-        # preserves rolling information from 1-minute history while reducing
-        # the rows entering the daily F&O PIT join.
+        # Build features and labels from completed five-minute bars, then sample
+        # only on the matching five-minute decision cadence.
         feat = sample_decisions(feat, args.sample_minutes)
         feat = fno_join_features(feat, fno, sym)
         feat = feat.replace([np.inf, -np.inf], np.nan)
@@ -436,6 +473,8 @@ def main():
 
     manifest = {
         "status": "BRANCH_REPLACEMENT_ONLY",
+        "model_version": "2026-5mbar-multifactor-v1",
+        "bar_interval_minutes": 5,
         "model_family": "logistic_regression+ridge",
         "target": "target_30m",
         "feature_count": len(FEATURES),
@@ -465,8 +504,8 @@ def main():
         "regressor_sha256": "",
         "no_auto_orders": True,
         "training_data_sources": [
-            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_HISTORICAL_SEED",
-            "NSE_OFFICIAL_INTRADAY_INCREMENTAL_WHEN_AVAILABLE",
+            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS",
+            "NSE_OFFICIAL_INTRADAY_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS_WHEN_AVAILABLE",
             "NSE_OFFICIAL_NIFTY50_CONTEXT",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
@@ -477,8 +516,8 @@ def main():
     }
 
     out.mkdir(parents=True, exist_ok=True)
-    cp = out / "deployment_all_nse_intraday_multifactor_classifier_2026.joblib"
-    rp = out / "deployment_all_nse_intraday_multifactor_regressor_2026.joblib"
+    cp = out / "deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
+    rp = out / "deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
 
     joblib.dump(clf, cp)
     joblib.dump(reg, rp)
@@ -486,7 +525,7 @@ def main():
     manifest["classifier_sha256"] = hashlib.sha256(cp.read_bytes()).hexdigest()
     manifest["regressor_sha256"] = hashlib.sha256(rp.read_bytes()).hexdigest()
 
-    (out / "ALL_NSE_INTRADAY_MULTIFACTOR_2026_MODEL_MANIFEST.json").write_text(
+    (out / "ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json").write_text(
         json.dumps(manifest, indent=2),
         encoding="utf-8",
     )
