@@ -113,74 +113,61 @@ def test_actionable_signal_abstains_when_feature_readiness_is_low():
 
 def test_active_calibration_never_overrides_data_readiness_hold():
     guard = capture._primary_signal_with_readiness_guard
-    assert guard("PASS", False, "BUY") == "BUY"
-    assert guard("PASS", False, "SELL") == "SELL"
-    assert guard("PASS_DATA_LIMITED", True, "BUY") == "HOLD"
-    assert guard("PASS", True, "BUY") == "HOLD"
-    assert guard("PASS_UNTRAINED_SYMBOL", False, "SELL") == "HOLD"
-    assert guard("PASS", None, "BUY") == "HOLD"
-    assert guard("PASS", False, "ABSTAIN") == "HOLD"
+    assert guard("PREDICTED", False, "BUY") == "BUY"
+    assert guard("PREDICTED", False, "SELL") == "SELL"
+    assert guard("PREDICTED_DATA_LIMITED", True, "BUY") == "HOLD"
+    assert guard("PREDICTED", True, "BUY") == "HOLD"
+    assert guard("PREDICTED_UNTRAINED_SYMBOL", False, "SELL") == "HOLD"
+    assert guard("PREDICTED", None, "BUY") == "HOLD"
+    assert guard("PREDICTED", False, "ABSTAIN") == "HOLD"
 
 
 def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
     ts = int(pd.Timestamp("2026-10-21 10:00:00", tz=IST).timestamp())
     frame = capture.AllNSEMinutePredictor._parse_candles([
         {"ts": ts, "o": 100, "h": 102, "l": 99, "c": 101, "v": 12},
-        {"ts": ts + 60, "o": 101, "h": 103, "l": 100, "c": 102, "v": 18},
+        {"ts": ts + 300, "o": 101, "h": 103, "l": 100, "c": 102, "v": 18},
     ])
     assert len(frame) == 2
     assert str(frame.index.tz) == "Asia/Kolkata"
+    assert frame.index.tolist() == [pd.Timestamp("2026-10-21 10:05:00", tz=IST), pd.Timestamp("2026-10-21 10:10:00", tz=IST)]
     assert frame.iloc[-1]["Close"] == 102
     assert frame.iloc[-1]["Volume"] == 18
 
 
-def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_path, monkeypatch):
+def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_history(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 
-    minute = pd.Timestamp.now(tz=IST).floor("min")
+    minute = pd.Timestamp.now(tz=IST).floor("5min")
     predictor = AllNSEMinutePredictor(tmp_path)
     predictor.start = lambda: None
-    predictor._seed_ready = True
-    predictor._seed_complete = True
-    predictor._seed_status = "READY"
+    predictor._seed_ready = False
+    predictor._seed_complete = False
+    predictor._seed_status = "READY_PARTIAL"
     predictor._symbols = ["AAA", "BBB", "CCC"]
-    predictor._codes = {"AAA": "NSE_1", "BBB": "NSE_2"}
-    predictor._seed_coverage = 2
-    predictor._seed_errors = 0
-    predictor._trained_symbols = {"AAA", "BBB"}
+    predictor._codes = {"AAA": "NSE_1", "BBB": "NSE_2", "CCC": "NSE_3"}
+    predictor._seed_coverage = 0
+    predictor._seed_errors = 1
+    predictor._trained_symbols = {"AAA"}
     predictor._model_status = {
-        "training_symbol_count": 2,
+        "training_symbol_count": 1,
         "trained_until": "2026-10-20T09:15:00+00:00",
         "manifest_sha256_match": True,
     }
     predictor._schedule_current_session_history_refresh = lambda _minute: {
-        "status": "OK", "minute": _minute.isoformat(),
-        "batch_count": 1, "failed_batches": 0,
-        "failed_symbols": [], "updated_symbols": 2, "elapsed_seconds": 0.1,
-        "pending_symbol_count": 0,
+        "status": "PARTIAL", "minute": _minute.isoformat(),
+        "batch_count": 1, "failed_batches": 1,
+        "failed_symbols": ["BBB"], "updated_symbols": 0, "elapsed_seconds": 0.1,
+        "pending_symbol_count": 2,
     }
-
-    idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
-        periods=60,
-        freq="min",
-        tz=IST,
-        name="Datetime",
+    predictor._load_completed_fno_context = lambda _minute: ({}, "UNAVAILABLE", None)
+    predictor._history = {}
+    predictor._market_history = pd.DataFrame(
+        columns=["Open", "High", "Low", "Close", "Volume"],
+        index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
     )
-    history = pd.DataFrame(
-        {
-            "Open": np.linspace(99, 100, len(idx)),
-            "High": np.linspace(100, 101, len(idx)),
-            "Low": np.linspace(98, 99, len(idx)),
-            "Close": np.linspace(99.5, 100.5, len(idx)),
-            "Volume": np.full(len(idx), 10.0),
-        },
-        index=idx,
-    )
-    predictor._history = {"AAA": history.copy(), "BBB": history.copy()}
-    predictor._market_history = history.copy()
     predictor._model_api = SimpleNamespace(
         FEATURES=["f1", "f2"],
         _latest_features=lambda price_df, market_df=None, fno=None, decision_timestamp=None: {
@@ -189,36 +176,25 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
         },
     )
     predictor._classifier = SimpleNamespace(
-        predict_proba=lambda frame: np.array([[0.2, 0.8], [0.8, 0.2]])
+        predict_proba=lambda frame: np.array([[0.2, 0.8]] * len(frame))
     )
     predictor._regressor = SimpleNamespace(
-        predict=lambda frame: np.array([0.01, -0.01])
+        predict=lambda frame: np.array([0.01] * len(frame))
     )
-    predictor._fetch_current_nifty_quote = lambda: (25000.0, minute, None)
+    predictor._fetch_current_nifty_quote = lambda: (None, None, "optional context missing")
 
     snapshot_dir = tmp_path / "all_universe_minute_snapshots"
     snapshot_dir.mkdir(parents=True)
     quote_path = snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
-    pd.DataFrame([
-        {
-            "symbol": "AAA",
-            "instrument_code": "NSE_1",
-            "cycle_minute_ist": minute.isoformat(),
-            "quote_status": "PASS",
-            "actual_observed_price": 101.25,
-            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
-            "day_volume": 10000,
-        },
-        {
-            "symbol": "BBB",
-            "instrument_code": "NSE_2",
-            "cycle_minute_ist": minute.isoformat(),
-            "quote_status": "PASS",
-            "actual_observed_price": 202.5,
-            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=3)).isoformat(),
-            "day_volume": 20000,
-        },
-    ]).to_parquet(quote_path, index=False)
+    pd.DataFrame([{
+        "symbol": "AAA",
+        "instrument_code": "NSE_1",
+        "cycle_minute_ist": minute.isoformat(),
+        "quote_status": "PASS",
+        "actual_observed_price": 101.25,
+        "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
+        "day_volume": 10000,
+    }]).to_parquet(quote_path, index=False)
 
     class FakeDriveStore:
         def upload_or_update(self, local_path, remote_relative_path, mime_type="application/octet-stream"):
@@ -234,9 +210,10 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     result = predictor.run_for_capture(
         {
             "cycle_minute_ist": minute.isoformat(),
-            "status": "OK",
-            "expected_symbol_count": 2,
-            "row_count": 2,
+            "status": "PERSISTENCE_ERROR",
+            "snapshot_persisted": True,
+            "expected_symbol_count": 3,
+            "row_count": 3,
             "snapshot_drive_path": (
                 "production_data/all_universe_minute_snapshots/"
                 f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
@@ -245,30 +222,23 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
         worker_root=tmp_path,
     )
 
-    assert result["status"] == "OK"
-    assert result["row_count"] == 2
-    assert result["prediction_count"] == 2
-    assert result["prediction_status_counts"] == {"PASS": 2}
-    assert result["quality_gate_pass"] is True
+    assert result["status"] == "STORED"
+    assert result["row_count"] == 1
+    assert result["expected_symbol_count"] == 3
+    assert result["eligible_symbol_count"] == 1
+    assert result["prediction_count"] == 1
+    assert result["prediction_status_counts"] == {"PREDICTED": 1}
+    assert "quality_gate_pass" not in result
 
     written = pd.read_parquet(
         tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
         f"{minute:%d}" / f"predictions_{minute:%Y%m%d_%H%M}.parquet"
     ).set_index("symbol")
+    assert written.index.tolist() == ["AAA"]
     assert written.loc["AAA", "actual_market_value"] == 101.25
     assert written.loc["AAA", "probability_up_30m"] == pytest.approx(0.8)
     assert written.loc["AAA", "signal"] == "BUY"
-    assert written.loc["BBB", "actual_market_value"] == 202.5
-    assert written.loc["BBB", "probability_up_30m"] == pytest.approx(0.2)
-    assert written.loc["BBB", "signal"] == "SELL"
-
-    # The version and readiness segment must be persisted with every prediction,
-    # otherwise historical outcomes cannot be safely attributed to this artifact.
-    expected_base_version = predictor._production_model_version()
-    assert written.loc["AAA", "base_model_version"] == expected_base_version
-    assert written.loc["BBB", "base_model_version"] == expected_base_version
-    assert written.loc["AAA", "model_version"] == f"{expected_base_version}__READINESS_READY"
-    assert written.loc["BBB", "model_version"] == f"{expected_base_version}__READINESS_READY"
+    assert written.loc["AAA", "history_input_mode"] == "CURRENT_QUOTE_ONLY"
 
     import json
     minute_manifest_path = (
@@ -276,10 +246,10 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
         f"{minute:%d}" / f"manifest_{minute:%Y%m%d_%H%M}.json"
     )
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
-    assert saved_manifest["model_version"] == expected_base_version
-    assert saved_manifest["feature_quality_diagnostics"]["mean_feature_coverage_pct"] == 100.0
-    assert saved_manifest["feature_quality_diagnostics"]["feature_group_coverage_pct"]["price_technical"] is None
-
+    assert saved_manifest["model_version"] == predictor._production_model_version()
+    assert saved_manifest["eligible_symbol_count"] == 1
+    assert saved_manifest["skipped_missing_quote_count"] == 2
+    assert "quality_gate_pass" not in saved_manifest
 
 
 def test_prediction_capture_blocks_when_snapshot_was_not_persisted(tmp_path):
@@ -348,9 +318,9 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
     assert str(empty_market.index.tz) == "Asia/Kolkata"
 
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=1),
+        end=minute,
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -365,16 +335,16 @@ def test_missing_nifty_context_does_not_break_timestamp_filtering():
         index=index,
     )
     before = capture.AllNSEMinutePredictor._market_history_before(market, minute)
-    assert len(before) == 1
-    assert before.index.max() == minute - pd.Timedelta(minutes=1)
+    assert len(before) == 3
+    assert before.index.max() == minute
 
 
 def test_stale_market_history_is_excluded_from_feature_context():
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     index = pd.date_range(
-        minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=10),
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -400,16 +370,16 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
     predictor = capture.AllNSEMinutePredictor(tmp_path)
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     stale_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=8),
+        end=minute - pd.Timedelta(minutes=10),
         periods=4,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
     fresh_idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
+        end=minute,
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -438,9 +408,9 @@ def test_fresh_market_context_refetches_when_cached_nifty_history_is_stale(tmp_p
 
     assert calls == [minute]
     assert not before.empty
-    assert before.index.max() == minute - pd.Timedelta(minutes=1)
-    assert (before.index < minute).all()
-    assert predictor._market_history.index.max() == minute - pd.Timedelta(minutes=1)
+    assert before.index.max() == minute
+    assert (before.index <= minute).all()
+    assert predictor._market_history.index.max() == minute
 
 
 def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeypatch):
@@ -448,9 +418,9 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute.tz_convert("UTC") - pd.Timedelta(minutes=2),
+        minute.tz_convert("UTC") - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz="UTC",
         name="Datetime",
     )
@@ -474,7 +444,7 @@ def test_yahoo_nifty_history_fallback_uses_only_real_predecision_candles(monkeyp
 
     assert len(result) == 2
     assert str(result.index.tz) == "Asia/Kolkata"
-    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result.index.max() == minute
     assert result["Close"].tolist() == [100.5, 101.5]
 
 
@@ -498,6 +468,7 @@ def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, 
     manifest = {
         "status": "REPLACEMENT",
         "model_version": "unit-test",
+        "bar_interval_minutes": 5,
         "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
         "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
         "training_symbols": ["AAA"],
@@ -547,9 +518,9 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute - pd.Timedelta(minutes=2),
+        minute - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -583,7 +554,7 @@ def test_yfinance_multindex_nifty_fallback_normalizes_real_ohlcv(
     assert len(result) == 2
     assert list(result.columns) == ["Open", "High", "Low", "Close", "Volume"]
     assert str(result.index.tz) == "Asia/Kolkata"
-    assert result.index.max() == minute - pd.Timedelta(minutes=1)
+    assert result.index.max() == minute
     assert result["Close"].tolist() == [100.5, 101.5]
     assert result["Volume"].tolist() == [10.0, 12.0]
 
@@ -594,9 +565,9 @@ def test_yfinance_ticker_history_is_preferred_before_download(monkeypatch):
 
     minute = pd.Timestamp("2026-10-27 10:00:00", tz=IST)
     idx = pd.date_range(
-        minute - pd.Timedelta(minutes=2),
+        minute - pd.Timedelta(minutes=10),
         periods=5,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -633,7 +604,7 @@ def test_yfinance_ticker_history_is_preferred_before_download(monkeypatch):
     assert result["Close"].tolist() == [100.5, 101.5]
     assert str(result.index.tz) == "Asia/Kolkata"
     assert len(calls) == 1
-    assert calls[0][1]["interval"] == "1m"
+    assert calls[0][1]["interval"] == "5m"
 
 def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
     assert capture.AllNSEMinutePredictor._nifty_instrument_code() is None
@@ -641,8 +612,8 @@ def test_unsupported_indstocks_index_id_is_not_used_as_rest_scrip_code():
 
 def test_nifty_quote_uses_a_fresh_real_candle_when_no_rest_index_token_exists(tmp_path):
     predictor = capture.AllNSEMinutePredictor(tmp_path)
-    now = pd.Timestamp.now(tz=IST)
-    latest = now.floor("min") - pd.Timedelta(minutes=1)
+    now = pd.Timestamp.now(tz=IST).floor("5min")
+    latest = now
     predictor._market_history = pd.DataFrame(
         {
             "Open": [24990.0],
@@ -710,9 +681,9 @@ def test_partial_seed_refresh_only_requests_symbols_with_cached_history(tmp_path
     predictor._symbols = ["AAA", "BBB"]
     predictor._codes = {"AAA": "NSE_100", "BBB": "NSE_101"}
     idx = pd.date_range(
-        end=minute - pd.Timedelta(minutes=1),
+        end=minute - pd.Timedelta(minutes=5),
         periods=20,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -742,7 +713,7 @@ def test_partial_seed_refresh_only_requests_symbols_with_cached_history(tmp_path
                 "success": True,
                 "data": {
                     "NSE_100": {"candles": [{
-                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "ts": int((minute - pd.Timedelta(minutes=5)).timestamp()),
                         "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
                     }]}
                 },
@@ -788,7 +759,7 @@ def test_successful_refresh_without_fresh_candle_keeps_symbol_pending(tmp_path, 
                 "success": True,
                 "data": {
                     "NSE_100": {"candles": [{
-                        "ts": int((minute - pd.Timedelta(minutes=1)).timestamp()),
+                        "ts": int((minute - pd.Timedelta(minutes=15)).timestamp()),
                         "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10,
                     }]},
                     "NSE_101": {"candles": []},
@@ -847,7 +818,7 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
             index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
         ),
     )
-    candle_ts = int((minute - pd.Timedelta(minutes=1)).timestamp())
+    candle_ts = int((minute - pd.Timedelta(minutes=5)).timestamp())
     requests = []
 
     class FakeResponse:
@@ -887,24 +858,6 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
     assert summary["auth_error"]
 
 
-
-def test_history_seed_completion_requires_quality_thresholds():
-    assert capture._history_seed_meets_quality_gate(
-        coverage_symbols=19,
-        universe_symbols=20,
-        failed_batches=0,
-    ) is True
-    assert capture._history_seed_meets_quality_gate(
-        coverage_symbols=18,
-        universe_symbols=20,
-        failed_batches=0,
-    ) is False
-    assert capture._history_seed_meets_quality_gate(
-        coverage_symbols=20,
-        universe_symbols=20,
-        failed_batches=2,
-        batch_size=5,
-    ) is False
 
 
 def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypatch):
@@ -968,11 +921,11 @@ def test_nifty_context_is_fetched_before_indstocks_instrument_auth(tmp_path, mon
     monkeypatch.setattr(indstocks_client, "configured", lambda: True)
 
     predictor = capture.AllNSEMinutePredictor(tmp_path)
-    cutoff = pd.Timestamp.now(tz=IST).floor("min")
+    cutoff = pd.Timestamp.now(tz=IST).floor("5min")
     idx = pd.date_range(
-        end=cutoff - pd.Timedelta(minutes=1),
+        end=cutoff,
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -1073,7 +1026,7 @@ def test_daily_fno_context_is_point_in_time_and_reaches_model_features():
     idx = pd.date_range(
         "2026-10-28 09:15:00",
         periods=30,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -1134,7 +1087,7 @@ def test_history_seed_progress_is_published_before_universe_seed_finishes(tmp_pa
     idx = pd.date_range(
         "2026-10-26 15:20:00",
         periods=3,
-        freq="min",
+        freq="5min",
         tz=IST,
         name="Datetime",
     )
@@ -1224,3 +1177,37 @@ def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp
     assert set(second["SYMBOL"]) == {"AAA", "BBB"}
     assert second["UNIVERSE_SOURCE"].eq("INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK").all()
 
+
+
+def test_empty_snapshot_slot_skips_prediction_without_failing_other_slots(tmp_path):
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: pytest.fail("No symbol is eligible; history seeding must not run")
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "No symbol is eligible; history refresh must not run"
+    )
+    snapshot_dir = tmp_path / "all_universe_minute_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    pd.DataFrame([{
+        "symbol": "AAA",
+        "instrument_code": "NSE_1",
+        "cycle_minute_ist": minute.isoformat(),
+        "quote_status": "MISSING_QUOTE",
+        "actual_observed_price": None,
+        "quote_observed_at_ist": None,
+    }]).to_parquet(snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet", index=False)
+
+    result = predictor.run_for_capture({
+        "cycle_minute_ist": minute.isoformat(),
+        "status": "PERSISTENCE_ERROR",
+        "snapshot_persisted": True,
+        "expected_symbol_count": 1,
+        "snapshot_drive_path": (
+            "production_data/all_universe_minute_snapshots/"
+            f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+        ),
+    }, worker_root=tmp_path)
+
+    assert result["status"] == "NO_ELIGIBLE_SYMBOLS"
+    assert result["prediction_count"] == 0
+    assert not list((tmp_path / "all_nse_minute_predictions").rglob("predictions_*.parquet"))

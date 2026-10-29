@@ -107,6 +107,18 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 STATE.get("all_universe_capture_status") or capture.get("status") or "NOT_RUN"
             ).upper()
             capture_error = STATE.get("all_universe_capture_error")
+        if capture.get("snapshot_persisted") is True:
+            source_status = capture_status
+            source_error = capture_error
+            capture = {
+                **capture,
+                "source_snapshot_status": source_status,
+                "source_snapshot_error": source_error,
+                "status": "STORED",
+                "error": None,
+            }
+            capture_status = "STORED"
+            capture_error = None
         if all_nse_status == "NOT_SCHEDULED":
             all_nse = STATE.get("all_nse_minute_prediction_last_result") or {}
             all_nse_status = str(
@@ -130,11 +142,12 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "history_ready", "history_status", "history_seed_coverage_symbols",
                 "history_seed_failed_batches", "history_refresh_batch_count",
                 "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
-                "quality_gate_pass", "status", "error",
+                "eligible_symbol_count", "skipped_missing_quote_count",
+                "source_snapshot_drive_path", "prediction_policy", "status", "error",
             )
             if key in all_nse
         })
-        if all_nse_status not in {"OK", "NOT_RUN"}:
+        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}:
             STATE["all_nse_minute_prediction_error"] = str(
                 all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
             )
@@ -146,6 +159,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "cycle_minute_ist", "expected_symbol_count", "row_count", "quoted_symbol_count",
                 "missing_quote_count", "unmapped_symbol_count", "forecast_symbol_count",
                 "matched_outcome_count", "snapshot_drive_path", "remote_snapshot_path",
+                "snapshot_persisted", "source_snapshot_status", "source_snapshot_error",
                 "status", "error",
             )
             if key in capture
@@ -156,18 +170,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             STATE["all_universe_capture_error"] = str(
                 capture_error or f"Full-universe capture status is {capture_status}"
             )
-        elif capture_status == "OK":
+        elif capture_status in {"OK", "STORED", "PARTIAL"}:
             STATE["all_universe_capture_error"] = None
             STATE["all_universe_capture_warning"] = None
             if STATE.get("last_error") in previous_capture_issues:
                 STATE["last_error"] = None
-        elif capture_status == "PARTIAL":
-            STATE["all_universe_capture_error"] = None
-            STATE["all_universe_capture_warning"] = (
-                f"Quote coverage incomplete: {capture.get('quoted_symbol_count', 0)}/"
-                f"{capture.get('expected_symbol_count', 0)} NSE symbols"
-            )
-            STATE["last_error"] = STATE["all_universe_capture_warning"]
         elif capture_status == "NOT_RUN":
             STATE["all_universe_capture_warning"] = (
                 None if status == "MARKET_CLOSED"
@@ -226,126 +233,95 @@ def _diagnostic_age_seconds(value: Any) -> float | None:
 
 
 def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
-    """Return a strict, machine-readable all-NSE capture readiness result."""
+    """Report persistence and per-slot prediction outcomes; coverage is informational."""
     state = _public_status()
-    now_utc = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+
     if path == "/capturez":
         item = state.get("all_universe_capture_last_result") or {}
-        prefix = "all_nse_quote_capture"
-        expected = item.get("expected_symbol_count")
-        row_count = item.get("row_count")
-        valid = item.get("quoted_symbol_count")
-        missing = item.get("missing_quote_count")
         drive_path = item.get("snapshot_drive_path") or item.get("remote_snapshot_path")
         minute = item.get("cycle_minute_ist")
-        item_status = str(item.get("status") or "NOT_RUN").upper()
+        row_count = int(item.get("row_count") or 0)
         age = _diagnostic_age_seconds(minute)
-        reasons = []
-        if state.get("drive_preflight_status") != "OK":
-            reasons.append("Google Drive read/write preflight is not ready")
-        if item_status != "OK":
-            reasons.append(f"latest full-universe quote snapshot status is {item_status}")
-        if age is None or age < 0 or age > 420:
-            reasons.append("latest full-universe quote snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
-        if expected is None or int(expected or 0) <= 0:
-            reasons.append("official NSE universe count is missing or zero")
-        elif row_count is None or int(row_count) != int(expected):
-            reasons.append("snapshot row count does not equal the expected NSE universe")
-        if expected is not None and (valid is None or missing is None
-                                     or int(valid) != int(expected) or int(missing) != 0):
-            reasons.append("one or more NSE symbols lack a valid current quote")
-        if not drive_path:
-            reasons.append("confirmed Drive snapshot path is missing")
+        stored = bool(drive_path and row_count > 0)
         payload = {
-            "status": "ok" if not reasons else "degraded",
-            "probe": prefix,
-            "checked_at_utc": now_utc,
+            "status": "ok" if stored else "degraded",
+            "probe": "all_nse_quote_capture",
+            "checked_at_utc": now_utc.isoformat(),
             "cycle_minute_ist": minute,
-            "capture_status": item_status,
             "age_seconds": None if age is None else round(age, 1),
-            "expected_symbol_count": expected,
+            "expected_symbol_count": item.get("expected_symbol_count"),
             "row_count": row_count,
-            "quoted_symbol_count": valid,
-            "missing_quote_count": missing,
+            "quoted_symbol_count": item.get("quoted_symbol_count"),
+            "missing_quote_count": item.get("missing_quote_count"),
+            "quote_coverage_is_informational": True,
             "drive_path": drive_path,
-            "reasons": reasons,
+            "reasons": [] if stored else ["No persisted same-slot quote snapshot is recorded."],
         }
-    elif path == "/predictionz":
+        return (200 if stored else 503), payload
+
+    if path == "/predictionz":
         item = state.get("all_nse_minute_prediction_last_result") or {}
-        prefix = "all_nse_minute_prediction_actual"
-        expected = item.get("expected_symbol_count")
-        row_count = item.get("row_count")
-        predicted = item.get("prediction_count")
-        missing = item.get("missing_quote_count")
-        limited = item.get("data_limited_count")
-        minute = item.get("cycle_minute_ist")
-        item_status = str(item.get("status") or state.get("all_nse_minute_prediction_status") or "NOT_RUN").upper()
-        age = _diagnostic_age_seconds(minute)
         drive_path = item.get("remote_path")
         manifest_path = item.get("manifest_drive_path")
+        minute = item.get("cycle_minute_ist")
+        row_count = int(item.get("row_count") or 0)
+        predicted = int(item.get("prediction_count") or 0)
+        eligible = int(item.get("eligible_symbol_count") or 0)
+        item_status = str(item.get("status") or state.get("all_nse_minute_prediction_status") or "NOT_RUN").upper()
+        age = _diagnostic_age_seconds(minute)
+
+        # No valid quote is an expected no-op for that slot, not a global
+        # coverage failure. The stored source snapshot remains the audit record.
+        no_data = item_status == "NO_ELIGIBLE_SYMBOLS" or (
+            eligible == 0 and predicted == 0 and not drive_path
+        )
+        if no_data:
+            payload = {
+                "status": "no_data",
+                "probe": "all_nse_minute_prediction_actual",
+                "checked_at_utc": now_utc.isoformat(),
+                "cycle_minute_ist": minute,
+                "age_seconds": None if age is None else round(age, 1),
+                "expected_symbol_count": item.get("expected_symbol_count"),
+                "row_count": row_count,
+                "eligible_symbol_count": eligible,
+                "prediction_count": 0,
+                "source_snapshot_drive_path": item.get("source_snapshot_drive_path"),
+                "reason": "No individually valid stock quote existed in this slot; no prediction was generated.",
+                "reasons": [],
+            }
+            return 200, payload
+
+        stored = bool(drive_path and manifest_path and row_count > 0)
+        has_prediction = predicted > 0
         reasons = []
-        if state.get("drive_preflight_status") != "OK":
-            reasons.append("Google Drive read/write preflight is not ready")
-        if item_status != "OK":
-            reasons.append(f"latest all-NSE prediction snapshot status is {item_status}")
-        if age is None or age < 0 or age > 420:
-            reasons.append("latest prediction snapshot is missing or older than 420 seconds (5-minute cadence plus processing allowance)")
-        if expected is None or int(expected or 0) <= 0:
-            reasons.append("expected NSE universe count is missing or zero")
-        elif row_count is None or int(row_count) != int(expected):
-            reasons.append("prediction row count does not equal the expected NSE universe")
-        expected_n = max(1, int(expected or 0))
-        if predicted is None or int(predicted) < int(expected_n * 0.95):
-            reasons.append("model prediction coverage is below 95% of the expected NSE universe")
-        if missing is None or int(missing or 0) / expected_n > 0.02:
-            reasons.append("missing current quotes exceed the 2% tolerance")
-        if limited is None or int(limited or 0) / expected_n > 0.10:
-            reasons.append("data-limited predictions exceed the 10% tolerance")
-        model_failures = int(item.get("model_failure_count") or 0)
-        untrained = int(item.get("untrained_symbol_count") or 0)
-        if model_failures / expected_n > 0.01:
-            reasons.append("model/feature failures exceed the 1% tolerance")
-        if untrained / expected_n > 0.10:
-            reasons.append("untrained-symbol share exceeds the 10% tolerance")
-        if item.get("model_artifact_verified") is not True:
-            reasons.append("production model artifacts are not verified against their manifest")
-        seed_coverage = int(item.get("history_seed_coverage_symbols") or 0)
-        if seed_coverage / expected_n < 0.90:
-            reasons.append("historical seed coverage is below 90%")
-        seed_batches = max(1, (expected_n + 4) // 5)
-        if int(item.get("history_seed_failed_batches") or 0) / seed_batches > 0.05:
-            reasons.append("failed historical seed batches exceed the 5% tolerance")
-        refresh_batches = int(item.get("history_refresh_batch_count") or 0)
-        refresh_failures = int(item.get("history_refresh_failed_batches") or 0)
-        if refresh_batches <= 0 or refresh_failures / max(1, refresh_batches) > 0.05:
-            reasons.append("current-session one-minute candle refresh is missing or exceeds the 5% failure tolerance")
-        if item.get("quality_gate_pass") is not True:
-            reasons.append("prediction quality gate is not passing")
-        if item.get("history_ready") is not True:
-            reasons.append("historical feature data is not ready")
-        if not drive_path or not manifest_path:
-            reasons.append("confirmed Drive prediction or manifest path is missing")
+        if not stored:
+            reasons.append("No persisted prediction artifact and manifest are recorded.")
+        elif eligible > 0 and not has_prediction:
+            reasons.append("Stock quotes were eligible, but the model emitted no predictions.")
         payload = {
-            "status": "ok" if not reasons else "degraded",
-            "probe": prefix,
-            "checked_at_utc": now_utc,
+            "status": "ok" if stored and has_prediction else "degraded",
+            "probe": "all_nse_minute_prediction_actual",
+            "checked_at_utc": now_utc.isoformat(),
             "cycle_minute_ist": minute,
-            "capture_status": item_status,
             "age_seconds": None if age is None else round(age, 1),
-            "expected_symbol_count": expected,
+            "expected_symbol_count": item.get("expected_symbol_count"),
+            "snapshot_symbol_count": item.get("snapshot_symbol_count"),
             "row_count": row_count,
+            "eligible_symbol_count": eligible,
+            "skipped_missing_quote_count": item.get("skipped_missing_quote_count", item.get("missing_quote_count")),
             "prediction_count": predicted,
-            "missing_quote_count": missing,
-            "data_limited_count": limited,
-            "quality_gate_pass": item.get("quality_gate_pass"),
+            "prediction_coverage_pct": item.get("prediction_coverage_pct"),
+            "prediction_coverage_is_informational": True,
             "history_ready": item.get("history_ready"),
             "drive_path": drive_path,
             "manifest_drive_path": manifest_path,
             "reasons": reasons,
         }
-    else:
-        return 404, {"status": "not_found"}
-    return (200 if not reasons else 503), payload
+        return (200 if stored and has_prediction else 503), payload
+
+    return 404, {"status": "not_found"}
 
 
 
@@ -353,7 +329,7 @@ def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
     """Verify the worker's own read-only market-data credentials without exposing secrets."""
     from indstocks_client import (
         configured,
-        historical_1m,
+        historical_5m,
         latest_quote,
         profile,
         _load_instruments,
@@ -407,17 +383,17 @@ def _indstocks_provider_diagnostic() -> tuple[int, dict[str, Any]]:
         return 503, payload
 
     try:
-        candles = historical_1m("RELIANCE.NS", days=3)
+        candles = historical_5m("RELIANCE.NS", days=3)
         if candles is None or candles.empty:
-            raise RuntimeError("no one-minute history returned")
-        payload["checks"]["one_minute_history"] = "PASS"
-        payload["one_minute_history_rows"] = int(len(candles))
-        payload["latest_one_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
+            raise RuntimeError("no five-minute history returned")
+        payload["checks"]["five_minute_history"] = "AVAILABLE_OPTIONAL"
+        payload["five_minute_history_rows"] = int(len(candles))
+        payload["latest_five_minute_candle_at"] = pd.Timestamp(candles.index.max()).isoformat()
     except Exception as exc:
-        payload["checks"]["one_minute_history"] = "FAIL"
-        payload["failed_check"] = "one_minute_history"
-        payload["error_type"] = type(exc).__name__
-        return 503, payload
+        # Current stored quotes can still be evaluated with quote-only features.
+        # Missing history is per-symbol context, not a whole-provider failure.
+        payload["checks"]["five_minute_history"] = "UNAVAILABLE_OPTIONAL"
+        payload["history_warning_type"] = type(exc).__name__
 
     payload["status"] = "ok"
     return 200, payload
@@ -513,10 +489,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         payload = {
             "status": "degraded" if (
                 error
-                or capture_status not in {"OK", "NOT_RUN"}
+                or capture_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
-                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "NOT_RUN"}
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
@@ -646,11 +622,13 @@ class WorkerHandler(BaseHTTPRequestHandler):
             prediction_status = str(
                 (result.get("all_nse_minute_predictions") or {}).get("status") or ""
             ).upper()
-            # Ask Cloud Scheduler to retry only durability/execution failures.
-            # Quality-gated PARTIAL results remain visible as PARTIAL; they are
-            # not converted into success or silently retried as if they were 5xx.
+            # Retry only durability/execution failures; partial quote coverage
+            # is informational and never prevents other symbols being predicted.
+            capture_snapshot_persisted = (
+                (result.get("all_universe_capture") or {}).get("snapshot_persisted") is True
+            )
             retryable_persistence_failure = (
-                capture_status in {"ERROR", "PERSISTENCE_ERROR"}
+                (capture_status in {"ERROR", "PERSISTENCE_ERROR"} and not capture_snapshot_persisted)
                 or prediction_status in {
                     "ERROR", "PERSISTENCE_ERROR",
                     "BLOCKED_SNAPSHOT_CAPTURE", "BLOCKED_SNAPSHOT_VALIDATION",

@@ -36,6 +36,8 @@ concurrency:
 
 jobs:
   deploy-and-verify:
+    # Production rollout is manual; merging code must not change the live worker.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:

@@ -25,15 +25,15 @@ FEATURES = [
     "fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis","fno_available",
 ]
 
-DRIVE_MODEL_ROOT = "models/all_nse_intraday_multifactor_replacement_2026"
-REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_MULTIFACTOR_2026_MODEL_MANIFEST.json"
-REMOTE_CLASSIFIER = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_multifactor_classifier_2026.joblib"
-REMOTE_REGRESSOR = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_multifactor_regressor_2026.joblib"
+DRIVE_MODEL_ROOT = "models/all_nse_intraday_5mbar_multifactor_replacement_2026"
+REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json"
+REMOTE_CLASSIFIER = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
+REMOTE_REGRESSOR = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
 
-CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_replacement"
-LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_INTRADAY_MULTIFACTOR_2026_MODEL_MANIFEST.json"
-LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_intraday_multifactor_classifier_2026.joblib"
-LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_intraday_multifactor_regressor_2026.joblib"
+CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_5mbar_replacement"
+LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json"
+LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
+LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
 
 BUY_P = 0.60
 SELL_P = 0.40
@@ -220,6 +220,8 @@ def _download_artifact_atomically(remote: str, local: Path) -> None:
 
 
 def _artifact_hashes_match(manifest: dict[str, Any]) -> bool:
+    if int(manifest.get("bar_interval_minutes") or 0) != 5:
+        return False
     expected_classifier = str(manifest.get("classifier_sha256") or "")
     expected_regressor = str(manifest.get("regressor_sha256") or "")
     return bool(
@@ -262,6 +264,7 @@ _MODEL_CACHE = {}
 
 def model_target_contract() -> dict[str, Any]:
     return {
+        "bar_interval_minutes": 5,
         "target": "target_30m",
         "positive_class": 1,
         "positive_class_meaning": "UP: future 30-minute return > 0",
@@ -295,6 +298,7 @@ def model_status() -> dict[str,Any]:
         "target":m.get("target"),
         "model_version":str(artifact_version or "unversioned"),
         "feature_count":len(FEATURES),
+        "bar_interval_minutes":m.get("bar_interval_minutes"),
         "training_symbols":m.get("training_symbols",[]),
         "training_symbol_count":m.get("training_symbol_count"),
         "universe_size":m.get("universe_size"),
@@ -302,7 +306,7 @@ def model_status() -> dict[str,Any]:
         "trained_until":m.get("trained_until"),
         "classifier_sha256":classifier_sha or None,
         "regressor_sha256":regressor_sha or None,
-        "manifest_sha256_match": all([
+        "manifest_sha256_match": int(m.get("bar_interval_minutes") or 0) == 5 and all([
             LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
             LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
         ]),
@@ -321,7 +325,7 @@ def _sha256(path: Path)->str:
 def _models():
     if _MODEL_CACHE: return _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]
     s=model_status()
-    if not s.get("manifest_sha256_match"): raise RuntimeError("ALL-NSE Intraday model hashes do not match manifest")
+    if not s.get("manifest_sha256_match"): raise RuntimeError("ALL-NSE 5-minute-bar model contract or artifact hashes do not match manifest")
     clf=joblib.load(LOCAL_CLASSIFIER); reg=joblib.load(LOCAL_REGRESSOR)
     _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]=clf,reg
     return clf,reg

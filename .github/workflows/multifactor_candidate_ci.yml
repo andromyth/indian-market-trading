@@ -50,6 +50,7 @@ jobs:
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
           all_nse_delivery_model.py
           all_nse_intraday_model.py
+          colab_build_all_nse_intraday_multifactor.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
@@ -138,6 +139,9 @@ jobs:
           tests/test_multifactor_data_layer_v2.py
           tests/test_59_feature_source_coverage.py
           tests/test_candidate_pipeline_stages.py
+          tests/test_all_nse_minute_prediction_capture.py
+          tests/test_all_universe_minute_capture.py
+          tests/test_all_nse_5m_bar_training.py
           tests/test_final_algorithm_data_readiness_v2.py
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py

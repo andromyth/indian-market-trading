@@ -130,7 +130,9 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
         prediction_snapshots=[],
     )
 
-    assert result["status"] == "PARTIAL"
+    assert result["status"] == "STORED"
+    assert result["snapshot_persisted"] is True
+    assert result["coverage_is_informational"] is True
     assert result["expected_symbol_count"] == 2
     assert result["quoted_symbol_count"] == 1
     assert result["missing_quote_count"] == 1
@@ -197,7 +199,7 @@ def test_pending_snapshot_upload_is_retried_once_and_receipt_prevents_reupload(t
     assert len(store.paths) == 1
 
 
-def test_service_health_clears_recovered_quote_coverage_warning():
+def test_service_health_does_not_warn_on_partial_stored_quote_coverage():
     from autonomous_intraday_worker_service import STATE, _record_tick_result
 
     original = dict(STATE)
@@ -208,21 +210,20 @@ def test_service_health_clears_recovered_quote_coverage_warning():
         _record_tick_result({
             "status": "PASS",
             "all_universe_capture": {
-                "status": "PARTIAL",
+                "status": "STORED",
                 "expected_symbol_count": 2600,
-                "quoted_symbol_count": 2598,
-                "missing_quote_count": 2,
+                "quoted_symbol_count": 1,
+                "missing_quote_count": 2599,
             },
         })
-        assert STATE["all_universe_capture_warning"] == (
-            "Quote coverage incomplete: 2598/2600 NSE symbols"
-        )
-        assert STATE["last_error"] == STATE["all_universe_capture_warning"]
+        assert STATE["all_universe_capture_warning"] is None
+        assert STATE["all_universe_capture_error"] is None
+        assert STATE["last_error"] is None
 
         _record_tick_result({
             "status": "PASS",
             "all_universe_capture": {
-                "status": "OK",
+                "status": "STORED",
                 "expected_symbol_count": 2600,
                 "quoted_symbol_count": 2600,
                 "missing_quote_count": 0,
@@ -400,3 +401,10 @@ def test_resilient_quote_fetch_retries_only_symbols_missing_from_partial_respons
     }
     assert result["unresolved_codes"] == []
     assert calls == ["NSE_1,NSE_2", "NSE_2"]
+
+
+def test_snapshot_coverage_is_informational_only():
+    assert capture._snapshot_coverage_pct(90, 100) == 90.0
+    assert capture._snapshot_coverage_pct(2619, 2620) == 99.962
+    assert capture._snapshot_coverage_pct(89, 100) == 89.0
+    assert capture._snapshot_coverage_pct(0, 0) == 0.0

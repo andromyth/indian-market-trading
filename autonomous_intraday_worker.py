@@ -1393,7 +1393,10 @@ class AutonomousIntradayWorker:
                     prediction_snapshots=self.last_minute_snapshot_rows,
                 )
                 result["all_universe_capture"] = all_universe_capture
-                if all_universe_capture.get("status") != "OK":
+                if (
+                    all_universe_capture.get("status") not in {"OK", "STORED", "PARTIAL"}
+                    and all_universe_capture.get("snapshot_persisted") is not True
+                ):
                     _log(
                         "all_universe_minute_capture_degraded",
                         minute=minute_key,

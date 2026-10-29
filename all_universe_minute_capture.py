@@ -20,6 +20,15 @@ import pandas as pd
 
 IST = ZoneInfo("Asia/Kolkata")
 BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET URLs.
+
+
+def _snapshot_coverage_pct(complete_symbols: int, expected_symbols: int) -> float:
+    """Return quote coverage as an informational metric; never use it as a gate."""
+    expected = max(0, int(expected_symbols))
+    complete = max(0, int(complete_symbols))
+    return round(100.0 * complete / expected, 3) if expected else 0.0
+
+
 QUOTE_REQUEST_MAX_ATTEMPTS = 3
 QUOTE_FALLBACK_BATCH_SIZE = 50
 QUOTE_RETRY_BACKOFF_SECONDS = 0.35
@@ -530,7 +539,7 @@ def capture_all_universe_minute_snapshot(
 
     now_ts = pd.Timestamp(now)
     now_ts = now_ts.tz_localize(IST) if now_ts.tzinfo is None else now_ts.tz_convert(IST)
-    cycle_minute = now_ts.floor("min")
+    cycle_minute = now_ts.floor("5min")
     local_dir = Path(worker_root) / "all_universe_minute_snapshots"
     local_dir.mkdir(parents=True, exist_ok=True)
     remote_day = cycle_minute.strftime("%Y/%m/%d")
@@ -545,6 +554,7 @@ def capture_all_universe_minute_snapshot(
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "INDSTOCKS_BATCH_QUOTE",
         "status": "STARTING",
+        "snapshot_persisted": False,
         "expected_symbol_count": 0,
         "quoted_symbol_count": 0,
         "missing_quote_count": 0,
@@ -695,6 +705,12 @@ def capture_all_universe_minute_snapshot(
         manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
         manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
         manifest["row_count"] = int(len(frame))
+        complete_coverage_pct = _snapshot_coverage_pct(
+            manifest["quoted_symbol_count"], manifest["expected_symbol_count"]
+        )
+        manifest["complete_quote_symbol_count"] = manifest["quoted_symbol_count"]
+        manifest["complete_quote_symbol_coverage_pct"] = complete_coverage_pct
+        manifest["coverage_is_informational"] = True
         manifest["forecast_record_count"] = int(frame["forecast_count"].sum())
         local_path = local_dir / f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
         temp_path = local_path.with_suffix(".tmp.parquet")
@@ -715,7 +731,8 @@ def capture_all_universe_minute_snapshot(
                 }, sort_keys=True),
                 encoding="utf-8",
             )
-            manifest["status"] = "OK" if request_errors == 0 and frame["quote_status"].eq("PASS").all() else "PARTIAL"
+            manifest["status"] = "STORED"
+            manifest["snapshot_persisted"] = True
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
             manifest["snapshot_drive_path"] = remote_path
