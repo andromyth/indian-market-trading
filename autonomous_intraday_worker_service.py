@@ -108,6 +108,15 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             ).upper()
             capture_error = STATE.get("all_universe_capture_error")
         if capture.get("snapshot_persisted") is True:
+            source_status = capture_status
+            source_error = capture_error
+            capture = {
+                **capture,
+                "source_snapshot_status": source_status,
+                "source_snapshot_error": source_error,
+                "status": "STORED",
+                "error": None,
+            }
             capture_status = "STORED"
             capture_error = None
         if all_nse_status == "NOT_SCHEDULED":
@@ -149,7 +158,8 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "cycle_minute_ist", "expected_symbol_count", "row_count", "quoted_symbol_count",
                 "missing_quote_count", "unmapped_symbol_count", "forecast_symbol_count",
                 "matched_outcome_count", "snapshot_drive_path", "remote_snapshot_path",
-                "snapshot_persisted", "status", "error",
+                "snapshot_persisted", "source_snapshot_status", "source_snapshot_error",
+                "status", "error",
             )
             if key in capture
         })
