@@ -202,6 +202,8 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     pd.DataFrame([
         {
             "symbol": "AAA",
+            "instrument_code": "NSE_1",
+            "cycle_minute_ist": minute.isoformat(),
             "quote_status": "PASS",
             "actual_observed_price": 101.25,
             "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
@@ -209,6 +211,8 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
         },
         {
             "symbol": "BBB",
+            "instrument_code": "NSE_2",
+            "cycle_minute_ist": minute.isoformat(),
             "quote_status": "PASS",
             "actual_observed_price": 202.5,
             "quote_observed_at_ist": (minute + pd.Timedelta(seconds=3)).isoformat(),
@@ -228,7 +232,16 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     monkeypatch.setattr("persistent_store.GoogleDriveStore", FakeDriveStore)
 
     result = predictor.run_for_capture(
-        {"cycle_minute_ist": minute.isoformat(), "status": "OK"},
+        {
+            "cycle_minute_ist": minute.isoformat(),
+            "status": "OK",
+            "expected_symbol_count": 2,
+            "row_count": 2,
+            "snapshot_drive_path": (
+                "production_data/all_universe_minute_snapshots/"
+                f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+            ),
+        },
         worker_root=tmp_path,
     )
 
@@ -267,6 +280,54 @@ def test_run_for_capture_writes_one_actual_and_prediction_row_per_symbol(tmp_pat
     assert saved_manifest["feature_quality_diagnostics"]["mean_feature_coverage_pct"] == 100.0
     assert saved_manifest["feature_quality_diagnostics"]["feature_group_coverage_pct"]["price_technical"] is None
 
+
+
+def test_prediction_capture_blocks_when_snapshot_was_not_persisted(tmp_path):
+    from all_nse_minute_prediction_capture import AllNSEMinutePredictor
+
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    predictor = AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: None
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "History refresh must not run when snapshot persistence is unconfirmed"
+    )
+
+    result = predictor.run_for_capture(
+        {"cycle_minute_ist": minute.isoformat(), "status": "PERSISTENCE_ERROR"},
+        worker_root=tmp_path,
+    )
+
+    assert result["status"] == "BLOCKED_SNAPSHOT_CAPTURE"
+    assert result["prediction_count"] == 0
+    assert not list((tmp_path / "all_nse_minute_predictions").rglob("predictions_*.parquet"))
+
+
+def test_prediction_capture_blocks_when_same_slot_snapshot_is_missing(tmp_path):
+    from all_nse_minute_prediction_capture import AllNSEMinutePredictor
+
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    predictor = AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: None
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "History refresh must not run when the source snapshot is missing"
+    )
+    result = predictor.run_for_capture(
+        {
+            "cycle_minute_ist": minute.isoformat(),
+            "status": "OK",
+            "expected_symbol_count": 1,
+            "row_count": 1,
+            "snapshot_drive_path": (
+                "production_data/all_universe_minute_snapshots/"
+                f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+            ),
+        },
+        worker_root=tmp_path,
+    )
+
+    assert result["status"] == "BLOCKED_SNAPSHOT_VALIDATION"
+    assert result["prediction_count"] == 0
+    assert not list((tmp_path / "all_nse_minute_predictions").rglob("predictions_*.parquet"))
 
 
 def test_missing_nifty_context_does_not_break_timestamp_filtering():

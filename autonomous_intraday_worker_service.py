@@ -603,7 +603,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                             WORKER.root,
                         )
                         prediction_status = str(prediction_capture.get("status") or "").upper()
-                        if prediction_status not in {"ERROR", "PERSISTENCE_ERROR"}:
+                        if prediction_status not in {
+                            "ERROR", "PERSISTENCE_ERROR",
+                            "BLOCKED_SNAPSHOT_CAPTURE", "BLOCKED_SNAPSHOT_VALIDATION",
+                        }:
                             prediction_error = None
                             break
                         prediction_error = str(
@@ -647,8 +650,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
             # Quality-gated PARTIAL results remain visible as PARTIAL; they are
             # not converted into success or silently retried as if they were 5xx.
             retryable_persistence_failure = (
-                capture_status == "PERSISTENCE_ERROR"
-                or prediction_status in {"ERROR", "PERSISTENCE_ERROR"}
+                capture_status in {"ERROR", "PERSISTENCE_ERROR"}
+                or prediction_status in {
+                    "ERROR", "PERSISTENCE_ERROR",
+                    "BLOCKED_SNAPSHOT_CAPTURE", "BLOCKED_SNAPSHOT_VALIDATION",
+                }
             )
             if retryable_persistence_failure:
                 _log(
