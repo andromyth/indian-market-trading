@@ -210,7 +210,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     result = predictor.run_for_capture(
         {
             "cycle_minute_ist": minute.isoformat(),
-            "status": "STORED",
+            "status": "PERSISTENCE_ERROR",
+            "snapshot_persisted": True,
             "expected_symbol_count": 3,
             "row_count": 3,
             "snapshot_drive_path": (
