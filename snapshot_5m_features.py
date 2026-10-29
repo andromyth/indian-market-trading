@@ -94,9 +94,17 @@ def resample_minute_candles_to_snapshot_5m(frame: pd.DataFrame | None) -> pd.Dat
     return out.loc[~out.index.duplicated(keep="last")]
 
 
-def _rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+def _rsi_series(
+    close: pd.Series,
+    period: int = 14,
+    session_key: pd.Series | None = None,
+) -> pd.Series:
     c = pd.to_numeric(close, errors="coerce")
     delta = c.diff()
+    # Keep the rolling RSI state across sessions, but never interpret the
+    # overnight close-to-open discontinuity as an intraday return.
+    if session_key is not None:
+        delta = delta.where(session_key.eq(session_key.shift(1)))
     up = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     result = 100 - 100 / (1 + up / down.replace(0, np.nan))
@@ -156,22 +164,16 @@ def make_snapshot_feature_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
 
     for name, lag in RETURN_LAGS.items():
         out[name] = close.groupby(session_key, sort=False).pct_change(periods=lag, fill_method=None)
-    out["rsi_70m"] = close.groupby(session_key, sort=False).transform(
-        lambda series: _rsi_series(series, 14)
-    )
+    # Long rolling indicators use only observed five-minute samples, including
+    # previous sessions. Short-horizon return features above remain session-local.
+    out["rsi_70m"] = _rsi_series(close, 14, session_key)
 
     for minutes, window in ((25, 5), (50, 10), (100, 20), (250, 50)):
-        moving_average = close.groupby(session_key, sort=False).transform(
-            lambda series: series.rolling(window, min_periods=window).mean()
-        )
+        moving_average = close.rolling(window, min_periods=window).mean()
         out[f"ma_{minutes}m_ratio"] = close / moving_average - 1.0
 
-    volume_mean = volume.groupby(session_key, sort=False).transform(
-        lambda series: series.rolling(20, min_periods=20).mean()
-    )
-    volume_std = volume.groupby(session_key, sort=False).transform(
-        lambda series: series.rolling(20, min_periods=20).std()
-    )
+    volume_mean = volume.rolling(20, min_periods=20).mean()
+    volume_std = volume.rolling(20, min_periods=20).std()
     out["volume_ratio_100m"] = volume / volume_mean
     out["volume_z_100m"] = (volume - volume_mean) / volume_std.replace(0, np.nan)
 
