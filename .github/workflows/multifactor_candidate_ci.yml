@@ -50,6 +50,8 @@ jobs:
           COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
           all_nse_delivery_model.py
           all_nse_intraday_model.py
+          snapshot_5m_features.py
+          colab_build_all_nse_intraday_multifactor.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
@@ -131,6 +133,7 @@ jobs:
       - name: Run multi-factor tests
         run: >
           pytest -q
+          tests/test_snapshot_5m_features.py
           tests/test_purged_walk_forward.py
           tests/test_cash_master_incremental_refresh.py
           tests/test_bulk_eod_zip_recovery.py
