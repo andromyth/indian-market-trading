@@ -196,32 +196,50 @@ MODEL_BUNDLE_FILES = (
 
 
 def _discover_model_bundle_folder(store: Any, models_id: str) -> str:
-    """Resolve one complete, exact-name bundle if its configured folder was renamed."""
-    query = (
-        f"'{models_id}' in parents and "
+    """Resolve one exact five-minute bundle anywhere in the bounded models tree."""
+    query_template = (
+        "'{parent_id}' in parents and "
         "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
-    folders = []
-    page_token = None
-    while True:
-        params = {
-            "q": query,
-            "spaces": "drive",
-            "fields": "nextPageToken,files(id,name,mimeType)",
-            "pageSize": 100,
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        response = store.service.files().list(**params).execute()
-        folders.extend(response.get("files") or [])
-        page_token = response.get("nextPageToken")
-        if not page_token:
-            break
+    max_depth = 6
+    max_folders = 2000
+    candidates = [{"id": models_id, "name": "models"}]
+    queue = [(models_id, 0)]
+    seen = {models_id}
 
-    # The bundle may have been saved directly in models/ or one level below it.
-    candidates = [{"id": models_id, "name": "models"}, *folders]
+    while queue:
+        parent_id, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        page_token = None
+        while True:
+            params = {
+                "q": query_template.format(parent_id=parent_id),
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 100,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            response = store.service.files().list(**params).execute()
+            for item in response.get("files") or []:
+                folder_id = str(item.get("id") or "")
+                if not folder_id or folder_id in seen:
+                    continue
+                seen.add(folder_id)
+                candidates.append(item)
+                if len(candidates) > max_folders:
+                    raise RuntimeError(
+                        f"Model bundle discovery exceeded the safe folder limit ({max_folders}); "
+                        "refusing to select a partial search result."
+                    )
+                queue.append((folder_id, depth + 1))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
     complete = [
         item for item in candidates
         if all(store._find_child(item["id"], name) for name in MODEL_BUNDLE_FILES)
@@ -236,15 +254,15 @@ def _discover_model_bundle_folder(store: Any, models_id: str) -> str:
         )
 
     relevant = sorted(
-        item["name"] for item in folders
-        if any(term in str(item.get("name", "")).lower() for term in ("intraday", "5m", "multifactor"))
+        item["name"] for item in candidates[1:]
+        if any(term in str(item.get("name", "")).lower() for term in ("intraday", "5m", "multifactor", "model", "bundle"))
     )
-    detail = ", ".join(relevant[:8]) or "none"
+    detail = ", ".join(relevant[:12]) or "none"
     raise FileNotFoundError(
         f"Google Drive model folder '{MODEL_FOLDER_NAME}' is missing under models; "
-        f"no sibling contains the exact manifest and both estimator files (candidate folders: {detail})."
+        f"no exact manifest-plus-two-estimator bundle was found within {max_depth} folder levels "
+        f"(candidate folders: {detail})."
     )
-
 
 def _drive_download(remote: str, local: Path) -> None:
     from persistent_store import GoogleDriveStore

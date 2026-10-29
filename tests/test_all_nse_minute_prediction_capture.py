@@ -1282,3 +1282,31 @@ def test_model_drive_path_fails_closed_when_no_complete_bundle_exists():
     )
     with pytest.raises(FileNotFoundError, match="no sibling contains the exact manifest"):
         model._discover_model_bundle_folder(store, "models-id")
+
+
+def test_model_drive_path_resolves_complete_bundle_nested_in_models_tree():
+    import all_nse_intraday_model as model
+
+    folder_type = "application/vnd.google-apps.folder"
+    hierarchy = {
+        "models-id": [{"id": "folder-archive", "name": "archive", "mimeType": folder_type}],
+        "folder-archive": [{"id": "folder-old-builds", "name": "old-builds", "mimeType": folder_type}],
+        "folder-old-builds": [{"id": "folder-exact-bundle", "name": "bundle-v2", "mimeType": folder_type}],
+    }
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+        def execute(self):
+            return self.payload
+    class Files:
+        def list(self, **kwargs):
+            parent_id = kwargs["q"].split("'")[1]
+            return Request({"files": hierarchy.get(parent_id, [])})
+    class Store:
+        service = type("Service", (), {"files": lambda _self: Files()})()
+        def _find_child(self, parent_id, name, *_args, **_kwargs):
+            if parent_id == "folder-exact-bundle" and name in model.MODEL_BUNDLE_FILES:
+                return {"id": f"artifact-{name}", "name": name}
+            return None
+
+    assert model._discover_model_bundle_folder(Store(), "models-id") == "folder-exact-bundle"
