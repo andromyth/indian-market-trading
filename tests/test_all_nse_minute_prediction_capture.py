@@ -126,11 +126,11 @@ def test_parse_candles_keeps_exchange_candle_fields_and_ist_timestamps():
     ts = int(pd.Timestamp("2026-10-21 10:00:00", tz=IST).timestamp())
     frame = capture.AllNSEMinutePredictor._parse_candles([
         {"ts": ts, "o": 100, "h": 102, "l": 99, "c": 101, "v": 12},
-        {"ts": ts + 60, "o": 101, "h": 103, "l": 100, "c": 102, "v": 18},
+        {"ts": ts + 300, "o": 101, "h": 103, "l": 100, "c": 102, "v": 18},
     ])
     assert len(frame) == 2
     assert str(frame.index.tz) == "Asia/Kolkata"
-    assert frame.index.tolist() == [pd.Timestamp("2026-10-21 10:05:00", tz=IST), pd.Timestamp("2026-10-21 10:06:00", tz=IST)]
+    assert frame.index.tolist() == [pd.Timestamp("2026-10-21 10:05:00", tz=IST), pd.Timestamp("2026-10-21 10:10:00", tz=IST)]
     assert frame.iloc[-1]["Close"] == 102
     assert frame.iloc[-1]["Volume"] == 18
 
