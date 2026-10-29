@@ -191,3 +191,31 @@ def test_training_features_use_five_minute_rows_without_resampling_minute_candle
     assert "target_30m" in out.columns
     assert out.loc[idx[0], "ret_5m"] != out.loc[idx[-1], "ret_5m"]
     assert np.isnan(out.loc[idx[-1], "target_30m"])
+
+
+
+def test_rolling_indicators_warm_from_prior_snapshots_without_overnight_return():
+    prior_idx = pd.date_range("2026-10-27 09:15", periods=60, freq="5min", tz=IST)
+    current_idx = pd.date_range("2026-10-28 09:15", periods=2, freq="5min", tz=IST)
+    idx = prior_idx.append(current_idx).rename("Datetime")
+    close = np.concatenate([np.linspace(100.0, 159.0, len(prior_idx)), [220.0, 221.0]])
+    day_open = np.concatenate([np.full(len(prior_idx), 100.0), [219.0, 219.0]])
+    day_high = np.concatenate([np.linspace(101.0, 160.0, len(prior_idx)), [221.0, 222.0]])
+    day_low = np.concatenate([np.linspace(99.0, 158.0, len(prior_idx)), [218.0, 218.0]])
+    frame = pd.DataFrame({
+        "Close": close,
+        "Volume": np.concatenate([np.full(len(prior_idx), 50.0), [np.nan, 10.0]]),
+        "day_open": day_open,
+        "day_high": day_high,
+        "day_low": day_low,
+        "day_volume": np.concatenate([np.arange(1000.0, 1060.0), [1000.0, 1010.0]]),
+    }, index=idx)
+
+    features = make_snapshot_feature_frame(frame)
+    open_slot = pd.Timestamp("2026-10-28 09:15", tz=IST)
+    next_slot = pd.Timestamp("2026-10-28 09:20", tz=IST)
+
+    assert pd.notna(features.loc[open_slot, "ma_250m_ratio"])
+    assert pd.notna(features.loc[open_slot, "rsi_70m"])
+    assert pd.isna(features.loc[open_slot, "ret_5m"])
+    assert features.loc[next_slot, "ret_5m"] == pytest.approx(close[-1] / close[-2] - 1.0)
