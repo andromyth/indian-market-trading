@@ -260,7 +260,7 @@ def _discover_model_bundle_folder(store: Any, models_id: str) -> str:
     detail = ", ".join(relevant[:12]) or "none"
     raise FileNotFoundError(
         f"Google Drive model folder '{MODEL_FOLDER_NAME}' is missing under models; "
-        f"no exact manifest-plus-two-estimator bundle was found within {max_depth} folder levels "
+        f"no sibling contains the exact manifest and both estimator files within {max_depth} folder levels "
         f"(candidate folders: {detail})."
     )
 
