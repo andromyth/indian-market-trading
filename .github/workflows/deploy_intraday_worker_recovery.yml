@@ -130,7 +130,7 @@ jobs:
           payload=json.load(open(sys.argv[1],encoding="utf-8"))
           matches=[
               item for item in ((payload.get("status") or {}).get("traffic") or [])
-              if item.get("tag") == "preflight" and item.get("url") and item.get("revisionName")
+              if item.get("tag") == "preflight5m" and item.get("url") and item.get("revisionName")
           ]
           if not matches:
               sys.exit("No tagged, zero-traffic candidate revision was found.")
