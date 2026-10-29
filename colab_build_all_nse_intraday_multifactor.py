@@ -21,7 +21,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 
-from all_nse_intraday_model import FEATURES
+from snapshot_5m_features import (
+    FEATURES, FEATURE_SCHEMA_VERSION, SNAPSHOT_CADENCE_MINUTES,
+    make_snapshot_feature_frame, resample_minute_candles_to_snapshot_5m,
+)
 
 IST = "Asia/Kolkata"
 PERSISTENT_INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
@@ -66,55 +69,22 @@ def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
-def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
-    x = _norm(g)
+def make_features(g: pd.DataFrame, market: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Train against five-minute endpoint samples using the shared inference schema."""
+    del market
+    x = resample_minute_candles_to_snapshot_5m(g)
     if x.empty:
         return pd.DataFrame()
-    c, h, l, o, v = x["Close"], x["High"], x["Low"], x["Open"], x["Volume"]
-    out = pd.DataFrame(index=x.index)
-
-    for n in (1, 3, 5, 10, 15, 30):
-        out[f"ret_{n}"] = c.pct_change(n)
-
-    out["rsi14"] = rsi_series(c)
-    pc = c.shift(1)
-    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    out["atr14_pct"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / c
-
-    for n in (5, 10, 20, 50):
-        out[f"ma{n}_ratio"] = c / c.rolling(n, min_periods=n).mean() - 1
-
-    out["range_pct"] = (h - l) / c
-    out["body_pct"] = (c - o) / o
-
-    vm = v.rolling(20, min_periods=20).mean()
-    vs = v.rolling(20, min_periods=20).std()
-    out["volume_ratio"] = v / vm
-    out["volume_z20"] = (v - vm) / vs
-
-    mins = x.index.hour * 60 + x.index.minute
-    out["tod_sin"] = np.sin(2 * np.pi * mins / 390.0)
-    out["tod_cos"] = np.cos(2 * np.pi * mins / 390.0)
-
-    if market is not None and not market.empty:
-        m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
-        mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
-        for n in (1, 3, 5, 10, 15, 30):
-            out[f"market_ret_{n}"] = mc.pct_change(n, fill_method=None)
-        out["market_rsi14"] = rsi_series(mc)
-    else:
-        for n in (1, 3, 5, 10, 15, 30):
-            out[f"market_ret_{n}"] = np.nan
-        out["market_rsi14"] = np.nan
-
-    out["relative_ret_1"] = out["ret_1"] - out["market_ret_1"]
-    out["relative_ret_5"] = out["ret_5"] - out["market_ret_5"]
-    out["relative_ret_15"] = out["ret_15"] - out["market_ret_15"]
-
-    # Strict timestamp target: use the actual +30 minute timestamp within a
-    # one-minute tolerance rather than assuming 30 rows == 30 minutes.
-    right = pd.DataFrame({"future_ts": x.index, "future_close": c.to_numpy()}).sort_values("future_ts")
-    left = pd.DataFrame({"decision_ts": x.index, "future_ts": x.index + pd.Timedelta(minutes=30)}).sort_values("future_ts")
+    out = make_snapshot_feature_frame(x)
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    right = pd.DataFrame({
+        "future_ts": x.index,
+        "future_close": close.to_numpy(),
+    }).sort_values("future_ts")
+    left = pd.DataFrame({
+        "decision_ts": x.index,
+        "future_ts": x.index + pd.Timedelta(minutes=30),
+    }).sort_values("future_ts")
     merged = pd.merge_asof(
         left,
         right,
@@ -123,7 +93,8 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
         tolerance=pd.Timedelta(minutes=1),
     )
     future_close = merged.set_index("decision_ts")["future_close"].reindex(out.index)
-    out["future_return_30m"] = future_close / c - 1
+    out["future_close"] = future_close.to_numpy()
+    out["future_return_30m"] = out["future_close"] / close - 1.0
     out["target_30m"] = np.where(
         out["future_return_30m"].notna(),
         (out["future_return_30m"] > 0).astype(float),
@@ -298,7 +269,7 @@ def main():
     ap.add_argument("--drive-root", default="/content/drive/MyDrive/Indian_Market_Research")
     ap.add_argument("--out", default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_intraday_multifactor_replacement_2026")
     ap.add_argument("--min-rows-symbol", type=int, default=300)
-    ap.add_argument("--sample-minutes", type=int, default=15)
+    ap.add_argument("--sample-minutes", type=int, default=5)
     ap.add_argument("--max-train-rows-per-symbol", type=int, default=2000)
     args = ap.parse_args()
 
@@ -316,7 +287,7 @@ def main():
             "Historical intraday seed not found. Run seed_nse_intraday_history.py first."
         )
 
-    market = load_market(root)
+    market = pd.DataFrame()
     fno = load_fno(root)
 
     # Colab RAM is limited, so never accumulate the complete minute-derived
@@ -388,7 +359,7 @@ def main():
 
     if not frames:
         raise RuntimeError(
-            "No ALL-NSE intraday symbols have sufficient seeded 1-minute history."
+            "No ALL-NSE intraday symbols have enough history to build the five-minute snapshot feature contract."
         )
 
     data = pd.concat(frames, axis=0, ignore_index=False)
@@ -439,6 +410,8 @@ def main():
         "model_family": "logistic_regression+ridge",
         "target": "target_30m",
         "feature_count": len(FEATURES),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "input_cadence_minutes": SNAPSHOT_CADENCE_MINUTES,
         "features": FEATURES,
         "universe_size": universe_size,
         "training_symbols": train_symbols,
@@ -464,16 +437,15 @@ def main():
         "classifier_sha256": "",
         "regressor_sha256": "",
         "no_auto_orders": True,
-        "training_data_sources": [
-            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_HISTORICAL_SEED",
-            "NSE_OFFICIAL_INTRADAY_INCREMENTAL_WHEN_AVAILABLE",
-            "NSE_OFFICIAL_NIFTY50_CONTEXT",
+         "training_data_sources": [
+            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_RESAMPLED_TO_5M_SNAPSHOT_ENDPOINTS",
+            "NSE_OFFICIAL_INTRADAY_INCREMENTAL_RESAMPLED_TO_5M_SNAPSHOT_ENDPOINTS_WHEN_AVAILABLE",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
         "historical_seed_source_url": "https://github.com/olo-labs/olo-testdata-nse-min-candle",
-        "live_incremental_source": "NSE_OFFICIAL_CHART",
+        "live_incremental_source": "PERSISTED_FIVE_MINUTE_NSE_SNAPSHOTS",
         "point_in_time_fno": True,
-        "volume_policy": "Use source-reported volume only; missing volume stays NaN.",
+        "volume_policy": "Training interval volume sums completed minute candles; live interval volume is the difference in cumulative day volume between consecutive five-minute snapshots. Missing volume stays NaN.",
     }
 
     out.mkdir(parents=True, exist_ok=True)
