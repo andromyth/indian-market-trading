@@ -187,14 +187,76 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     return {k:_safe(vals.get(k)) for k in FEATURES}
 
 
+MODEL_FOLDER_NAME = DRIVE_MODEL_ROOT.rsplit("/", 1)[-1]
+MODEL_BUNDLE_FILES = (
+    Path(REMOTE_MANIFEST).name,
+    Path(REMOTE_CLASSIFIER).name,
+    Path(REMOTE_REGRESSOR).name,
+)
+
+
+def _discover_model_bundle_folder(store: Any, models_id: str) -> str:
+    """Resolve one complete, exact-name bundle if its configured folder was renamed."""
+    query = (
+        f"'{models_id}' in parents and "
+        "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    folders = []
+    page_token = None
+    while True:
+        params = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "nextPageToken,files(id,name,mimeType)",
+            "pageSize": 100,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        response = store.service.files().list(**params).execute()
+        folders.extend(response.get("files") or [])
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    # The bundle may have been saved directly in models/ or one level below it.
+    candidates = [{"id": models_id, "name": "models"}, *folders]
+    complete = [
+        item for item in candidates
+        if all(store._find_child(item["id"], name) for name in MODEL_BUNDLE_FILES)
+    ]
+    if len(complete) == 1:
+        return complete[0]["id"]
+    if len(complete) > 1:
+        names = ", ".join(sorted(item["name"] for item in complete)[:8])
+        raise RuntimeError(
+            f"Multiple complete five-minute model bundles found under models: {names}; "
+            "refusing ambiguous selection."
+        )
+
+    relevant = sorted(
+        item["name"] for item in folders
+        if any(term in str(item.get("name", "")).lower() for term in ("intraday", "5m", "multifactor"))
+    )
+    detail = ", ".join(relevant[:8]) or "none"
+    raise FileNotFoundError(
+        f"Google Drive model folder '{MODEL_FOLDER_NAME}' is missing under models; "
+        f"no sibling contains the exact manifest and both estimator files (candidate folders: {detail})."
+    )
+
+
 def _drive_download(remote: str, local: Path) -> None:
     from persistent_store import GoogleDriveStore
     from googleapiclient.http import MediaIoBaseDownload
     store = GoogleDriveStore()
     parent = store.root_id
     parts = remote.strip("/").split("/")
-    for part in parts[:-1]:
+    for index, part in enumerate(parts[:-1]):
         found = store._find_child(parent, part)
+        if not found and parts[:index] == ["models"] and part == MODEL_FOLDER_NAME:
+            parent = _discover_model_bundle_folder(store, parent)
+            continue
         if not found: raise FileNotFoundError(f"Google Drive path component not found: {part}")
         parent = found["id"]
     found = store._find_child(parent, parts[-1])
