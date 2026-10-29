@@ -1,6 +1,7 @@
 name: Inspect all-NSE capture infrastructure
 # Follow-up read-only inspection after worker revision rollout.
 # A push to this workflow requests a fresh read-only capture/scheduler diagnostics run.
+# Pre-market diagnostic request: 2026-10-29; this workflow does not deploy or mutate resources.
 
 on:
   workflow_dispatch:
