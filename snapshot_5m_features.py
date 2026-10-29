@@ -67,7 +67,10 @@ def resample_minute_candles_to_snapshot_5m(frame: pd.DataFrame | None) -> pd.Dat
         day_open = _safe_float(opens.iloc[0]) if not opens.empty else (_safe_float(closes.iloc[0]) if not closes.empty else np.nan)
         for slot in pd.date_range(start + pd.Timedelta(minutes=5), end - pd.Timedelta(minutes=5), freq="5min"):
             window = day.loc[(day.index >= slot - pd.Timedelta(minutes=5)) & (day.index < slot)]
-            if window.empty or window.index.max() < slot - pd.Timedelta(minutes=1):
+            expected_minutes = pd.date_range(
+                slot - pd.Timedelta(minutes=5), periods=5, freq="min"
+            )
+            if not window.index.equals(expected_minutes):
                 continue
             close_values = window["Close"].dropna()
             if close_values.empty:
@@ -122,42 +125,84 @@ def _fill_session_prefix_from_previous_session(values: pd.Series, session_key: p
 
 
 def make_snapshot_feature_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
-    """Feature computation shared by offline training and live five-minute inference."""
-    x = normalise_price_frame(frame)
-    if x.empty or x["Close"].notna().sum() == 0:
-        return pd.DataFrame(columns=FEATURES, index=x.index)
+    """Build features on a complete five-minute clock grid, preserving missing slots.
+
+    The grid begins at the NSE open and ends at the latest supplied slot for each
+    session. Missing quote rows stay missing; row-count shifts must never masquerade
+    as five-minute returns when a source snapshot is absent.
+    """
+    source = normalise_price_frame(frame)
+    if source.empty or source["Close"].notna().sum() == 0:
+        return pd.DataFrame(columns=FEATURES, index=source.index)
+    sessions = []
+    for session_date, day in source.groupby(pd.Index(source.index.date), sort=True):
+        day = day.loc[(day.index.time >= time(9, 15)) & (day.index.time < time(15, 30))]
+        if day.empty:
+            continue
+        session_open = pd.Timestamp(datetime.combine(session_date, time(9, 15)), tz=IST)
+        latest = day.index.max().floor("5min")
+        if latest < session_open:
+            continue
+        grid = pd.date_range(session_open, latest, freq="5min")
+        sessions.append(day.reindex(grid))
+    if not sessions:
+        return pd.DataFrame(columns=FEATURES, index=source.index)
+    x = pd.concat(sessions).sort_index()
     idx = pd.DatetimeIndex(x.index)
-    session = pd.Series(idx.date, index=x.index)
-    close, volume = pd.to_numeric(x["Close"], errors="coerce"), pd.to_numeric(x["Volume"], errors="coerce")
+    session_key = pd.Series(idx.date, index=x.index)
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    volume = pd.to_numeric(x["Volume"], errors="coerce")
     out = pd.DataFrame(index=x.index)
+
     for name, lag in RETURN_LAGS.items():
-        values = close.groupby(session, sort=False).pct_change(periods=lag, fill_method=None)
-        out[name] = _fill_session_prefix_from_previous_session(values, session)
-    rsi = close.groupby(session, sort=False).transform(lambda s: _rsi_series(s, 14))
-    out["rsi_70m"] = _fill_session_prefix_from_previous_session(rsi, session)
-    for minutes, window in ((25,5),(50,10),(100,20),(250,50)):
-        avg = close.groupby(session, sort=False).transform(lambda s: s.rolling(window, min_periods=window).mean())
-        out[f"ma_{minutes}m_ratio"] = _fill_session_prefix_from_previous_session(close / avg - 1.0, session)
-    vm = volume.groupby(session, sort=False).transform(lambda s: s.rolling(20, min_periods=20).mean())
-    vs = volume.groupby(session, sort=False).transform(lambda s: s.rolling(20, min_periods=20).std())
-    out["volume_ratio_100m"] = _fill_session_prefix_from_previous_session(volume / vm, session)
-    out["volume_z_100m"] = _fill_session_prefix_from_previous_session((volume - vm) / vs.replace(0, np.nan), session)
+        out[name] = close.groupby(session_key, sort=False).pct_change(periods=lag, fill_method=None)
+    out["rsi_70m"] = close.groupby(session_key, sort=False).transform(
+        lambda series: _rsi_series(series, 14)
+    )
+
+    for minutes, window in ((25, 5), (50, 10), (100, 20), (250, 50)):
+        moving_average = close.groupby(session_key, sort=False).transform(
+            lambda series: series.rolling(window, min_periods=window).mean()
+        )
+        out[f"ma_{minutes}m_ratio"] = close / moving_average - 1.0
+
+    volume_mean = volume.groupby(session_key, sort=False).transform(
+        lambda series: series.rolling(20, min_periods=20).mean()
+    )
+    volume_std = volume.groupby(session_key, sort=False).transform(
+        lambda series: series.rolling(20, min_periods=20).std()
+    )
+    out["volume_ratio_100m"] = volume / volume_mean
+    out["volume_z_100m"] = (volume - volume_mean) / volume_std.replace(0, np.nan)
+
     day_open = x["day_open"].copy()
     missing_open = day_open.isna()
-    fallback_open = (x["Open"].groupby(session, sort=False).transform("first")
-                     if x["Open"].notna().any() else close.groupby(session, sort=False).transform("first"))
+    fallback_open = (
+        x["Open"].groupby(session_key, sort=False).transform("first")
+        if x["Open"].notna().any()
+        else close.groupby(session_key, sort=False).transform("first")
+    )
     day_open.loc[missing_open] = fallback_open.loc[missing_open]
-    fallback_high = (x["High"].groupby(session, sort=False).cummax()
-                     if x["High"].notna().any() else close.groupby(session, sort=False).cummax())
-    fallback_low = (x["Low"].groupby(session, sort=False).cummin()
-                    if x["Low"].notna().any() else close.groupby(session, sort=False).cummin())
+    fallback_high = (
+        x["High"].groupby(session_key, sort=False).cummax()
+        if x["High"].notna().any()
+        else close.groupby(session_key, sort=False).cummax()
+    )
+    fallback_low = (
+        x["Low"].groupby(session_key, sort=False).cummin()
+        if x["Low"].notna().any()
+        else close.groupby(session_key, sort=False).cummin()
+    )
+    day_high = x["day_high"].fillna(fallback_high)
+    day_low = x["day_low"].fillna(fallback_low)
     out["session_return"] = close / day_open - 1.0
-    out["day_high_ratio"] = close / x["day_high"].fillna(fallback_high) - 1.0
-    out["day_low_ratio"] = close / x["day_low"].fillna(fallback_low) - 1.0
+    out["day_high_ratio"] = close / day_high - 1.0
+    out["day_low_ratio"] = close / day_low - 1.0
+
     elapsed = np.clip(idx.hour * 60 + idx.minute - 555, 0, 389)
     out["tod_sin"] = np.sin(2 * np.pi * elapsed / 390.0)
     out["tod_cos"] = np.cos(2 * np.pi * elapsed / 390.0)
-    for name in ("fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis"):
+    for name in ("fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi", "fno_basis"):
         out[name] = np.nan
     out["fno_available"] = 0.0
     return out.reindex(columns=FEATURES)
