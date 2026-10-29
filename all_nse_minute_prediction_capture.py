@@ -268,8 +268,7 @@ def _current_minute_row(
         if not same_day_history.empty and "day_volume" in same_day_history:
             latest_history_ts = _as_ist_timestamp(same_day_history.index.max())
             if latest_history_ts == snapshot_minute - pd.Timedelta(minutes=SNAPSHOT_CADENCE_MINUTES):
-                day_volume_values = pd.to_numeric(same_day_history["day_volume"], errors="coerce").dropna()
-                history_volume = day_volume_values.iloc[-1] if not day_volume_values.empty else np.nan
+                history_volume = _safe_float(same_day_history.iloc[-1].get("day_volume"))
             else:
                 history_volume = np.nan
         else:
