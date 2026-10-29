@@ -400,3 +400,10 @@ def test_resilient_quote_fetch_retries_only_symbols_missing_from_partial_respons
     }
     assert result["unresolved_codes"] == []
     assert calls == ["NSE_1,NSE_2", "NSE_2"]
+
+
+def test_snapshot_coverage_threshold_is_90_percent():
+    assert capture._snapshot_coverage_status(90, 100) == ("OK", 90.0)
+    assert capture._snapshot_coverage_status(2619, 2620) == ("OK", 99.962)
+    assert capture._snapshot_coverage_status(89, 100) == ("PARTIAL", 89.0)
+    assert capture._snapshot_coverage_status(0, 0) == ("PARTIAL", 0.0)
