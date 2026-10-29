@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Build the pooled ALL-NSE Intraday 30-minute replacement model in Colab.
+"""Train the pooled ALL-NSE 30-minute model exclusively from persisted five-minute snapshots."""
 
-Historical training uses the persisted OLO public NSE minute-candle seed plus
-any official NSE incremental 1-minute partitions already accumulated in Drive.
-Live/incremental inference remains NSE-first. No orders are placed.
-"""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import joblib
@@ -23,12 +20,12 @@ from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 
 from snapshot_5m_features import (
     FEATURES, FEATURE_SCHEMA_VERSION, SNAPSHOT_CADENCE_MINUTES,
-    make_snapshot_feature_frame, resample_minute_candles_to_snapshot_5m,
+    make_snapshot_feature_frame, normalise_price_frame,
 )
 
 IST = "Asia/Kolkata"
-PERSISTENT_INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
-SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
+SNAPSHOT_REL = Path("production_data/all_universe_minute_snapshots")
+_SNAPSHOT_CACHE_ROOT: Path | None = None
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
@@ -70,9 +67,9 @@ def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
 
 
 def make_features(g: pd.DataFrame, market: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Train against five-minute endpoint samples using the shared inference schema."""
+    """Build the 30-minute target on actual persisted five-minute snapshot rows."""
     del market
-    x = resample_minute_candles_to_snapshot_5m(g)
+    x = normalise_price_frame(g)
     if x.empty:
         return pd.DataFrame()
     out = make_snapshot_feature_frame(x)
@@ -103,47 +100,131 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame | None = None) -> pd.Dat
     return out
 
 
-def load_symbol(root: Path, sym: str) -> pd.DataFrame:
-    parts = []
-    errors = []
+def build_snapshot_training_cache(root: Path, cache_root: Path) -> dict[str, Any]:
+    """Create symbol-partitioned rows from saved five-minute full-universe snapshots only."""
+    import duckdb
 
-    # Historical seed consolidated into one Parquet file per symbol.
-    seed_dir = root / SEED_REL / f"symbol={sym}"
-    seed_files = sorted(seed_dir.glob("*.parquet")) if seed_dir.exists() else []
-    for p in seed_files:
-        try:
-            z = pd.read_parquet(p)
-            if z is None or z.empty:
-                continue
-            parts.append(_norm(z))
-        except Exception as exc:
-            errors.append(f"seed:{p.name}:{type(exc).__name__}:{exc}")
-
-    # Official NSE incremental archive, if it already contains observations.
-    official_dir = root / PERSISTENT_INTRADAY_REL
-    if official_dir.exists():
-        for p in sorted(official_dir.rglob(f"{sym}.parquet")):
-            try:
-                z = pd.read_parquet(p)
-                if z is None or z.empty:
-                    continue
-                parts.append(_norm(z))
-            except Exception as exc:
-                errors.append(f"official:{p}:{type(exc).__name__}:{exc}")
-
-    if errors and not parts:
+    snapshot_root = root / SNAPSHOT_REL
+    files = sorted(snapshot_root.rglob("snapshot_*.parquet")) if snapshot_root.exists() else []
+    if not files:
         raise RuntimeError(
-            f"Could not read any intraday data for {sym}. "
-            + " | ".join(errors[:3])
+            f"No persisted five-minute quote snapshots found under {snapshot_root}; "
+            "the one-minute candle archive is not an allowed training fallback."
         )
+    cache_root = Path(cache_root)
+    shutil.rmtree(cache_root, ignore_errors=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    file_list = "[" + ", ".join(
+        "'" + str(path.resolve()).replace("\\", "/").replace("'", "''") + "'"
+        for path in files
+    ) + "]"
+    destination = str(cache_root.resolve()).replace("\\", "/").replace("'", "''")
+    query = f"""
+        COPY (
+            WITH raw AS (
+                SELECT
+                    UPPER(TRIM(CAST(symbol AS VARCHAR))) AS symbol,
+                    TRY_CAST(cycle_minute_ist AS TIMESTAMPTZ) AS snapshot_ts,
+                    UPPER(TRIM(CAST(quote_status AS VARCHAR))) AS quote_status,
+                    TRY_CAST(actual_observed_price AS DOUBLE) AS observed_price,
+                    TRY_CAST(day_volume AS DOUBLE) AS day_volume,
+                    TRY_CAST(day_open AS DOUBLE) AS day_open,
+                    TRY_CAST(day_high AS DOUBLE) AS day_high,
+                    TRY_CAST(day_low AS DOUBLE) AS day_low
+                FROM read_parquet({file_list}, union_by_name=true)
+            ),
+            eligible AS (
+                SELECT *
+                FROM raw
+                WHERE symbol <> ''
+                  AND snapshot_ts IS NOT NULL
+                  AND EXTRACT(MINUTE FROM (snapshot_ts AT TIME ZONE 'Asia/Kolkata')) % 5 = 0
+                  AND CAST(snapshot_ts AT TIME ZONE 'Asia/Kolkata' AS TIME) >= TIME '09:15:00'
+                  AND CAST(snapshot_ts AT TIME ZONE 'Asia/Kolkata' AS TIME) < TIME '15:30:00'
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY symbol, snapshot_ts
+                    ORDER BY quote_status DESC
+                ) = 1
+            ),
+            ordered AS (
+                SELECT *,
+                    LAG(snapshot_ts) OVER w AS previous_ts,
+                    LAG(quote_status) OVER w AS previous_quote_status,
+                    LAG(observed_price) OVER w AS previous_price,
+                    LAG(day_volume) OVER w AS previous_day_volume
+                FROM eligible
+                WINDOW w AS (
+                    PARTITION BY symbol, CAST(snapshot_ts AT TIME ZONE 'Asia/Kolkata' AS DATE)
+                    ORDER BY snapshot_ts
+                )
+            ),
+            features AS (
+                SELECT
+                    symbol,
+                    snapshot_ts AT TIME ZONE 'Asia/Kolkata' AS "Timestamp",
+                    CASE WHEN quote_status = 'PASS' AND observed_price > 0
+                         THEN observed_price ELSE NULL END AS "Close",
+                    CASE
+                        WHEN quote_status = 'PASS' AND observed_price > 0
+                         AND previous_quote_status = 'PASS' AND previous_price > 0
+                         AND snapshot_ts - previous_ts = INTERVAL '5 minutes'
+                         AND day_volume IS NOT NULL
+                         AND previous_day_volume IS NOT NULL
+                         AND day_volume >= previous_day_volume
+                        THEN day_volume - previous_day_volume
+                        ELSE NULL
+                    END AS "Volume",
+                    CASE WHEN quote_status = 'PASS' AND observed_price > 0 THEN day_open ELSE NULL END AS day_open,
+                    CASE WHEN quote_status = 'PASS' AND observed_price > 0 THEN day_high ELSE NULL END AS day_high,
+                    CASE WHEN quote_status = 'PASS' AND observed_price > 0 THEN day_low ELSE NULL END AS day_low,
+                    CASE WHEN quote_status = 'PASS' AND observed_price > 0 THEN day_volume ELSE NULL END AS day_volume
+                FROM ordered
+            )
+            SELECT * FROM features
+            ORDER BY symbol, "Timestamp"
+        ) TO '{destination}'
+        (FORMAT PARQUET, PARTITION_BY (symbol), COMPRESSION ZSTD)
+    """
+    con = duckdb.connect()
+    try:
+        con.execute("SET TimeZone='UTC'")
+        con.execute(query)
+    finally:
+        con.close()
+    manifest = {
+        "training_input_source": "PERSISTED_FIVE_MINUTE_NSE_QUOTE_SNAPSHOTS_ONLY",
+        "snapshot_cadence_minutes": SNAPSHOT_CADENCE_MINUTES,
+        "snapshot_file_count": len(files),
+        "snapshot_root": str(snapshot_root),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "cache_root": str(cache_root),
+    }
+    (cache_root / "_snapshot_training_cache_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return manifest
 
-    parts = [p for p in parts if p is not None and not p.empty]
+
+def load_symbol(root: Path, sym: str) -> pd.DataFrame:
+    """Read one symbol's ordered history from the one-pass snapshot-only cache."""
+    cache_root = _SNAPSHOT_CACHE_ROOT or (Path(root) / "snapshot_training_cache")
+    symbol_dir = cache_root / f"symbol={str(sym).strip().upper()}"
+    if not symbol_dir.exists():
+        return pd.DataFrame()
+    parts = []
+    for path in sorted(symbol_dir.rglob("*.parquet")):
+        try:
+            frame = pd.read_parquet(path)
+            if not frame.empty:
+                parts.append(normalise_price_frame(frame))
+        except Exception:
+            continue
+    parts = [frame for frame in parts if frame is not None and not frame.empty]
     if not parts:
         return pd.DataFrame()
+    merged = pd.concat(parts).sort_index()
+    return merged.loc[~merged.index.duplicated(keep="last")]
 
-    q = pd.concat(parts).sort_index()
-    q = q[~q.index.duplicated(keep="last")]
-    return q
 
 def load_market(root: Path) -> pd.DataFrame:
     cands = [
@@ -271,22 +352,26 @@ def main():
     ap.add_argument("--min-rows-symbol", type=int, default=300)
     ap.add_argument("--sample-minutes", type=int, default=5)
     ap.add_argument("--max-train-rows-per-symbol", type=int, default=2000)
+    ap.add_argument("--snapshot-cache-dir", default="/content/all_nse_intraday_snapshot_training_cache")
     args = ap.parse_args()
 
     root = Path(args.drive_root)
     out = Path(args.out)
+    global _SNAPSHOT_CACHE_ROOT
+    _SNAPSHOT_CACHE_ROOT = Path(args.snapshot_cache_dir)
 
     from delivery_training_universe import official_nse_symbols
     universe = sorted(set(official_nse_symbols(force_refresh=True)))
     if not universe:
         raise RuntimeError("Official NSE universe is empty")
 
-    seed_root = root / SEED_REL
-    if not seed_root.exists():
+    snapshot_root = root / SNAPSHOT_REL
+    if not snapshot_root.exists() or not any(snapshot_root.rglob("snapshot_*.parquet")):
         raise RuntimeError(
-            "Historical intraday seed not found. Run seed_nse_intraday_history.py first."
+            f"Persisted five-minute snapshot archive is empty: {snapshot_root}. "
+            "Training will not fall back to one-minute candle history."
         )
-
+    snapshot_cache_manifest = build_snapshot_training_cache(root, _SNAPSHOT_CACHE_ROOT)
     market = pd.DataFrame()
     fno = load_fno(root)
 
@@ -359,7 +444,7 @@ def main():
 
     if not frames:
         raise RuntimeError(
-            "No ALL-NSE intraday symbols have enough history to build the five-minute snapshot feature contract."
+            "No ALL-NSE symbols have enough persisted five-minute snapshots to build a training candidate."
         )
 
     data = pd.concat(frames, axis=0, ignore_index=False)
@@ -438,14 +523,13 @@ def main():
         "regressor_sha256": "",
         "no_auto_orders": True,
          "training_data_sources": [
-            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_RESAMPLED_TO_5M_SNAPSHOT_ENDPOINTS",
-            "NSE_OFFICIAL_INTRADAY_INCREMENTAL_RESAMPLED_TO_5M_SNAPSHOT_ENDPOINTS_WHEN_AVAILABLE",
+            "PERSISTED_FIVE_MINUTE_NSE_QUOTE_SNAPSHOTS_ONLY",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
-        "historical_seed_source_url": "https://github.com/olo-labs/olo-testdata-nse-min-candle",
+        "snapshot_training_cache": snapshot_cache_manifest,
         "live_incremental_source": "PERSISTED_FIVE_MINUTE_NSE_SNAPSHOTS",
         "point_in_time_fno": True,
-        "volume_policy": "Training interval volume sums completed minute candles; live interval volume is the difference in cumulative day volume between consecutive five-minute snapshots. Missing volume stays NaN.",
+        "volume_policy": "Training and live volume use the difference in provider cumulative day volume between adjacent five-minute snapshots. Missing slots, invalid quotes, or volume resets stay NaN.",
     }
 
     out.mkdir(parents=True, exist_ok=True)
