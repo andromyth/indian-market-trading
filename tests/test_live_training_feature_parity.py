@@ -31,7 +31,6 @@ def test_training_stock_and_market_returns_match_live_session_aware_features():
     features = make_features(prices, prices)
     for stamp in prices.index[-9:]:
         observed_price = prices.loc[:stamp, "Close"]
-        expected_market = _session_aware_returns(observed_price, 1)
         for period in (1, 3, 5, 10, 15, 30):
             expected = _session_aware_returns(observed_price, period)
             assert np.isclose(
@@ -40,7 +39,6 @@ def test_training_stock_and_market_returns_match_live_session_aware_features():
             assert np.isclose(
                 features.loc[stamp, f"market_ret_{period}"], expected, equal_nan=True
             ), f"market return mismatch period={period} at {stamp}"
-        assert np.isfinite(expected_market) or np.isnan(expected_market)
 
 
 def test_training_returns_do_not_include_overnight_gap():
