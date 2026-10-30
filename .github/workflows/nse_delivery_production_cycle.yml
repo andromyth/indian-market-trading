@@ -152,6 +152,8 @@ jobs:
             --lookback-days 150 \
             --delivery-lookback-days 150 \
             --source-wait-minutes 0 \
+            --allow-fundamental-refresh-fallback \
+            --backfill-pit-calendar-days 45 \
             --expected-date "${{ steps.target.outputs.target_date }}"
 
       - name: Generate active ALL-NSE 59-feature Delivery predictions for next NSE session
@@ -308,3 +310,28 @@ jobs:
             --lookback-calendar-days 14 \
             --max-backfills-per-run 14 \
             --audit-only
+
+      - name: Append verified daily PIT snapshots to the aggregate research panel
+        if: steps.target.outputs.target_date != ''
+        run: |
+          set -euo pipefail
+          python -u append_delivery_pit_snapshots_to_research_panel.py \
+            --target-date "${{ steps.target.outputs.target_date }}"
+
+      - name: Re-run strict Delivery walk-forward audit on the refreshed panel
+        if: steps.target.outputs.target_date != ''
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -u strict_delivery_walkforward_audit.py \
+            --output-dir strict-delivery-audit-after-pit-refresh
+
+      - name: Upload refreshed strict Delivery audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strict-delivery-audit-after-pit-refresh-${{ github.run_id }}
+          path: strict-delivery-audit-after-pit-refresh/*
+          if-no-files-found: ignore
+          retention-days: 30
