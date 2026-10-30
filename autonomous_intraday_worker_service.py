@@ -633,6 +633,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "reason": "Full-NSE prediction snapshots are written on five-minute capture slots only.",
                 }
             else:
+                # Each symbol in the confirmed same-slot Drive snapshot is an
+                # independent prediction candidate. run_for_capture validates
+                # its own quote and history; no universe-wide coverage threshold
+                # may prevent other complete symbols from being evaluated.
                 prediction_capture = {"status": "ERROR", "error": "Prediction capture did not run."}
                 prediction_error = None
                 for prediction_attempt in range(1, 4):
