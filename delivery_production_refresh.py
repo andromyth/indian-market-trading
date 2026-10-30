@@ -575,9 +575,13 @@ def main():
         )
         for day in missing_pit_dates:
             day_panel = panel.loc[session_dates.eq(day)].copy()
-            day_panel = day_panel.sort_values(["symbol", "decision_timestamp"]).drop_duplicates("symbol", keep="last")
             if day_panel.empty:
                 raise RuntimeError(f"No panel rows available to backfill {day}.")
+            if day_panel.duplicated(["symbol", "date"]).any():
+                raise RuntimeError(
+                    f"Duplicate symbol/date rows found in historical PIT backfill source for {day}."
+                )
+            day_panel = day_panel.sort_values(["symbol", "decision_timestamp"])
             actual_dates = pd.to_datetime(day_panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
             if set(actual_dates) != {day}:
                 raise RuntimeError(f"Backfill date mismatch for {day}: {sorted(set(actual_dates))}")
@@ -586,6 +590,7 @@ def main():
             day_path = FEATURE_DIR / f"DELIVERY_PIT_FEATURES_{day}.parquet"
             report_path = FEATURE_DIR / f"DELIVERY_PIT_READINESS_{day}.json"
             day_panel.to_parquet(day_path, index=False)
+            gate_reasons = day_panel["production_data_quality_gate_reasons"].map(json.loads)
             report = {
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "snapshot": day_path.name,
@@ -594,8 +599,24 @@ def main():
                 "feature_count": len(FEATURES_59),
                 "symbols": int(day_panel["symbol"].nunique()),
                 "rows": int(len(day_panel)),
+                "group_readiness": {
+                    column: readiness_summary(day_panel[column]) for column in readiness_cols
+                },
+                "production_feature_coverage_pct": round(
+                    float(day_panel["production_feature_coverage"].mean() * 100), 3
+                ),
+                "production_rows_all_59_features": int(
+                    day_panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()
+                ),
+                "production_data_quality_gate_pct": readiness_summary(
+                    day_panel["production_data_quality_gate"]
+                )["ready_pct"],
                 "production_data_quality_gate_pass_rows": int(day_panel["production_data_quality_gate"].sum()),
                 "production_data_quality_gate_blocked_rows": int((~day_panel["production_data_quality_gate"]).sum()),
+                "production_data_quality_gate_block_reason_counts": {
+                    reason: int(sum(reason in reasons for reasons in gate_reasons))
+                    for reason in sorted({reason for reasons in gate_reasons for reason in reasons})
+                },
                 "source_audit": source_audit,
                 "model_weights_changed": False,
                 "model_promotion_performed": False,
