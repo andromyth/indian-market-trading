@@ -50,13 +50,17 @@ def _store():
     return GoogleDriveStore()
 
 
-def _refresh_fundamental_availability(store, symbols: list[str]) -> dict:
-    """Refresh official NSE filing coverage through the current session before gating signals.
+def _refresh_fundamental_availability(
+    store,
+    symbols: list[str],
+    *,
+    as_of_date: date,
+    allow_stale_fallback: bool = False,
+) -> dict:
+    """Refresh filing availability as of the target session.
 
-    A stale-but-complete historical catalogue is not current coverage. The
-    candidate builder's paginated NSE catalogue refreshes when its cache window
-    or age is stale, then rebuilds the availability index for the current
-    universe. Upload all three artifacts so retries reuse the verified result.
+    An explicit fallback may reuse older metadata, but never extends its
+    coverage. Rows beyond cached coverage remain unknown and blocked.
     """
     from colab_build_all_nse_delivery_multifactor_candidate import (
         FUND_AVAILABILITY,
@@ -66,40 +70,63 @@ def _refresh_fundamental_availability(store, symbols: list[str]) -> dict:
         _catalog_all,
     )
 
-    catalog = _catalog_all(force_refresh=False)
-    report = _build_fundamental_availability(catalog, symbols)
-    if report.get("coverage_complete") is not True:
-        raise RuntimeError(
-            "NSE fundamental filing availability is not complete through the "
-            f"current session: {report}"
+    target = as_of_date
+    try:
+        catalog = _catalog_all(force_refresh=False, as_of_date=target)
+        report = _build_fundamental_availability(catalog, symbols)
+        coverage_end = pd.to_datetime(report.get("coverage_end"), errors="coerce")
+        if report.get("coverage_complete") is not True or pd.isna(coverage_end) or coverage_end.date() < target:
+            raise RuntimeError(
+                "NSE filing availability does not cover target session "
+                f"{target}: {report}"
+            )
+    except Exception as exc:
+        if not allow_stale_fallback:
+            raise
+        cached_meta = {}
+        try:
+            if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size:
+                cached_meta = json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
+        except Exception:
+            cached_meta = {}
+        coverage_start = pd.to_datetime(cached_meta.get("coverage_start"), errors="coerce")
+        coverage_end = pd.to_datetime(cached_meta.get("coverage_end"), errors="coerce")
+        index_available = FUND_AVAILABILITY.exists() and FUND_AVAILABILITY.stat().st_size > 0
+        current_covered = bool(
+            cached_meta.get("coverage_complete") is True
+            and index_available
+            and pd.notna(coverage_start)
+            and pd.notna(coverage_end)
+            and coverage_start.date() <= target <= coverage_end.date()
         )
-    today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
-    if report.get("coverage_end") != today_ist:
-        raise RuntimeError(
-            "NSE fundamental filing catalogue is stale: "
-            f"coverage_end={report.get('coverage_end')}, required={today_ist}"
-        )
-    store.upload_or_update(
-        FUND_CATALOG_CACHE,
-        "corporate/nse_integrated_filing_catalog_2025_2026.json",
-        mime_type="application/json",
-    )
-    store.upload_or_update(
-        FUND_AVAILABILITY,
-        "corporate/pit_fundamental_availability_2025_2026.parquet",
-        mime_type="application/octet-stream",
-    )
-    store.upload_or_update(
-        FUND_AVAILABILITY_META,
-        "corporate/pit_fundamental_availability_2025_2026.meta.json",
-        mime_type="application/json",
-    )
+        return {
+            **cached_meta,
+            "target_date": target.isoformat(),
+            "refresh_status": "FALLBACK_STALE_OR_MISSING_CATALOG",
+            "fallback_used": True,
+            "current_target_covered": current_covered,
+            "availability_index_available": index_available,
+            "catalog_available": FUND_CATALOG_CACHE.exists() and FUND_CATALOG_CACHE.stat().st_size > 0,
+            "refresh_error": f"{type(exc).__name__}: {exc}",
+            "coverage_end_required": target.isoformat(),
+            "safety_rule": "Coverage dates were not extended. Rows outside cached coverage remain unknown and blocked; missing filings were not converted to zero.",
+            "catalog_persisted": False,
+            "availability_index_persisted": False,
+        }
+
+    store.upload_or_update(FUND_CATALOG_CACHE, "corporate/nse_integrated_filing_catalog_2025_2026.json", mime_type="application/json")
+    store.upload_or_update(FUND_AVAILABILITY, "corporate/pit_fundamental_availability_2025_2026.parquet", mime_type="application/octet-stream")
+    store.upload_or_update(FUND_AVAILABILITY_META, "corporate/pit_fundamental_availability_2025_2026.meta.json", mime_type="application/json")
     return {
         **report,
         "catalog_rows": len(catalog),
         "catalog_persisted": True,
         "availability_index_persisted": True,
-        "coverage_end_required": today_ist,
+        "target_date": target.isoformat(),
+        "coverage_end_required": target.isoformat(),
+        "refresh_status": "REFRESHED",
+        "fallback_used": False,
+        "current_target_covered": True,
     }
 
 def _is_retryable_download_error(exc: Exception) -> bool:
@@ -232,6 +259,38 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
         token = resp.get("nextPageToken")
         if not token: break
 
+def _decorate_snapshot_rows(frame, features, readiness_cols):
+    """Attach the shared production gate and coverage diagnostics to a PIT slice."""
+    from delivery_quality_gate import quality_gate_reasons
+
+    snapshot = frame.copy()
+    missing = [column for column in features if column not in snapshot.columns]
+    if missing:
+        raise RuntimeError(f"59-feature production snapshot missing columns: {missing}")
+    snapshot["production_data_quality_score"] = (
+        snapshot[readiness_cols].apply(pd.to_numeric, errors="coerce").notna().sum(axis=1)
+        / len(readiness_cols)
+    )
+    numeric_features = snapshot[features].apply(pd.to_numeric, errors="coerce").replace(
+        [float("inf"), float("-inf")], float("nan")
+    )
+    snapshot["production_feature_coverage"] = numeric_features.notna().mean(axis=1)
+    snapshot["production_feature_non_missing_count"] = numeric_features.notna().sum(axis=1)
+    snapshot["production_core_ready"] = (
+        pd.to_numeric(snapshot["ready_market_price"], errors="coerce").eq(1)
+        & pd.to_numeric(snapshot["ready_market_context"], errors="coerce").eq(1)
+    )
+    snapshot["production_optional_state_known"] = (
+        snapshot[["ready_news", "ready_events", "ready_fno", "ready_fundamentals"]]
+        .apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+    )
+    snapshot["production_data_quality_gate_reasons"] = snapshot.apply(
+        lambda row: json.dumps(quality_gate_reasons(row)), axis=1
+    )
+    snapshot["production_data_quality_gate"] = snapshot["production_data_quality_gate_reasons"].eq("[]")
+    return snapshot
+
+
 def _download_recent_eod(store, lookback_days: int):
     p = store.root_id
     for part in ("production_data","nse_official","bulk_eod"):
@@ -350,7 +409,20 @@ def main():
         default="",
         help="Expected NSE production session date (YYYY-MM-DD).",
     )
+    ap.add_argument(
+        "--allow-fundamental-refresh-fallback",
+        action="store_true",
+        help="Allow a dated PIT snapshot with stale/unknown filing coverage; unknowns remain blocked.",
+    )
+    ap.add_argument(
+        "--backfill-pit-calendar-days",
+        type=int,
+        default=0,
+        help="Backfill missing source-ready daily PIT snapshots within this calendar-day window.",
+    )
     args=ap.parse_args()
+    if args.backfill_pit_calendar_days < 0:
+        raise ValueError("--backfill-pit-calendar-days must be >= 0")
     expected_date = (
         date.fromisoformat(args.expected_date.strip())
         if args.expected_date.strip()
@@ -438,7 +510,10 @@ def main():
     _stage(f"PANEL BUILT: rows={len(panel):,}, cols={len(panel.columns):,}")
     _stage("FUNDAMENTAL AVAILABILITY PHASE: refreshing official NSE filing coverage")
     fundamental_availability_refresh = _refresh_fundamental_availability(
-        store, trainable
+        store,
+        trainable,
+        as_of_date=reference_date,
+        allow_stale_fallback=args.allow_fundamental_refresh_fallback,
     )
     _stage(
         "FUNDAMENTAL AVAILABILITY REFRESH DONE: "
@@ -460,37 +535,101 @@ def main():
     panel=attach_readiness_flags(panel)
     _stage("READINESS PHASE DONE")
 
-    panel["decision_timestamp"]=pd.to_datetime(panel["decision_timestamp"],errors="coerce",utc=True)
-    panel=panel.dropna(subset=["symbol","decision_timestamp"]).sort_values(["symbol","decision_timestamp"]).drop_duplicates("symbol",keep="last").reset_index(drop=True)
-    missing=[c for c in FEATURES_59 if c not in panel.columns]
-    if missing: raise RuntimeError(f"59-feature production panel missing columns: {missing}")
-    readiness_cols=["ready_market_price","ready_market_context","ready_news","ready_events","ready_fno","ready_fundamentals"]
-    panel["production_data_quality_score"]=panel[readiness_cols].apply(pd.to_numeric,errors="coerce").notna().sum(axis=1)/len(readiness_cols)
-    panel["production_feature_coverage"] = panel[FEATURES_59].apply(
-        pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], float("nan")).notna().mean(axis=1)
-    panel["production_feature_non_missing_count"] = panel[FEATURES_59].apply(
-        pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], float("nan")).notna().sum(axis=1)
-    panel["production_core_ready"]=(
-        pd.to_numeric(panel["ready_market_price"],errors="coerce").eq(1)&
-        pd.to_numeric(panel["ready_market_context"],errors="coerce").eq(1)
-    )
-    panel["production_optional_state_known"]=panel[["ready_news","ready_events","ready_fno","ready_fundamentals"]].apply(pd.to_numeric,errors="coerce").notna().all(axis=1)
-    # Keep the strict gate; make every block explainable instead of silently
-    # converting unknown source state into a generic HOLD downstream.
-    from delivery_quality_gate import quality_gate_reasons
-    panel["production_data_quality_gate_reasons"] = panel.apply(
-        lambda row: json.dumps(quality_gate_reasons(row)), axis=1
-    )
-    panel["production_data_quality_gate"] = panel["production_data_quality_gate_reasons"].eq("[]")
-    latest_date=pd.to_datetime(panel["decision_timestamp"],utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
+    panel["decision_timestamp"] = pd.to_datetime(panel["decision_timestamp"], errors="coerce", utc=True)
+    panel = panel.dropna(subset=["symbol", "decision_timestamp"]).copy()
+    missing = [column for column in FEATURES_59 if column not in panel.columns]
+    if missing:
+        raise RuntimeError(f"59-feature production panel missing columns: {missing}")
+    readiness_cols = ["ready_market_price", "ready_market_context", "ready_news", "ready_events", "ready_fno", "ready_fundamentals"]
+    latest_date = pd.to_datetime(panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
     if expected_date is not None and latest_date != expected_date:
         raise RuntimeError(
             f"Production refresh resolved latest session {latest_date}, "
-            f"but expected target session is {expected_date}. "
-            "Refusing to publish an older PIT snapshot."
+            f"but expected target session is {expected_date}. Refusing to publish an older PIT snapshot."
         )
+
+    historical_backfills = []
+    if args.backfill_pit_calendar_days:
+        from backfill_missing_delivery_pit_snapshots import load_drive_inventory
+        inventory = load_drive_inventory(store)
+        window_start = reference_date - timedelta(days=args.backfill_pit_calendar_days)
+        session_dates = pd.to_datetime(panel["date"], errors="coerce").dt.date
+        panel_dates = set(session_dates.dropna())
+        source_ready_dates = sorted(
+            day for day in (inventory["eod"] & inventory["delivery"])
+            if window_start <= day <= reference_date
+        )
+        missing_panel_dates = [day for day in source_ready_dates if day not in panel_dates]
+        if missing_panel_dates:
+            raise RuntimeError(
+                "Source-ready archive dates missing from built PIT panel: "
+                + ", ".join(day.isoformat() for day in missing_panel_dates[:20])
+            )
+        missing_pit_dates = [
+            day for day in source_ready_dates
+            if day not in inventory["pit"] and day != latest_date
+        ]
+        _stage(
+            f"HISTORICAL PIT BACKFILL PLAN: sessions={len(source_ready_dates)}; "
+            f"missing={len(missing_pit_dates)}; window={window_start}..{reference_date}"
+        )
+        for day in missing_pit_dates:
+            day_panel = panel.loc[session_dates.eq(day)].copy()
+            if day_panel.empty:
+                raise RuntimeError(f"No panel rows available to backfill {day}.")
+            if day_panel.duplicated(["symbol", "date"]).any():
+                raise RuntimeError(
+                    f"Duplicate symbol/date rows found in historical PIT backfill source for {day}."
+                )
+            day_panel = day_panel.sort_values(["symbol", "decision_timestamp"])
+            actual_dates = pd.to_datetime(day_panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+            if set(actual_dates) != {day}:
+                raise RuntimeError(f"Backfill date mismatch for {day}: {sorted(set(actual_dates))}")
+            day_panel = _decorate_snapshot_rows(day_panel, FEATURES_59, readiness_cols)
+            FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+            day_path = FEATURE_DIR / f"DELIVERY_PIT_FEATURES_{day}.parquet"
+            report_path = FEATURE_DIR / f"DELIVERY_PIT_READINESS_{day}.json"
+            day_panel.to_parquet(day_path, index=False)
+            gate_reasons = day_panel["production_data_quality_gate_reasons"].map(json.loads)
+            report = {
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "snapshot": day_path.name,
+                "snapshot_date": day.isoformat(),
+                "historical_backfill": True,
+                "feature_count": len(FEATURES_59),
+                "symbols": int(day_panel["symbol"].nunique()),
+                "rows": int(len(day_panel)),
+                "group_readiness": {
+                    column: readiness_summary(day_panel[column]) for column in readiness_cols
+                },
+                "production_feature_coverage_pct": round(
+                    float(day_panel["production_feature_coverage"].mean() * 100), 3
+                ),
+                "production_rows_all_59_features": int(
+                    day_panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()
+                ),
+                "production_data_quality_gate_pct": readiness_summary(
+                    day_panel["production_data_quality_gate"]
+                )["ready_pct"],
+                "production_data_quality_gate_pass_rows": int(day_panel["production_data_quality_gate"].sum()),
+                "production_data_quality_gate_blocked_rows": int((~day_panel["production_data_quality_gate"]).sum()),
+                "production_data_quality_gate_block_reason_counts": {
+                    reason: int(sum(reason in reasons for reasons in gate_reasons))
+                    for reason in sorted({reason for reasons in gate_reasons for reason in reasons})
+                },
+                "source_audit": source_audit,
+                "model_weights_changed": False,
+                "model_promotion_performed": False,
+                "orders_placed": False,
+            }
+            report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+            store.upload_or_update(day_path, f"features/daily/{day_path.name}", mime_type="application/octet-stream")
+            store.upload_or_update(report_path, f"features/daily/{report_path.name}", mime_type="application/json")
+            historical_backfills.append({"date": day.isoformat(), "rows": len(day_panel), "symbols": int(day_panel["symbol"].nunique())})
+            _stage(f"HISTORICAL PIT BACKFILL SAVED: date={day}; rows={len(day_panel)}")
+
+    panel = panel.sort_values(["symbol", "decision_timestamp"]).drop_duplicates("symbol", keep="last").reset_index(drop=True)
+    panel = _decorate_snapshot_rows(panel, FEATURES_59, readiness_cols)
     snap=FEATURE_DIR/f"DELIVERY_PIT_FEATURES_{latest_date}.parquet"
     snap.parent.mkdir(parents=True,exist_ok=True)
     _stage(f"SNAPSHOT WRITE: {snap.name}")
@@ -509,6 +648,10 @@ def main():
         "minimum_history_sessions":MIN_HISTORY,
         "source_status":source_status,"eod_status":eod_status,"delivery_status":delivery_status,"live_rss_news":live_news_result,
         "source_audit":source_audit,"group_readiness":group_ready,
+        "historical_snapshots_backfilled": historical_backfills,
+        "historical_snapshots_backfilled_count": len(historical_backfills),
+        "fundamental_refresh_fallback_used": bool(fundamental_availability_refresh.get("fallback_used")),
+        "fundamental_coverage_current_target": bool(fundamental_availability_refresh.get("current_target_covered")),
         "feature_coverage":feature_coverage_report(panel),
         "production_feature_coverage_pct":round(float(panel["production_feature_coverage"].mean()*100),3),
         "production_rows_all_59_features":int(panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()),
