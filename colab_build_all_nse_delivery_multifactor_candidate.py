@@ -79,20 +79,29 @@ def _fn(x):
         return float(t)
     except Exception: return np.nan
 def _fl(tag): return str(tag).split("}",1)[-1].split(":",1)[-1]
-def _catalog_all(force_refresh=False):
+def _catalog_all(force_refresh=False, as_of_date=None):
     from datetime import datetime, timezone
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    today = as_of_date or datetime.now(ZoneInfo("Asia/Kolkata")).date()
     from_date = "01-01-2025"
     to_date = today.strftime("%d-%m-%Y")
     if not force_refresh and FUND_CATALOG_CACHE.exists() and FUND_CATALOG_CACHE.stat().st_size>0:
         try:
             cached=json.loads(FUND_CATALOG_CACHE.read_text(encoding="utf-8"))
             meta=cached.get("meta",{})
-            same_window=meta.get("from_date")==from_date and meta.get("to_date")==to_date
+            coverage_start = datetime.strptime(meta.get("coverage_start", ""), "%Y-%m-%d").date()
+            coverage_end = datetime.strptime(meta.get("coverage_end", ""), "%Y-%m-%d").date()
+            covers_as_of = (
+                meta.get("from_date") == from_date
+                and coverage_start <= today <= coverage_end
+            )
             fetched=datetime.fromisoformat(meta["fetched_at"]).replace(tzinfo=timezone.utc) if meta.get("fetched_at") else None
             fresh=fetched is not None and (datetime.now(timezone.utc)-fetched).total_seconds() < 24*3600
-            if same_window and fresh and meta.get("coverage_complete") is True and isinstance(cached.get("data"),list):
-                print(f"fundamental catalog cache reused rows={len(cached['data']):,}", flush=True)
+            if covers_as_of and fresh and meta.get("coverage_complete") is True and isinstance(cached.get("data"),list):
+                print(
+                    f"fundamental catalog cache reused rows={len(cached['data']):,}; "
+                    f"coverage={coverage_start}..{coverage_end}; as_of={today}",
+                    flush=True,
+                )
                 return cached["data"]
         except Exception:
             pass
