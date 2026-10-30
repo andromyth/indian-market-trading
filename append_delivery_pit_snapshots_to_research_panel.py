@@ -160,7 +160,7 @@ def _validate_parquet_sessions(
             FROM (
                 SELECT
                     TRY_CAST(date AS DATE) AS date,
-                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\\\.NS|\\\\.BO|-EQ|\\\\.EQ)$', '') AS symbol,
+                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\.NS|\\.BO|-EQ|\\.EQ)$', '') AS symbol,
                     COUNT(*) AS duplicate_count
                 FROM read_parquet({path_sql})
                 GROUP BY 1, 2
@@ -219,7 +219,7 @@ def append_panel(store: GoogleDriveStore, target_date: date) -> dict[str, Any]:
             SELECT COUNT(*) FROM (
                 SELECT
                     TRY_CAST(date AS DATE) AS date,
-                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\\\.NS|\\\\.BO|-EQ|\\\\.EQ)$', '') AS symbol
+                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\.NS|\\.BO|-EQ|\\.EQ)$', '') AS symbol
                 FROM read_parquet({panel_sql})
                 GROUP BY 1, 2 HAVING COUNT(*) > 1
             )
@@ -283,7 +283,7 @@ def append_panel(store: GoogleDriveStore, target_date: date) -> dict[str, Any]:
             SELECT COUNT(*) FROM (
                 SELECT
                     TRY_CAST(date AS DATE) AS date,
-                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\\\.NS|\\\\.BO|-EQ|\\\\.EQ)$', '') AS symbol
+                    REGEXP_REPLACE(UPPER(TRIM(CAST(symbol AS VARCHAR))), '(\\.NS|\\.BO|-EQ|\\.EQ)$', '') AS symbol
                 FROM read_parquet({temp_sql})
                 GROUP BY 1, 2 HAVING COUNT(*) > 1
             )
