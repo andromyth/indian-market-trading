@@ -36,6 +36,11 @@ from multifactor_data_layer_v2 import FEATURES_59  # noqa: E402
 DEFAULT_REMOTE_PANEL = "models/all_nse_delivery_multifactor_replacement_2026/ALL_NSE_MULTIFACTOR_59_FEATURE_PIT_PANEL_2026.parquet"
 IST = "Asia/Kolkata"
 COVERAGE_FLOOR = 0.70
+DEFAULT_RESEARCH_START_DATE = date(2025, 6, 1)
+READINESS_COLUMNS = (
+    "ready_market_price", "ready_market_context", "ready_news",
+    "ready_events", "ready_fno", "ready_fundamentals",
+)
 HOLDOUT_FRACTION = 0.20
 MIN_TRAIN_SESSIONS = 60
 OOF_FOLDS = 3
@@ -139,6 +144,13 @@ def safe_gate(value: Any) -> bool:
     return False
 
 
+def quality_gate_from_readiness_flags(row: pd.Series) -> bool:
+    """Reconstruct the existing production gate only from explicit PIT readiness states."""
+    from delivery_quality_gate import quality_gate_reasons
+
+    return not quality_gate_reasons(row)
+
+
 def session_successors(session_dates: list[pd.Timestamp], holidays: set[date]):
     """Map to the next observed exchange session; skip labels across a missing weekday."""
     observed = {pd.Timestamp(value).normalize() for value in session_dates}
@@ -221,7 +233,7 @@ def load_panel_symbol_sample(panel_path: Path, symbol_limit: int = 500):
             "SELECT symbol FROM audit_symbol_sample ORDER BY symbol"
         ).fetchall()]
         use_columns = ["symbol", "date", "close"]
-        for optional in ("decision_timestamp", "production_data_quality_gate"):
+        for optional in ("decision_timestamp", "production_data_quality_gate", *READINESS_COLUMNS):
             if optional in columns:
                 use_columns.append(optional)
         use_columns.extend(list(FEATURES_59))
@@ -254,8 +266,9 @@ def prepare_labeled_panel(
     panel: pd.DataFrame,
     holidays: set[date],
     all_session_dates: list | None = None,
+    research_start_date: date | None = DEFAULT_RESEARCH_START_DATE,
 ):
-    """Reconstruct raw close-to-close labels and validate the point-in-time clock."""
+    """Reconstruct exact-session labels inside a fixed feature-availability research cohort."""
     if panel is None or panel.empty:
         raise ValueError("PIT panel is empty.")
     required = {"symbol", "date", "close", *FEATURES_59}
@@ -276,6 +289,13 @@ def prepare_labeled_panel(
     x = x[x["symbol"].ne("") & x["close"].gt(0)].copy()
     x["reference_date"] = pd.to_datetime(x["reference_date"]).dt.normalize()
 
+    rows_before_cohort = len(x)
+    cohort_start = pd.Timestamp(research_start_date).normalize() if research_start_date is not None else None
+    if cohort_start is not None:
+        x = x.loc[x["reference_date"] >= cohort_start].copy()
+        if x.empty:
+            raise ValueError(f"No PIT rows remain on or after research start date {cohort_start.date()}.")
+
     duplicate_rows = int(x.duplicated(["symbol", "reference_date"], keep=False).sum())
     if duplicate_rows:
         raise ValueError(
@@ -286,6 +306,8 @@ def prepare_labeled_panel(
         pd.Timestamp(v).normalize()
         for v in (all_session_dates if all_session_dates is not None else x["reference_date"].unique())
     )
+    if cohort_start is not None:
+        sessions = [session for session in sessions if session >= cohort_start]
     successors, gaps = session_successors(sessions, holidays)
     future = x[["symbol", "reference_date", "close"]].rename(
         columns={"reference_date": "target_date", "close": "actual_close"}
@@ -324,9 +346,14 @@ def prepare_labeled_panel(
     if "production_data_quality_gate" in labeled:
         labeled["quality_gate"] = labeled["production_data_quality_gate"].map(safe_gate)
         gate_source = "production_data_quality_gate"
+    elif set(READINESS_COLUMNS).issubset(labeled.columns):
+        labeled["quality_gate"] = labeled[list(READINESS_COLUMNS)].apply(
+            quality_gate_from_readiness_flags, axis=1
+        )
+        gate_source = "reconstructed_from_pit_readiness_flags"
     else:
         labeled["quality_gate"] = False
-        gate_source = "MISSING_GATE_BLOCKS_ACTIONS"
+        gate_source = "MISSING_GATE_AND_READINESS_FLAGS_BLOCK_ACTIONS"
     labeled["eligible_for_action"] = labeled["quality_gate"] & (labeled["feature_coverage"] >= COVERAGE_FLOOR)
 
     feature_groups = {
@@ -358,6 +385,9 @@ def prepare_labeled_panel(
 
     stats = {
         "input_rows": int(input_rows),
+        "research_cohort_start_date": cohort_start.date().isoformat() if cohort_start is not None else None,
+        "rows_excluded_before_research_cohort": int(rows_before_cohort - len(x)),
+        "readiness_columns_present": [name for name in READINESS_COLUMNS if name in labeled.columns],
         "clean_symbol_date_rows": int(len(x)),
         "labeled_rows": int(len(labeled)),
         "symbols": int(labeled["symbol"].nunique()),
@@ -371,6 +401,7 @@ def prepare_labeled_panel(
         "rows_dropped_for_invalid_decision_clock": invalid_clock_rows,
         "quality_gate_source": gate_source,
         "quality_gate_column_present": "production_data_quality_gate" in labeled.columns,
+        "quality_gate_reconstructed_from_readiness": gate_source == "reconstructed_from_pit_readiness_flags",
         "quality_gate_pass_rows": int(labeled["quality_gate"].sum()),
         "quality_gate_fail_or_missing_rows": int((~labeled["quality_gate"]).sum()),
         "quality_gate_pass_pct": round(float(labeled["quality_gate"].mean() * 100), 3),
@@ -702,8 +733,16 @@ def render_summary(report):
     return "\n".join(lines) + "\n"
 
 
-def run_audit(panel_path: Path, out: Path):
-    print(f"SELECT SYMBOL SAMPLE: path={panel_path}; bytes={panel_path.stat().st_size:,}", flush=True)
+def run_audit(
+    panel_path: Path,
+    out: Path,
+    research_start_date: date = DEFAULT_RESEARCH_START_DATE,
+):
+    print(
+        f"SELECT SYMBOL SAMPLE: path={panel_path}; bytes={panel_path.stat().st_size:,}; "
+        f"research_start_date={research_start_date.isoformat()}",
+        flush=True,
+    )
     panel, panel_sample, all_session_dates = load_panel_symbol_sample(panel_path, symbol_limit=500)
     print(
         f"PANEL SAMPLE READY: full_rows={panel_sample['full_panel_rows']:,}; "
@@ -711,7 +750,10 @@ def run_audit(panel_path: Path, out: Path):
         f"sampled_rows={panel_sample['sampled_panel_rows']:,}",
         flush=True,
     )
-    labeled, stats = prepare_labeled_panel(panel, parse_holidays(), all_session_dates=all_session_dates)
+    labeled, stats = prepare_labeled_panel(
+        panel, parse_holidays(), all_session_dates=all_session_dates,
+        research_start_date=research_start_date,
+    )
     del panel
     print(
         f"LABEL BUILD COMPLETE: labeled_rows={len(labeled):,}; "
@@ -810,7 +852,8 @@ def run_audit(panel_path: Path, out: Path):
         "data": stats,
         "panel_sampling": panel_sample,
         "split": {
-            "method": "chronological 80/20 session split, with target-date purge at cutoff",
+            "method": "chronological 80/20 session split, with target-date purge at cutoff, within the fixed feature-availability cohort",
+            "research_cohort_start_date": stats.get("research_cohort_start_date"),
             "holdout_start_reference_date": holdout_start.date().isoformat(),
             "development_first_reference_date": dev_sessions[0].date().isoformat(),
             "development_last_reference_date": dev_sessions[-1].date().isoformat(),
@@ -926,6 +969,11 @@ def main():
     ap.add_argument("--remote-panel", default=DEFAULT_REMOTE_PANEL)
     ap.add_argument("--local-panel", default="/tmp/strict-delivery-audit/PIT_PANEL.parquet")
     ap.add_argument("--output-dir", default="strict-delivery-audit-out")
+    ap.add_argument(
+        "--research-start-date",
+        default=DEFAULT_RESEARCH_START_DATE.isoformat(),
+        help="First session in the fixed feature-availability research cohort (YYYY-MM-DD).",
+    )
     args = ap.parse_args()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -955,7 +1003,7 @@ def main():
         print(json.dumps(blocked, indent=2))
         return 2
     try:
-        report = run_audit(panel_path, out)
+        report = run_audit(panel_path, out, research_start_date=date.fromisoformat(args.research_start_date))
         report["input_provenance"] = provenance
         (out / "strict_delivery_walkforward_audit.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(json.dumps({
