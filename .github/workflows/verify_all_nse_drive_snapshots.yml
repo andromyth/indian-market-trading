@@ -160,10 +160,14 @@ jobs:
               keys = (
                   "status","cycle_minute_ist","expected_symbol_count","row_count",
                   "quoted_symbol_count","actual_quote_count","missing_quote_count",
-                  "unmapped_symbol_count","prediction_count","data_limited_count",
-                  "quality_gate_pass","history_ready","remote_snapshot_path",
-                  "snapshot_drive_path","remote_path","manifest_drive_path","prediction_drive_path","predictions_drive_path",
-                  "prediction_drive_error","manifest_drive_error","error",
+                  "unmapped_symbol_count","eligible_symbol_count","prediction_count",
+                  "prediction_status_counts","data_limited_count","untrained_symbol_count",
+                  "model_failure_count","model_artifact_verified","trained_symbol_manifest_available",
+                  "model_coverage_symbols","model_version","model_status","prediction_coverage_pct",
+                  "history_ready","history_seed_coverage_symbols","history_seed_complete",
+                  "remote_snapshot_path","snapshot_drive_path","remote_path","manifest_drive_path",
+                  "prediction_drive_path","predictions_drive_path","prediction_drive_error",
+                  "manifest_drive_error","error",
               )
               for key in keys:
                   if key in payload:
