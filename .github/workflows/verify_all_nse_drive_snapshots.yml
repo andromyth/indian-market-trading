@@ -284,5 +284,8 @@ jobs:
               print("AGGREGATE_COVERAGE_POLICY=INFORMATIONAL_ONLY")
               print("OVERALL_VERDICT=NOT_APPLICABLE_PER_SYMBOL_RECORDS_REPORTED")
               sys.exit(0)
+          except Exception as exc:
+              print(f"DRIVE_INSPECTION_ERROR={type(exc).__name__}: {exc}")
+              sys.exit(2)
           PY
           rm -f /tmp/gdrive-oauth.json /tmp/gdrive-root-id.txt /tmp/oauth-secret-error.txt /tmp/root-secret-error.txt
