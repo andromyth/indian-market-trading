@@ -329,6 +329,33 @@ def prepare_labeled_panel(
         gate_source = "MISSING_GATE_BLOCKS_ACTIONS"
     labeled["eligible_for_action"] = labeled["quality_gate"] & (labeled["feature_coverage"] >= COVERAGE_FLOOR)
 
+    feature_groups = {
+        "price_volume_technical": [name for name in FEATURES_59 if not name.startswith(("market_", "relative_", "delivery_", "news_", "event_", "fno_", "fundamental_", "fund_"))],
+        "market_relative": [name for name in FEATURES_59 if name.startswith(("market_", "relative_"))],
+        "delivery": [name for name in FEATURES_59 if name.startswith("delivery_")],
+        "news_events": [name for name in FEATURES_59 if name.startswith(("news_", "event_"))],
+        "fno": [name for name in FEATURES_59 if name.startswith("fno_")],
+        "fundamentals": [name for name in FEATURES_59 if name.startswith(("fundamental_", "fund_"))],
+    }
+    feature_availability = {
+        name: round(float(matrix[name].notna().mean() * 100), 3)
+        for name in FEATURES_59
+    }
+    feature_group_availability = {
+        group: round(float(matrix[columns].notna().to_numpy().mean() * 100), 3) if columns else None
+        for group, columns in feature_groups.items()
+    }
+    feature_coverage_by_year = []
+    for year, group in labeled.groupby(labeled["reference_date"].dt.year, sort=True):
+        feature_coverage_by_year.append({
+            "year": int(year),
+            "rows": int(len(group)),
+            "median_feature_coverage_pct": round(float(group["feature_coverage"].median() * 100), 3),
+            "rows_ge_70pct_coverage_pct": round(float((group["feature_coverage"] >= COVERAGE_FLOOR).mean() * 100), 3),
+            "quality_gate_pass_pct": round(float(group["quality_gate"].mean() * 100), 3),
+            "joint_action_eligibility_pct": round(float(group["eligible_for_action"].mean() * 100), 3),
+        })
+
     stats = {
         "input_rows": int(input_rows),
         "clean_symbol_date_rows": int(len(x)),
@@ -343,7 +370,14 @@ def prepare_labeled_panel(
         "rows_without_exact_next_session_price_or_invalid_clock": int(max(0, rows_with_successor - len(labeled))),
         "rows_dropped_for_invalid_decision_clock": invalid_clock_rows,
         "quality_gate_source": gate_source,
+        "quality_gate_column_present": "production_data_quality_gate" in labeled.columns,
+        "quality_gate_pass_rows": int(labeled["quality_gate"].sum()),
+        "quality_gate_fail_or_missing_rows": int((~labeled["quality_gate"]).sum()),
         "quality_gate_pass_pct": round(float(labeled["quality_gate"].mean() * 100), 3),
+        "rows_eligible_for_action": int(labeled["eligible_for_action"].sum()),
+        "feature_availability_by_feature_pct": feature_availability,
+        "feature_group_availability_pct": feature_group_availability,
+        "feature_coverage_by_reference_year": feature_coverage_by_year,
         "feature_coverage_ge_70_pct": round(float((labeled["feature_coverage"] >= COVERAGE_FLOOR).mean() * 100), 3),
         "joint_action_eligibility_pct": round(float(labeled["eligible_for_action"].mean() * 100), 3),
         "feature_coverage_median_pct": round(float(labeled["feature_coverage"].median() * 100), 3),
@@ -845,6 +879,9 @@ def render_summary(report):
     fixed = report["untouched_holdout"]["fixed_policy"]
     tuned = report["untouched_holdout"]["oof_selected_candidate_policy"]
     cert = report["strict_oos_certification"]
+    feature_availability = report["data"].get("feature_availability_by_feature_pct", {})
+    lowest_coverage = sorted(feature_availability.items(), key=lambda item: item[1])[:10]
+    lowest_coverage_text = ", ".join(f"{name}={coverage:.1f}%" for name, coverage in lowest_coverage)
     return "\n".join([
         "# Strict Delivery Walk-Forward Audit", "",
         f"- Data range: {report['data']['first_observed_session']} to {report['data']['last_observed_session']}",
@@ -853,6 +890,11 @@ def render_summary(report):
         f"- Holdout cutoff: {report['split']['holdout_start_reference_date']}",
         f"- Training label purge passed: {report['split']['training_targets_strictly_before_holdout']}",
         f"- Holdout labels used in threshold tuning: {report['split']['holdout_targets_used_for_selection_or_tuning']}",
+        f"- Quality-gate column present: {report['data'].get('quality_gate_column_present')}; pass rate: {report['data']['quality_gate_pass_pct']}%",
+        f"- Rows eligible for actions: {report['data'].get('rows_eligible_for_action', 0):,}",
+        f"- Rows with >=70% feature coverage: {report['data']['feature_coverage_ge_70_pct']}%",
+        f"- Lowest-coverage features: {lowest_coverage_text}",
+        f"- Feature-group availability: {json.dumps(report['data'].get('feature_group_availability_pct', {}), sort_keys=True)}",
         "", "## Fixed-policy holdout",
         f"- Directional accuracy: {fixed['directional_accuracy_p50']}",
         f"- Balanced accuracy: {fixed['balanced_accuracy_p50']}",
