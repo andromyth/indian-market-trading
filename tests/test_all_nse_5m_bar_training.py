@@ -63,3 +63,26 @@ def test_resample_does_not_fabricate_an_ohlcv_bar_from_sparse_rows():
     bars = resample_completed_5m_bars(frame)
 
     assert bars.empty
+
+def test_fno_join_normalizes_millisecond_and_nanosecond_session_dates():
+    from colab_build_all_nse_intraday_multifactor import fno_join_features
+
+    feature_index = pd.DatetimeIndex(
+        [pd.Timestamp("2026-10-29 10:00:00", tz=IST)]
+    )
+    features = pd.DataFrame({"target_30m": [0.01]}, index=feature_index)
+    fno = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(["2026-10-27", "2026-10-29"]).astype(
+                "datetime64[ms]"
+            ),
+            "Symbol": ["ABC", "ABC"],
+            "pcr": [1.25, 9.99],
+        }
+    )
+
+    joined = fno_join_features(features, fno, "ABC")
+
+    # Same-session F&O data is excluded; the prior session remains available.
+    assert joined["fno_pcr"].iloc[0] == 1.25
+    assert joined["fno_available"].iloc[0] == 1.0

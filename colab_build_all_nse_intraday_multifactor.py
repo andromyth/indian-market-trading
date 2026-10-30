@@ -260,7 +260,10 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
         feature_frame["fno_available"] = 0.0
         return feature_frame
 
-    z["_date"] = pd.to_datetime(z[datecol], errors="coerce").dt.normalize()
+    fno_dates = pd.to_datetime(z[datecol], errors="coerce")
+    if isinstance(fno_dates.dtype, pd.DatetimeTZDtype):
+        fno_dates = fno_dates.dt.tz_convert(IST).dt.tz_localize(None)
+    z["_date"] = fno_dates.dt.normalize().astype("datetime64[ns]")
     z = z[
         z[symcol].astype(str).str.upper().str.replace(".NS", "", regex=False).eq(sym.upper())
     ].sort_values("_date")
@@ -289,7 +292,7 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
     # vectorized operation instead of scanning all available dates row-by-row.
     left = pd.DataFrame({
         "_row_ts": feature_frame.index,
-        "_session_date": idx.normalize().tz_localize(None),
+        "_session_date": idx.normalize().tz_localize(None).astype("datetime64[ns]"),
     }).sort_values("_session_date")
 
     for outc, aliases in alias_map.items():
@@ -309,6 +312,13 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
         # Shift F&O observations forward to the next trading session's intraday
         # rows by matching each session to the latest strictly prior F&O date.
         left_key = left[["_row_ts", "_session_date"]].copy()
+        # Parquet may restore F&O dates at millisecond precision while the
+        # five-minute feature index uses nanoseconds. merge_asof requires
+        # identical key dtypes, so normalize both join keys explicitly.
+        left_key["_session_date"] = pd.to_datetime(
+            left_key["_session_date"], errors="coerce"
+        ).astype("datetime64[ns]")
+        d["_date"] = pd.to_datetime(d["_date"], errors="coerce").astype("datetime64[ns]")
         merged = pd.merge_asof(
             left_key,
             d,
