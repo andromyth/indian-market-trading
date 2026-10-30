@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/repair_delivery_pit_research_panel.yml"
+      - "delivery_production_refresh.py"
   workflow_dispatch:
     inputs:
       target_date:
