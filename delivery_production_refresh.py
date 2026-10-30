@@ -259,6 +259,34 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
         token = resp.get("nextPageToken")
         if not token: break
 
+def _rows_for_nse_session(frame, session_date: date):
+    """Return only the exact NSE session, rejecting mixed-date or duplicate rows."""
+    if "date" not in frame.columns or "decision_timestamp" not in frame.columns:
+        raise RuntimeError("PIT source panel lacks date/decision_timestamp columns.")
+    source_dates = pd.to_datetime(frame["date"], errors="coerce").dt.date
+    rows = frame.loc[source_dates.eq(session_date)].copy()
+    if rows.empty:
+        raise RuntimeError(f"No PIT panel rows available for NSE session {session_date}.")
+    decision_dates = (
+        pd.to_datetime(rows["decision_timestamp"], errors="coerce", utc=True)
+        .dt.tz_convert("Asia/Kolkata").dt.date
+    )
+    if decision_dates.isna().any() or set(decision_dates) != {session_date}:
+        observed = sorted({str(value) for value in decision_dates.dropna()})
+        raise RuntimeError(
+            f"PIT decision timestamp mismatch: requested={session_date}, observed={observed}"
+        )
+    if rows["symbol"].isna().any():
+        raise RuntimeError(f"PIT session {session_date} contains blank symbols.")
+    duplicate_mask = rows.duplicated(["symbol", "date"], keep=False)
+    if duplicate_mask.any():
+        duplicates = rows.loc[duplicate_mask, "symbol"].astype(str).head(10).tolist()
+        raise RuntimeError(
+            f"PIT session {session_date} has duplicate symbol/date keys: {duplicates}"
+        )
+    return rows.sort_values(["symbol", "decision_timestamp"]).reset_index(drop=True)
+
+
 def _decorate_snapshot_rows(frame, features, readiness_cols):
     """Attach the shared production gate and coverage diagnostics to a PIT slice."""
     from delivery_quality_gate import quality_gate_reasons
@@ -565,26 +593,19 @@ def main():
                 "Source-ready archive dates missing from built PIT panel: "
                 + ", ".join(day.isoformat() for day in missing_panel_dates[:20])
             )
-        missing_pit_dates = [
-            day for day in source_ready_dates
-            if day not in inventory["pit"] and day != latest_date
+        historical_rebuild_dates = [
+            day for day in source_ready_dates if day != latest_date
         ]
         _stage(
-            f"HISTORICAL PIT BACKFILL PLAN: sessions={len(source_ready_dates)}; "
-            f"missing={len(missing_pit_dates)}; window={window_start}..{reference_date}"
+            f"HISTORICAL PIT REBUILD PLAN: source_ready_sessions={len(source_ready_dates)}; "
+            f"rebuild_sessions={len(historical_rebuild_dates)}; "
+            f"previously_named_snapshots={len(inventory['pit'])}; "
+            f"window={window_start}..{reference_date}"
         )
-        for day in missing_pit_dates:
-            day_panel = panel.loc[session_dates.eq(day)].copy()
-            if day_panel.empty:
-                raise RuntimeError(f"No panel rows available to backfill {day}.")
-            if day_panel.duplicated(["symbol", "date"]).any():
-                raise RuntimeError(
-                    f"Duplicate symbol/date rows found in historical PIT backfill source for {day}."
-                )
-            day_panel = day_panel.sort_values(["symbol", "decision_timestamp"])
-            actual_dates = pd.to_datetime(day_panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
-            if set(actual_dates) != {day}:
-                raise RuntimeError(f"Backfill date mismatch for {day}: {sorted(set(actual_dates))}")
+        for day in historical_rebuild_dates:
+            # Rewrite every source-ready date, not only absent filenames. Older
+            # daily snapshot files may contain rolling multi-session panels.
+            day_panel = _rows_for_nse_session(panel, day)
             day_panel = _decorate_snapshot_rows(day_panel, FEATURES_59, readiness_cols)
             FEATURE_DIR.mkdir(parents=True, exist_ok=True)
             day_path = FEATURE_DIR / f"DELIVERY_PIT_FEATURES_{day}.parquet"
@@ -626,9 +647,11 @@ def main():
             store.upload_or_update(day_path, f"features/daily/{day_path.name}", mime_type="application/octet-stream")
             store.upload_or_update(report_path, f"features/daily/{report_path.name}", mime_type="application/json")
             historical_backfills.append({"date": day.isoformat(), "rows": len(day_panel), "symbols": int(day_panel["symbol"].nunique())})
-            _stage(f"HISTORICAL PIT BACKFILL SAVED: date={day}; rows={len(day_panel)}")
+            _stage(f"HISTORICAL PIT SNAPSHOT REBUILT: date={day}; rows={len(day_panel)}; symbols={day_panel['symbol'].nunique()}")
 
-    panel = panel.sort_values(["symbol", "decision_timestamp"]).drop_duplicates("symbol", keep="last").reset_index(drop=True)
+    # The target snapshot must contain only the target session. A per-symbol
+    # latest-row dedup over the whole lookback creates a mixed-date snapshot.
+    panel = _rows_for_nse_session(panel, latest_date)
     panel = _decorate_snapshot_rows(panel, FEATURES_59, readiness_cols)
     snap=FEATURE_DIR/f"DELIVERY_PIT_FEATURES_{latest_date}.parquet"
     snap.parent.mkdir(parents=True,exist_ok=True)
@@ -650,6 +673,8 @@ def main():
         "source_audit":source_audit,"group_readiness":group_ready,
         "historical_snapshots_backfilled": historical_backfills,
         "historical_snapshots_backfilled_count": len(historical_backfills),
+        "historical_snapshots_rebuilt": historical_backfills,
+        "historical_snapshots_rebuilt_count": len(historical_backfills),
         "fundamental_refresh_fallback_used": bool(fundamental_availability_refresh.get("fallback_used")),
         "fundamental_coverage_current_target": bool(fundamental_availability_refresh.get("current_target_covered")),
         "feature_coverage":feature_coverage_report(panel),
