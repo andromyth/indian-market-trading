@@ -90,6 +90,7 @@ jobs:
           selfdriving/sd_registry.py
           selfdriving/sd_github_job_v2.py
           strict_delivery_walkforward_audit.py
+          append_delivery_pit_snapshots_to_research_panel.py
           live_signal_guards.py
           COLAB_SD_V2_RETRAIN.py
           COLAB_SD_INTRADAY_V2_RETRAIN.py
@@ -185,6 +186,7 @@ jobs:
           tests/test_live_accuracy_audit_inputs.py
           tests/test_strict_delivery_walkforward.py
           tests/test_delivery_production_refresh.py
+          tests/test_append_delivery_pit_snapshots_to_research_panel.py
           tests/test_delivery_factor_weightage.py
 
       - name: Run deployment smoke test
