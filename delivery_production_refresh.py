@@ -409,7 +409,20 @@ def main():
         default="",
         help="Expected NSE production session date (YYYY-MM-DD).",
     )
+    ap.add_argument(
+        "--allow-fundamental-refresh-fallback",
+        action="store_true",
+        help="Allow a dated PIT snapshot with stale/unknown filing coverage; unknowns remain blocked.",
+    )
+    ap.add_argument(
+        "--backfill-pit-calendar-days",
+        type=int,
+        default=0,
+        help="Backfill missing source-ready daily PIT snapshots within this calendar-day window.",
+    )
     args=ap.parse_args()
+    if args.backfill_pit_calendar_days < 0:
+        raise ValueError("--backfill-pit-calendar-days must be >= 0")
     expected_date = (
         date.fromisoformat(args.expected_date.strip())
         if args.expected_date.strip()
@@ -497,7 +510,10 @@ def main():
     _stage(f"PANEL BUILT: rows={len(panel):,}, cols={len(panel.columns):,}")
     _stage("FUNDAMENTAL AVAILABILITY PHASE: refreshing official NSE filing coverage")
     fundamental_availability_refresh = _refresh_fundamental_availability(
-        store, trainable
+        store,
+        trainable,
+        as_of_date=reference_date,
+        allow_stale_fallback=args.allow_fundamental_refresh_fallback,
     )
     _stage(
         "FUNDAMENTAL AVAILABILITY REFRESH DONE: "
@@ -519,37 +535,80 @@ def main():
     panel=attach_readiness_flags(panel)
     _stage("READINESS PHASE DONE")
 
-    panel["decision_timestamp"]=pd.to_datetime(panel["decision_timestamp"],errors="coerce",utc=True)
-    panel=panel.dropna(subset=["symbol","decision_timestamp"]).sort_values(["symbol","decision_timestamp"]).drop_duplicates("symbol",keep="last").reset_index(drop=True)
-    missing=[c for c in FEATURES_59 if c not in panel.columns]
-    if missing: raise RuntimeError(f"59-feature production panel missing columns: {missing}")
-    readiness_cols=["ready_market_price","ready_market_context","ready_news","ready_events","ready_fno","ready_fundamentals"]
-    panel["production_data_quality_score"]=panel[readiness_cols].apply(pd.to_numeric,errors="coerce").notna().sum(axis=1)/len(readiness_cols)
-    panel["production_feature_coverage"] = panel[FEATURES_59].apply(
-        pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], float("nan")).notna().mean(axis=1)
-    panel["production_feature_non_missing_count"] = panel[FEATURES_59].apply(
-        pd.to_numeric, errors="coerce"
-    ).replace([float("inf"), float("-inf")], float("nan")).notna().sum(axis=1)
-    panel["production_core_ready"]=(
-        pd.to_numeric(panel["ready_market_price"],errors="coerce").eq(1)&
-        pd.to_numeric(panel["ready_market_context"],errors="coerce").eq(1)
-    )
-    panel["production_optional_state_known"]=panel[["ready_news","ready_events","ready_fno","ready_fundamentals"]].apply(pd.to_numeric,errors="coerce").notna().all(axis=1)
-    # Keep the strict gate; make every block explainable instead of silently
-    # converting unknown source state into a generic HOLD downstream.
-    from delivery_quality_gate import quality_gate_reasons
-    panel["production_data_quality_gate_reasons"] = panel.apply(
-        lambda row: json.dumps(quality_gate_reasons(row)), axis=1
-    )
-    panel["production_data_quality_gate"] = panel["production_data_quality_gate_reasons"].eq("[]")
-    latest_date=pd.to_datetime(panel["decision_timestamp"],utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
+    panel["decision_timestamp"] = pd.to_datetime(panel["decision_timestamp"], errors="coerce", utc=True)
+    panel = panel.dropna(subset=["symbol", "decision_timestamp"]).copy()
+    missing = [column for column in FEATURES_59 if column not in panel.columns]
+    if missing:
+        raise RuntimeError(f"59-feature production panel missing columns: {missing}")
+    readiness_cols = ["ready_market_price", "ready_market_context", "ready_news", "ready_events", "ready_fno", "ready_fundamentals"]
+    latest_date = pd.to_datetime(panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date.max()
     if expected_date is not None and latest_date != expected_date:
         raise RuntimeError(
             f"Production refresh resolved latest session {latest_date}, "
-            f"but expected target session is {expected_date}. "
-            "Refusing to publish an older PIT snapshot."
+            f"but expected target session is {expected_date}. Refusing to publish an older PIT snapshot."
         )
+
+    historical_backfills = []
+    if args.backfill_pit_calendar_days:
+        from backfill_missing_delivery_pit_snapshots import load_drive_inventory
+        inventory = load_drive_inventory(store)
+        window_start = reference_date - timedelta(days=args.backfill_pit_calendar_days)
+        session_dates = pd.to_datetime(panel["date"], errors="coerce").dt.date
+        panel_dates = set(session_dates.dropna())
+        source_ready_dates = sorted(
+            day for day in (inventory["eod"] & inventory["delivery"])
+            if window_start <= day <= reference_date
+        )
+        missing_panel_dates = [day for day in source_ready_dates if day not in panel_dates]
+        if missing_panel_dates:
+            raise RuntimeError(
+                "Source-ready archive dates missing from built PIT panel: "
+                + ", ".join(day.isoformat() for day in missing_panel_dates[:20])
+            )
+        missing_pit_dates = [
+            day for day in source_ready_dates
+            if day not in inventory["pit"] and day != latest_date
+        ]
+        _stage(
+            f"HISTORICAL PIT BACKFILL PLAN: sessions={len(source_ready_dates)}; "
+            f"missing={len(missing_pit_dates)}; window={window_start}..{reference_date}"
+        )
+        for day in missing_pit_dates:
+            day_panel = panel.loc[session_dates.eq(day)].copy()
+            day_panel = day_panel.sort_values(["symbol", "decision_timestamp"]).drop_duplicates("symbol", keep="last")
+            if day_panel.empty:
+                raise RuntimeError(f"No panel rows available to backfill {day}.")
+            actual_dates = pd.to_datetime(day_panel["decision_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+            if set(actual_dates) != {day}:
+                raise RuntimeError(f"Backfill date mismatch for {day}: {sorted(set(actual_dates))}")
+            day_panel = _decorate_snapshot_rows(day_panel, FEATURES_59, readiness_cols)
+            FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+            day_path = FEATURE_DIR / f"DELIVERY_PIT_FEATURES_{day}.parquet"
+            report_path = FEATURE_DIR / f"DELIVERY_PIT_READINESS_{day}.json"
+            day_panel.to_parquet(day_path, index=False)
+            report = {
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "snapshot": day_path.name,
+                "snapshot_date": day.isoformat(),
+                "historical_backfill": True,
+                "feature_count": len(FEATURES_59),
+                "symbols": int(day_panel["symbol"].nunique()),
+                "rows": int(len(day_panel)),
+                "production_data_quality_gate_pass_rows": int(day_panel["production_data_quality_gate"].sum()),
+                "production_data_quality_gate_blocked_rows": int((~day_panel["production_data_quality_gate"]).sum()),
+                "source_audit": source_audit,
+                "model_weights_changed": False,
+                "model_promotion_performed": False,
+                "orders_placed": False,
+            }
+            report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+            store.upload_or_update(day_path, f"features/daily/{day_path.name}", mime_type="application/octet-stream")
+            store.upload_or_update(report_path, f"features/daily/{report_path.name}", mime_type="application/json")
+            historical_backfills.append({"date": day.isoformat(), "rows": len(day_panel), "symbols": int(day_panel["symbol"].nunique())})
+            _stage(f"HISTORICAL PIT BACKFILL SAVED: date={day}; rows={len(day_panel)}")
+
+    panel = panel.sort_values(["symbol", "decision_timestamp"]).drop_duplicates("symbol", keep="last").reset_index(drop=True)
+    panel = _decorate_snapshot_rows(panel, FEATURES_59, readiness_cols)
     snap=FEATURE_DIR/f"DELIVERY_PIT_FEATURES_{latest_date}.parquet"
     snap.parent.mkdir(parents=True,exist_ok=True)
     _stage(f"SNAPSHOT WRITE: {snap.name}")
@@ -568,6 +627,10 @@ def main():
         "minimum_history_sessions":MIN_HISTORY,
         "source_status":source_status,"eod_status":eod_status,"delivery_status":delivery_status,"live_rss_news":live_news_result,
         "source_audit":source_audit,"group_readiness":group_ready,
+        "historical_snapshots_backfilled": historical_backfills,
+        "historical_snapshots_backfilled_count": len(historical_backfills),
+        "fundamental_refresh_fallback_used": bool(fundamental_availability_refresh.get("fallback_used")),
+        "fundamental_coverage_current_target": bool(fundamental_availability_refresh.get("current_target_covered")),
         "feature_coverage":feature_coverage_report(panel),
         "production_feature_coverage_pct":round(float(panel["production_feature_coverage"].mean()*100),3),
         "production_rows_all_59_features":int(panel["production_feature_non_missing_count"].eq(len(FEATURES_59)).sum()),
