@@ -109,10 +109,12 @@ jobs:
               for key in (
                   "session_date", "expected_minutes", "snapshot_files_present",
                   "minute_manifests_present", "missing_snapshot_minutes",
-                  "failed_symbol_completeness_minutes", "observed_quote_coverage_pct",
-                  "prediction_files_present", "missing_prediction_minutes",
-                  "prediction_model_quality_failures", "quality_gate_pass",
-                  "audit_status", "drive_json_write", "drive_csv_write",
+                  "missing_manifest_minutes", "slots_with_incomplete_symbols",
+                  "observed_quote_coverage_pct", "average_complete_symbol_coverage_pct",
+                  "minimum_complete_symbol_coverage_pct", "prediction_files_present",
+                  "missing_prediction_minutes", "prediction_model_diagnostics",
+                  "prediction_status_counts", "audit_status",
+                  "drive_json_write", "drive_csv_write",
               )
           }
           print("FULL_UNIVERSE_MINUTE_AUDIT_SUMMARY:", json.dumps(summary, sort_keys=True, default=str))
@@ -130,17 +132,10 @@ jobs:
           if operational_failures:
               raise SystemExit(" | ".join(operational_failures))
 
-          if not report.get("quality_gate_pass", False):
-              warning = (
-                  f"Data-quality gate needs attention for {report.get('session_date')}: "
-                  f"{len(report.get('missing_snapshot_minutes') or [])} missing snapshots, "
-                  f"{len(report.get('failed_symbol_completeness_minutes') or [])} symbol-completeness failures, "
-                  f"{len(report.get('missing_prediction_minutes') or [])} missing prediction slots, "
-                  f"{len(report.get('prediction_model_quality_failures') or [])} model-quality failures. "
-                  "See the persisted JSON/CSV audit for details."
-              )
-              print("::warning title=Intraday capture quality warning::" + warning)
-              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_NEEDS_ATTENTION")
-          else:
-              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_PASS")
+          print(
+              "SYMBOL_LEVEL_DIAGNOSTICS_RECORDED: "
+              f"{len(report.get('slots_with_incomplete_symbols') or [])} slots contain one or more incomplete symbols; "
+              "individual complete-symbol rows remain eligible for same-slot prediction."
+          )
+          print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_SYMBOL_LEVEL_DIAGNOSTICS")
           PY
