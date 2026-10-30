@@ -11,24 +11,9 @@ on:
         description: "Last ledger date YYYY-MM-DD; blank uses today in IST"
         required: false
         default: ""
-  # Existing outcome audit starts at 16:00 IST; learning runs later to allow it to finish.
+  # Learning runs after the 15:30 IST NSE cash close, after outcome matching has time to finish.
   schedule:
     - cron: "0 11 * * 1-5"
-  # Run once when the full-NSE learner/runtime integration changes on main;
-  # future production-model versions can be evaluated without waiting for Monday.
-  push:
-    branches:
-      - main
-    paths:
-      - "all_nse_prediction_learning.py"
-      - "all_nse_minute_prediction_capture.py"
-      - "all_nse_intraday_model.py"
-      - "audit_all_universe_minute_snapshots.py"
-      - "calibration_autopilot.py"
-      - "calibration_overlay.py"
-      - "prediction_learning_engine.py"
-      - ".github/workflows/autonomous_prediction_learning.yml"
-
 permissions:
   contents: read
 
@@ -61,23 +46,35 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          from datetime import date, datetime, timedelta
+          from datetime import date, datetime, time, timedelta
           from zoneinfo import ZoneInfo
           from market_session_guard import is_nse_trading_day
 
-          today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          today = now.date()
           start_text = os.environ.get("REQUESTED_START_DATE", "").strip()
           end_text = os.environ.get("REQUESTED_END_DATE", "").strip()
           end = date.fromisoformat(end_text) if end_text else today
           start = date.fromisoformat(start_text) if start_text else end - timedelta(days=29)
           if end < start:
               raise SystemExit("learning end date is before start date")
-          should_run = is_nse_trading_day(end)
+          # Same-day outcome learning is deferred until after the NSE cash close.
+          # Historical/manual date ranges remain available outside market hours.
+          after_cash_close = now.time() >= time(15, 45)
+          should_run = (
+              end <= today
+              and is_nse_trading_day(end)
+              and (end < today or after_cash_close)
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"start_date={start.isoformat()}\n")
               out.write(f"end_date={end.isoformat()}\n")
               out.write(f"should_run={'true' if should_run else 'false'}\n")
-          print(f"learning_start={start} learning_end={end} trading_day={should_run}")
+          print(
+              f"learning_start={start} learning_end={end} "
+              f"trading_day={is_nse_trading_day(end)} "
+              f"after_cash_close={after_cash_close} learning_allowed={should_run}"
+          )
           PY
 
       - name: Verify Google Drive read/write access

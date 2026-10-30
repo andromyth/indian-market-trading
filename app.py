@@ -4,7 +4,12 @@ The dashboard produces decision-support signals only. It does not place orders.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
+import re
+from datetime import timedelta
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -103,6 +108,216 @@ from market_watchlist import (
     fetch_watchlist_articles,
     target_session_date as resolve_watch_target_session,
 )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
+    """Read the newest durable five-minute quote snapshot and its matching predictions."""
+    try:
+        drive = persistent_drive_status()
+        if not drive.get("configured") or drive.get("reachable") is False:
+            return {
+                "status": "DRIVE_UNAVAILABLE",
+                "reason": drive.get("reason") or "Google Drive is not configured or reachable.",
+            }
+
+        from persistent_store import GoogleDriveStore
+
+        store = GoogleDriveStore()
+
+        def folder_id(parts: list[str]) -> str | None:
+            parent = store.root_id
+            for part in parts:
+                hit = store._find_child(
+                    parent, part, "application/vnd.google-apps.folder"
+                )
+                if not hit:
+                    return None
+                parent = hit["id"]
+            return parent
+
+        def list_children(parent: str) -> list[dict]:
+            items = []
+            page_token = None
+            while True:
+                params = {
+                    "q": f"'{parent}' in parents and trashed = false",
+                    "spaces": "drive",
+                    "fields": "nextPageToken,files(id,name,mimeType,modifiedTime)",
+                    "pageSize": 1000,
+                    "includeItemsFromAllDrives": True,
+                    "supportsAllDrives": True,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                response = store.service.files().list(**params).execute()
+                items.extend(response.get("files") or [])
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    return items
+
+        def read_bytes(file_id: str) -> bytes:
+            raw = store.service.files().get_media(fileId=file_id).execute()
+            return raw.read() if hasattr(raw, "read") else bytes(raw)
+
+        def normalize_symbols(frame: pd.DataFrame) -> pd.DataFrame:
+            x = frame.copy()
+            x["symbol"] = (
+                x["symbol"].astype(str).str.strip().str.upper()
+                .str.replace(".NS", "", regex=False)
+                .str.replace(".BO", "", regex=False)
+            )
+            return x
+
+        today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        for offset in range(22):
+            session = today - timedelta(days=offset)
+            quote_folder = folder_id([
+                "production_data", "all_universe_minute_snapshots",
+                f"{session:%Y}", f"{session:%m}", f"{session:%d}",
+            ])
+            if not quote_folder:
+                continue
+            quote_files = list_children(quote_folder)
+            quote_by_name = {item.get("name"): item for item in quote_files}
+            manifests = sorted(
+                (
+                    item for item in quote_files
+                    if re.fullmatch(r"manifest_\d{8}_\d{4}\.json", str(item.get("name") or ""))
+                ),
+                key=lambda item: str(item.get("name") or ""),
+                reverse=True,
+            )
+            for manifest_file in manifests:
+                capture_manifest = json.loads(read_bytes(manifest_file["id"]).decode("utf-8"))
+                snapshot_path = str(
+                    capture_manifest.get("snapshot_drive_path")
+                    or capture_manifest.get("remote_snapshot_path")
+                    or ""
+                )
+                snapshot_name = snapshot_path.rsplit("/", 1)[-1]
+                snapshot_file = quote_by_name.get(snapshot_name)
+                snapshot_stored = bool(
+                    snapshot_file
+                    and (
+                        capture_manifest.get("snapshot_persisted") is True
+                        or str(capture_manifest.get("status") or "").upper() in {"STORED", "OK", "PARTIAL"}
+                    )
+                )
+                if not snapshot_stored:
+                    continue
+
+                quote_frame = pd.read_parquet(io.BytesIO(read_bytes(snapshot_file["id"])))
+                if quote_frame.empty or "symbol" not in quote_frame.columns:
+                    continue
+                quote_frame = normalize_symbols(quote_frame)
+
+                cycle_minute = pd.to_datetime(
+                    capture_manifest.get("cycle_minute_ist"), errors="coerce"
+                )
+                if pd.isna(cycle_minute):
+                    cycle_minute = pd.to_datetime(
+                        str(manifest_file.get("name"))[9:22], format="%Y%m%d_%H%M",
+                        errors="coerce",
+                    )
+                minute_key = str(manifest_file["name"])[9:22]
+                prediction_folder = folder_id([
+                    "production_data", "all_nse_minute_predictions",
+                    f"{session:%Y}", f"{session:%m}", f"{session:%d}",
+                ])
+                prediction_manifest = {}
+                prediction_frame = pd.DataFrame()
+                prediction_file_stored = False
+                if prediction_folder:
+                    prediction_files = {
+                        item.get("name"): item for item in list_children(prediction_folder)
+                    }
+                    prediction_file = prediction_files.get(f"predictions_{minute_key}.parquet")
+                    prediction_manifest_file = prediction_files.get(f"manifest_{minute_key}.json")
+                    if prediction_manifest_file:
+                        try:
+                            prediction_manifest = json.loads(
+                                read_bytes(prediction_manifest_file["id"]).decode("utf-8")
+                            )
+                        except Exception:
+                            prediction_manifest = {}
+                    if prediction_file:
+                        try:
+                            prediction_frame = pd.read_parquet(
+                                io.BytesIO(read_bytes(prediction_file["id"]))
+                            )
+                            prediction_file_stored = True
+                        except Exception:
+                            prediction_frame = pd.DataFrame()
+
+                if not prediction_frame.empty and "symbol" in prediction_frame.columns:
+                    prediction_frame = normalize_symbols(prediction_frame)
+                    keep = [
+                        "symbol", "prediction_status", "signal", "probability_up_30m",
+                        "expected_return_30m", "confidence", "data_readiness_score",
+                        "model_version", "forecast_target_timestamp_utc", "error",
+                    ]
+                    prediction_frame = prediction_frame[
+                        [column for column in keep if column in prediction_frame.columns]
+                    ].drop_duplicates("symbol", keep="last")
+                    prediction_frame["_prediction_row_stored"] = True
+                    view = quote_frame.merge(prediction_frame, on="symbol", how="left")
+                else:
+                    view = quote_frame.copy()
+                    view["_prediction_row_stored"] = False
+
+                if "_prediction_row_stored" not in view.columns:
+                    view["_prediction_row_stored"] = False
+                view["_prediction_row_stored"] = view["_prediction_row_stored"].fillna(False).astype(bool)
+                if "quote_status" not in view:
+                    view["quote_status"] = "UNKNOWN"
+                view["quote_status"] = view["quote_status"].fillna("UNKNOWN").astype(str).str.upper()
+                if "actual_observed_price" in view:
+                    price = pd.to_numeric(view["actual_observed_price"], errors="coerce")
+                else:
+                    price = pd.Series(np.nan, index=view.index)
+                instrument = view.get("instrument_code", pd.Series("", index=view.index)).fillna("").astype(str).str.strip()
+                quote_time = pd.to_datetime(
+                    view.get("quote_observed_at_utc", pd.Series(pd.NaT, index=view.index)),
+                    errors="coerce", utc=True,
+                )
+                view["capture_complete"] = (
+                    view["quote_status"].eq("PASS")
+                    & instrument.ne("")
+                    & price.gt(0)
+                    & quote_time.notna()
+                )
+                view["snapshot_stored"] = True
+                view["prediction_stored"] = view["_prediction_row_stored"]
+                view["prediction_status"] = (
+                    view.get("prediction_status", pd.Series("", index=view.index))
+                    .fillna("PREDICTION_NOT_WRITTEN").astype(str)
+                )
+                if "quote_observed_at_ist" not in view:
+                    view["quote_observed_at_ist"] = view.get("quote_observed_at_utc")
+                view = view.sort_values(
+                    ["capture_complete", "symbol"], ascending=[False, True]
+                ).reset_index(drop=True)
+                return {
+                    "status": "OK",
+                    "cycle_minute_ist": capture_manifest.get("cycle_minute_ist") or str(cycle_minute),
+                    "session_date": session.isoformat(),
+                    "capture_manifest": capture_manifest,
+                    "prediction_manifest": prediction_manifest,
+                    "prediction_file_stored": prediction_file_stored,
+                    "rows": view,
+                }
+
+        return {
+            "status": "NO_STORED_SNAPSHOT",
+            "reason": "No persisted five-minute NSE quote snapshot was found in the last 22 calendar days.",
+        }
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "reason": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
 
 try:
     from indstocks_client import (
@@ -1133,7 +1348,7 @@ if interface_mode == "Live Test":
 
     workspace = st.radio(
         "Workspace",
-        ["Market overview", "Delivery · 7 sessions", "Intraday · 1 minute"],
+        ["Market overview", "5-minute NSE snapshots", "Delivery · 7 sessions", "Intraday · 1 minute"],
         horizontal=True,
         label_visibility="collapsed",
         key="trading_workspace",
@@ -1192,6 +1407,104 @@ if interface_mode == "Live Test":
                 "Watchlist refreshes when requested and is cached for 15 minutes. "
                 "Model inference runs only in the selected Delivery or Intraday workspace."
             )
+
+    elif workspace == "5-minute NSE snapshots":
+        st.subheader("Full-NSE five-minute captures and predictions")
+        st.caption(
+            "Drive-backed, symbol-level records for the latest stored five-minute slot. "
+            "A complete symbol is evaluated independently; missing or incomplete symbols do not block others. "
+            "Outcome matching and learning run separately after the market session."
+        )
+        refresh_col, slot_col = st.columns([1, 4])
+        with refresh_col:
+            if st.button("Refresh stored data", key="refresh_all_nse_5m"):
+                _cached_latest_all_nse_5m_snapshot.clear()
+        with st.spinner("Reading the latest persisted five-minute snapshot and matching predictions from Google Drive…"):
+            stored_view = _cached_latest_all_nse_5m_snapshot(refresh_revision)
+        if stored_view.get("status") != "OK":
+            st.info(stored_view.get("reason") or "No five-minute persisted records are available.")
+        else:
+            rows_5m = stored_view["rows"].copy()
+            capture_manifest = stored_view.get("capture_manifest") or {}
+            prediction_manifest = stored_view.get("prediction_manifest") or {}
+            cycle_minute = str(stored_view.get("cycle_minute_ist") or "Unknown")
+            captured_count = int(rows_5m["capture_complete"].sum()) if "capture_complete" in rows_5m else 0
+            prediction_count = int(
+                pd.to_numeric(rows_5m.get("probability_up_30m"), errors="coerce").notna().sum()
+            ) if "probability_up_30m" in rows_5m else 0
+            prediction_rows_stored = int(rows_5m["prediction_stored"].sum()) if "prediction_stored" in rows_5m else 0
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Stored symbol rows", f"{len(rows_5m):,}")
+            m2.metric("Complete quote rows", f"{captured_count:,}")
+            m3.metric("Prediction rows stored", f"{prediction_rows_stored:,}")
+            m4.metric("Model forecasts emitted", f"{prediction_count:,}")
+            st.caption(
+                f"Latest stored slot: {cycle_minute} · session: {stored_view.get('session_date')} · "
+                f"snapshot file stored: Yes · prediction file stored: {'Yes' if stored_view.get('prediction_file_stored') else 'No'}"
+            )
+
+            search_symbol = st.text_input("Find symbol", key="all_nse_5m_symbol_filter").strip().upper()
+            view_filter = st.selectbox(
+                "Rows",
+                ["All symbols", "Complete quote captured", "Prediction emitted", "Needs attention"],
+                key="all_nse_5m_status_filter",
+            )
+            filtered = rows_5m.copy()
+            if search_symbol:
+                filtered = filtered.loc[
+                    filtered["symbol"].astype(str).str.upper().str.contains(search_symbol, regex=False)
+                ]
+            if view_filter == "Complete quote captured":
+                filtered = filtered.loc[filtered["capture_complete"]]
+            elif view_filter == "Prediction emitted":
+                if "probability_up_30m" in filtered:
+                    filtered = filtered.loc[
+                        pd.to_numeric(filtered["probability_up_30m"], errors="coerce").notna()
+                    ]
+                else:
+                    filtered = filtered.iloc[0:0]
+            elif view_filter == "Needs attention":
+                has_prediction = (
+                    pd.to_numeric(filtered["probability_up_30m"], errors="coerce").notna()
+                    if "probability_up_30m" in filtered
+                    else pd.Series(False, index=filtered.index)
+                )
+                filtered = filtered.loc[~filtered["capture_complete"] | ~has_prediction]
+
+            display_columns = [
+                "symbol", "quote_status", "capture_complete", "actual_observed_price",
+                "quote_observed_at_ist", "snapshot_stored", "prediction_stored",
+                "prediction_status", "signal", "probability_up_30m",
+                "expected_return_30m", "confidence", "data_readiness_score",
+                "forecast_target_timestamp_utc", "model_version", "error",
+            ]
+            display_columns = [column for column in display_columns if column in filtered.columns]
+            st.dataframe(
+                filtered[display_columns],
+                width="stretch",
+                hide_index=True,
+                height=620,
+            )
+            with st.expander("Capture and prediction slot metadata", expanded=False):
+                st.json({
+                    "capture": {
+                        key: capture_manifest.get(key)
+                        for key in (
+                            "status", "cycle_minute_ist", "expected_symbol_count",
+                            "quoted_symbol_count", "missing_quote_count",
+                            "snapshot_persisted", "snapshot_drive_path",
+                        )
+                    },
+                    "prediction": {
+                        key: prediction_manifest.get(key)
+                        for key in (
+                            "status", "cycle_minute_ist", "eligible_symbol_count",
+                            "prediction_count", "prediction_status_counts",
+                            "model_failure_count", "model_artifact_verified",
+                            "prediction_drive_path",
+                        )
+                    },
+                })
 
     elif workspace == "Delivery · 7 sessions":
         st.subheader(f"{selected_root} · Daily OHLC outlook" if selected_root else "Daily OHLC outlook")

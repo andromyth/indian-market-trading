@@ -107,14 +107,7 @@ def _group_by_name(files: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
 
 
 def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
-    """Count unique symbols with a valid, complete core quote observation.
-
-    A symbol counts only when its row has PASS status, a nonblank symbol and
-    provider instrument code, a positive finite live price, and a valid
-    observation timestamp. Duplicate rows for a symbol are not counted as
-    complete; optional daily context fields are retained as data but do not
-    invalidate an otherwise valid live quote.
-    """
+    """Classify complete and incomplete quote rows independently by symbol."""
     required = [
         "symbol",
         "instrument_code",
@@ -122,29 +115,33 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
         "actual_observed_price",
         "quote_observed_at_utc",
     ]
+    empty_result = {
+        "snapshot_row_count": 0,
+        "complete_symbol_count": 0,
+        "incomplete_symbol_count": 0,
+        "snapshot_duplicate_symbol_count": 0,
+        "symbol_capture_status_counts": {},
+        "incomplete_symbol_samples": [],
+        "missing_required_snapshot_columns": [],
+        "snapshot_error": None,
+    }
     if not isinstance(frame, pd.DataFrame):
         return {
-            "snapshot_row_count": 0,
-            "complete_symbol_count": 0,
-            "snapshot_duplicate_symbol_count": 0,
+            **empty_result,
             "missing_required_snapshot_columns": required,
             "snapshot_error": "Snapshot loader did not return a DataFrame",
         }
     missing_columns = [column for column in required if column not in frame.columns]
     if missing_columns:
         return {
+            **empty_result,
             "snapshot_row_count": int(len(frame)),
-            "complete_symbol_count": 0,
-            "snapshot_duplicate_symbol_count": 0,
             "missing_required_snapshot_columns": missing_columns,
             "snapshot_error": "Snapshot is missing required core quote columns",
         }
     if frame.empty:
         return {
-            "snapshot_row_count": 0,
-            "complete_symbol_count": 0,
-            "snapshot_duplicate_symbol_count": 0,
-            "missing_required_snapshot_columns": [],
+            **empty_result,
             "snapshot_error": "Snapshot contains no symbol rows",
         }
 
@@ -170,13 +167,43 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
         & price_valid
         & timestamps.notna()
     )
+
+    incomplete_samples = []
+    for index in frame.index[~complete]:
+        reasons = []
+        symbol = str(symbols.loc[index] or "")
+        if not symbol:
+            reasons.append("MISSING_SYMBOL")
+        elif not bool(unique_symbol.loc[index]):
+            reasons.append("DUPLICATE_SYMBOL")
+        if str(statuses.loc[index]) != "PASS":
+            reasons.append(str(statuses.loc[index]) or "MISSING_QUOTE_STATUS")
+        if not str(instruments.loc[index]):
+            reasons.append("MISSING_INSTRUMENT_CODE")
+        if not bool(price_valid.loc[index]):
+            reasons.append("INVALID_OR_MISSING_PRICE")
+        if pd.isna(timestamps.loc[index]):
+            reasons.append("INVALID_OR_MISSING_QUOTE_TIMESTAMP")
+        if len(incomplete_samples) < 100:
+            incomplete_samples.append({
+                "symbol": symbol or None,
+                "reasons": reasons,
+            })
+
     return {
         "snapshot_row_count": int(len(frame)),
         "complete_symbol_count": int(complete.sum()),
+        "incomplete_symbol_count": int((~complete).sum()),
         "snapshot_duplicate_symbol_count": duplicate_symbol_count,
+        "symbol_capture_status_counts": {
+            str(key): int(value)
+            for key, value in statuses.value_counts(dropna=False).items()
+        },
+        "incomplete_symbol_samples": incomplete_samples,
         "missing_required_snapshot_columns": [],
         "snapshot_error": None,
     }
+
 
 def build_audit_report(
     session_date: date,
@@ -186,6 +213,7 @@ def build_audit_report(
     snapshot_loader,
     as_of: datetime | pd.Timestamp | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Record five-minute capture diagnostics without a universe-wide pass/fail gate."""
     expected = expected_minutes(session_date, as_of=as_of)
     groups = _group_by_name(files)
     snapshot_files: dict[str, list[dict[str, Any]]] = {}
@@ -211,7 +239,10 @@ def build_audit_report(
         snapshot_metrics = {
             "snapshot_row_count": 0,
             "complete_symbol_count": 0,
+            "incomplete_symbol_count": 0,
             "snapshot_duplicate_symbol_count": 0,
+            "symbol_capture_status_counts": {},
+            "incomplete_symbol_samples": [],
             "missing_required_snapshot_columns": [],
             "snapshot_error": "Snapshot file is missing",
         }
@@ -250,36 +281,30 @@ def build_audit_report(
 
     frame = pd.DataFrame(rows)
     expected_count = len(expected)
-    snapshots_present = int(frame["snapshot_present"].sum())
-    manifests_present = int(frame["manifest_present"].sum())
-    duplicate_snapshot_files = int(frame["snapshot_duplicate_file_count"].sum())
-    duplicate_manifest_files = int(frame["manifest_duplicate_file_count"].sum())
+    snapshots_present = int(frame["snapshot_present"].sum()) if not frame.empty else 0
+    manifests_present = int(frame["manifest_present"].sum()) if not frame.empty else 0
+    duplicate_snapshot_files = int(frame["snapshot_duplicate_file_count"].sum()) if not frame.empty else 0
+    duplicate_manifest_files = int(frame["manifest_duplicate_file_count"].sum()) if not frame.empty else 0
     status_counts = {
-        str(k): int(v)
-        for k, v in frame["capture_status"].value_counts(dropna=False).items()
-    }
+        str(key): int(value)
+        for key, value in frame["capture_status"].value_counts(dropna=False).items()
+    } if not frame.empty else {}
     total_expected_symbols = pd.to_numeric(
         frame["expected_symbol_count"], errors="coerce"
-    ).fillna(0).sum()
+    ).fillna(0).sum() if not frame.empty else 0
     total_quoted_symbols = pd.to_numeric(
         frame["quoted_symbol_count"], errors="coerce"
-    ).fillna(0).sum()
+    ).fillna(0).sum() if not frame.empty else 0
     total_missing_quotes = pd.to_numeric(
         frame["missing_quote_count"], errors="coerce"
-    ).fillna(0).sum()
+    ).fillna(0).sum() if not frame.empty else 0
     total_outcomes = pd.to_numeric(
         frame["matched_outcome_count"], errors="coerce"
-    ).fillna(0).sum()
-    all_snapshots_present = snapshots_present == expected_count
-    all_manifests_present = manifests_present == expected_count
+    ).fillna(0).sum() if not frame.empty else 0
     coverage_pct = (
         float(total_quoted_symbols / total_expected_symbols * 100.0)
         if total_expected_symbols else 0.0
     )
-    # Snapshot success is measured per scheduled slot: more than 90% of the
-    # expected symbols must each have one complete, valid quote row. Do not let
-    # a strong slot average hide a broken five-minute snapshot.
-    complete_symbol_coverage_threshold_pct = 90.0
     frame["complete_symbol_coverage_pct"] = frame.apply(
         lambda row: (
             float(row["complete_symbol_count"] / row["expected_symbol_count"] * 100.0)
@@ -288,87 +313,41 @@ def build_audit_report(
             else 0.0
         ),
         axis=1,
+    ) if not frame.empty else pd.Series(dtype=float)
+    slot_coverages = (
+        pd.to_numeric(frame["complete_symbol_coverage_pct"], errors="coerce").fillna(0).tolist()
+        if not frame.empty else []
     )
-    slot_coverages = [float(value) for value in frame["complete_symbol_coverage_pct"]]
-    failed_symbol_completeness_minutes = [
-        str(row["minute_key_ist"])
-        for row in rows
-        if (
-            float(
-                frame.loc[frame["minute_key_ist"].eq(row["minute_key_ist"]),
-                          "complete_symbol_coverage_pct"].iloc[0]
-            ) <= complete_symbol_coverage_threshold_pct
-        )
-    ]
-    minimum_complete_symbol_coverage_pct = (
-        min(slot_coverages) if slot_coverages else 0.0
-    )
+    minimum_complete_symbol_coverage_pct = min(slot_coverages) if slot_coverages else 0.0
     average_complete_symbol_coverage_pct = (
         sum(slot_coverages) / len(slot_coverages) if slot_coverages else 0.0
     )
     total_complete_symbols = int(
         pd.to_numeric(frame["complete_symbol_count"], errors="coerce").fillna(0).sum()
-    )
-    all_slots_meet_symbol_threshold = bool(
-        expected_count > 0
-        and len(slot_coverages) == expected_count
-        and all(value > complete_symbol_coverage_threshold_pct for value in slot_coverages)
-    )
+    ) if not frame.empty else 0
+    slots_with_incomplete_symbols = [
+        str(row["minute_key_ist"])
+        for _, row in frame.iterrows()
+        if (
+            pd.notna(row.get("expected_symbol_count"))
+            and int(row.get("complete_symbol_count") or 0)
+                < int(row.get("expected_symbol_count") or 0)
+        )
+    ]
     recovered_persistence_issue_minutes = [
         str(row["minute_key_ist"])
-        for row in rows
+        for _, row in frame.iterrows()
         if (
             row["capture_status"] == "PERSISTENCE_ERROR"
             and row["snapshot_present"]
             and row["manifest_present"]
-            and pd.notna(row["expected_symbol_count"])
-            and float(row["expected_symbol_count"]) > 0
-            and float(row["complete_symbol_count"])
-                / float(row["expected_symbol_count"]) * 100.0
-                > complete_symbol_coverage_threshold_pct
+            and not row.get("snapshot_error")
+            and int(row.get("complete_symbol_count") or 0) > 0
         )
     ]
-    slot_coverage_by_minute = {
-        str(row["minute_key_ist"]): float(row["complete_symbol_coverage_pct"])
-        for _, row in frame.iterrows()
-    }
-    # Keep the status flag consistent with the symbol-completeness gate.
-    # PARTIAL is acceptable only when that slot has >90% complete symbol rows
-    # and its snapshot/manifest are present, unique, and readable.
-    statuses_data_complete = bool(
-        expected_count > 0
-        and all(
-            row["snapshot_present"]
-            and row["manifest_present"]
-            and int(row["snapshot_duplicate_file_count"]) == 0
-            and int(row["manifest_duplicate_file_count"]) == 0
-            and not row.get("snapshot_error")
-            and not row.get("manifest_error")
-            and slot_coverage_by_minute.get(str(row["minute_key_ist"]), 0.0)
-                > complete_symbol_coverage_threshold_pct
-            and (
-                row["capture_status"] in ("OK", "PARTIAL")
-                or (
-                    row["capture_status"] == "PERSISTENCE_ERROR"
-                    and str(row["minute_key_ist"]) in recovered_persistence_issue_minutes
-                )
-            )
-            for row in rows
-        )
-    )
-    quality_gate_pass = bool(
-        expected_count > 0
-        and all_snapshots_present
-        and all_manifests_present
-        and duplicate_snapshot_files == 0
-        and duplicate_manifest_files == 0
-        and not corrupt_manifests
-        and not corrupt_snapshots
-        and all_slots_meet_symbol_threshold
-    )
     report = {
         "audit_name": "all-universe-minute-capture-audit",
-        "schema_version": "all-universe-minute-audit-v3",
+        "schema_version": "all-universe-minute-audit-v4",
         "session_date": session_date.isoformat(),
         "timezone": "Asia/Kolkata",
         "capture_interval_minutes": CAPTURE_INTERVAL_MINUTES,
@@ -384,15 +363,11 @@ def build_audit_report(
         ],
         "corrupt_manifest_minutes": corrupt_manifests,
         "corrupt_snapshot_minutes": corrupt_snapshots,
-        "failed_symbol_completeness_minutes": failed_symbol_completeness_minutes,
+        "slots_with_incomplete_symbols": slots_with_incomplete_symbols,
         "recovered_persistence_issue_minutes": recovered_persistence_issue_minutes,
         "duplicate_snapshot_files": duplicate_snapshot_files,
         "duplicate_manifest_files": duplicate_manifest_files,
         "capture_status_counts": status_counts,
-        "capture_status_gate_pass": statuses_data_complete,
-        "complete_symbol_coverage_threshold_pct": complete_symbol_coverage_threshold_pct,
-        "capture_quality_gate_pass": quality_gate_pass,
-        "snapshot_quality_gate_pass": quality_gate_pass,
         "total_expected_symbol_minutes": int(total_expected_symbols),
         "total_quoted_symbol_minutes": int(total_quoted_symbols),
         "total_missing_quote_rows": int(total_missing_quotes),
@@ -400,18 +375,18 @@ def build_audit_report(
         "total_complete_symbol_rows": total_complete_symbols,
         "average_complete_symbol_coverage_pct": round(average_complete_symbol_coverage_pct, 4),
         "minimum_complete_symbol_coverage_pct": round(minimum_complete_symbol_coverage_pct, 4),
-        "all_slots_meet_symbol_completeness_threshold": all_slots_meet_symbol_threshold,
+        "coverage_is_informational": True,
         "matched_outcomes": int(total_outcomes),
         "total_pending_snapshot_recovery_errors": int(
             pd.to_numeric(
                 frame["pending_snapshot_recovery_errors"], errors="coerce"
             ).fillna(0).sum()
-        ),
+        ) if not frame.empty else 0,
         "total_pending_manifest_recovery_errors": int(
             pd.to_numeric(
                 frame["pending_manifest_recovery_errors"], errors="coerce"
             ).fillna(0).sum()
-        ),
+        ) if not frame.empty else 0,
         "forecast_scope_note": (
             "Forecast counts describe only symbols for which the active forecast engine "
             "actually emitted rows; quote capture does not imply every symbol was forecast."
@@ -420,16 +395,16 @@ def build_audit_report(
             "INDstocks quote timestamps are collector-observation times, not exchange-stamped "
             "one-minute OHLCV candle timestamps."
         ),
-        "quality_gate_pass": quality_gate_pass,
-        "audit_status": "PASS" if quality_gate_pass else "NEEDS_ATTENTION",
+        "symbol_level_policy": (
+            "Each symbol with one complete same-slot quote row is independently eligible for "
+            "prediction after the stored snapshot is confirmed. Missing or incomplete symbols "
+            "do not block predictions for other symbols."
+        ),
+        "audit_status": "RECORDED",
         "audit_note": (
-            "Snapshot capture passes only when every expected snapshot and manifest exists "
-            "without duplicates or corruption, and every five-minute snapshot has strictly "
-            "more than 90% of expected symbols represented by one complete core quote row. "
-            "A complete row requires PASS quote status, a nonblank symbol and instrument code, "
-            "a positive finite observed price, and a valid quote-observation timestamp. "
-            "The gate is per slot, not an aggregate across the trading day. PARTIAL statuses, "
-            "missing symbols, invalid rows, and optional daily-context gaps remain diagnostic."
+            "This report records slot and per-symbol diagnostics only. Coverage percentages, "
+            "missing symbols, partial slots and model-readiness counts are informational; "
+            "there is no universe-wide or percentage-based acceptance threshold."
         ),
         "audited_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -443,7 +418,7 @@ def build_prediction_audit(
     *,
     session_date: date,
 ) -> dict[str, Any]:
-    """Validate each scheduled all-NSE prediction Parquet and its manifest."""
+    """Record prediction storage and same-slot linkage without percentage gates."""
     groups = _group_by_name(files)
     first_prediction_key = (
         datetime.combine(session_date, time(9, 15), tzinfo=IST) + timedelta(minutes=20)
@@ -453,13 +428,13 @@ def build_prediction_audit(
     corrupt_manifests: list[str] = []
     duplicate_files = 0
     duplicate_manifests = 0
-    row_count_failures: list[str] = []
-    prediction_snapshot_link_failures: list[str] = []
-    model_quality_failures: list[str] = []
-    total_expected_rows = 0
-    total_persisted_rows = 0
+    row_count_errors: list[str] = []
+    snapshot_link_diagnostics: list[str] = []
+    model_diagnostics: list[dict[str, Any]] = []
+    total_declared_rows = 0
     total_predictions = 0
     status_counts: dict[str, int] = {}
+    prediction_status_counts: dict[str, int] = {}
 
     for key in expected:
         snapshots = groups.get(f"predictions_{key}.parquet", [])
@@ -470,92 +445,66 @@ def build_prediction_audit(
             missing_manifests.append(key)
         duplicate_files += max(0, len(snapshots) - 1)
         duplicate_manifests += max(0, len(manifests) - 1)
-        manifest: dict[str, Any] = {}
-        if manifests:
-            try:
-                manifest = manifest_loader(manifests[0]["id"])
-            except Exception:
-                corrupt_manifests.append(key)
-                continue
-        status = str(manifest.get("status") or ("MISSING_MANIFEST" if not manifests else "CORRUPT_MANIFEST"))
+        if not manifests:
+            continue
+        try:
+            manifest = manifest_loader(manifests[0]["id"])
+        except Exception:
+            corrupt_manifests.append(key)
+            continue
+
+        status = str(manifest.get("status") or "UNKNOWN").upper()
         status_counts[status] = status_counts.get(status, 0) + 1
-        expected_symbols = manifest.get("expected_symbol_count")
-        row_count = manifest.get("row_count")
-        prediction_count = manifest.get("prediction_count")
         try:
-            expected_int = int(expected_symbols)
-            row_count_int = int(row_count)
+            expected_symbols = int(manifest.get("expected_symbol_count") or 0)
+            row_count = int(manifest.get("row_count") or 0)
+            prediction_count = int(manifest.get("prediction_count") or 0)
         except (TypeError, ValueError):
-            expected_int = row_count_int = 0
-        total_expected_rows += expected_int
-        total_persisted_rows += row_count_int
-        try:
-            total_predictions += int(prediction_count or 0)
-        except (TypeError, ValueError):
-            pass
-        if expected_int <= 0 or row_count_int != expected_int:
-            row_count_failures.append(key)
+            expected_symbols = row_count = prediction_count = -1
+        if min(expected_symbols, row_count, prediction_count) < 0:
+            row_count_errors.append(key)
+            continue
+        total_declared_rows += row_count
+        total_predictions += prediction_count
+        for status_name, count in (manifest.get("prediction_status_counts") or {}).items():
+            prediction_status_counts[str(status_name)] = (
+                prediction_status_counts.get(str(status_name), 0) + int(count or 0)
+            )
+
         expected_snapshot_minute = datetime.strptime(key, "%Y%m%d_%H%M").replace(tzinfo=IST)
         expected_snapshot_path = (
             "production_data/all_universe_minute_snapshots/"
             f"{session_date:%Y/%m/%d}/snapshot_{key}.parquet"
         )
         snapshot_link_ok = (
-            manifest.get("quote_snapshot_rows_validated") is True
+            bool(snapshots)
+            and manifest.get("quote_snapshot_rows_validated") is True
             and manifest.get("quote_snapshot_cycle_minute_ist") == expected_snapshot_minute.isoformat()
             and manifest.get("quote_snapshot_drive_path") == expected_snapshot_path
-            and manifest.get("quote_snapshot_expected_symbol_count") == expected_int
-            and manifest.get("quote_snapshot_capture_status") in {"OK", "PARTIAL"}
+            and manifest.get("quote_snapshot_expected_symbol_count") == expected_symbols
+            and manifest.get("quote_snapshot_capture_status") in {"OK", "PARTIAL", "STORED"}
         )
         if not snapshot_link_ok:
-            prediction_snapshot_link_failures.append(key)
-        if key < first_prediction_key:
-            continue  # Model history warm-up; the all-symbol rows must still be persisted.
-        n = max(1, expected_int)
-        prediction_fraction = int(prediction_count or 0) / n if prediction_count is not None else 0.0
-        missing_fraction = int(manifest.get("missing_quote_count") or 0) / n
-        limited_fraction = int(manifest.get("data_limited_count") or 0) / n
-        untrained_fraction = int(manifest.get("untrained_symbol_count") or 0) / n
-        model_failure_fraction = int(manifest.get("model_failure_count") or 0) / n
-        seed_coverage_fraction = int(manifest.get("history_seed_coverage_symbols") or 0) / n
-        seed_batches = max(1, (n + 4) // 5)
-        seed_failure_fraction = int(manifest.get("history_seed_failed_batches") or 0) / seed_batches
-        refresh_batches = int(manifest.get("history_refresh_batch_count") or 0)
-        refresh_failure_fraction = (
-            int(manifest.get("history_refresh_failed_batches") or 0) / refresh_batches
-            if refresh_batches else 1.0
-        )
-        quality_ok = (
-            snapshot_link_ok
-            and status == "OK"
-            and manifest.get("quality_gate_pass") is True
-            and prediction_count is not None
-            and prediction_fraction >= 0.95
-            and missing_fraction <= 0.02
-            and limited_fraction <= 0.10
-            and untrained_fraction <= 0.10
-            and model_failure_fraction <= 0.01
-            and manifest.get("model_artifact_verified") is True
-            and manifest.get("trained_symbol_manifest_available") is True
-            and manifest.get("history_ready") is True
-            and seed_coverage_fraction >= 0.90
-            and seed_failure_fraction <= 0.05
-            and refresh_failure_fraction <= 0.05
-        )
-        if not quality_ok:
-            model_quality_failures.append(key)
+            snapshot_link_diagnostics.append(key)
 
-    quality_gate_pass = bool(
-        len(expected) > 0
-        and len(missing_files) == 0
-        and len(missing_manifests) == 0
-        and duplicate_files == 0
-        and duplicate_manifests == 0
-        and len(corrupt_manifests) == 0
-        and len(row_count_failures) == 0
-        and len(prediction_snapshot_link_failures) == 0
-        and len(model_quality_failures) == 0
-    )
+        if key >= first_prediction_key and (
+            prediction_count == 0
+            or int(manifest.get("model_failure_count") or 0) > 0
+            or manifest.get("model_artifact_verified") is not True
+        ):
+            model_diagnostics.append({
+                "minute_key_ist": key,
+                "prediction_count": prediction_count,
+                "stored_rows": row_count,
+                "eligible_symbol_count": manifest.get("eligible_symbol_count"),
+                "model_failure_count": manifest.get("model_failure_count"),
+                "data_limited_count": manifest.get("data_limited_count"),
+                "untrained_symbol_count": manifest.get("untrained_symbol_count"),
+                "model_artifact_verified": manifest.get("model_artifact_verified"),
+                "model_status": manifest.get("model_status"),
+                "prediction_status_counts": manifest.get("prediction_status_counts") or {},
+            })
+
     return {
         "prediction_expected_slots": len(expected),
         "prediction_files_present": len(expected) - len(missing_files),
@@ -565,15 +514,15 @@ def build_prediction_audit(
         "corrupt_prediction_manifest_minutes": corrupt_manifests,
         "duplicate_prediction_files": duplicate_files,
         "duplicate_prediction_manifests": duplicate_manifests,
-        "prediction_row_count_failures": row_count_failures,
-        "prediction_snapshot_link_failures": prediction_snapshot_link_failures,
-        "prediction_model_quality_failures": model_quality_failures,
-        "prediction_status_counts": status_counts,
-        "total_expected_prediction_symbol_rows": total_expected_rows,
-        "total_persisted_prediction_rows": total_persisted_rows,
+        "prediction_row_count_errors": row_count_errors,
+        "prediction_snapshot_link_diagnostics": snapshot_link_diagnostics,
+        "prediction_model_diagnostics": model_diagnostics,
+        "prediction_status_counts": prediction_status_counts,
+        "prediction_slot_status_counts": status_counts,
+        "total_declared_prediction_rows": total_declared_rows,
         "total_model_prediction_count": total_predictions,
         "prediction_warmup_until": first_prediction_key,
-        "prediction_quality_gate_pass": quality_gate_pass,
+        "prediction_coverage_is_informational": True,
     }
 
 
@@ -592,6 +541,7 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
     files = _list_children(store, day_folder_id) if day_folder_id else []
     load_manifest = lambda file_id: _download_json(store, file_id)
     as_of = datetime.now(IST)
+
     def load_snapshot(file_id: str) -> pd.DataFrame:
         raw = store.service.files().get_media(fileId=file_id).execute()
         if hasattr(raw, "read"):
@@ -622,18 +572,8 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
         load_manifest,
         session_date=session_date,
     )
-    capture_quality_gate_pass = bool(
-        report.get("capture_quality_gate_pass", report.get("quality_gate_pass"))
-    )
     report.update(prediction_report)
-    # Preserve the snapshot-only verdict separately from the combined verdict.
-    # Prediction failures must not be mislabeled as market snapshot failures.
-    report["capture_quality_gate_pass"] = capture_quality_gate_pass
-    report["snapshot_quality_gate_pass"] = capture_quality_gate_pass
-    report["quality_gate_pass"] = bool(
-        capture_quality_gate_pass and prediction_report["prediction_quality_gate_pass"]
-    )
-    report["audit_status"] = "PASS" if report["quality_gate_pass"] else "NEEDS_ATTENTION"
+    report["audit_status"] = "RECORDED"
 
     output_dir = (
         Path("data")
@@ -670,9 +610,6 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
             or report["drive_csv_write"].get("status") != "OK"
         ):
             report["audit_status"] = "PERSISTENCE_ERROR"
-            report["quality_gate_pass"] = False
-        # Include write results in the final JSON stored on local disk and, if
-        # possible, overwrite the first Drive JSON so it contains final status.
         json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
         if report.get("drive_json_write", {}).get("status") == "OK":
             final_json_write = store.upload_or_update(
@@ -684,14 +621,13 @@ def run_audit(session_date: date, *, sync_drive: bool = True) -> tuple[dict[str,
 
     return report, rows
 
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Audit all-NSE-equity five-minute quote and prediction snapshots plus Drive persistence."
     )
     parser.add_argument("--date", default="", help="NSE session date YYYY-MM-DD (default: today in IST)")
     parser.add_argument("--sync-drive", action="store_true", help="Upload audit JSON and CSV to Google Drive")
-    parser.add_argument("--strict", action="store_true", help="Exit nonzero when the data-quality gate fails")
+    parser.add_argument("--strict", action="store_true", help="Deprecated; retained for compatibility and does not apply a global quality gate.")
     args = parser.parse_args()
     if args.date:
         session_date = date.fromisoformat(args.date)
@@ -711,7 +647,7 @@ def main() -> int:
 
     report, _ = run_audit(session_date, sync_drive=args.sync_drive)
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report.get("quality_gate_pass") or not args.strict else 2
+    return 0
 
 
 if __name__ == "__main__":

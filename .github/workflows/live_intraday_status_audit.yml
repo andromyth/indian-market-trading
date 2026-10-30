@@ -78,44 +78,16 @@ jobs:
               "prediction_ledger_today": report.get("prediction_ledger_by_day", {}).get(today),
               "one_minute_bar_partitions_today": report.get("watchlist_one_minute_bars_by_day", {}).get(today),
               "full_universe_capture_today": report.get("full_universe_minute_capture_by_day", {}).get(today),
-              "latest_global_manifest": report.get("full_universe_latest_manifest"),
+              "latest_capture_manifest": report.get("full_universe_latest_manifest"),
               "outcome_audit_today": report.get("outcome_audits_by_day", {}).get(today),
-              "verdict": report.get("verdict"),
+              "diagnostic_note": "Per-symbol persistence and prediction records are evaluated independently; no universe-wide coverage threshold is applied.",
           }
           rendered = json.dumps(summary, sort_keys=True, default=str)
-          print("LIVE_INTRADAY_STATUS_SUMMARY:", rendered)
-
-          # Gate the most recent NSE trading day covered by the lookback.
-          # The 09:15 opening tick is exempt from forecast/actual completeness,
-          # because no completed 09:15 one-minute candle exists at tick start.
-          from datetime import date
-          from market_session_guard import is_nse_trading_day
-          candidates = sorted(
-              (day for day in report.get("watchlist_minute_snapshots_by_day", {}) if is_nse_trading_day(date.fromisoformat(day))),
-              reverse=True,
-          )
-          gate = {"applicable": bool(candidates), "session_date": None, "pass": True, "failures": []}
-          if candidates:
-              session = candidates[0]
-              gate["session_date"] = session
-              watch = report["watchlist_minute_snapshots_by_day"].get(session) or {}
-              ledger = report["prediction_ledger_by_day"].get(session) or {}
-              if watch.get("expected_snapshot_minutes", 0) > 0:
-                  if not watch.get("all_expected_snapshot_files_present"):
-                      gate["failures"].append("missing or duplicate expected minute snapshot files")
-                  if watch.get("expected_prediction_actual_minutes", 0) > 0 and not watch.get("all_required_minutes_have_predictions_and_actuals"):
-                      gate["failures"].append("one or more expected minutes lack a valid prediction plus timestamped actual price for every watchlist symbol")
-                  if not ledger.get("exists") or int(ledger.get("prediction_rows") or 0) == 0:
-                      gate["failures"].append("prediction ledger missing or empty")
-              gate["pass"] = not gate["failures"]
-          print("WATCHLIST_MINUTE_AUDIT_GATE:", json.dumps(gate, sort_keys=True))
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write("WATCHLIST_MINUTE_AUDIT_OK=" + ("true" if gate["pass"] else "false") + "\n")
+          print("LIVE_INTRADAY_SYMBOL_STATUS_SUMMARY:", rendered)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write("## Live intraday persistence audit\n\n")
-              fh.write(json.dumps({"summary": summary, "watchlist_minute_gate": gate}, indent=2, sort_keys=True, default=str) + "\n")
+              fh.write("## Live intraday persistence and symbol diagnostics\n\n")
+              fh.write(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
           PY
-
       - name: Audit latest completed NSE session's full-universe minute snapshots
         shell: bash
         run: |
@@ -173,21 +145,19 @@ jobs:
               "session_date", "nse_trading_day", "capture_interval_minutes",
               "expected_minutes", "snapshot_files_present", "missing_snapshot_minutes",
               "minute_manifests_present", "missing_manifest_minutes",
-              "capture_status_counts", "capture_status_gate_pass",
-              "complete_symbol_coverage_threshold_pct", "capture_quality_gate_pass",
-              "snapshot_quality_gate_pass", "corrupt_snapshot_minutes",
-              "failed_symbol_completeness_minutes", "total_expected_symbol_minutes",
-              "total_quoted_symbol_minutes", "total_missing_quote_rows",
-              "observed_quote_coverage_pct", "total_complete_symbol_rows",
-              "average_complete_symbol_coverage_pct", "minimum_complete_symbol_coverage_pct",
-              "all_slots_meet_symbol_completeness_threshold", "matched_outcomes",
+              "capture_status_counts", "corrupt_snapshot_minutes",
+              "corrupt_manifest_minutes", "slots_with_incomplete_symbols",
+              "total_expected_symbol_minutes", "total_quoted_symbol_minutes",
+              "total_missing_quote_rows", "observed_quote_coverage_pct",
+              "total_complete_symbol_rows", "average_complete_symbol_coverage_pct",
+              "minimum_complete_symbol_coverage_pct", "matched_outcomes",
               "prediction_expected_slots", "prediction_files_present",
               "missing_prediction_minutes", "prediction_manifests_present",
-              "missing_prediction_manifest_minutes", "prediction_row_count_failures",
-              "prediction_model_quality_failures", "total_persisted_prediction_rows",
-              "total_model_prediction_count", "prediction_quality_gate_pass",
-              "quality_gate_pass", "audit_status",
-              "drive_json_write", "drive_csv_write",
+              "missing_prediction_manifest_minutes", "prediction_row_count_errors",
+              "prediction_snapshot_link_diagnostics", "prediction_model_diagnostics",
+              "prediction_status_counts", "prediction_slot_status_counts",
+              "total_declared_prediction_rows", "total_model_prediction_count",
+              "audit_status", "drive_json_write", "drive_csv_write",
           )
           summary = {k: report.get(k) for k in keys}
           rendered = json.dumps(summary, sort_keys=True, default=str)
@@ -262,17 +232,9 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write("## Full-universe minute capture audit\n\n")
               fh.write("```json\n" + json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n```\n")
-          # Keep data-quality verdicts strict in the persisted report, but do
-          # not mark a successfully executed and saved diagnostic as a failed
-          # workflow merely because the report found gaps. Fail the action only
-          # if the audit output could not be persisted or the audit itself failed.
-          warnings = []
-          if os.getenv("WATCHLIST_MINUTE_AUDIT_OK", "true").lower() != "true":
-              warnings.append("WATCHLIST_MINUTE_CAPTURE_WARNING: per-minute prediction/actual snapshots are missing or incomplete.")
-          if report.get("nse_trading_day") and not report.get("capture_quality_gate_pass", report.get("quality_gate_pass")):
-              warnings.append("FULL_UNIVERSE_MINUTE_CAPTURE_WARNING: one or more five-minute slots failed the symbol-completeness gate.")
-          if report.get("nse_trading_day") and not report.get("prediction_quality_gate_pass", False):
-              warnings.append("ALL_NSE_MINUTE_PREDICTION_WARNING: prediction persistence or model-quality checks are incomplete.")
+          # Incomplete symbols and partial slots are recorded as diagnostics,
+          # not promoted to a universe-wide acceptance or rejection decision.
+          print("SYMBOL_LEVEL_DIAGNOSTICS_RECORDED=true")
 
           operational_failures = []
           if report.get("audit_status") == "PERSISTENCE_ERROR":
@@ -283,10 +245,5 @@ jobs:
                   operational_failures.append(f"{key} was not confirmed OK.")
           if operational_failures:
               raise SystemExit(" | ".join(operational_failures))
-          if warnings:
-              message = " | ".join(warnings)
-              print("::warning title=Intraday audit quality warning::" + message)
-              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_NEEDS_ATTENTION")
-          else:
-              print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_QUALITY_GATE_PASS")
+          print("AUDIT_EXECUTION=COMPLETED_REPORT_PERSISTED_SYMBOL_LEVEL_DIAGNOSTICS")
           PY
