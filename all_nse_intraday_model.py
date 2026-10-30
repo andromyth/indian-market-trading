@@ -88,23 +88,10 @@ def _returns(c: pd.Series, n: int) -> float:
 
 
 def _session_aware_returns(c: pd.Series, n: int) -> float:
-    """Calculate returns within a session; use prior-session bars during warm-up."""
+    """Match training: rolling close-to-close returns include prior-session bars."""
     if c is None or c.empty:
         return np.nan
-    values = pd.to_numeric(c, errors="coerce")
-    index = pd.DatetimeIndex(values.index)
-    index = index.tz_localize("Asia/Kolkata") if index.tz is None else index.tz_convert("Asia/Kolkata")
-    session_dates = pd.Index(index.date)
-    current_date = session_dates[-1]
-    current = values.loc[session_dates == current_date].dropna()
-    if len(current) > n:
-        return _returns(current, n)
-    previous_dates = sorted({day for day in session_dates if day < current_date})
-    if previous_dates:
-        previous = values.loc[session_dates == previous_dates[-1]].dropna()
-        if len(previous) > n:
-            return _returns(previous, n)
-    return np.nan
+    return _returns(c, n)
 
 
 def _rsi(c: pd.Series, n: int=14) -> float:
