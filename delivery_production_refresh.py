@@ -50,13 +50,17 @@ def _store():
     return GoogleDriveStore()
 
 
-def _refresh_fundamental_availability(store, symbols: list[str]) -> dict:
-    """Refresh official NSE filing coverage through the current session before gating signals.
+def _refresh_fundamental_availability(
+    store,
+    symbols: list[str],
+    *,
+    as_of_date: date,
+    allow_stale_fallback: bool = False,
+) -> dict:
+    """Refresh filing availability as of the target session.
 
-    A stale-but-complete historical catalogue is not current coverage. The
-    candidate builder's paginated NSE catalogue refreshes when its cache window
-    or age is stale, then rebuilds the availability index for the current
-    universe. Upload all three artifacts so retries reuse the verified result.
+    An explicit fallback may reuse older metadata, but never extends its
+    coverage. Rows beyond cached coverage remain unknown and blocked.
     """
     from colab_build_all_nse_delivery_multifactor_candidate import (
         FUND_AVAILABILITY,
@@ -66,40 +70,63 @@ def _refresh_fundamental_availability(store, symbols: list[str]) -> dict:
         _catalog_all,
     )
 
-    catalog = _catalog_all(force_refresh=False)
-    report = _build_fundamental_availability(catalog, symbols)
-    if report.get("coverage_complete") is not True:
-        raise RuntimeError(
-            "NSE fundamental filing availability is not complete through the "
-            f"current session: {report}"
+    target = as_of_date
+    try:
+        catalog = _catalog_all(force_refresh=False, as_of_date=target)
+        report = _build_fundamental_availability(catalog, symbols)
+        coverage_end = pd.to_datetime(report.get("coverage_end"), errors="coerce")
+        if report.get("coverage_complete") is not True or pd.isna(coverage_end) or coverage_end.date() < target:
+            raise RuntimeError(
+                "NSE filing availability does not cover target session "
+                f"{target}: {report}"
+            )
+    except Exception as exc:
+        if not allow_stale_fallback:
+            raise
+        cached_meta = {}
+        try:
+            if FUND_AVAILABILITY_META.exists() and FUND_AVAILABILITY_META.stat().st_size:
+                cached_meta = json.loads(FUND_AVAILABILITY_META.read_text(encoding="utf-8"))
+        except Exception:
+            cached_meta = {}
+        coverage_start = pd.to_datetime(cached_meta.get("coverage_start"), errors="coerce")
+        coverage_end = pd.to_datetime(cached_meta.get("coverage_end"), errors="coerce")
+        index_available = FUND_AVAILABILITY.exists() and FUND_AVAILABILITY.stat().st_size > 0
+        current_covered = bool(
+            cached_meta.get("coverage_complete") is True
+            and index_available
+            and pd.notna(coverage_start)
+            and pd.notna(coverage_end)
+            and coverage_start.date() <= target <= coverage_end.date()
         )
-    today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
-    if report.get("coverage_end") != today_ist:
-        raise RuntimeError(
-            "NSE fundamental filing catalogue is stale: "
-            f"coverage_end={report.get('coverage_end')}, required={today_ist}"
-        )
-    store.upload_or_update(
-        FUND_CATALOG_CACHE,
-        "corporate/nse_integrated_filing_catalog_2025_2026.json",
-        mime_type="application/json",
-    )
-    store.upload_or_update(
-        FUND_AVAILABILITY,
-        "corporate/pit_fundamental_availability_2025_2026.parquet",
-        mime_type="application/octet-stream",
-    )
-    store.upload_or_update(
-        FUND_AVAILABILITY_META,
-        "corporate/pit_fundamental_availability_2025_2026.meta.json",
-        mime_type="application/json",
-    )
+        return {
+            **cached_meta,
+            "target_date": target.isoformat(),
+            "refresh_status": "FALLBACK_STALE_OR_MISSING_CATALOG",
+            "fallback_used": True,
+            "current_target_covered": current_covered,
+            "availability_index_available": index_available,
+            "catalog_available": FUND_CATALOG_CACHE.exists() and FUND_CATALOG_CACHE.stat().st_size > 0,
+            "refresh_error": f"{type(exc).__name__}: {exc}",
+            "coverage_end_required": target.isoformat(),
+            "safety_rule": "Coverage dates were not extended. Rows outside cached coverage remain unknown and blocked; missing filings were not converted to zero.",
+            "catalog_persisted": False,
+            "availability_index_persisted": False,
+        }
+
+    store.upload_or_update(FUND_CATALOG_CACHE, "corporate/nse_integrated_filing_catalog_2025_2026.json", mime_type="application/json")
+    store.upload_or_update(FUND_AVAILABILITY, "corporate/pit_fundamental_availability_2025_2026.parquet", mime_type="application/octet-stream")
+    store.upload_or_update(FUND_AVAILABILITY_META, "corporate/pit_fundamental_availability_2025_2026.meta.json", mime_type="application/json")
     return {
         **report,
         "catalog_rows": len(catalog),
         "catalog_persisted": True,
         "availability_index_persisted": True,
-        "coverage_end_required": today_ist,
+        "target_date": target.isoformat(),
+        "coverage_end_required": target.isoformat(),
+        "refresh_status": "REFRESHED",
+        "fallback_used": False,
+        "current_target_covered": True,
     }
 
 def _is_retryable_download_error(exc: Exception) -> bool:
@@ -231,6 +258,38 @@ def _walk(store, folder_id: str, prefix: str, depth: int, out: list[dict]) -> No
                 out.append({**item, "relative": rel})
         token = resp.get("nextPageToken")
         if not token: break
+
+def _decorate_snapshot_rows(frame, features, readiness_cols):
+    """Attach the shared production gate and coverage diagnostics to a PIT slice."""
+    from delivery_quality_gate import quality_gate_reasons
+
+    snapshot = frame.copy()
+    missing = [column for column in features if column not in snapshot.columns]
+    if missing:
+        raise RuntimeError(f"59-feature production snapshot missing columns: {missing}")
+    snapshot["production_data_quality_score"] = (
+        snapshot[readiness_cols].apply(pd.to_numeric, errors="coerce").notna().sum(axis=1)
+        / len(readiness_cols)
+    )
+    numeric_features = snapshot[features].apply(pd.to_numeric, errors="coerce").replace(
+        [float("inf"), float("-inf")], float("nan")
+    )
+    snapshot["production_feature_coverage"] = numeric_features.notna().mean(axis=1)
+    snapshot["production_feature_non_missing_count"] = numeric_features.notna().sum(axis=1)
+    snapshot["production_core_ready"] = (
+        pd.to_numeric(snapshot["ready_market_price"], errors="coerce").eq(1)
+        & pd.to_numeric(snapshot["ready_market_context"], errors="coerce").eq(1)
+    )
+    snapshot["production_optional_state_known"] = (
+        snapshot[["ready_news", "ready_events", "ready_fno", "ready_fundamentals"]]
+        .apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+    )
+    snapshot["production_data_quality_gate_reasons"] = snapshot.apply(
+        lambda row: json.dumps(quality_gate_reasons(row)), axis=1
+    )
+    snapshot["production_data_quality_gate"] = snapshot["production_data_quality_gate_reasons"].eq("[]")
+    return snapshot
+
 
 def _download_recent_eod(store, lookback_days: int):
     p = store.root_id
