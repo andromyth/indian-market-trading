@@ -296,6 +296,7 @@ def prepare_labeled_panel(
         if x.empty:
             raise ValueError(f"No PIT rows remain on or after research start date {cohort_start.date()}.")
 
+    rows_excluded_before_research_cohort = rows_before_cohort - len(x)
     duplicate_rows = int(x.duplicated(["symbol", "reference_date"], keep=False).sum())
     if duplicate_rows:
         raise ValueError(
@@ -386,7 +387,7 @@ def prepare_labeled_panel(
     stats = {
         "input_rows": int(input_rows),
         "research_cohort_start_date": cohort_start.date().isoformat() if cohort_start is not None else None,
-        "rows_excluded_before_research_cohort": int(rows_before_cohort - len(x)),
+        "rows_excluded_before_research_cohort": int(rows_excluded_before_research_cohort),
         "readiness_columns_present": [name for name in READINESS_COLUMNS if name in labeled.columns],
         "clean_symbol_date_rows": int(len(x)),
         "labeled_rows": int(len(labeled)),
