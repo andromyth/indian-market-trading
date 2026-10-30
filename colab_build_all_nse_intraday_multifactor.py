@@ -131,7 +131,7 @@ def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
     d = c.diff()
     up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
-    return 100 - 1 / (1 + up / dn.replace(0, np.nan))
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
 def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
