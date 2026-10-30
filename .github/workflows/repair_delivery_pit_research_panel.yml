@@ -1,0 +1,103 @@
+name: Repair Delivery PIT snapshots and research panel
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Completed NSE session date to recover (YYYY-MM-DD)"
+        required: true
+        default: "2026-10-30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: delivery-pit-research-panel-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      TARGET_DATE: ${{ inputs.target_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate target NSE session and Drive write access
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from datetime import date
+          from nse_bulk_eod_ingest import business_days
+          from persistent_store import drive_status
+
+          target = date.fromisoformat(os.environ["TARGET_DATE"])
+          if target not in set(business_days(target, target)):
+              raise SystemExit(f"Target is not a configured NSE CM session: {target}")
+          status = drive_status(require_write=True)
+          print(status)
+          if not status.get("configured") or status.get("reachable") is False:
+              raise SystemExit("Google Drive authentication/preflight failed")
+          if status.get("write_ready") is False:
+              raise SystemExit("Google Drive write authorization is not ready")
+          PY
+
+      - name: Rebuild dated PIT snapshots from verified EOD and Delivery archives
+        run: |
+          set -euo pipefail
+          python -u delivery_production_refresh.py \
+            --lookback-days 150 \
+            --delivery-lookback-days 150 \
+            --source-wait-minutes 0 \
+            --allow-fundamental-refresh-fallback \
+            --backfill-pit-calendar-days 45 \
+            --expected-date "$TARGET_DATE"
+
+      - name: Verify recent EOD, Delivery and daily PIT continuity
+        run: |
+          set -euo pipefail
+          python -u backfill_missing_delivery_pit_snapshots.py \
+            --target-date "$TARGET_DATE" \
+            --lookback-calendar-days 45 \
+            --max-backfills-per-run 45 \
+            --audit-only
+
+      - name: Append verified daily PIT sessions to aggregate research panel
+        run: |
+          set -euo pipefail
+          python -u append_delivery_pit_snapshots_to_research_panel.py \
+            --target-date "$TARGET_DATE"
+
+      - name: Re-run strict Delivery walk-forward audit
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -u strict_delivery_walkforward_audit.py \
+            --output-dir strict-delivery-audit-after-pit-repair
+
+      - name: Upload PIT repair and audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-pit-repair-${{ github.run_id }}
+          path: |
+            .market_data/features/daily/DELIVERY_PIT_READINESS_*.json
+            .market_data/diagnostics/production/research_panel_incremental_update_latest.json
+            strict-delivery-audit-after-pit-repair/*
+          if-no-files-found: warn
+          retention-days: 30
