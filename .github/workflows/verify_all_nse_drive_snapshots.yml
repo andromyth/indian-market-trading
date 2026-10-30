@@ -201,63 +201,67 @@ jobs:
                       print(f"{label}_AGE_MINUTES={age:.1f}")
 
               def inspect_day(label, parent_folder, ts, prefix):
-              if not ts:
-                  print(f"{label}_MINUTE_FILES=UNAVAILABLE_NO_TIMESTAMP")
-                  return False
-              local=ts.astimezone(ZoneInfo("Asia/Kolkata"))
-              cur=parent_folder
-              for component in (f"{local:%Y}",f"{local:%m}",f"{local:%d}"):
-                  cur_obj=child_folder(cur["id"],component)
-                  if not cur_obj:
-                      print(f"{label}_DAY_FOLDER_MISSING={component}")
+                  if not ts:
+                      print(f"{label}_MINUTE_FILES=UNAVAILABLE_NO_TIMESTAMP")
                       return False
-                  cur=cur_obj
-              files=list_children(cur["id"])
-              target_slot_file = f"{prefix}_{local:%Y%m%d_%H%M}.parquet"
-              target_slot_file_present = any(
-                  item.get("name") == target_slot_file for item in files
-              )
-              print(f"{label}_LATEST_SLOT_FILE={target_slot_file}")
-              print(f"{label}_LATEST_SLOT_FILE_STORED={target_slot_file_present}")
-              pattern=re.compile(rf"^{re.escape(prefix)}_(\d{{8}})_(\d{{4}})\.parquet$")
-              stamps=[]
-              for file in files:
-                  m=pattern.match(file.get("name",""))
-                  if not m: continue
-                  stamp=dt.datetime.strptime(m.group(1)+m.group(2),"%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Kolkata"))
-                  stamps.append((stamp,file.get("name"),file.get("modifiedTime")))
-              stamps.sort()
-              local_now=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
-              session_open=local_now.replace(hour=9,minute=15,second=0,microsecond=0)
-              session_close=local_now.replace(hour=15,minute=30,second=0,microsecond=0)
-              window_end=min(local_now.replace(second=0,microsecond=0),session_close)
-              if window_end < session_open:
-                  window_start=None
-                  recent=[]
-              else:
-                  window_start=max(session_open,window_end-dt.timedelta(minutes=29))
-                  recent=[x for x in stamps if window_start<=x[0]<=window_end]
-              print(f"{label}_MARKET_WINDOW_START={window_start.strftime('%H:%M') if window_start else 'market-not-open'}")
-              print(f"{label}_MARKET_WINDOW_END={window_end.strftime('%H:%M') if window_start else 'market-not-open'}")
-              print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES={len(recent)}")
-              if recent:
-                  print(f"{label}_OLDEST_FILE_IN_WINDOW={recent[0][1]}")
-                  print(f"{label}_LATEST_FILE={recent[-1][1]}")
-                  print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
-                  gaps=[]
+                  local=ts.astimezone(ZoneInfo("Asia/Kolkata"))
+                  cur=parent_folder
+                  for component in (f"{local:%Y}",f"{local:%m}",f"{local:%d}"):
+                      cur_obj=child_folder(cur["id"],component)
+                      if not cur_obj:
+                          print(f"{label}_DAY_FOLDER_MISSING={component}")
+                          return False
+                      cur=cur_obj
+                  files=list_children(cur["id"])
+                  target_slot_file = f"{prefix}_{local:%Y%m%d_%H%M}.parquet"
+                  target_slot_file_present = any(
+                      item.get("name") == target_slot_file for item in files
+                  )
+                  print(f"{label}_LATEST_SLOT_FILE={target_slot_file}")
+                  print(f"{label}_LATEST_SLOT_FILE_STORED={target_slot_file_present}")
+                  pattern=re.compile(rf"^{re.escape(prefix)}_(\d{{8}})_(\d{{4}})\.parquet$")
+                  stamps=[]
+                  for file in files:
+                      m=pattern.match(file.get("name",""))
+                      if not m: continue
+                      stamp=dt.datetime.strptime(m.group(1)+m.group(2),"%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+                      stamps.append((stamp,file.get("name"),file.get("modifiedTime")))
+                  stamps.sort()
+                  local_now=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+                  session_open=local_now.replace(hour=9,minute=15,second=0,microsecond=0)
+                  session_close=local_now.replace(hour=15,minute=30,second=0,microsecond=0)
+                  window_end=min(local_now.replace(second=0,microsecond=0),session_close)
+                  if window_end < session_open:
+                      window_start=None
+                      recent=[]
+                      expected_slots=[]
+                  else:
+                      window_start=max(session_open,window_end-dt.timedelta(minutes=29))
+                      offset_minutes=(window_start-session_open).total_seconds()/60.0
+                      first_slot_index=int((offset_minutes+4.999999)//5)
+                      first_slot=session_open+dt.timedelta(minutes=first_slot_index*5)
+                      last_slot=min(window_end,session_close-dt.timedelta(minutes=5))
+                      expected_slots=[]
+                      cursor=first_slot
+                      while cursor<=last_slot:
+                          expected_slots.append(cursor)
+                          cursor+=dt.timedelta(minutes=5)
+                      recent=[x for x in stamps if window_start<=x[0]<=window_end]
+                  print(f"{label}_MARKET_WINDOW_START={window_start.strftime('%H:%M') if window_start else 'market-not-open'}")
+                  print(f"{label}_MARKET_WINDOW_END={window_end.strftime('%H:%M') if window_start else 'market-not-open'}")
+                  print(f"{label}_EXPECTED_FIVE_MINUTE_SLOTS={len(expected_slots)}")
+                  print(f"{label}_FILES_IN_WINDOW={len(recent)}")
+                  if recent:
+                      print(f"{label}_OLDEST_FILE_IN_WINDOW={recent[0][1]}")
+                      print(f"{label}_LATEST_FILE={recent[-1][1]}")
+                      print(f"{label}_LATEST_FILE_MODIFIED_UTC={recent[-1][2]}")
                   tset={x[0] for x in recent}
-                  cursor=window_start
-                  while cursor<=window_end:
-                      if cursor not in tset:
-                          gaps.append(cursor.strftime('%H:%M'))
-                      cursor+=dt.timedelta(minutes=1)
-                  print(f"{label}_MISSING_MARKET_MINUTES={','.join(gaps) if gaps else 'none'}")
-              else:
-                  print(f"{label}_MINUTE_FILES_LAST_30_MARKET_MINUTES=0")
-              return target_slot_file_present
+                  gaps=[slot.strftime('%H:%M') for slot in expected_slots if slot not in tset]
+                  print(f"{label}_MISSING_FIVE_MINUTE_SLOTS={','.join(gaps) if gaps else 'none'}")
+                  return target_slot_file_present
 
-          quote_slot_file_stored = inspect_day("QUOTE",quotes,qts,"snapshot")
-          prediction_slot_file_stored = inspect_day("PREDICTION",predictions,pts,"predictions")
+              quote_slot_file_stored = inspect_day("QUOTE",quotes,qts,"snapshot")
+              prediction_slot_file_stored = inspect_day("PREDICTION",predictions,pts,"predictions")
 
               now_ist=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
               for label,obj,ts in (("QUOTE",qm,qts),("PREDICTION",pm,pts)):
