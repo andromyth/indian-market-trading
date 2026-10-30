@@ -166,6 +166,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
 
     if market is not None and not market.empty:
         m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
+        mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
         for n in (1, 3, 5, 10, 15, 30):
             market_returns = session_aware_pct_change(m["Close"], n)
             out[f"market_ret_{n}"] = market_returns.reindex(
