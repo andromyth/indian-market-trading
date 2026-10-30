@@ -255,7 +255,10 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                     keep = [
                         "symbol", "prediction_status", "signal", "probability_up_30m",
                         "expected_return_30m", "confidence", "data_readiness_score",
-                        "model_version", "forecast_target_timestamp_utc", "error",
+                        "model_version", "forecast_target_timestamp_utc",
+                        "actual_market_value", "actual_observed_at_utc",
+                        "actual_quote_status", "actual_quote_age_seconds",
+                        "source_snapshot_drive_path", "error",
                     ]
                     prediction_frame = prediction_frame[
                         [column for column in keep if column in prediction_frame.columns]
@@ -281,11 +284,13 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                     view.get("quote_observed_at_utc", pd.Series(pd.NaT, index=view.index)),
                     errors="coerce", utc=True,
                 )
+                symbol_counts = view["symbol"].map(view["symbol"].value_counts())
                 view["capture_complete"] = (
                     view["quote_status"].eq("PASS")
                     & instrument.ne("")
                     & price.gt(0)
                     & quote_time.notna()
+                    & symbol_counts.eq(1)
                 )
                 view["snapshot_stored"] = True
                 view["prediction_stored"] = view["_prediction_row_stored"]
@@ -293,6 +298,34 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                     view.get("prediction_status", pd.Series("", index=view.index))
                     .fillna("PREDICTION_NOT_WRITTEN").astype(str)
                 )
+                view["prediction_snapshot_link_status"] = "NOT_PREDICTED"
+                if "actual_market_value" in view and "actual_observed_at_utc" in view:
+                    prediction_price = pd.to_numeric(view["actual_market_value"], errors="coerce")
+                    quote_price = pd.to_numeric(view["actual_observed_price"], errors="coerce")
+                    price_match = pd.Series(
+                        np.isclose(
+                            prediction_price.fillna(-1).to_numpy(dtype=float),
+                            quote_price.fillna(-2).to_numpy(dtype=float),
+                            rtol=1e-7,
+                            atol=1e-4,
+                        ),
+                        index=view.index,
+                    )
+                    prediction_time = pd.to_datetime(
+                        view["actual_observed_at_utc"], errors="coerce", utc=True
+                    )
+                    quote_time_utc = pd.to_datetime(
+                        view.get("quote_observed_at_utc", pd.Series(pd.NaT, index=view.index)),
+                        errors="coerce", utc=True,
+                    )
+                    time_match = (
+                        prediction_time.notna()
+                        & quote_time_utc.notna()
+                        & (prediction_time - quote_time_utc).dt.total_seconds().abs().le(2.0)
+                    )
+                    linked = view["_prediction_row_stored"] & price_match & time_match
+                    view.loc[view["_prediction_row_stored"], "prediction_snapshot_link_status"] = "MISMATCH_OR_UNVERIFIED"
+                    view.loc[linked, "prediction_snapshot_link_status"] = "MATCHED_TO_SNAPSHOT_QUOTE"
                 if "quote_observed_at_ist" not in view:
                     view["quote_observed_at_ist"] = view.get("quote_observed_at_utc")
                 view = view.sort_values(
@@ -1474,7 +1507,8 @@ if interface_mode == "Live Test":
             display_columns = [
                 "symbol", "quote_status", "capture_complete", "actual_observed_price",
                 "quote_observed_at_ist", "snapshot_stored", "prediction_stored",
-                "prediction_status", "signal", "probability_up_30m",
+                "prediction_status", "prediction_snapshot_link_status", "signal",
+                "actual_market_value", "actual_observed_at_utc", "probability_up_30m",
                 "expected_return_30m", "confidence", "data_readiness_score",
                 "forecast_target_timestamp_utc", "model_version", "error",
             ]
