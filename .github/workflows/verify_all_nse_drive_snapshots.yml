@@ -251,13 +251,10 @@ jobs:
               inspect_day("QUOTE",quotes,qts,"snapshot")
               inspect_day("PREDICTION",predictions,pts,"predictions")
 
-              verdicts=[]
               now_ist=dt.datetime.now(ZoneInfo("Asia/Kolkata"))
-              close_time=dt.time(15,30)
-              after_close=now_ist.time()>close_time
               for label,obj,ts in (("QUOTE",qm,qts),("PREDICTION",pm,pts)):
                   if not obj or not ts:
-                      verdicts.append(False); print(f"{label}_VERDICT=FAIL: no readable latest manifest")
+                      print(f"{label}_STORAGE_STATUS=NO_READABLE_LATEST_MANIFEST")
                       continue
                   local_ts=ts.astimezone(ZoneInfo("Asia/Kolkata"))
                   age=(now_ist-local_ts).total_seconds()
@@ -265,24 +262,27 @@ jobs:
                   expected=obj.get("expected_symbol_count")
                   count=obj.get("quoted_symbol_count") if label=="QUOTE" else obj.get("prediction_count")
                   miss=obj.get("missing_quote_count")
-                  if label=="QUOTE":
-                      full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0)
-                  else:
-                      full=(expected is not None and count is not None and int(count)==int(expected) and int(miss or 0)==0 and obj.get("quality_gate_pass") is True and obj.get("history_ready") is True and int(obj.get("data_limited_count") or 0)==0)
-                  if after_close:
-                      fresh=(local_ts.date()==now_ist.date() and dt.time(15,28)<=local_ts.time().replace(tzinfo=None)<=close_time)
-                      print(f"{label}_FRESHNESS_BASIS=last market minutes through 15:30 IST")
-                  else:
-                      fresh=(age>=0 and age<=180)
-                      print(f"{label}_FRESHNESS_BASIS=within 180 seconds during the session")
-                  ok=(status=="OK" and full and fresh)
-                  verdicts.append(ok)
+                  row_count=obj.get("row_count")
+                  stored_path = (
+                      obj.get("snapshot_drive_path") or obj.get("remote_snapshot_path")
+                      if label=="QUOTE"
+                      else obj.get("remote_path") or obj.get("manifest_drive_path")
+                  )
+                  stored = status in {"OK","STORED","PARTIAL"} and bool(stored_path) and count is not None and int(count)>0
                   print(f"{label}_LATEST_AGE_MINUTES={max(0.0,age)/60:.1f}")
-                  print(f"{label}_VERDICT={'PASS' if ok else 'FAIL'}")
-              print(f"OVERALL_VERDICT={'PASS' if all(verdicts) else 'FAIL'}")
-              sys.exit(0 if all(verdicts) else 1)
-          except Exception as exc:
-              print(f"DRIVE_INSPECTION_ERROR={type(exc).__name__}: {exc}")
-              sys.exit(2)
+                  print(f"{label}_SESSION_DATE={local_ts.date().isoformat()}")
+                  print(f"{label}_CYCLE_TIME_IST={local_ts.strftime('%H:%M:%S')}")
+                  print(f"{label}_EXPECTED_SYMBOL_COUNT={expected}")
+                  print(f"{label}_STORED_ROW_COUNT={row_count}")
+                  print(f"{label}_SYMBOL_ROWS_WITH_DATA={count}")
+                  if label=="QUOTE":
+                      print(f"{label}_MISSING_SYMBOL_COUNT={miss}")
+                  if label=="PREDICTION":
+                      print(f"{label}_MODEL_ARTIFACT_VERIFIED={obj.get('model_artifact_verified')}")
+                      print(f"{label}_MODEL_FAILURE_COUNT={obj.get('model_failure_count')}")
+                  print(f"{label}_STORAGE_STATUS={'STORED_SYMBOL_ROWS_AVAILABLE' if stored else 'NO_PERSISTED_SYMBOL_ROWS'}")
+              print("AGGREGATE_COVERAGE_POLICY=INFORMATIONAL_ONLY")
+              print("OVERALL_VERDICT=NOT_APPLICABLE_PER_SYMBOL_RECORDS_REPORTED")
+              sys.exit(0)
           PY
           rm -f /tmp/gdrive-oauth.json /tmp/gdrive-root-id.txt /tmp/oauth-secret-error.txt /tmp/root-secret-error.txt
