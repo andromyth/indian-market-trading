@@ -40,7 +40,7 @@ def _symbol_column(frame: pd.DataFrame) -> str:
 def _latest_per_symbol(frame: pd.DataFrame, as_of) -> pd.DataFrame:
     x = frame.copy()
     x["symbol"] = x[_symbol_column(x)].astype(str).str.strip().str.upper()
-    x["symbol"] = x["symbol"].str.replace(r"\\.(NS|BO)$", "", regex=True)
+    x["symbol"] = x["symbol"].str.replace(r"\.(NS|BO)$", "", regex=True)
     date_col = next(
         (c for c in ("date", "prediction_date", "as_of_date", "feature_date") if c in x.columns),
         None,
