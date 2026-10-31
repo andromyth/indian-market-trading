@@ -1,0 +1,63 @@
+name: Beta V2 intraday retraining preflight (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta-v2-intraday-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Audit Google Drive source archive and champion registries
+        env:
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          python -u audit_beta_v2_intraday_preflight.py --out beta_v2_intraday_preflight.json
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beta-v2-intraday-preflight
+          path: beta_v2_intraday_preflight.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Summarize preflight
+        if: always()
+        run: |
+          if [ -f beta_v2_intraday_preflight.json ]; then
+            python - <<'PY'
+            import json, os
+            from pathlib import Path
+            report = json.loads(Path("beta_v2_intraday_preflight.json").read_text())
+            summary = {
+                "status": report.get("status"),
+                "mode": report.get("mode"),
+                "official_symbols": (report.get("official_nse_universe") or {}).get("symbol_count"),
+                "archive_folder_coverage_pct": (report.get("history_archive") or {}).get("folder_coverage_pct"),
+                "missing_or_invalid_champion_horizons": report.get("missing_or_invalid_champion_horizons"),
+                "promotion_performed": report.get("promotion_performed"),
+            }
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+                fh.write("## Beta V2 intraday preflight\n\n```json\n")
+                json.dump(summary, fh, indent=2)
+                fh.write("\n```\n")
+            print(json.dumps(summary, indent=2))
+            PY
+          fi
