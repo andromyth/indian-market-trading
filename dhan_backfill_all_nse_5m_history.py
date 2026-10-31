@@ -10,7 +10,7 @@ import argparse
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -85,10 +85,10 @@ def usable_session_summary(frame: pd.DataFrame, minimum_bars: int = MIN_SESSION_
     }
 
 
-def retain_latest_sessions(frame: pd.DataFrame, maximum_sessions: int = 500) -> pd.DataFrame:
+def retain_latest_sessions(frame: pd.DataFrame, maximum_sessions: int = 500, minimum_bars: int = MIN_SESSION_BARS) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
-    summary = usable_session_summary(frame)
+    summary = usable_session_summary(frame, minimum_bars)
     dates = summary["usable_session_dates"][-int(maximum_sessions):]
     if not dates:
         return frame.iloc[0:0].copy()
@@ -142,6 +142,8 @@ def _process_symbol(
     sessions: int,
     local_root: Path,
     pause_seconds: float,
+    minimum_sessions: int,
+    minimum_bars: int,
 ) -> dict[str, Any]:
     from dhan_client import historical_intraday_range
     from persistent_store import GoogleDriveStore
@@ -168,8 +170,8 @@ def _process_symbol(
         parts = [part for part in (existing, fetched) if part is not None and not part.empty]
         merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
         merged = merged.loc[~merged.index.duplicated(keep="last")]
-        merged = retain_latest_sessions(merged, sessions)
-        summary = usable_session_summary(merged)
+        merged = retain_latest_sessions(merged, sessions, minimum_bars)
+        summary = usable_session_summary(merged, minimum_bars)
         if merged.empty:
             return {"symbol": symbol, "status": "NO_DATA", **{k: v for k, v in summary.items() if k != "usable_session_dates"}}
         merged.to_parquet(local, index=True, compression="zstd")
@@ -182,7 +184,7 @@ def _process_symbol(
             raise RuntimeError(f"Drive upload was not confirmed: {upload}")
         return {
             "symbol": symbol,
-            "status": "OK" if summary["usable_sessions"] >= 200 else "INSUFFICIENT_HISTORY",
+            "status": "OK" if summary["usable_sessions"] >= minimum_sessions else "INSUFFICIENT_HISTORY",
             "remote_path": remote,
             "rows": int(len(merged)),
             "fetched_rows": int(len(fetched)),
@@ -205,6 +207,7 @@ def main() -> int:
     parser.add_argument("--minimum-bars-per-session", type=int, default=50)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--pause-seconds", type=float, default=0.55)
+    parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--symbols", default="")
     parser.add_argument("--end-date", default="")
@@ -218,6 +221,8 @@ def main() -> int:
         raise ValueError("--minimum-bars-per-session must be at least 50")
     if args.workers < 1 or args.workers > 3:
         raise ValueError("--workers must be between 1 and 3")
+    if not 0.5 <= args.minimum_symbol_coverage <= 1.0:
+        raise ValueError("--minimum-symbol-coverage must be between 0.5 and 1.0")
 
     from dhan_client import DhanConfig, get_access_token, resolve_equity_symbol
     from persistent_store import GoogleDriveStore, drive_status
@@ -258,6 +263,7 @@ def main() -> int:
             pool.submit(
                 _process_symbol, symbol, security_id, config, start, end,
                 args.sessions, local_root, args.pause_seconds,
+                args.minimum_usable_sessions, args.minimum_bars_per_session,
             ): symbol
             for symbol, security_id in resolved
         }
@@ -272,7 +278,7 @@ def main() -> int:
     preferred = [row for row in ok if int(row.get("usable_sessions") or 0) >= 500]
     report = {
         "audit": "nse_native_five_minute_historical_backfill",
-        "completed_at_utc": datetime.now().astimezone().astimezone().isoformat(),
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "DHANHQ_HISTORICAL_NSE_EQ_INTERVAL_5",
         "bar_interval_minutes": 5,
         "timestamp_convention": "provider_bar_start_plus_5_minutes_as_bar_close",
@@ -285,6 +291,13 @@ def main() -> int:
         "official_symbols_requested": len(symbols),
         "symbols_resolved": len(resolved),
         "symbols_with_200_plus_sessions": len(ok),
+        "symbols_with_data_after_2026_09_24": sum(
+            bool(row.get("last_timestamp_ist")) and row["last_timestamp_ist"][:10] > "2026-09-24"
+            for row in results
+        ),
+        "latest_archive_timestamp_ist": max(
+            (row.get("last_timestamp_ist") or "" for row in results), default=None
+        ),
         "symbols_with_500_sessions": len(preferred),
         "symbols_with_errors": sum(row.get("status") == "ERROR" for row in results),
         "symbols_below_200_sessions": sum(row.get("status") == "INSUFFICIENT_HISTORY" for row in results),
@@ -300,7 +313,8 @@ def main() -> int:
         raise RuntimeError(f"Backfill manifest Drive write not confirmed: {uploaded}")
     report["manifest_drive_path"] = MANIFEST_REMOTE
     print(json.dumps({key: value for key, value in report.items() if key != "symbols"}, indent=2, sort_keys=True))
-    return 0 if len(ok) >= max(1, int(len(symbols) * 0.5)) and not report["symbols_with_errors"] else 2
+    required_ok = max(1, int(np.ceil(len(symbols) * args.minimum_symbol_coverage)))
+    return 0 if len(ok) >= required_ok and not report["symbols_with_errors"] else 2
 
 
 if __name__ == "__main__":
