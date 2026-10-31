@@ -188,7 +188,7 @@ def fetch_indstocks_5m_batch(
             time.sleep(wait)
         last_request_started = time.monotonic()
         params = {
-            "scrip-codes": ",".join(pending_codes),
+            "scrip-codes": ",".join(symbols_by_code),
             "start_time": int(cursor.timestamp() * 1000),
             "end_time": int(window_end.timestamp() * 1000),
         }
