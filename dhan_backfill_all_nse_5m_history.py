@@ -249,8 +249,8 @@ def main() -> int:
     from dhan_client import DhanConfig, get_access_token, resolve_equity_symbol
     from persistent_store import GoogleDriveStore, drive_status
     config = DhanConfig.from_env()
-    if not config.has_any_credential() or not get_access_token(config):
-        raise RuntimeError("Dhan credentials are missing or no valid access token is available.")
+    if not (config.has_any_credential() or config.has_totp_flow()) or not get_access_token(config):
+        raise RuntimeError("Dhan TOTP credentials or a valid access token are required.")
     preflight = drive_status(require_write=True)
     if not preflight.get("configured") or preflight.get("reachable") is not True or preflight.get("write_ready") is not True:
         raise RuntimeError("Google Drive read/write preflight failed: " + str(preflight.get("reason")))
