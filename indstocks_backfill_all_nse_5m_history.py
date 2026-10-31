@@ -181,7 +181,7 @@ def fetch_indstocks_5m_batch(
             result[symbol] = pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
         else:
             merged = pd.concat(parts).sort_index()
-            result[symbol] = normalize_indstocks_5m(merged)
+            result[symbol] = merged[OHLCV].sort_index().loc[~merged.index.duplicated(keep='last')][OHLCV]
     return result, calls
 
 
