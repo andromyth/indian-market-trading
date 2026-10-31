@@ -14,6 +14,7 @@ EOD_REMOTE_ROOT = "production_data/nse_official/bulk_eod"
 EOD_LOCAL_ROOT = BASE / "production_data" / "nse_official" / "bulk_eod"
 REMOTE_SOURCES = {
     "fno": "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+    "fno_history": "production_data/nse_official/fno/fno_daily_features_history_2016_2026.parquet",
     "news": "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
     "web_news": "processed/live_news/website_news_pit_2026.parquet",
     "events": "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
@@ -477,7 +478,7 @@ def main():
         # in Drive must not consume the entire upstream wait window.
         missing=[
             k for k,v in source_status.items()
-            if v=="MISSING" and k not in ("fundamental_filing_catalog", "web_news")
+            if v=="MISSING" and k not in ("fundamental_filing_catalog", "web_news", "fno_history")
         ]
         if not missing or datetime.now(timezone.utc)>=deadline:
             break
