@@ -983,6 +983,48 @@ def make_panel(bulk, symbols, sort_output=True, delivery=None):
         out = out.reset_index(drop=True)
     return out
 
+def _load_fno_source_frame(
+    current_path: Path | None = None,
+    history_path: Path | None = None,
+) -> pd.DataFrame:
+    """Combine the historical and current official F&O PIT archives; current wins overlaps."""
+    current_path = current_path or BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
+    history_path = history_path or BASE / "production_data/nse_official/fno/fno_daily_features_history_2016_2026.parquet"
+    frames = []
+    source_paths = {}
+    for label, path in (("history", history_path), ("current", current_path)):
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        frame = pd.read_parquet(path)
+        if frame.empty:
+            continue
+        if not {"symbol", "date"}.issubset(frame.columns):
+            raise ValueError(f"F&O {label} archive is missing symbol/date columns: {path}")
+        frame = frame.copy()
+        frame["symbol"] = frame["symbol"].map(normalize_symbol)
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame = frame.dropna(subset=["symbol", "date"])
+        source_paths[label] = {
+            "path": str(path),
+            "rows": int(len(frame)),
+            "symbols": int(frame["symbol"].nunique()),
+            "source_dates": int(frame["date"].nunique()),
+            "first_source_date": str(frame["date"].min().date()) if not frame.empty else None,
+            "last_source_date": str(frame["date"].max().date()) if not frame.empty else None,
+        }
+        if not frame.empty:
+            frames.append(frame)
+
+    if frames:
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        combined = combined.drop_duplicates(["symbol", "date"], keep="last")
+        combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
+    else:
+        combined = pd.DataFrame()
+    combined.attrs["source_paths"] = source_paths
+    return combined
+
+
 def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
     """Exact next-session join for official NSE derivatives data.
 
@@ -996,18 +1038,19 @@ def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None 
         "fno_pcr", "fno_oi_change", "fno_iv_change", "fno_available",
         "fno_fut_close", "fno_fut_basis", "fno_fut_return", "fno_fut_oi",
     ]
-    if not path.exists() or path.stat().st_size == 0:
+    f = source_frame.copy() if source_frame is not None else _load_fno_source_frame()
+    source_paths = f.attrs.get("source_paths", {})
+    if f.empty:
         out = panel.copy()
         for column in fno_columns:
             if column not in out.columns:
                 out[column] = np.nan
         return out, {
-            "exists": False, "rows": 0, "symbols": 0,
+            "exists": bool(source_paths), "rows": 0, "symbols": 0,
             "source_dates": 0, "covered_target_sessions": 0,
-            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+            "path": str(path), "source_paths": source_paths,
+            "pit_rule": "source_trade_date_available_next_session_09:15_IST",
         }
-
-    f = source_frame.copy() if source_frame is not None else pd.read_parquet(path)
     if f.empty or not {"symbol", "date"}.issubset(f.columns):
         out = panel.copy()
         for column in fno_columns:
@@ -1016,7 +1059,8 @@ def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None 
         return out, {
             "exists": False, "rows": 0, "symbols": 0,
             "source_dates": 0, "covered_target_sessions": 0,
-            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+            "path": str(path), "source_paths": source_paths,
+            "pit_rule": "source_trade_date_available_next_session_09:15_IST",
         }
 
     f = f.copy()
@@ -1046,7 +1090,8 @@ def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None 
         return out, {
             "exists": True, "rows": 0, "symbols": 0,
             "source_dates": len(source_dates), "covered_target_sessions": len(covered_target_dates),
-            "path": str(path), "pit_rule": "source_trade_date_available_next_session_09:15_IST",
+            "path": str(path), "source_paths": source_paths,
+            "pit_rule": "source_trade_date_available_next_session_09:15_IST",
         }
 
     value_map = {column: column for column in fno_columns if column in f.columns}
@@ -1085,6 +1130,7 @@ def _merge_broad_fno_pit(panel: pd.DataFrame, source_frame: pd.DataFrame | None 
     return out, {
         "exists": True,
         "path": str(path),
+        "source_paths": source_paths,
         "rows": int(len(f)),
         "symbols": int(f["symbol"].nunique()),
         "source_dates": len(source_dates),
@@ -1818,7 +1864,6 @@ def _load_roster_checkpoint(out: Path, cash_master: Path) -> dict:
 
 def _load_panel_source_cache() -> dict:
     """Load the smaller optional PIT layers once per panel process, not once per symbol batch."""
-    fno_path = BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
     news_path = BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet"
     web_news_path = BASE / "processed/live_news/website_news_pit_2026.parquet"
     events_path = BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet"
@@ -1829,7 +1874,7 @@ def _load_panel_source_cache() -> dict:
     fundamentals_path = BASE / "corporate/pit_fundamentals_all_nse_2025_2026.parquet"
 
     cache = {
-        "fno": pd.read_parquet(fno_path) if fno_path.exists() and fno_path.stat().st_size else pd.DataFrame(),
+        "fno": _load_fno_source_frame(),
         "news": load_optional_layer(news_path),
         "web_news": load_optional_layer(web_news_path),
         "events": load_optional_layer(events_path),
@@ -1855,6 +1900,7 @@ def _panel_source_signature(
 ) -> dict:
     source_paths = {
         "fno": BASE / "production_data/nse_official/fno/fno_daily_features_2026.parquet",
+        "fno_history": BASE / "production_data/nse_official/fno/fno_daily_features_history_2016_2026.parquet",
         "news": BASE / "processed/pit_replay/NEWS_ENRICHED_PIT_REPLAY_2026.parquet",
         "events": BASE / "processed/pit_replay/EVENTS_FUNDAMENTALS_PIT_REPLAY_2026.parquet",
         "news_events_manifest": BASE / "processed/pit_replay/nse_all_universe_raw_2026/ALL_NSE_NEWS_EVENTS_MANIFEST_2026.json",
