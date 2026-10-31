@@ -60,6 +60,7 @@ jobs:
             --sessions "${{ inputs.sessions }}" \
             --calendar-days "${{ inputs.calendar_days }}" \
             --minimum-usable-sessions 200 \
+            --minimum-symbol-coverage 0.90 \
             --workers 2 \
             --pause-seconds 0.55 \
             --max-symbols "${{ inputs.max_symbols }}"
