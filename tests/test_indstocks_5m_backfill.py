@@ -93,3 +93,19 @@ def test_indstocks_batch_rejects_more_than_five_symbols():
         assert "at most 5" in str(exc)
     else:
         raise AssertionError("Expected five-symbol API cap to be enforced")
+
+
+def test_instrument_mapping_prefers_eq_but_keeps_symbols_with_other_equity_series(monkeypatch):
+    import indstocks_client
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    frame = pd.DataFrame({
+        "EXCH": ["NSE", "NSE", "NSE"],
+        "SEGMENT": ["E", "E", "E"],
+        "SECURITY_ID": ["11", "12", "13"],
+        "TRADING_SYMBOL": ["SBIN", "SBIN", "NEWSTOCK"],
+        "SERIES": ["BE", "EQ", "BE"],
+    })
+    monkeypatch.setattr(indstocks_client, "_load_instruments", lambda exchange: frame)
+    codes = backfill._instrument_codes()
+    assert codes == {"SBIN": "NSE_12", "NEWSTOCK": "NSE_13"}
