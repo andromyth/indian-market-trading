@@ -456,6 +456,8 @@ class AllNSEMinutePredictor:
         # Symbols left stale by a provider/auth interruption are retried first
         # on the next history refresh rather than repeatedly falling at the tail.
         self._history_refresh_pending_symbols: set[str] = set()
+        self._history_archive_pending = pd.DataFrame()
+        self._history_archive_last_status: dict[str, Any] = {"status": "NOT_STARTED"}
         self._last_health: dict[str, Any] = {
             "status": "NOT_STARTED",
             "history_ready": False,
@@ -500,6 +502,9 @@ class AllNSEMinutePredictor:
                 "history_seed_error": self._seed_error,
                 "history_seed_universe_source": self._seed_universe_source,
                 "history_refresh_pending_symbols": len(self._history_refresh_pending_symbols),
+                "history_archive_status": self._history_archive_last_status.get("status"),
+                "history_archive_remote_path": self._history_archive_last_status.get("remote_path"),
+                "history_archive_pending_rows": int(len(self._history_archive_pending)),
                 "trained_symbol_count": len(self._trained_symbols),
             })
 
@@ -1815,6 +1820,80 @@ class AllNSEMinutePredictor:
                 }
             time.sleep(min(0.25, remaining))
 
+    def _persist_history_archive(
+        self,
+        frames: dict[str, pd.DataFrame],
+        sources: dict[str, str],
+        minute: pd.Timestamp,
+    ) -> dict[str, Any]:
+        """Persist only newly observed, genuine 5-minute OHLCV bars to Drive."""
+        from five_minute_history_archive import (
+            build_history_archive_frame,
+            merge_history_archive_frames,
+        )
+        from persistent_store import GoogleDriveStore
+
+        current = build_history_archive_frame(
+            frames,
+            sources,
+            cutoff=_as_ist_timestamp(minute),
+        )
+        with self._lock:
+            pending = self._history_archive_pending.copy()
+        combined = merge_history_archive_frames(pending, current)
+        if combined.empty:
+            result = {"status": "NO_NEW_ROWS", "rows": 0, "symbols": 0}
+            with self._lock:
+                self._history_archive_last_status = result
+            return result
+
+        day_dir = (
+            self.root / "five_minute_history_archive"
+            / f"{minute:%Y}" / f"{minute:%m}" / f"{minute:%d}"
+        )
+        day_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"capture_{minute:%Y%m%d_%H%M}.parquet"
+        local_path = day_dir / filename
+        remote = (
+            "production_data/nse_official/intraday_5m_live/"
+            f"{minute:%Y/%m/%d}/{filename}"
+        )
+        try:
+            combined.to_parquet(local_path, index=False, compression="zstd")
+            store = GoogleDriveStore()
+            uploaded = store.upload_or_update(
+                local_path,
+                remote,
+                mime_type="application/vnd.apache.parquet",
+            )
+            if str(uploaded.get("status") or "").upper() != "OK":
+                raise RuntimeError(f"Drive 5-minute history write not confirmed: {uploaded}")
+            result = {
+                "status": "OK",
+                "remote_path": remote,
+                "rows": int(len(combined)),
+                "symbols": int(combined["symbol"].nunique()),
+                "drive_action": uploaded.get("action"),
+                "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            with self._lock:
+                self._history_archive_pending = pd.DataFrame()
+                self._history_archive_last_status = result
+            return result
+        except Exception as exc:
+            result = {
+                "status": "ERROR",
+                "remote_path": remote,
+                "rows_pending": int(len(combined)),
+                "symbols_pending": int(combined["symbol"].nunique()),
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
+            with self._lock:
+                self._history_archive_pending = combined
+                self._history_archive_last_status = result
+            self._log("all_nse_five_minute_history_archive_failed", **result)
+            return result
+
     def _refresh_current_session_history(self, minute: pd.Timestamp) -> dict[str, Any]:
         """Refresh genuine five-minute candles; never turn LTP snapshots into OHLC bars."""
         minute = _as_ist_timestamp(minute).floor("5min")
@@ -2028,11 +2107,39 @@ class AllNSEMinutePredictor:
                 merged = pd.concat(pieces).sort_index()
                 return merged.loc[~merged.index.duplicated(keep="last")].tail(HISTORY_LOOKBACK_BARS)
 
+            archive_frames: dict[str, pd.DataFrame] = {}
+            archive_sources = {
+                symbol: "INDSTOCKS_HISTORICAL_5M"
+                for symbol in updated
+            }
+            if "__NIFTY50__" in updated:
+                archive_sources["__NIFTY50__"] = nifty_history_source or "YAHOO_FINANCE_5M_FALLBACK"
             with self._lock:
                 for symbol, frame in updated.items():
-                    self._history[symbol] = merge_history(self._history.get(symbol), frame)
-                if "__NIFTY50__" in updated:
-                    self._market_history = merge_history(self._market_history, updated["__NIFTY50__"])
+                    existing = (
+                        self._market_history
+                        if symbol == "__NIFTY50__"
+                        else self._history.get(symbol)
+                    )
+                    if frame is not None and not frame.empty:
+                        if existing is None or existing.empty:
+                            new_rows = frame.copy()
+                        else:
+                            previous_latest = pd.Timestamp(existing.index.max())
+                            new_rows = frame.loc[frame.index > previous_latest].copy()
+                        if not new_rows.empty:
+                            archive_frames[symbol] = new_rows
+                    if symbol == "__NIFTY50__":
+                        self._market_history = merge_history(self._market_history, frame)
+                    else:
+                        self._history[symbol] = merge_history(existing, frame)
+
+            archive_result = self._persist_history_archive(
+                archive_frames,
+                archive_sources,
+                minute,
+            )
+            with self._lock:
                 summary = {
                     "status": (
                         "AUTH_DEFERRED" if auth_failure_event.is_set()
@@ -2050,6 +2157,11 @@ class AllNSEMinutePredictor:
                     "current_session_candle_rows": candle_rows,
                     "nifty_history_source": nifty_history_source,
                     "nifty_history_rows": int(len(updated.get("__NIFTY50__", pd.DataFrame()))),
+                    "history_archive_status": archive_result.get("status"),
+                    "history_archive_remote_path": archive_result.get("remote_path"),
+                    "history_archive_rows": archive_result.get("rows", archive_result.get("rows_pending", 0)),
+                    "history_archive_symbols": archive_result.get("symbols", archive_result.get("symbols_pending", 0)),
+                    "history_archive_error": archive_result.get("error"),
                     "window_start_ist": window_start.isoformat(),
                     "window_end_ist": max(batch_end_minutes).isoformat(),
                     "batch_end_minute_span": {
