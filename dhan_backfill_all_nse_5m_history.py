@@ -187,6 +187,8 @@ def _process_symbol(
         summary = usable_session_summary(merged, minimum_bars)
         if merged.empty:
             return {"symbol": symbol, "status": "NO_DATA", **{k: v for k, v in summary.items() if k != "usable_session_dates"}}
+        latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
+        fresh_latest = pd.notna(latest) and latest >= pd.Timestamp(end) - pd.Timedelta(days=10)
         merged.to_parquet(local, index=True, compression="zstd")
         upload = store.upload_or_update(
             local,
@@ -195,9 +197,15 @@ def _process_symbol(
         )
         if str(upload.get("status") or "").upper() != "OK":
             raise RuntimeError(f"Drive upload was not confirmed: {upload}")
+        session_ready = summary["usable_sessions"] >= minimum_sessions
         return {
             "symbol": symbol,
-            "status": "OK" if summary["usable_sessions"] >= minimum_sessions else "INSUFFICIENT_HISTORY",
+            "status": (
+                "OK" if session_ready and fresh_latest
+                else "STALE_LATEST_DATA" if session_ready
+                else "INSUFFICIENT_HISTORY"
+            ),
+            "fresh_latest_data": bool(fresh_latest),
             "remote_path": remote,
             "rows": int(len(merged)),
             "fetched_rows": int(len(fetched)),
@@ -288,6 +296,7 @@ def main() -> int:
 
     results.extend({"symbol": row["symbol"], "status": "ERROR", "error": row["error"]} for row in resolution_errors)
     results.sort(key=lambda row: row["symbol"])
+    session_ready = [row for row in results if int(row.get("usable_sessions") or 0) >= 200]
     ok = [row for row in results if row.get("status") == "OK"]
     preferred = [row for row in ok if int(row.get("usable_sessions") or 0) >= 500]
     report = {
@@ -306,7 +315,10 @@ def main() -> int:
         "range_end_ist": end.isoformat(),
         "official_symbols_requested": len(symbols),
         "symbols_resolved": len(resolved),
-        "symbols_with_200_plus_sessions": len(ok),
+        "symbols_with_200_plus_sessions": len(session_ready),
+        "symbols_with_fresh_latest_data": sum(row.get("fresh_latest_data") is True for row in results),
+        "symbols_with_200_plus_sessions_and_fresh_data": len(ok),
+        "symbols_with_stale_latest_data": sum(row.get("status") == "STALE_LATEST_DATA" for row in results),
         "symbols_with_data_after_2026_09_24": sum(
             bool(row.get("last_timestamp_ist")) and row["last_timestamp_ist"][:10] > "2026-09-24"
             for row in results
