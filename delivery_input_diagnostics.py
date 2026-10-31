@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from delivery_training_universe import load_official_nse_universe
-from all_nse_delivery_model import _latest_drive_pit_features
+from all_nse_delivery_model import _latest_drive_pit_features, _load_manifest
 
 IST = ZoneInfo("Asia/Kolkata")
 MIN_COMPLETE_SYMBOL_COVERAGE_PCT = 90.0
@@ -66,6 +66,11 @@ def main() -> int:
     if not universe:
         raise RuntimeError("Official NSE universe returned zero symbols.")
 
+    manifest = _load_manifest()
+    expected_features = list(manifest.get("features", []))
+    if len(expected_features) != 59 or len(set(expected_features)) != 59:
+        raise RuntimeError("Active ALL-NSE Delivery manifest does not expose 59 unique features.")
+
     pit, snapshot_date = _latest_drive_pit_features(as_of)
     if pit is None or pit.empty:
         print("ALL_NSE_DELIVERY_READINESS", {
@@ -80,7 +85,7 @@ def main() -> int:
     pit_symbols = set(pit["symbol"]) & universe
     indexed = pit.set_index("symbol", drop=False)
     missing_columns = [
-        c for c in (*CORE_READY_FLAGS, *KNOWN_STATE_FLAGS)
+        c for c in (*expected_features, *CORE_READY_FLAGS, *KNOWN_STATE_FLAGS)
         if c not in pit.columns
     ]
     if missing_columns:
@@ -125,6 +130,8 @@ def main() -> int:
         "as_of_ist": now.isoformat(),
         "snapshot_date": snapshot_date,
         "model_path": "active ALL-NSE 59-feature PIT Delivery",
+        "feature_contract_count": len(expected_features),
+        "feature_schema_complete": True,
         "official_nse_symbols": universe_count,
         "pit_symbols_in_universe": len(pit_symbols),
         "pit_symbol_coverage_pct": pit_coverage_pct,
