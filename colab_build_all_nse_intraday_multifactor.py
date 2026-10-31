@@ -470,9 +470,9 @@ def main():
     ap.add_argument("--max-sessions", type=int, default=500)
     ap.add_argument("--min-bars-per-session", type=int, default=50)
     args = ap.parse_args()
-    if not 1 <= args.min-usable-sessions <= args.max-sessions <= 500:
+    if not 1 <= args.min_usable_sessions <= args.max_sessions <= 500:
         raise ValueError("Session limits must satisfy 1 <= min-usable-sessions <= max-sessions <= 500")
-    if args.min-bars-per-session < 50:
+    if args.min_bars_per_session < 50:
         raise ValueError("--min-bars-per-session must be at least 50")
 
     root = Path(args.drive_root)
@@ -531,10 +531,10 @@ def main():
         session_counts = valid_bars.groupby(pd.Index(raw.index.date)).sum()
         usable_dates = sorted(session_counts[session_counts >= args.min_bars_per_session].index)
         usable_sessions = len(usable_dates)
-        if usable_sessions < args.min-usable-sessions:
+        if usable_sessions < args.min_usable_sessions:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_SESSIONS"))
             continue
-        retained_dates = {str(day) for day in usable_dates[-args.max-sessions:]}
+        retained_dates = {str(day) for day in usable_dates[-args.max_sessions:]}
         raw = raw.loc[pd.Index(raw.index.date).astype(str).isin(retained_dates)]
         if len(raw) < args.min_rows_symbol:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_ROWS"))
@@ -647,9 +647,9 @@ def main():
         "training_symbol_count": trainable,
         "coverage_pct": round(100 * trainable / universe_size, 4) if universe_size else 0.0,
         "minimum_rows_per_symbol": args.min_rows_symbol,
-        "minimum_usable_sessions": args.min-usable-sessions,
-        "maximum_sessions_retained": args.max-sessions,
-        "minimum_bars_per_usable_session": args.min-bars-per-session,
+        "minimum_usable_sessions": args.min_usable_sessions,
+        "maximum_sessions_retained": args.max_sessions,
+        "minimum_bars_per_usable_session": args.min_bars_per_session,
         "symbols_with_200_plus_sessions": int(sum(row[2] >= 200 for row in coverage)),
         "symbols_with_500_sessions": int(sum(row[2] >= 500 for row in coverage)),
         "sample_minutes": args.sample_minutes,
