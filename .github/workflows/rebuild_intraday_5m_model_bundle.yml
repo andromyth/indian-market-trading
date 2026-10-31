@@ -26,7 +26,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repair-intraday-5m-model]')
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    # The seed-derived universe is used only when the live NSE roster endpoint is unavailable.
+    # The trainer uses the current official NSE equity roster and native five-minute history only.
     env:
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           python -u rebuild_all_nse_intraday_5m_model_from_drive.py \
             --work-root "$RUNNER_TEMP/all-nse-intraday-5m-model-recovery" \
-            --min-symbol-coverage 0.50 \
+            --min-symbol-coverage 0.90 \
             --min-trainable-symbols 100
 
       - name: Request guarded staged deployment
