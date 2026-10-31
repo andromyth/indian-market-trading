@@ -13,7 +13,7 @@ It is intended to identify data-pipeline gaps before any model change.
 """
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 import json
@@ -44,6 +44,17 @@ def _is_trading_day(d) -> bool:
     return d.weekday() < 5 and d not in NSE_EQUITY_HOLIDAYS_BY_YEAR.get(
         d.year, frozenset()
     )
+
+
+def _latest_completed_session(now: datetime | None = None) -> date:
+    """Return the most recent calendar-valid NSE session whose EOD may be complete."""
+    current = now or datetime.now(IST)
+    session = current.date()
+    if not (_is_trading_day(session) and current.time() >= EOD_READY):
+        session -= timedelta(days=1)
+    while not _is_trading_day(session):
+        session -= timedelta(days=1)
+    return session
 
 
 def _nse_daily(symbol: str, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -88,23 +99,21 @@ def _value_repr(v):
 
 def main() -> int:
     symbols = [str(x).upper() for x in MANIFEST.get("trained_symbols", [])]
-    today = datetime.now(IST).date()
-
-    if not _is_trading_day(today) or datetime.now(IST).time() < EOD_READY:
-        print(
-            "DIAGNOSTIC_BLOCKED:",
-            {"today": today.isoformat(), "reason": "run_after_current_nse_eod_ready"},
-            flush=True,
-        )
-        return 0
+    now = datetime.now(IST)
+    as_of = _latest_completed_session(now)
 
     print(
         "DELIVERY INPUT DIAGNOSTICS",
-        {"symbols": symbols, "as_of": today.isoformat()},
+        {
+            "symbols": symbols,
+            "as_of": as_of.isoformat(),
+            "run_at_ist": now.isoformat(),
+            "eod_gate_ist": EOD_READY.isoformat(),
+        },
         flush=True,
     )
 
-    histories = ensure_delivery_history(symbols, today, min_rows=65)
+    histories = ensure_delivery_history(symbols, as_of, min_rows=65)
     all_news = tag_news_items(get_news(max_items=100))
 
     frames: dict[str, pd.DataFrame] = {}
@@ -162,6 +171,9 @@ def main() -> int:
                 "symbol": symbol,
                 "price_rows": len(price_df),
                 "price_latest": str(price_df.index[-1].date()) if not price_df.empty else None,
+                "eod_session_match": bool(
+                    not price_df.empty and price_df.index[-1].date() == as_of
+                ),
                 "benchmark": benchmark,
                 "market_rows_140d": len(market_df),
                 "market_latest_140d": str(market_df.index[-1]) if not market_df.empty else None,
@@ -182,6 +194,20 @@ def main() -> int:
 
     print("SOURCE_AND_READINESS")
     print(pd.DataFrame(source_rows).to_string(index=False), flush=True)
+    stale_symbols = [
+        row["symbol"] for row in source_rows if not row["eod_session_match"]
+    ]
+    print(
+        "EOD_SESSION_READINESS:",
+        {
+            "as_of": as_of.isoformat(),
+            "symbols_checked": len(source_rows),
+            "fresh_symbols": len(source_rows) - len(stale_symbols),
+            "stale_or_missing_symbols": stale_symbols,
+            "status": "PASS" if not stale_symbols else "PARTIAL",
+        },
+        flush=True,
+    )
 
     print("MISSING_FEATURES_BY_SYMBOL")
     for row in source_rows:
