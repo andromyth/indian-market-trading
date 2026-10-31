@@ -105,8 +105,8 @@ def model_status() -> dict[str, Any]:
 
 
 def supported_symbol(symbol: str) -> bool:
-    root = str(symbol or "").strip().upper().replace(".NS", "").replace(".BO", "")
-    return root in {str(x).upper() for x in MANIFEST.get("trained_symbols", [])}
+    """Archived staging adapter is disabled; use the root ALL-NSE adapter."""
+    return False
 
 
 def _safe(v: Any) -> float:
@@ -262,43 +262,10 @@ def build_feature_row(
 
 
 def predict(feature_df: pd.DataFrame, symbol: str, decision_timestamp: Any = None) -> dict[str, Any]:
-    if not supported_symbol(symbol):
-        return {
-            "symbol": symbol,
-            "prediction_status": "BLOCKED",
-            "reason": "symbol_not_in_validated_universe",
-            "trained_symbols": MANIFEST.get("trained_symbols", []),
-        }
-
-    features = feature_names()
-    missing = [c for c in features if c not in feature_df.columns]
-    if missing:
-        return {"symbol": symbol, "prediction_status": "BLOCKED", "reason": "missing_required_features", "missing_features": missing}
-
-    X = feature_df[features].apply(pd.to_numeric, errors="coerce")
-    clf = _load_classifier()
-    reg = _load_regressor()
-    p = float(np.clip(clf.predict_proba(X)[:, 1][0], 0, 1))
-    predicted_return = float(reg.predict(X)[0])
-
-    # Existing delivery artifacts define next-session UP probability. We use the
-    # same threshold policy as the earlier engine; thresholds are explicit and
-    # are not silently changed here.
-    signal = "BUY" if p >= 0.60 and predicted_return > 0.0015 else ("SELL" if p <= 0.40 and predicted_return < -0.0015 else "HOLD")
-    confidence = "HIGH" if abs(p - 0.5) >= 0.25 else ("MEDIUM" if abs(p - 0.5) >= 0.12 else "LOW")
-    non_null_fraction = float(X.notna().mean(axis=1).iloc[0])
+    """Fail closed rather than scoring with the archived three-symbol model."""
     return {
-        "symbol": symbol,
-        "decision_timestamp": str(decision_timestamp) if decision_timestamp is not None else None,
-        "predicted_return_next_session": predicted_return,
-        "probability_up_next_session": p,
-        "probability_down_next_session": 1.0 - p,
-        "signal": signal,
-        "confidence": confidence,
-        "feature_count": len(features),
-        "data_readiness_score": non_null_fraction,
-        "missing_feature_count": int(X.isna().sum(axis=1).iloc[0]),
-        "model_family": "logistic_regression + hgb_return_regressor",
-        "prediction_status": "PASS",
-        "trained_symbols": MANIFEST.get("trained_symbols", []),
+        "symbol": str(symbol or "").strip().upper().replace(".NS", "").replace(".BO", ""),
+        "prediction_status": "BLOCKED",
+        "reason": "legacy_53_feature_adapter_inactive_use_root_all_nse_delivery_model",
+        "legacy_53_feature_adapter": "INACTIVE",
     }
