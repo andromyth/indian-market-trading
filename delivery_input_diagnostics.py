@@ -24,7 +24,6 @@ import pandas as pd
 from data_fetcher import (
     benchmark_for_symbol,
     get_corporate_announcements,
-    get_historical,
     get_news,
     get_option_chain,
     news_for_symbol,
@@ -32,6 +31,7 @@ from data_fetcher import (
 )
 from delivery_model import MANIFEST, build_feature_row, feature_names, predict
 from delivery_history_cache import ensure_delivery_history
+from nse_data_layer import fetch_index_history
 from fo_analysis import summarize as fo_summarize
 from nse_bulk_eod_ingest import NSE_EQUITY_HOLIDAYS_BY_YEAR
 from triggers import tag_news_items
@@ -55,6 +55,34 @@ def _latest_completed_session(now: datetime | None = None) -> date:
     while not _is_trading_day(session):
         session -= timedelta(days=1)
     return session
+
+
+def _nse_market_history(
+    benchmark: str,
+    as_of: date,
+    calendar_days: int,
+) -> pd.DataFrame:
+    raw = fetch_index_history(
+        benchmark,
+        as_of - timedelta(days=calendar_days),
+        as_of,
+        sync_drive=True,
+    )
+    if raw is None or raw.empty or "date" not in raw.columns:
+        return pd.DataFrame()
+    x = raw.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date"]).set_index("date")
+    x = x.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+    return x.sort_index()
 
 
 def _nse_daily(symbol: str, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -123,14 +151,23 @@ def main() -> int:
     for symbol in symbols:
         price_df = _nse_daily(symbol, histories)
         benchmark = benchmark_for_symbol(symbol)
-        market_df = get_historical(benchmark, period="140d", interval="1d")
+        market_error = None
+        try:
+            market_df = _nse_market_history(benchmark, as_of, calendar_days=140)
+        except Exception as exc:
+            market_df = pd.DataFrame()
+            market_error = f"{type(exc).__name__}: {exc}"
 
-        # Diagnostic-only longer context request. This does not change the
-        # production runner; it tells us whether the benchmark provider is
-        # truncating the normal 140-day request.
+        # Diagnostic-only longer context request, anchored to the same
+        # completed NSE session as the stock history.
         market_df_long = pd.DataFrame()
         if len(market_df) < 21:
-            market_df_long = get_historical(benchmark, period="260d", interval="1d")
+            try:
+                market_df_long = _nse_market_history(
+                    benchmark, as_of, calendar_days=260
+                )
+            except Exception as exc:
+                market_error = market_error or f"{type(exc).__name__}: {exc}"
 
         aliases = stock_news_keywords(symbol)
         matched = news_for_symbol(aliases, all_news)
@@ -177,6 +214,7 @@ def main() -> int:
                 "benchmark": benchmark,
                 "market_rows_140d": len(market_df),
                 "market_latest_140d": str(market_df.index[-1]) if not market_df.empty else None,
+                "market_data_error": market_error,
                 "market_rows_260d_diag": len(market_df_long),
                 "news_matches": len(matched),
                 "announcements": len(announcements),
