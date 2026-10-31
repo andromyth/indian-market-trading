@@ -12,6 +12,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock, local
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,9 @@ MANIFEST_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/bac
 MIN_SESSION_BARS = 50
 FRESHNESS_WINDOW_DAYS = 7
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+_STORE_LOCAL = local()
+_FOLDER_CACHE: dict[tuple[str, str], str] = {}
+_FOLDER_CACHE_LOCK = Lock()
 
 
 def normalize_dhan_5m(frame: pd.DataFrame, cutoff: pd.Timestamp | None = None) -> pd.DataFrame:
@@ -97,15 +101,33 @@ def retain_latest_sessions(frame: pd.DataFrame, maximum_sessions: int = 500, min
     return frame.loc[keep].sort_index()
 
 
+def _thread_drive_store() -> Any:
+    """Reuse one Drive service per worker thread; discovery clients are not shared across threads."""
+    store = getattr(_STORE_LOCAL, "store", None)
+    if store is None:
+        from persistent_store import GoogleDriveStore
+        store = GoogleDriveStore()
+        _STORE_LOCAL.store = store
+    return store
+
+
 def _resolve_remote_file(store: Any, remote: str) -> dict[str, Any] | None:
     folder_mime = "application/vnd.google-apps.folder"
     parent = store.root_id
     parts = remote.strip("/").split("/")
-    for component in parts[:-1]:
+    for index, component in enumerate(parts[:-1], start=1):
+        cache_key = (str(store.root_id), "/".join(parts[:index]))
+        with _FOLDER_CACHE_LOCK:
+            cached_id = _FOLDER_CACHE.get(cache_key)
+        if cached_id:
+            parent = cached_id
+            continue
         hit = store._find_child(parent, component, folder_mime)
         if not hit:
             return None
         parent = hit["id"]
+        with _FOLDER_CACHE_LOCK:
+            _FOLDER_CACHE[cache_key] = parent
     return store._find_child(parent, parts[-1])
 
 
@@ -148,9 +170,7 @@ def _process_symbol(
     minimum_bars: int,
 ) -> dict[str, Any]:
     from dhan_client import historical_intraday_range
-    from persistent_store import GoogleDriveStore
-
-    store = GoogleDriveStore()
+    store = _thread_drive_store()
     remote = f"{REMOTE_ROOT}/symbol={symbol}/{symbol}.parquet"
     local = local_root / f"symbol={symbol}" / f"{symbol}.parquet"
     local.parent.mkdir(parents=True, exist_ok=True)
