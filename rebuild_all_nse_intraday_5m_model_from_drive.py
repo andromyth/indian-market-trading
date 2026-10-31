@@ -22,6 +22,8 @@ from typing import Any
 MODEL_REMOTE = "models/all_nse_intraday_5mbar_multifactor_replacement_2026"
 SEED_REMOTE = "production_data/nse_official/intraday_seed/olo_minute_archive/symbols"
 SEED_REL = Path(SEED_REMOTE)
+NATIVE_5M_SEED_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
+LIVE_5M_REMOTE = "production_data/nse_official/intraday_5m_live"
 MARKET_FILES = (
     "raw/2018_2025/NIFTY50-INDEX.parquet",
     "raw/2026/NIFTY50-INDEX.parquet",
@@ -134,6 +136,13 @@ def _download_optional_path(store: Any, remote_path: str, local_root: Path) -> b
     return True
 
 
+def _download_optional_tree(store: Any, remote_path: str, root: Path) -> tuple[int, int]:
+    folder_id = _resolve_folder(store, remote_path)
+    if not folder_id:
+        return 0, 0
+    return _download_tree(store, folder_id, remote_path, root)
+
+
 def _download_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int, int]:
     symbols_folder = _resolve_folder(store, SEED_REMOTE)
     if not symbols_folder:
@@ -238,6 +247,15 @@ def main() -> int:
         if item.get("mimeType") != "application/vnd.google-apps.folder"
         and str(item.get("name", "")).lower().endswith(".parquet")
     )
+    native_folder = _resolve_folder(store, NATIVE_5M_SEED_REMOTE)
+    native_children = _list_children(store, native_folder) if native_folder else []
+    universe.update(
+        str(item.get("name", "")).split("=", 1)[1].upper().replace(".NS", "").replace(".BO", "")
+        for item in native_children
+        if item.get("mimeType") == "application/vnd.google-apps.folder"
+        and str(item.get("name", "")).startswith("symbol=")
+        and str(item.get("name", "")).split("=", 1)[1].strip()
+    )
     universe = {s for s in universe if s and s not in {"NAN", "NONE"}}
     if len(universe) < args.min_seed_universe_symbols:
         raise RuntimeError(
@@ -252,12 +270,18 @@ def main() -> int:
     }, sort_keys=True))
 
     seed_symbols, seed_files, seed_bytes = _download_seed(store, root, universe)
+    native_files, native_bytes = _download_optional_tree(store, NATIVE_5M_SEED_REMOTE, root)
+    live_files, live_bytes = _download_optional_tree(store, LIVE_5M_REMOTE, root)
     coverage = seed_symbols / len(universe)
     print("SEED_INPUT_SUMMARY=" + json.dumps({
         "official_nse_symbols": len(universe),
         "seed_symbols_with_files": seed_symbols,
         "seed_parquet_files": seed_files,
         "seed_bytes": seed_bytes,
+        "native_5m_parquet_files": native_files,
+        "native_5m_bytes": native_bytes,
+        "live_5m_slot_files": live_files,
+        "live_5m_bytes": live_bytes,
         "seed_symbol_coverage_pct": round(coverage * 100, 4),
     }, sort_keys=True))
     if seed_symbols < max(args.min_trainable_symbols, math.ceil(len(universe) * args.min_symbol_coverage)):
@@ -274,6 +298,8 @@ def main() -> int:
         "nifty_market_context_files": [path for path, ok in zip(MARKET_FILES, market_found) if ok],
         "fno_daily_features_available": fno_found,
         "historical_seed_symbols": seed_symbols,
+        "native_5m_parquet_files": native_files,
+        "live_5m_slot_files": live_files,
     }, sort_keys=True))
 
     # The canonical builder imports the 34-feature runtime contract and performs
@@ -292,6 +318,9 @@ def main() -> int:
             "--min-rows-symbol", "300",
             "--sample-minutes", "5",
             "--max-train-rows-per-symbol", "2000",
+            "--min-usable-sessions", "200",
+            "--max-sessions", "500",
+            "--min-bars-per-session", "50",
         ]
         train_main()
     finally:
