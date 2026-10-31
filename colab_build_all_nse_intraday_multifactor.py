@@ -350,6 +350,124 @@ def load_market(root: Path, live_frame: pd.DataFrame | None = None) -> pd.DataFr
     return _merge_5m_parts(five_minute_parts)
 
 
+def load_symbol(root: Path, sym: str) -> pd.DataFrame:
+    parts = []
+    errors = []
+
+    # Historical seed consolidated into one Parquet file per symbol.
+    seed_dir = root / SEED_REL / f"symbol={sym}"
+    seed_files = sorted(seed_dir.glob("*.parquet")) if seed_dir.exists() else []
+    for p in seed_files:
+        try:
+            z = pd.read_parquet(p)
+            if z is None or z.empty:
+                continue
+            parts.append(_norm(z))
+        except Exception as exc:
+            errors.append(f"seed:{p.name}:{type(exc).__name__}:{exc}")
+
+    # Official NSE incremental archive, if it already contains observations.
+    official_dir = root / PERSISTENT_INTRADAY_REL
+    if official_dir.exists():
+        for p in sorted(official_dir.rglob(f"{sym}.parquet")):
+            try:
+                z = pd.read_parquet(p)
+                if z is None or z.empty:
+                    continue
+                parts.append(_norm(z))
+            except Exception as exc:
+                errors.append(f"official:{p}:{type(exc).__name__}:{exc}")
+
+    if errors and not parts:
+        raise RuntimeError(
+            f"Could not read any intraday data for {sym}. "
+            + " | ".join(errors[:3])
+        )
+
+    parts = [p for p in parts if p is not None and not p.empty]
+    if not parts:
+        return pd.DataFrame()
+
+    q = pd.concat(parts).sort_index()
+    q = q[~q.index.duplicated(keep="last")]
+    return q
+
+def load_market(root: Path) -> pd.DataFrame:
+    cands = [
+        root / "raw/2018_2025/NIFTY50-INDEX.parquet",
+        root / "raw/2026/NIFTY50-INDEX.parquet",
+    ]
+    parts = []
+    for p in cands:
+        if p.exists():
+            try:
+                z = pd.read_parquet(p)
+                if not z.empty:
+                    parts.append(_norm(z))
+            except Exception:
+                pass
+    if not parts:
+        return pd.DataFrame()
+    q = pd.concat(parts).sort_index()
+    return q[~q.index.duplicated(keep="last")]
+
+
+def load_symbol_5m(
+    root: Path,
+    sym: str,
+    live_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Merge legacy one-minute history, native 5m history and live 5m bars."""
+    parts = []
+    minute_history = load_symbol(root, sym)
+    if minute_history is not None and not minute_history.empty:
+        aggregated = resample_completed_5m_bars(minute_history)
+        if not aggregated.empty:
+            parts.append(aggregated)
+
+    native_dir = root / NATIVE_5M_SEED_REL / f"symbol={sym}"
+    if native_dir.exists():
+        for path in sorted(native_dir.rglob("*.parquet")):
+            try:
+                bars = _close_labeled_5m(pd.read_parquet(path))
+                if not bars.empty:
+                    parts.append(bars)
+            except Exception as exc:
+                print(f"NATIVE_5M_ARCHIVE_READ_ERROR symbol={sym} path={path} error={type(exc).__name__}:{exc}", flush=True)
+
+    if live_frame is not None and not live_frame.empty:
+        bars = _close_labeled_5m(live_frame)
+        if not bars.empty:
+            parts.append(bars)
+    return _merge_5m_parts(parts)
+
+
+def load_market_5m(root: Path, live_frame: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Return NIFTY context on the same close-timestamped five-minute cadence."""
+    legacy = load_market(root)
+    parts = []
+    if legacy is not None and not legacy.empty:
+        aggregated = resample_completed_5m_bars(legacy)
+        if not aggregated.empty:
+            parts.append(aggregated)
+
+    native_dir = root / NATIVE_5M_SEED_REL / "symbol=__NIFTY50__"
+    if native_dir.exists():
+        for path in sorted(native_dir.rglob("*.parquet")):
+            try:
+                bars = _close_labeled_5m(pd.read_parquet(path))
+                if not bars.empty:
+                    parts.append(bars)
+            except Exception:
+                pass
+
+    if live_frame is not None and not live_frame.empty:
+        bars = _close_labeled_5m(live_frame)
+        if not bars.empty:
+            parts.append(bars)
+    return _merge_5m_parts(parts)
+
+
 def load_fno(root: Path) -> pd.DataFrame:
     p = root / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
     try:
@@ -504,7 +622,7 @@ def main():
         raise RuntimeError("No historical minute or native five-minute seed archive is available.")
 
     live_history = load_live_history(root)
-    market = load_market(root, live_history.get("__NIFTY50__"))
+    market = load_market_5m(root, live_history.get("__NIFTY50__"))
     fno = load_fno(root)
 
     # Colab RAM is limited, so never accumulate the complete five-minute-derived
@@ -523,7 +641,7 @@ def main():
     retained_rows = 0
 
     for i, sym in enumerate(universe, 1):
-        raw = load_symbol(root, sym, live_history.get(sym))
+        raw = load_symbol_5m(root, sym, live_history.get(sym))
         if raw.empty:
             coverage.append((sym, 0, 0, "EXCLUDED_NO_HISTORY"))
             continue
