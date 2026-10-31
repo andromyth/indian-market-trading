@@ -109,3 +109,32 @@ def test_instrument_mapping_prefers_eq_but_keeps_symbols_with_other_equity_serie
     monkeypatch.setattr(indstocks_client, "_load_instruments", lambda exchange: frame)
     codes = backfill._instrument_codes()
     assert codes == {"SBIN": "NSE_12", "NEWSTOCK": "NSE_13"}
+
+
+
+def test_indstocks_batch_calls_guard_for_each_seven_day_window(monkeypatch):
+    import indstocks_client
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    calls = []
+    guards = []
+
+    class Response:
+        @staticmethod
+        def json():
+            return {"success": True, "data": {}}
+
+    monkeypatch.setattr(indstocks_client, "_request", lambda *args, **kwargs: (calls.append(args) or Response()))
+    monkeypatch.setattr(backfill.time, "sleep", lambda _: None)
+    symbols = [("RELIANCE", "NSE_100")]
+    start = pd.Timestamp("2026-01-01 09:15", tz=IST).to_pydatetime()
+    end = pd.Timestamp("2026-01-16 09:15", tz=IST).to_pydatetime()
+
+    _, request_count = fetch_indstocks_5m_batch(
+        symbols, start, end, pause_seconds=0,
+        request_guard=lambda: guards.append(True),
+    )
+
+    assert request_count == 3
+    assert len(calls) == 3
+    assert len(guards) == 3

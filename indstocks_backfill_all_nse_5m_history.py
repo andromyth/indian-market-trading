@@ -36,6 +36,11 @@ OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 MAX_CODES_PER_REQUEST = 5
 MAX_DAYS_PER_REQUEST = 7
 
+# Set by the private Cloud Run worker so this job reuses its process-local TOTP
+# token cache and yields API capacity during live-market hours.
+REQUEST_GUARD = None
+BACKFILL_PROGRESS_CALLBACK = None
+
 
 def normalize_indstocks_5m(frame: pd.DataFrame | None, cutoff: pd.Timestamp | None = None) -> pd.DataFrame:
     """Convert INDstocks candle-open timestamps into completed five-minute bar closes."""
@@ -121,7 +126,8 @@ def fetch_indstocks_5m_batch(
     start: datetime,
     end: datetime,
     *,
-    pause_seconds: float = 0.22,
+    pause_seconds: float = 1.0,
+    request_guard: Any = None,
 ) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch a maximum of five stocks at once over consecutive seven-day windows."""
     if not symbols_and_codes:
@@ -140,6 +146,8 @@ def fetch_indstocks_5m_batch(
     last_request_started = 0.0
     while cursor < end:
         window_end = min(end, cursor + timedelta(days=MAX_DAYS_PER_REQUEST))
+        if request_guard is not None:
+            request_guard()
         wait = pause_seconds - (time.monotonic() - last_request_started)
         if calls and wait > 0:
             time.sleep(wait)
@@ -217,20 +225,20 @@ def _write_manifest(store: Any, root: Path, report: dict[str, Any]) -> None:
         raise RuntimeError(f"INDstocks backfill manifest Drive write was not confirmed: {uploaded}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sessions", type=int, default=500)
     parser.add_argument("--calendar-days", type=int, default=1000)
     parser.add_argument("--initial-calendar-days", type=int, default=1000)
     parser.add_argument("--minimum-usable-sessions", type=int, default=200)
     parser.add_argument("--minimum-bars-per-session", type=int, default=50)
-    parser.add_argument("--pause-seconds", type=float, default=0.22)
+    parser.add_argument("--pause-seconds", type=float, default=1.0)
     parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--symbols", default="")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--work-root", default="/tmp/nse_5m_indstocks_backfill")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not 200 <= args.sessions <= 500:
         raise ValueError("--sessions must be between 200 and 500")
@@ -287,6 +295,8 @@ def main() -> int:
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
 
     for batch_no, batch in enumerate(batches, start=1):
+        if callable(REQUEST_GUARD):
+            REQUEST_GUARD()
         existing_by_symbol: dict[str, pd.DataFrame] = {}
         starts: dict[str, datetime] = {}
         for symbol, _ in batch:
@@ -308,7 +318,8 @@ def main() -> int:
         batch_start = min(starts.values())
         try:
             fetched_by_symbol, calls = fetch_indstocks_5m_batch(
-                batch, batch_start, end, pause_seconds=args.pause_seconds
+                batch, batch_start, end, pause_seconds=args.pause_seconds,
+                request_guard=REQUEST_GUARD,
             )
             total_api_calls += calls
         except Exception as exc:
@@ -360,12 +371,17 @@ def main() -> int:
                 "drive_bytes": uploaded.get("size"),
             })
 
-        print(
-            f"BACKFILL_PROGRESS provider=INDSTOCKS batch={batch_no}/{len(batches)} "
-            f"completed_symbols={min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable))}/{len(resolvable)} "
-            f"api_calls={total_api_calls}",
-            flush=True,
-        )
+        progress = {
+            "provider": "INDSTOCKS",
+            "batch": batch_no,
+            "total_batches": len(batches),
+            "completed_symbols": min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable)),
+            "resolved_symbols": len(resolvable),
+            "api_calls": total_api_calls,
+        }
+        print("BACKFILL_PROGRESS " + json.dumps(progress, sort_keys=True), flush=True)
+        if callable(BACKFILL_PROGRESS_CALLBACK):
+            BACKFILL_PROGRESS_CALLBACK(progress)
 
     results.sort(key=lambda row: row["symbol"])
     ready = [row for row in results if row.get("status") == "OK"]
