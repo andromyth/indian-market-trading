@@ -163,15 +163,21 @@ def analyze_symbol(store, symbol: str, folder: dict) -> dict:
                     continue
                 day_ts = ts[pos]
                 ready = feature_ready[pos]
-                nanos = day_ts.asi8
-                for local_i, timestamp in enumerate(day_ts):
-                    if not ready[local_i]:
-                        continue
-                    target_ns = timestamp.value + int(horizon) * 60_000_000_000
-                    target_i = int(np.searchsorted(nanos, target_ns, side="left"))
-                    if target_i < len(nanos) and nanos[target_i] - target_ns <= 60_000_000_000:
-                        valid_rows += 1
-                        valid_by_day.add(str(date.date()))
+                decision_ns = day_ts.asi8[ready]
+                if not len(decision_ns):
+                    continue
+                target_ns = decision_ns + int(horizon) * 60_000_000_000
+                target_i = np.searchsorted(day_ts.asi8, target_ns, side="left")
+                in_bounds = target_i < len(day_ts)
+                valid = np.zeros(len(target_i), dtype=bool)
+                valid[in_bounds] = (
+                    day_ts.asi8[target_i[in_bounds]] - target_ns[in_bounds]
+                    <= 60_000_000_000
+                )
+                count = int(valid.sum())
+                valid_rows += count
+                if count:
+                    valid_by_day.add(str(date.date()))
             horizon_sessions[str(horizon)] = len(valid_by_day)
             horizon_rows[str(horizon)] = valid_rows
 
