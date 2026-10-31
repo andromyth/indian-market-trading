@@ -29,9 +29,8 @@ def main() -> None:
     checks.append("OK production target_30m / 137 features")
 
     dm = json.loads(d_manifest.read_text(encoding="utf-8"))
-    expected = {"BHARTIARTL", "RELIANCE", "SBIN"}
-    if not expected.issubset({str(x).upper() for x in dm.get("trained_symbols", [])}):
-        raise SystemExit("Delivery trained-universe contract mismatch")
+    if "LEGACY_COMPATIBILITY_ONLY" not in str(dm.get("artifact_status", "")):
+        raise SystemExit("Legacy Delivery artifacts are not explicitly marked inactive")
 
     c = joblib.load(d_classifier)
     r = joblib.load(d_regressor)
@@ -39,7 +38,7 @@ def main() -> None:
         raise SystemExit("Delivery classifier classes are not [0, 1]")
     if int(c.n_features_in_) != 53 or int(r.n_features_in_) != 53:
         raise SystemExit("Delivery model feature count is not 53")
-    checks.append("OK delivery classifier/regressor / 53 features / classes [0,1]")
+    checks.append("OK legacy 53-feature artifacts are isolated from active ALL-NSE routing")
 
     import delivery_model  # noqa: F401
     import prediction_ledger  # noqa: F401

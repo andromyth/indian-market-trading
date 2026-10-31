@@ -1,9 +1,9 @@
-"""Delivery-horizon production model adapter.
+"""Legacy 53-feature Delivery compatibility adapter.
 
-This module wraps the already-trained next-session classifier/regressor. It does
-not retrain or alter the artifacts. It builds exactly the 53 named features
-exposed by the saved sklearn pipelines and keeps optional data explicitly
-missing when unavailable.
+Live Delivery predictions must use all_nse_delivery_model.py, which enforces
+current official NSE-universe membership and sufficient clean history. The
+53-feature artifacts and feature builder below are retained only for historical
+reproducibility; they are not the active prediction route.
 """
 from __future__ import annotations
 
@@ -86,27 +86,17 @@ def _load_regressor():
 
 
 def model_status() -> dict[str, Any]:
-    c_sha = hashlib.sha256(CLASSIFIER_PATH.read_bytes()).hexdigest() if CLASSIFIER_PATH.exists() else None
-    r_sha = hashlib.sha256(REGRESSOR_PATH.read_bytes()).hexdigest() if REGRESSOR_PATH.exists() else None
-    c = _load_classifier() if CLASSIFIER_PATH.exists() else None
-    r = _load_regressor() if REGRESSOR_PATH.exists() else None
-    return {
-        "classifier_exists": CLASSIFIER_PATH.exists(),
-        "regressor_exists": REGRESSOR_PATH.exists(),
-        "classifier_sha256": c_sha,
-        "regressor_sha256": r_sha,
-        "classifier_feature_count": int(getattr(c, "n_features_in_", 0)) if c is not None else 0,
-        "regressor_feature_count": int(getattr(r, "n_features_in_", 0)) if r is not None else 0,
-        "trained_symbols": list(MANIFEST.get("trained_symbols", [])),
-        "as_of": MANIFEST.get("as_of"),
-        "fundamentals_available_in_manifest": bool(MANIFEST.get("data_layers", {}).get("fundamentals", False)),
-        "policy": MANIFEST.get("research_policy", {}),
-    }
+    from all_nse_delivery_model import model_status as active_model_status
+    return {**active_model_status(), "legacy_53_feature_adapter": "INACTIVE"}
 
 
 def supported_symbol(symbol: str) -> bool:
-    root = str(symbol or "").strip().upper().replace(".NS", "").replace(".BO", "")
-    return root in {str(x).upper() for x in MANIFEST.get("trained_symbols", [])}
+    """Use the active official-NSE eligibility policy, never the legacy pilot list."""
+    try:
+        from all_nse_delivery_model import supported_symbol as active_supported_symbol
+        return bool(active_supported_symbol(symbol))
+    except Exception:
+        return False
 
 
 def _safe(v: Any) -> float:
@@ -262,43 +252,9 @@ def build_feature_row(
 
 
 def predict(feature_df: pd.DataFrame, symbol: str, decision_timestamp: Any = None) -> dict[str, Any]:
-    if not supported_symbol(symbol):
-        return {
-            "symbol": symbol,
-            "prediction_status": "BLOCKED",
-            "reason": "symbol_not_in_validated_universe",
-            "trained_symbols": MANIFEST.get("trained_symbols", []),
-        }
+    """Compatibility signature; live scoring delegates to the active ALL-NSE model."""
+    from all_nse_delivery_model import predict_symbol
 
-    features = feature_names()
-    missing = [c for c in features if c not in feature_df.columns]
-    if missing:
-        return {"symbol": symbol, "prediction_status": "BLOCKED", "reason": "missing_required_features", "missing_features": missing}
-
-    X = feature_df[features].apply(pd.to_numeric, errors="coerce")
-    clf = _load_classifier()
-    reg = _load_regressor()
-    p = float(np.clip(clf.predict_proba(X)[:, 1][0], 0, 1))
-    predicted_return = float(reg.predict(X)[0])
-
-    # Existing delivery artifacts define next-session UP probability. We use the
-    # same threshold policy as the earlier engine; thresholds are explicit and
-    # are not silently changed here.
-    signal = "BUY" if p >= 0.60 and predicted_return > 0.0015 else ("SELL" if p <= 0.40 and predicted_return < -0.0015 else "HOLD")
-    confidence = "HIGH" if abs(p - 0.5) >= 0.25 else ("MEDIUM" if abs(p - 0.5) >= 0.12 else "LOW")
-    non_null_fraction = float(X.notna().mean(axis=1).iloc[0])
-    return {
-        "symbol": symbol,
-        "decision_timestamp": str(decision_timestamp) if decision_timestamp is not None else None,
-        "predicted_return_next_session": predicted_return,
-        "probability_up_next_session": p,
-        "probability_down_next_session": 1.0 - p,
-        "signal": signal,
-        "confidence": confidence,
-        "feature_count": len(features),
-        "data_readiness_score": non_null_fraction,
-        "missing_feature_count": int(X.isna().sum(axis=1).iloc[0]),
-        "model_family": "logistic_regression + hgb_return_regressor",
-        "prediction_status": "PASS",
-        "trained_symbols": MANIFEST.get("trained_symbols", []),
-    }
+    result = predict_symbol(symbol, decision_timestamp=decision_timestamp)
+    result["legacy_53_feature_adapter"] = "INACTIVE"
+    return result

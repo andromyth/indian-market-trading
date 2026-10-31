@@ -47,9 +47,11 @@ a validation ledger, a rolling seven-completed-prediction scorecard, and a model
 health flag. Delivery predictions are recorded automatically when a supported
 stock is searched in Delivery mode.
 
-The current validated Delivery universe remains the three symbols declared in
-`production_delivery_model/PREDICTION_ENGINE_MANIFEST_V2_2026.json`. Unknown
-symbols are blocked rather than silently generalized.
+This directory preserves an older 53-feature compatibility implementation. Its
+three-symbol manifest is historical artifact provenance only and must not define
+the live universe. The active repository path is `all_nse_delivery_model.py`,
+which uses the official current NSE equity universe and includes symbols only
+when clean-history and data-quality requirements pass.
 
 New runtime files:
 - `delivery_model.py`

@@ -1,12 +1,13 @@
 {
   "engine_version": "2026.09-stage2",
+  "artifact_status": "LEGACY_COMPATIBILITY_ONLY_NOT_ACTIVE_FOR_PRODUCTION",
   "as_of": "2026-09-26T23:59:59",
   "trained_symbols": [
     "BHARTIARTL",
     "RELIANCE",
     "SBIN"
   ],
-  "deployment_scope_warning": "Current deployment models are trained on the available research universe only; wider-universe validation remains required before generalizing to every Indian stock.",
+  "deployment_scope_warning": "LEGACY 53-feature artifacts only. trained_symbols records historical artifact provenance and must not gate current predictions. The active repository path is all_nse_delivery_model.py, which uses the official current NSE equity universe and minimum clean-history/data-quality gates.",
   "data_layers": {
     "market_price": true,
     "market_context": true,
