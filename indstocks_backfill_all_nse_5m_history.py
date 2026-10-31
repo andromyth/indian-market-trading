@@ -26,7 +26,7 @@ from dhan_backfill_all_nse_5m_history import (
     MIN_SESSION_BARS,
     REMOTE_ROOT,
     _download_existing,
-    _thread_drive_store,
+    choose_backfill_start,
     retain_latest_sessions,
     usable_session_summary,
 )
@@ -97,10 +97,18 @@ def _instrument_codes() -> dict[str, str]:
         & x["SECURITY_ID"].str.fullmatch(r"\d+")
         & x["TRADING_SYMBOL"].ne("")
     ].copy()
+    if "SEGMENT" in x.columns:
+        equity = x["SEGMENT"].astype(str).str.strip().str.upper().isin({"E", "EQ", "EQUITY"})
+        if equity.any():
+            x = x.loc[equity]
     if "SERIES" in x.columns:
-        eq = x["SERIES"].astype(str).str.strip().str.upper().eq("EQ")
-        if eq.any():
-            x = x.loc[eq]
+        x["_series_priority"] = (
+            ~x["SERIES"].astype(str).str.strip().str.upper().eq("EQ")
+        ).astype(int)
+        x = x.sort_values(
+            ["TRADING_SYMBOL", "_series_priority"],
+            kind="stable",
+        )
     x = x.drop_duplicates("TRADING_SYMBOL", keep="first")
     return {
         str(row.TRADING_SYMBOL): f"NSE_{row.SECURITY_ID}"
