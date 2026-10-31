@@ -33,7 +33,7 @@ def test_indstocks_candle_open_timestamp_is_shifted_once_to_completed_bar_close(
     assert pd.isna(bars["Volume"].iloc[1])
 
 
-def test_indstocks_batch_uses_one_five_symbol_request_and_returns_open_timestamps(monkeypatch):
+def test_indstocks_batch_uses_one_five_symbol_request_and_returns_completed_bar_timestamps(monkeypatch):
     import indstocks_client
     import indstocks_backfill_all_nse_5m_history as backfill
 
@@ -77,9 +77,8 @@ def test_indstocks_batch_uses_one_five_symbol_request_and_returns_open_timestamp
     assert len(calls) == 1
     assert calls[0][0:2] == ("GET", "/market/historical/5minute")
     assert calls[0][2]["scrip-codes"] == "NSE_100,NSE_200"
-    # The fetcher preserves source open timestamps; normalization happens once
-    # in the archive-writing path.
-    assert frames["RELIANCE"].index[0] == pd.Timestamp("2026-10-30 09:15", tz=IST)
+    # Source candle-open timestamps are normalized once to completed bar closes.
+    assert frames["RELIANCE"].index[0] == pd.Timestamp("2026-10-30 09:20", tz=IST)
     assert frames["SBIN"].iloc[0]["Close"] == 200.5
 
 
