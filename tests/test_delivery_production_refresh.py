@@ -225,3 +225,69 @@ def test_fundamental_refresh_still_fails_closed_without_explicit_fallback():
             _refresh_fundamental_availability(
                 object(), ["AAA"], as_of_date=date(2026, 10, 30)
             )
+
+
+def test_rows_for_nse_session_extracts_only_requested_date_from_cumulative_panel():
+    import pandas as pd
+    from datetime import date
+    from delivery_production_refresh import _rows_for_nse_session
+
+    frame = pd.DataFrame({
+        "symbol": ["AAA", "BBB", "AAA", "BBB", "CCC"],
+        "date": [
+            "2026-10-02", "2026-10-02",
+            "2026-10-05", "2026-10-05",
+            "2026-10-06",
+        ],
+        "decision_timestamp": pd.to_datetime([
+            "2026-10-02T10:00:00+05:30",
+            "2026-10-02T10:00:00+05:30",
+            "2026-10-05T10:00:00+05:30",
+            "2026-10-05T10:00:00+05:30",
+            "2026-10-06T10:00:00+05:30",
+        ], utc=True),
+    })
+
+    result = _rows_for_nse_session(frame, date(2026, 10, 5))
+
+    assert result["symbol"].tolist() == ["AAA", "BBB"]
+    assert set(pd.to_datetime(result["date"]).dt.date) == {date(2026, 10, 5)}
+    assert set(
+        pd.to_datetime(result["decision_timestamp"], utc=True)
+        .dt.tz_convert("Asia/Kolkata").dt.date
+    ) == {date(2026, 10, 5)}
+
+
+def test_rows_for_nse_session_rejects_duplicate_symbol_date_keys():
+    import pandas as pd
+    import pytest
+    from datetime import date
+    from delivery_production_refresh import _rows_for_nse_session
+
+    frame = pd.DataFrame({
+        "symbol": ["AAA", "AAA"],
+        "date": ["2026-10-05", "2026-10-05"],
+        "decision_timestamp": pd.to_datetime([
+            "2026-10-05T10:00:00+05:30",
+            "2026-10-05T11:00:00+05:30",
+        ], utc=True),
+    })
+
+    with pytest.raises(RuntimeError, match="duplicate symbol/date"):
+        _rows_for_nse_session(frame, date(2026, 10, 5))
+
+
+def test_rows_for_nse_session_rejects_missing_target_session():
+    import pandas as pd
+    import pytest
+    from datetime import date
+    from delivery_production_refresh import _rows_for_nse_session
+
+    frame = pd.DataFrame({
+        "symbol": ["AAA"],
+        "date": ["2026-10-02"],
+        "decision_timestamp": pd.to_datetime(["2026-10-02T10:00:00+05:30"], utc=True),
+    })
+
+    with pytest.raises(RuntimeError, match="No PIT panel rows"):
+        _rows_for_nse_session(frame, date(2026, 10, 5))
