@@ -75,8 +75,9 @@ To run it, open **Actions → Backfill ALL-NSE native five-minute history → Ru
 
 The private Cloud Run worker exposes an authenticated backfill trigger so historical ingestion can share the same process-local INDstocks TOTP token cache as live capture. It does not mint a separate token in Streamlit or GitHub Actions.
 
-- `POST $SERVICE_URL/backfill` starts the default resumable run (500 target sessions, 1,000 calendar-day search range, 90% coverage gate) and returns immediately.
+- `POST $SERVICE_URL/backfill` requires the JSON body `{"confirm":"START_NATIVE_5M_BACKFILL"}` and starts the default resumable run (500 target sessions, 1,000 calendar-day search range, 90% coverage gate). Requests without the exact confirmation are rejected with HTTP 400.
 - `GET $SERVICE_URL/backfillz` reports status and per-batch progress. Invoke both endpoints only with Google Cloud IAM authentication; do not make the service public.
+- The GitHub Actions trigger is manual-only. Its confirmation input defaults to `no`; select `yes` deliberately to authorize a start request.
 - The backfill waits during NSE trading hours and uses a conservative one-request-per-second cadence to leave API capacity for live five-minute snapshots. It resumes from existing per-symbol Drive archives after process restarts.
 - Drive write readiness and INDstocks credentials are checked before starting. The endpoint returns `409` if a run is already active. A completed run with gaps is not a pass; inspect the Drive manifest and require at least 90% symbol coverage.
 - A Cloud Run instance restart stops the in-memory worker thread, but completed symbol archives are checkpointed to Drive. Check `/backfillz` and re-trigger if needed.
@@ -85,6 +86,6 @@ Example from an authenticated shell (does not print credentials):
 ~~~bash
 SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project indian-market-trading --region asia-south1 --format='value(status.url)')"
 TOKEN="$(gcloud auth print-identity-token)"
-curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfill"
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data '{"confirm":"START_NATIVE_5M_BACKFILL"}' "$SERVICE_URL/backfill"
 curl -fsS -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfillz"
 ~~~
