@@ -129,6 +129,8 @@ def fetch_indstocks_5m_batch(
     pause_seconds: float = 1.0,
     request_guard: Any = None,
     progress_context: dict[str, Any] | None = None,
+    store: Any = None,
+    checkpoint_root: Path | None = None,
 ) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch a maximum of five stocks at once over consecutive seven-day windows."""
     if not symbols_and_codes:
@@ -147,6 +149,19 @@ def fetch_indstocks_5m_batch(
     last_request_started = 0.0
     while cursor < end:
         window_end = min(end, cursor + timedelta(days=MAX_DAYS_PER_REQUEST))
+        window_key = f"{cursor:%Y%m%dT%H%M}_{window_end:%Y%m%dT%H%M}"
+        pending_codes = dict(symbols_by_code)
+        if store is not None and checkpoint_root is not None:
+            for code, symbol in list(pending_codes.items()):
+                checkpoint_remote = f"{REMOTE_ROOT}/symbol={symbol}/checkpoints/{window_key}.parquet"
+                checkpoint_local = checkpoint_root / f"symbol={symbol}" / f"{window_key}.parquet"
+                saved = _download_existing(store, checkpoint_remote, checkpoint_local)
+                if not saved.empty:
+                    accumulated[symbol].append(saved)
+                    pending_codes.pop(code, None)
+        if not pending_codes:
+            cursor = window_end
+            continue
         if request_guard is not None:
             request_guard()
         wait = pause_seconds - (time.monotonic() - last_request_started)
@@ -154,7 +169,7 @@ def fetch_indstocks_5m_batch(
             time.sleep(wait)
         last_request_started = time.monotonic()
         params = {
-            "scrip-codes": ",".join(symbols_by_code),
+            "scrip-codes": ",".join(pending_codes),
             "start_time": int(cursor.timestamp() * 1000),
             "end_time": int(window_end.timestamp() * 1000),
         }
@@ -178,7 +193,7 @@ def fetch_indstocks_5m_batch(
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")
         data = body.get("data") or {}
-        for code, symbol in symbols_by_code.items():
+        for code, symbol in pending_codes.items():
             instrument = data.get(code) or {}
             candles = instrument.get("candles") or []
             if not candles:
@@ -203,7 +218,17 @@ def fetch_indstocks_5m_batch(
                 index=pd.DatetimeIndex(index, name="Datetime"),
             )
             if not part.empty:
-                accumulated[symbol].append(part)
+                normalized_part = normalize_indstocks_5m(part)
+                if not normalized_part.empty:
+                    accumulated[symbol].append(normalized_part)
+                    if store is not None and checkpoint_root is not None:
+                        checkpoint_local = checkpoint_root / f"symbol={symbol}" / f"{window_key}.parquet"
+                        checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+                        normalized_part.to_parquet(checkpoint_local, index=True, compression="zstd")
+                        checkpoint_remote = f"{REMOTE_ROOT}/symbol={symbol}/checkpoints/{window_key}.parquet"
+                        uploaded = store.upload_or_update(checkpoint_local, checkpoint_remote, mime_type="application/vnd.apache.parquet")
+                        if str(uploaded.get("status") or "").upper() != "OK":
+                            raise RuntimeError(f"Drive checkpoint write failed for {symbol} window {window_key}: {uploaded}")
         calls += 1
         cursor = window_end
         if callable(BACKFILL_PROGRESS_CALLBACK):
@@ -371,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
                     "resolved_symbols": len(resolvable),
                     "api_calls": total_api_calls,
                 },
+                store=store,
+                checkpoint_root=local_root / "window_checkpoints",
             )
             total_api_calls += calls
         except Exception as exc:
