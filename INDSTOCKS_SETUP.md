@@ -69,3 +69,22 @@ Do not paste the token into chat, source files, workflow YAML, or logs. It expir
 The backfill requests native `5minute` candles only. It batches up to five NSE instruments per request, walks the range in seven-day windows, and pauses between requests to stay below the documented five data requests per second. It writes the same per-symbol native five-minute Parquet archive as DhanHQ and applies the same 200–500 usable-session / 90% fresh-coverage gate.
 
 To run it, open **Actions → Backfill ALL-NSE native five-minute history → Run workflow**, choose `provider=indstocks` (or `auto` when Dhan credentials are unavailable), `sessions=500`, `calendar_days=1000`, and `max_symbols=0`. Completion is determined only by the Drive `backfill_manifest.json` reporting `overall_status=PASS`; starting the workflow is not proof that the backfill completed.
+
+
+## Native five-minute historical backfill using the existing Cloud Run token
+
+The private Cloud Run worker exposes an authenticated backfill trigger so historical ingestion can share the same process-local INDstocks TOTP token cache as live capture. It does not mint a separate token in Streamlit or GitHub Actions.
+
+- `POST $SERVICE_URL/backfill` starts the default resumable run (500 target sessions, 1,000 calendar-day search range, 90% coverage gate) and returns immediately.
+- `GET $SERVICE_URL/backfillz` reports status and per-batch progress. Invoke both endpoints only with Google Cloud IAM authentication; do not make the service public.
+- The backfill waits during NSE trading hours and uses a conservative one-request-per-second cadence to leave API capacity for live five-minute snapshots. It resumes from existing per-symbol Drive archives after process restarts.
+- Drive write readiness and INDstocks credentials are checked before starting. The endpoint returns `409` if a run is already active. A completed run with gaps is not a pass; inspect the Drive manifest and require at least 90% symbol coverage.
+- A Cloud Run instance restart stops the in-memory worker thread, but completed symbol archives are checkpointed to Drive. Check `/backfillz` and re-trigger if needed.
+
+Example from an authenticated shell (does not print credentials):
+~~~bash
+SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project indian-market-trading --region asia-south1 --format='value(status.url)')"
+TOKEN="$(gcloud auth print-identity-token)"
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfill"
+curl -fsS -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfillz"
+~~~
