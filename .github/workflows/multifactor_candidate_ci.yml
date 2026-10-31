@@ -144,6 +144,7 @@ jobs:
           tests/test_all_nse_minute_prediction_capture.py
           tests/test_all_universe_minute_capture.py
           tests/test_all_nse_5m_bar_training.py
+          tests/test_live_training_feature_parity.py
           tests/test_final_algorithm_data_readiness_v2.py
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py

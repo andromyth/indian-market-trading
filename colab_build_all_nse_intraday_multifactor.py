@@ -98,6 +98,35 @@ def resample_completed_5m_bars(frame: pd.DataFrame) -> pd.DataFrame:
     return result.loc[~result.index.duplicated(keep="last")]
 
 
+def session_aware_pct_change(c: pd.Series, n: int) -> pd.Series:
+    """Match live returns: stay within a session and carry prior-session return during warm-up."""
+    values = pd.to_numeric(c, errors="coerce")
+    result = pd.Series(np.nan, index=values.index, dtype=float)
+    if values.empty:
+        return result
+    index = pd.DatetimeIndex(values.index)
+    index = index.tz_localize(IST) if index.tz is None else index.tz_convert(IST)
+    session_dates = pd.Index(index.date)
+    previous_session_return = np.nan
+    for day in pd.unique(session_dates):
+        positions = np.flatnonzero(session_dates == day)
+        session = values.iloc[positions].dropna()
+        if session.empty:
+            previous_session_return = np.nan
+            continue
+        if len(session) > n:
+            returns = session.pct_change(n, fill_method=None)
+            if np.isfinite(previous_session_return):
+                returns.iloc[:n] = previous_session_return
+            result.loc[session.index] = returns
+            previous_session_return = float(returns.iloc[-1])
+        else:
+            if np.isfinite(previous_session_return):
+                result.loc[session.index] = previous_session_return
+            previous_session_return = np.nan
+    return result
+
+
 def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
     d = c.diff()
     up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
@@ -113,7 +142,7 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=x.index)
 
     for n in (1, 3, 5, 10, 15, 30):
-        out[f"ret_{n}"] = c.pct_change(n)
+        out[f"ret_{n}"] = session_aware_pct_change(c, n)
 
     out["rsi14"] = rsi_series(c)
     pc = c.shift(1)
@@ -139,7 +168,10 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
         m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
         mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
         for n in (1, 3, 5, 10, 15, 30):
-            out[f"market_ret_{n}"] = mc.pct_change(n, fill_method=None)
+            market_returns = session_aware_pct_change(m["Close"], n)
+            out[f"market_ret_{n}"] = market_returns.reindex(
+                x.index, method="ffill", tolerance=pd.Timedelta(minutes=2)
+            )
         out["market_rsi14"] = rsi_series(mc)
     else:
         for n in (1, 3, 5, 10, 15, 30):
