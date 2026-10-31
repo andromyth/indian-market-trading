@@ -41,23 +41,4 @@ jobs:
       - name: Summarize preflight
         if: always()
         run: |
-          if [ -f beta_v2_intraday_preflight.json ]; then
-            python - <<'PY'
-            import json, os
-            from pathlib import Path
-            report = json.loads(Path("beta_v2_intraday_preflight.json").read_text())
-            summary = {
-                "status": report.get("status"),
-                "mode": report.get("mode"),
-                "official_symbols": (report.get("official_nse_universe") or {}).get("symbol_count"),
-                "archive_folder_coverage_pct": (report.get("history_archive") or {}).get("folder_coverage_pct"),
-                "missing_or_invalid_champion_horizons": report.get("missing_or_invalid_champion_horizons"),
-                "promotion_performed": report.get("promotion_performed"),
-            }
-            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
-                fh.write("## Beta V2 intraday preflight\n\n```json\n")
-                json.dump(summary, fh, indent=2)
-                fh.write("\n```\n")
-            print(json.dumps(summary, indent=2))
-            PY
-          fi
+          python -c 'import json, os; from pathlib import Path; r=json.loads(Path("beta_v2_intraday_preflight.json").read_text()) if Path("beta_v2_intraday_preflight.json").exists() else {}; s={"status":r.get("status"),"mode":r.get("mode"),"official_symbols":(r.get("official_nse_universe") or {}).get("symbol_count"),"archive_folder_coverage_pct":(r.get("history_archive") or {}).get("folder_coverage_pct"),"missing_or_invalid_champion_horizons":r.get("missing_or_invalid_champion_horizons"),"promotion_performed":r.get("promotion_performed")}; summary="## Beta V2 intraday preflight\n\n```json\n"+json.dumps(s,indent=2)+"\n```\n"; open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(summary); print(json.dumps(s,indent=2))'
