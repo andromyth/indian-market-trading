@@ -2,11 +2,15 @@ name: Start Cloud Run native five-minute history backfill
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/start_cloud_run_5m_backfill.yml"
+    inputs:
+      confirm_backfill:
+        description: "Explicitly authorize the resumable ALL-NSE native five-minute history backfill"
+        type: choice
+        required: true
+        default: "no"
+        options:
+          - "no"
+          - "yes"
 
 permissions:
   contents: read
@@ -17,7 +21,7 @@ concurrency:
 
 jobs:
   start-backfill:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[start-5m-backfill]')
+    if: github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -110,6 +114,8 @@ jobs:
           trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
           CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
             -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data '{"confirm":"START_NATIVE_5M_BACKFILL"}' \
             --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfill")" || CODE=000
           python - "$RESPONSE" "$CODE" <<'PY'
           import json, sys
