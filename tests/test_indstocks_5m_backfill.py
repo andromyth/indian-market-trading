@@ -121,7 +121,7 @@ def test_indstocks_batch_calls_guard_for_each_seven_day_window(monkeypatch):
     class Response:
         @staticmethod
         def json():
-            return {"success": True, "data": {}}
+            return {"success": True, "data": {"NSE_100": {"candles": []}}}
 
     monkeypatch.setattr(indstocks_client, "_request", lambda *args, **kwargs: (calls.append(args) or Response()))
     monkeypatch.setattr(backfill.time, "sleep", lambda _: None)
@@ -158,7 +158,11 @@ def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbo
 
     class Store:
         def __init__(self):
+            self.root_id = "test-root"
             self.uploads = []
+
+        def _find_child(self, parent, name, mime_type=None):
+            return None
 
         def upload_or_update(self, *args, **kwargs):
             self.uploads.append(args)
