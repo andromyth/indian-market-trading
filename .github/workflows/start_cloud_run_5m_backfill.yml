@@ -60,8 +60,19 @@ jobs:
                 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
                 --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
               if [[ "$CODE" == "200" ]]; then
+                PUBLIC_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 \
+                  --output /dev/null --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || PUBLIC_CODE=000
+                if [[ "$PUBLIC_CODE" == "200" ]]; then
+                  echo "ERROR=cloud_run_service_is_public; refusing to start backfill"
+                  exit 1
+                fi
+                if [[ "$PUBLIC_CODE" != "401" && "$PUBLIC_CODE" != "403" && "$PUBLIC_CODE" != "404" ]]; then
+                  echo "ERROR=unauthenticated_private_service_check_failed http=$PUBLIC_CODE"
+                  exit 1
+                fi
                 CALLER_IDENTITY="$SA"
                 echo "CLOUD_RUN_BACKFILL_ENDPOINT=READY"
+                echo "CLOUD_RUN_UNAUTHENTICATED_ACCESS=BLOCKED http=$PUBLIC_CODE"
                 echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_OUTPUT"
                 echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
                 echo "CALLER_IDENTITY=$CALLER_IDENTITY" >> "$GITHUB_ENV"
