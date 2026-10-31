@@ -1,0 +1,99 @@
+name: Start Cloud Run native five-minute history backfill
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/start_cloud_run_5m_backfill.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: start-cloud-run-native-5m-backfill
+  cancel-in-progress: false
+
+jobs:
+  start-backfill:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[start-5m-backfill]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+      INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Wait for the deployed private backfill endpoint
+        id: endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_service_url_missing"; exit 1; }
+          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$INVOKER" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          [[ -n "$TOKEN" ]] || { echo "ERROR=invoker_identity_token_unavailable"; exit 1; }
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          for attempt in $(seq 1 60); do
+            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
+            if [[ "$CODE" == "200" ]]; then
+              echo "CLOUD_RUN_BACKFILL_ENDPOINT=READY"
+              echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+              echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
+              echo "INVOKER_TOKEN_READY=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Waiting for deployed endpoint attempt=$attempt/60 http=$CODE"
+            sleep 30
+          done
+          echo "ERROR=backfill_endpoint_not_ready_after_30_minutes"
+          exit 1
+
+      - name: Start resumable backfill using Cloud Run's existing TOTP cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$INVOKER" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          [[ -n "$TOKEN" ]] || { echo "ERROR=invoker_identity_token_unavailable"; exit 1; }
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+            -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfill")" || CODE=000
+          python - "$RESPONSE" "$CODE" <<'PY'
+          import json, sys
+          path, code = sys.argv[1:]
+          try:
+              body = json.load(open(path, encoding="utf-8"))
+          except Exception:
+              raise SystemExit("BACKFILL_START_RESPONSE_INVALID_JSON http=" + code)
+          print("BACKFILL_START_RESULT=" + json.dumps({
+              "http_status": code,
+              "status": body.get("status"),
+              "status_endpoint": body.get("status_endpoint"),
+              "note": body.get("note"),
+          }, sort_keys=True))
+          if code == "202" and body.get("status") == "BACKFILL_STARTED":
+              raise SystemExit(0)
+          if code == "409" and body.get("status") == "BACKFILL_ALREADY_RUNNING":
+              state = body.get("five_minute_backfill") or {}
+              if state.get("status") in {"RUNNING", "PAUSED_FOR_LIVE_MARKET"}:
+                  raise SystemExit(0)
+          raise SystemExit("BACKFILL_START_FAILED http=" + code + " status=" + str(body.get("status")))
+          PY
