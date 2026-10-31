@@ -26,7 +26,7 @@ from autonomous_intraday_worker import (
     is_all_nse_capture_slot,
 )
 from all_nse_minute_prediction_capture import AllNSEMinutePredictor
-from market_session_guard import IST
+from market_session_guard import IST, is_nse_trading_day
 
 PORT = int(os.getenv("PORT", "8080"))
 WORKER_ROOT = Path(os.getenv("AUTONOMOUS_INTRADAY_ROOT", "/tmp/autonomous_intraday"))
@@ -43,6 +43,15 @@ STATE: dict[str, Any] = {
     "last_error": None,
     "drive_preflight_status": "NOT_CHECKED",
     "drive_preflight": {"reason": "Drive startup preflight is pending."},
+    "five_minute_backfill": {
+        "status": "IDLE",
+        "started_at_utc": None,
+        "updated_at_utc": None,
+        "finished_at_utc": None,
+        "progress": {},
+        "error": None,
+        "exit_code": None,
+    },
 }
 
 WORKER = AutonomousIntradayWorker(
@@ -56,6 +65,81 @@ WORKER = AutonomousIntradayWorker(
 
 # Separate pooled ALL-NSE inference path; the existing news watchlist remains unchanged.
 ALL_NSE_MINUTE_PREDICTOR = AllNSEMinutePredictor(WORKER_ROOT)
+BACKFILL_START_LOCK = threading.Lock()
+BACKFILL_THREAD: threading.Thread | None = None
+
+
+def _update_backfill_status(**fields: Any) -> None:
+    with STATE_LOCK:
+        current = dict(STATE.get("five_minute_backfill") or {})
+        current.update(fields)
+        current["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        STATE["five_minute_backfill"] = current
+
+
+def _backfill_progress(progress: dict[str, Any]) -> None:
+    _update_backfill_status(progress=progress, status="RUNNING")
+    _log("indstocks_5m_backfill_progress", **progress)
+
+
+def _wait_until_market_closed() -> None:
+    """Yield historical API requests during NSE live hours so snapshots stay first."""
+    announced = False
+    while True:
+        now = datetime.now(IST)
+        market_open = is_nse_trading_day(now.date()) and (
+            now.hour > 9 or (now.hour == 9 and now.minute >= 15)
+        ) and (now.hour < 15 or (now.hour == 15 and now.minute < 30))
+        if not market_open:
+            if announced:
+                _log("indstocks_5m_backfill_resumed_after_market")
+            return
+        if not announced:
+            _log("indstocks_5m_backfill_paused_for_live_market")
+            _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET")
+            announced = True
+        time.sleep(30)
+
+
+def _run_five_minute_backfill() -> None:
+    """Run in this process to share INDstocks TOTP token cache with live capture."""
+    _update_backfill_status(
+        status="RUNNING",
+        started_at_utc=datetime.now(timezone.utc).isoformat(),
+        finished_at_utc=None,
+        progress={},
+        error=None,
+        exit_code=None,
+    )
+    try:
+        import indstocks_backfill_all_nse_5m_history as backfill
+        from indstocks_client import configured
+        if not configured():
+            raise RuntimeError("INDstocks read-only credentials are not configured in Cloud Run.")
+        backfill.REQUEST_GUARD = _wait_until_market_closed
+        backfill.BACKFILL_PROGRESS_CALLBACK = _backfill_progress
+        exit_code = backfill.main([])
+        _update_backfill_status(
+            status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS",
+            exit_code=exit_code,
+            finished_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        _log("indstocks_5m_backfill_finished", status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS", exit_code=exit_code)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+        _update_backfill_status(
+            status="FAILED",
+            error=detail,
+            finished_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        _log("indstocks_5m_backfill_failed", error=detail)
+    finally:
+        try:
+            import indstocks_backfill_all_nse_5m_history as backfill
+            backfill.REQUEST_GUARD = None
+            backfill.BACKFILL_PROGRESS_CALLBACK = None
+        except Exception:
+            pass
 
 
 def _prepare_all_nse_history_before_capture(
@@ -529,6 +613,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path.rstrip("/") == "/backfillz":
+            with STATE_LOCK:
+                backfill = dict(STATE.get("five_minute_backfill") or {})
+            self._send_json(200, {"status": backfill.get("status", "IDLE"), "five_minute_backfill": backfill})
+            return
         if self.path == "/modelz":
             code, payload = _model_bundle_diagnostic()
             self._send_json(code, payload)
@@ -574,7 +663,43 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self._send_json(503 if payload["status"] == "degraded" else 200, payload)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/tick":
+        global BACKFILL_THREAD
+        route = self.path.rstrip("/")
+        if route == "/backfill":
+            if not BACKFILL_START_LOCK.acquire(blocking=False):
+                self._send_json(409, {"status": "BACKFILL_START_IN_PROGRESS"})
+                return
+            try:
+                with STATE_LOCK:
+                    backfill_status = str((STATE.get("five_minute_backfill") or {}).get("status") or "IDLE")
+                if backfill_status in {"RUNNING", "PAUSED_FOR_LIVE_MARKET"} or (
+                    BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
+                ):
+                    self._send_json(409, {"status": "BACKFILL_ALREADY_RUNNING", "five_minute_backfill": STATE.get("five_minute_backfill")})
+                    return
+                preflight = _preflight()
+                if not preflight.get("ready"):
+                    self._send_json(503, {"status": "DRIVE_PREFLIGHT_FAILED", "reason": preflight.get("reason")})
+                    return
+                from indstocks_client import configured
+                if not configured():
+                    self._send_json(503, {"status": "INDSTOCKS_CREDENTIALS_NOT_CONFIGURED"})
+                    return
+                BACKFILL_THREAD = threading.Thread(
+                    target=_run_five_minute_backfill,
+                    name="indstocks-native-5m-backfill",
+                    daemon=True,
+                )
+                BACKFILL_THREAD.start()
+                self._send_json(202, {
+                    "status": "BACKFILL_STARTED",
+                    "status_endpoint": "/backfillz",
+                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; yields API requests during live NSE hours.",
+                })
+                return
+            finally:
+                BACKFILL_START_LOCK.release()
+        if route != "/tick":
             self.send_error(404)
             return
         # Cloud Run concurrency is set to one. This lock is a second guard
@@ -789,6 +914,8 @@ def main() -> None:
         port=PORT,
         worker_root=str(WORKER_ROOT),
         tick_endpoint="/tick",
+        backfill_endpoint="/backfill",
+        backfill_status_endpoint="/backfillz",
         health_endpoint="/healthz",
         startup_gate="Drive preflight runs asynchronously; /tick is blocked until Drive is write-ready.",
         note="Cloud Scheduler calls /tick; service is private and must not be made public.",
