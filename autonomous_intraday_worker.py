@@ -64,7 +64,11 @@ def _log(event: str, **fields: Any) -> None:
         "logged_at_utc": datetime.now(timezone.utc).isoformat(),
         **fields,
     }
-    print("[AUTONOMOUS_INTRADAY] " + json.dumps(_clean_json(payload), sort_keys=True), flush=True)
+    try:
+        print("[AUTONOMOUS_INTRADAY] " + json.dumps(_clean_json(payload), sort_keys=True), flush=True)
+    except BrokenPipeError:
+        # A closed logging pipe must not terminate the long-running backfill.
+        pass
 
 
 def _download_drive_file_if_present(store: Any, remote_path: str, local_path: Path) -> bool:

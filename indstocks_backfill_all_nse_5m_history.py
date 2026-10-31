@@ -128,6 +128,7 @@ def fetch_indstocks_5m_batch(
     *,
     pause_seconds: float = 1.0,
     request_guard: Any = None,
+    progress_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch a maximum of five stocks at once over consecutive seven-day windows."""
     if not symbols_and_codes:
@@ -205,6 +206,14 @@ def fetch_indstocks_5m_batch(
                 accumulated[symbol].append(part)
         calls += 1
         cursor = window_end
+        if callable(BACKFILL_PROGRESS_CALLBACK):
+            BACKFILL_PROGRESS_CALLBACK({
+                "provider": "INDSTOCKS",
+                **(progress_context or {}),
+                "stage": "FETCHING_HISTORY",
+                "api_calls_in_batch": calls,
+                "window_end": window_end.isoformat(),
+            })
 
     result: dict[str, pd.DataFrame] = {}
     for symbol, parts in accumulated.items():
@@ -320,12 +329,22 @@ def main(argv: list[str] | None = None) -> int:
             fetched_by_symbol, calls = fetch_indstocks_5m_batch(
                 batch, batch_start, end, pause_seconds=args.pause_seconds,
                 request_guard=REQUEST_GUARD,
+                progress_context={
+                    "batch": batch_no,
+                    "total_batches": len(batches),
+                    "completed_symbols": (batch_no - 1) * MAX_CODES_PER_REQUEST,
+                    "resolved_symbols": len(resolvable),
+                    "api_calls": total_api_calls,
+                },
             )
             total_api_calls += calls
         except Exception as exc:
             detail = f"{type(exc).__name__}: {str(exc)[:300]}"
             results.extend({"symbol": symbol, "status": "ERROR", "error": detail} for symbol, _ in batch)
-            print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in batch]} error={detail}", flush=True)
+            try:
+                print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in batch]} error={detail}", flush=True)
+            except BrokenPipeError:
+                pass
             continue
 
         for symbol, _ in batch:
@@ -379,7 +398,10 @@ def main(argv: list[str] | None = None) -> int:
             "resolved_symbols": len(resolvable),
             "api_calls": total_api_calls,
         }
-        print("BACKFILL_PROGRESS " + json.dumps(progress, sort_keys=True), flush=True)
+        try:
+            print("BACKFILL_PROGRESS " + json.dumps(progress, sort_keys=True), flush=True)
+        except BrokenPipeError:
+            pass
         if callable(BACKFILL_PROGRESS_CALLBACK):
             BACKFILL_PROGRESS_CALLBACK(progress)
 
@@ -433,16 +455,19 @@ def main(argv: list[str] | None = None) -> int:
         "production_model_changed": False,
     }
     _write_manifest(store, local_root, report)
-    print("BACKFILL_MANIFEST=" + json.dumps({
-        key: report.get(key)
-        for key in (
-            "overall_status", "official_symbols_requested", "symbols_resolved",
-            "symbols_with_200_plus_sessions_and_fresh_data",
-            "required_symbols_with_200_plus_sessions_and_fresh_data",
-            "symbols_with_data_after_2026_09_24", "latest_archive_timestamp_ist",
-            "api_calls", "manifest_drive_path",
-        )
-    }, sort_keys=True))
+    try:
+        print("BACKFILL_MANIFEST=" + json.dumps({
+            key: report.get(key)
+            for key in (
+                "overall_status", "official_symbols_requested", "symbols_resolved",
+                "symbols_with_200_plus_sessions_and_fresh_data",
+                "required_symbols_with_200_plus_sessions_and_fresh_data",
+                "symbols_with_data_after_2026_09_24", "latest_archive_timestamp_ist",
+                "api_calls", "manifest_drive_path",
+            )
+        }, sort_keys=True))
+    except BrokenPipeError:
+        pass
     return 0 if report["overall_status"] == "PASS" else 2
 
 
