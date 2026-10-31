@@ -157,7 +157,6 @@ def main() -> int:
             inv = parquet_inventory(store, symbol_folders[sym]["id"])
             report["history_archive"]["per_symbol_file_inventory"][sym] = inv
 
-    beta_folder = resolve_folder(store, BETA_ROOT)
     for horizon in HORIZONS:
         entry = {
             "registry_path": f"{BETA_ROOT}/models/h{horizon}/registry.json",
@@ -207,7 +206,7 @@ def main() -> int:
         and listing_errors == 0
     )
     report["status"] = (
-        "PREFLIGHT_INVENTORY_PASS"
+        "INVENTORY_COMPLETE_REQUIRES_SESSION_VALIDATION"
         if history_complete and not missing_champions
         else "NEEDS_ATTENTION"
     )
