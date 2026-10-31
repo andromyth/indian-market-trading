@@ -652,8 +652,10 @@ def main():
         if usable_sessions < args.min_usable_sessions:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_SESSIONS"))
             continue
-        retained_dates = {str(day) for day in usable_dates[-args.max_sessions:]}
+        retained_date_list = usable_dates[-args.max_sessions:]
+        retained_dates = {str(day) for day in retained_date_list}
         raw = raw.loc[pd.Index(raw.index.date).astype(str).isin(retained_dates)]
+        usable_sessions = len(retained_date_list)
         if len(raw) < args.min_rows_symbol:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_ROWS"))
             continue
