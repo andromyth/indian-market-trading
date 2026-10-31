@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Train the ALL-NSE 30-minute model on completed 5-minute OHLCV bars.
+"""Train the ALL-NSE 30-minute model using native completed five-minute OHLCV only.
 
-Historical minute-candle archives are resampled to complete five-minute bars
-before feature/label creation. Live inference uses the same five-minute bar
-contract. No orders are placed.
+Training and live inference share the same five-minute bar contract. Legacy
+one-minute archives are deliberately excluded. No orders are placed.
 """
 from __future__ import annotations
 
@@ -330,14 +329,8 @@ def load_symbol_5m(
     sym: str,
     live_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Merge legacy one-minute history, native 5m history and live 5m bars."""
+    """Merge only native five-minute history and completed live five-minute bars."""
     parts = []
-    minute_history = load_symbol(root, sym)
-    if minute_history is not None and not minute_history.empty:
-        aggregated = resample_completed_5m_bars(minute_history)
-        if not aggregated.empty:
-            parts.append(aggregated)
-
     native_dir = root / NATIVE_5M_SEED_REL / f"symbol={sym}"
     if native_dir.exists():
         for path in sorted(native_dir.rglob("*.parquet")):
@@ -356,14 +349,8 @@ def load_symbol_5m(
 
 
 def load_market_5m(root: Path, live_frame: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Return NIFTY context on the same close-timestamped five-minute cadence."""
-    legacy = load_market(root)
+    """Return NIFTY context from native five-minute history and live five-minute bars."""
     parts = []
-    if legacy is not None and not legacy.empty:
-        aggregated = resample_completed_5m_bars(legacy)
-        if not aggregated.empty:
-            parts.append(aggregated)
-
     native_dir = root / NATIVE_5M_SEED_REL / "symbol=__NIFTY50__"
     if native_dir.exists():
         for path in sorted(native_dir.rglob("*.parquet")):
@@ -371,8 +358,8 @@ def load_market_5m(root: Path, live_frame: pd.DataFrame | None = None) -> pd.Dat
                 bars = _close_labeled_5m(pd.read_parquet(path))
                 if not bars.empty:
                     parts.append(bars)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"NATIVE_5M_MARKET_ARCHIVE_READ_ERROR path={path} error={type(exc).__name__}:{exc}", flush=True)
 
     if live_frame is not None and not live_frame.empty:
         bars = _close_labeled_5m(live_frame)
@@ -484,8 +471,7 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
 def sample_decisions(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if frame.empty or minutes <= 1:
         return frame
-    # Use the last available observation in each clock bucket, which preserves
-    # minute-scale features while limiting the training matrix size.
+    # Use the last completed five-minute observation in each clock bucket.
     bucket = frame.index.floor(f"{int(minutes)}min")
     return frame.groupby(bucket, sort=True).tail(1)
 
@@ -530,9 +516,9 @@ def main():
     if not universe:
         raise RuntimeError("Intraday training universe is empty")
 
-    seed_root = root / SEED_REL
-    if not seed_root.exists() and not (root / NATIVE_5M_SEED_REL).exists():
-        raise RuntimeError("No historical minute or native five-minute seed archive is available.")
+    native_seed_root = root / NATIVE_5M_SEED_REL
+    if not native_seed_root.exists():
+        raise RuntimeError("Native five-minute historical seed archive is missing; legacy one-minute data is not accepted.")
 
     live_history = load_live_history(root)
     market = load_market_5m(root, live_history.get("__NIFTY50__"))
@@ -705,15 +691,12 @@ def main():
         "regressor_sha256": "",
         "no_auto_orders": True,
         "training_data_sources": [
-            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS",
-            "NSE_OFFICIAL_INTRADAY_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS_WHEN_AVAILABLE",
             "DHAN_NSE_EQUITY_NATIVE_5M_HISTORICAL_ARCHIVE",
-            "ACTIVE_WORKER_NATIVE_5M_LIVE_ARCHIVE",
-            "NSE_OFFICIAL_NIFTY50_CONTEXT",
+            "INDSTOCKS_NATIVE_5M_LIVE_ARCHIVE_WITH_SOURCE_LABELS",
+            "NSE_OFFICIAL_NIFTY50_NATIVE_5M_CONTEXT_WHEN_AVAILABLE",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
-        "historical_seed_source_url": "https://github.com/olo-labs/olo-testdata-nse-min-candle",
-        "live_incremental_source": "NSE_OFFICIAL_CHART",
+        "live_incremental_source": "INDSTOCKS_HISTORICAL_5M",
         "point_in_time_fno": True,
         "volume_policy": "Use source-reported volume only; missing volume stays NaN.",
     }
