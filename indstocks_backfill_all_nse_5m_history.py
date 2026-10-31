@@ -9,6 +9,7 @@ stock directly to the same Drive archive used by the DhanHQ backfill.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import time
@@ -26,6 +27,7 @@ from dhan_backfill_all_nse_5m_history import (
     MIN_SESSION_BARS,
     REMOTE_ROOT,
     _download_existing,
+    _resolve_remote_file,
     choose_backfill_start,
     retain_latest_sessions,
     usable_session_summary,
@@ -143,6 +145,7 @@ def fetch_indstocks_5m_batch(
     from indstocks_client import _request
 
     symbols_by_code = {code: symbol for symbol, code in symbols_and_codes}
+    batch_key = hashlib.sha1("|".join(sorted(symbols_by_code.values())).encode()).hexdigest()[:16]
     accumulated: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol, _ in symbols_and_codes}
     cursor = start
     calls = 0
@@ -150,17 +153,33 @@ def fetch_indstocks_5m_batch(
     while cursor < end:
         window_end = min(end, cursor + timedelta(days=MAX_DAYS_PER_REQUEST))
         window_key = f"{cursor:%Y%m%dT%H%M}_{window_end:%Y%m%dT%H%M}"
-        pending_codes = dict(symbols_by_code)
-        if store is not None and checkpoint_root is not None:
-            for code, symbol in list(pending_codes.items()):
-                checkpoint_remote = f"{REMOTE_ROOT}/symbol={symbol}/checkpoints/{window_key}.parquet"
-                checkpoint_local = checkpoint_root / f"symbol={symbol}" / f"{window_key}.parquet"
-                saved = _download_existing(store, checkpoint_remote, checkpoint_local)
-                if not saved.empty:
-                    accumulated[symbol].append(saved)
-                    pending_codes.pop(code, None)
-        if not pending_codes:
+        checkpoint_remote = f"{REMOTE_ROOT}/window_checkpoints/{batch_key}/{window_key}.parquet"
+        checkpoint_local = (checkpoint_root or Path("/tmp/nse_5m_checkpoints")) / batch_key / f"{window_key}.parquet"
+        checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if store is not None and checkpoint_root is not None else None
+        if checkpoint_item:
+            from googleapiclient.http import MediaIoBaseDownload
+            checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+            request = store.service.files().get_media(fileId=checkpoint_item["id"])
+            with checkpoint_local.open("wb") as output:
+                downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            saved_window = pd.read_parquet(checkpoint_local)
+            if not saved_window.empty and "Symbol" in saved_window.columns:
+                saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
+                saved_window.index = saved_window.index.tz_localize(IST) if saved_window.index.tz is None else saved_window.index.tz_convert(IST)
+                for symbol in symbols_by_code.values():
+                    part = saved_window.loc[saved_window["Symbol"].eq(symbol), OHLCV]
+                    if not part.empty:
+                        accumulated[symbol].append(part)
             cursor = window_end
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS", **(progress_context or {}),
+                    "stage": "RESUMED_CHECKPOINT", "window_end": window_end.isoformat(),
+                    "api_calls_in_batch": calls,
+                })
             continue
         if request_guard is not None:
             request_guard()
@@ -193,7 +212,8 @@ def fetch_indstocks_5m_batch(
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")
         data = body.get("data") or {}
-        for code, symbol in pending_codes.items():
+        window_frames: list[pd.DataFrame] = []
+        for code, symbol in symbols_by_code.items():
             instrument = data.get(code) or {}
             candles = instrument.get("candles") or []
             if not candles:
@@ -217,18 +237,19 @@ def fetch_indstocks_5m_batch(
                 },
                 index=pd.DatetimeIndex(index, name="Datetime"),
             )
-            if not part.empty:
-                normalized_part = normalize_indstocks_5m(part)
-                if not normalized_part.empty:
-                    accumulated[symbol].append(normalized_part)
-                    if store is not None and checkpoint_root is not None:
-                        checkpoint_local = checkpoint_root / f"symbol={symbol}" / f"{window_key}.parquet"
-                        checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-                        normalized_part.to_parquet(checkpoint_local, index=True, compression="zstd")
-                        checkpoint_remote = f"{REMOTE_ROOT}/symbol={symbol}/checkpoints/{window_key}.parquet"
-                        uploaded = store.upload_or_update(checkpoint_local, checkpoint_remote, mime_type="application/vnd.apache.parquet")
-                        if str(uploaded.get("status") or "").upper() != "OK":
-                            raise RuntimeError(f"Drive checkpoint write failed for {symbol} window {window_key}: {uploaded}")
+            normalized_part = normalize_indstocks_5m(part)
+            if not normalized_part.empty:
+                accumulated[symbol].append(normalized_part)
+                tagged = normalized_part.copy()
+                tagged.insert(0, "Symbol", symbol)
+                window_frames.append(tagged)
+        if store is not None and checkpoint_root is not None:
+            checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+            window_data = pd.concat(window_frames).sort_index() if window_frames else pd.DataFrame(columns=["Symbol", *OHLCV], index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
+            window_data.to_parquet(checkpoint_local, index=True, compression="zstd")
+            uploaded = store.upload_or_update(checkpoint_local, checkpoint_remote, mime_type="application/vnd.apache.parquet")
+            if str(uploaded.get("status") or "").upper() != "OK":
+                raise RuntimeError(f"Drive checkpoint write failed for window {window_key}: {uploaded}")
         calls += 1
         cursor = window_end
         if callable(BACKFILL_PROGRESS_CALLBACK):
