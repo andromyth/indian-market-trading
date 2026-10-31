@@ -1,0 +1,39 @@
+name: Cloud Run backfill trigger safety tests
+
+on:
+  pull_request:
+    paths:
+      - "autonomous_intraday_worker_service.py"
+      - "tests/test_autonomous_intraday_backfill_trigger.py"
+      - ".github/workflows/start_cloud_run_5m_backfill.yml"
+      - ".github/workflows/backfill-trigger-safety-ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "autonomous_intraday_worker_service.py"
+      - "tests/test_autonomous_intraday_backfill_trigger.py"
+      - ".github/workflows/start_cloud_run_5m_backfill.yml"
+      - ".github/workflows/backfill-trigger-safety-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backfill-trigger-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Compile Cloud Run worker service
+        run: python -m py_compile autonomous_intraday_worker_service.py
+      - name: Test controlled backfill trigger
+        run: python -m pytest -q tests/test_autonomous_intraday_backfill_trigger.py
