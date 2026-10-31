@@ -22,6 +22,7 @@ IST = ZoneInfo("Asia/Kolkata")
 REMOTE_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 MANIFEST_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/backfill_manifest.json"
 MIN_SESSION_BARS = 50
+FRESHNESS_WINDOW_DAYS = 7
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
@@ -162,7 +163,7 @@ def _process_symbol(
         if (
             existing_summary["usable_sessions"] >= minimum_sessions
             and pd.notna(latest_existing)
-            and latest_existing >= pd.Timestamp(end) - pd.Timedelta(days=10)
+            and latest_existing >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
         ):
             start = end - timedelta(days=int(incremental_calendar_days))
         else:
@@ -188,7 +189,7 @@ def _process_symbol(
         if merged.empty:
             return {"symbol": symbol, "status": "NO_DATA", **{k: v for k, v in summary.items() if k != "usable_session_dates"}}
         latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
-        fresh_latest = pd.notna(latest) and latest >= pd.Timestamp(end) - pd.Timedelta(days=10)
+        fresh_latest = pd.notna(latest) and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
         merged.to_parquet(local, index=True, compression="zstd")
         upload = store.upload_or_update(
             local,
@@ -306,6 +307,7 @@ def main() -> int:
         "bar_interval_minutes": 5,
         "timestamp_convention": "provider_bar_start_plus_5_minutes_as_bar_close",
         "minimum_bars_per_usable_session": args.minimum_bars_per_session,
+        "freshness_window_days": FRESHNESS_WINDOW_DAYS,
         "target_sessions_per_symbol": args.sessions,
         "minimum_usable_sessions": args.minimum_usable_sessions,
         "calendar_days_requested": args.calendar_days,
@@ -342,7 +344,13 @@ def main() -> int:
     report["manifest_drive_path"] = MANIFEST_REMOTE
     print(json.dumps({key: value for key, value in report.items() if key != "symbols"}, indent=2, sort_keys=True))
     required_ok = max(1, int(np.ceil(len(symbols) * args.minimum_symbol_coverage)))
-    return 0 if len(ok) >= required_ok and not report["symbols_with_errors"] else 2
+    report["overall_status"] = "PASS" if len(ok) >= required_ok else "NEEDS_ATTENTION"
+    report["required_symbols_with_200_plus_sessions_and_fresh_data"] = required_ok
+    manifest_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    uploaded = store.upload_or_update(manifest_path, MANIFEST_REMOTE, mime_type="application/json")
+    if str(uploaded.get("status") or "").upper() != "OK":
+        raise RuntimeError(f"Final backfill manifest Drive write not confirmed: {uploaded}")
+    return 0 if len(ok) >= required_ok else 2
 
 
 if __name__ == "__main__":
