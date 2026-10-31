@@ -412,10 +412,9 @@ def main(argv: list[str] | None = None) -> int:
         for symbol, _ in active_batch:
             existing = existing_by_symbol[symbol]
             fetched = fetched_by_symbol.get(symbol, pd.DataFrame())
-            fetched = normalize_indstocks_5m(
-                fetched,
-                cutoff=pd.Timestamp.now(tz=IST).floor("5min"),
-            )
+            if not fetched.empty:
+                cutoff = pd.Timestamp.now(tz=IST).floor("5min")
+                fetched = fetched.loc[fetched.index <= cutoff].sort_index()
             parts = [frame for frame in (existing, fetched) if frame is not None and not frame.empty]
             merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
             merged = merged.loc[~merged.index.duplicated(keep="last")]
