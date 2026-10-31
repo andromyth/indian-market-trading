@@ -308,12 +308,33 @@ def main(argv: list[str] | None = None) -> int:
             REQUEST_GUARD()
         existing_by_symbol: dict[str, pd.DataFrame] = {}
         starts: dict[str, datetime] = {}
-        for symbol, _ in batch:
+        active_batch: list[tuple[str, str]] = []
+        for symbol, code in batch:
             remote = f"{REMOTE_ROOT}/symbol={symbol}/{symbol}.parquet"
             local = local_root / f"symbol={symbol}" / f"{symbol}.existing.parquet"
             existing = _download_existing(store, remote, local)
             existing_by_symbol[symbol] = existing
             summary = usable_session_summary(existing, args.minimum_bars_per_session)
+            latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
+            is_complete = (
+                int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
+                and pd.notna(latest)
+                and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
+            )
+            if is_complete:
+                results.append({
+                    "symbol": symbol,
+                    "status": "SKIPPED_EXISTING",
+                    "source": "INDSTOCKS_HISTORICAL_5M",
+                    "remote_path": remote,
+                    "rows": int(len(existing)),
+                    "usable_sessions": int(summary["usable_sessions"]),
+                    "last_timestamp_ist": summary["last_timestamp_ist"],
+                    "fresh_latest_data": True,
+                    "reason": "Existing Drive Parquet meets history and freshness requirements.",
+                })
+                continue
+            active_batch.append((symbol, code))
             starts[symbol] = choose_backfill_start(
                 summary,
                 end,
@@ -322,12 +343,26 @@ def main(argv: list[str] | None = None) -> int:
                 args.sessions,
             )
 
-        # Batch ranges must be common per request. Fetch the earliest start needed
-        # by any stock in this five-symbol group, then deduplicate against Drive.
+        # Do not spend provider calls on symbols already complete in Drive.
+        if not active_batch:
+            progress = {
+                "provider": "INDSTOCKS",
+                "batch": batch_no,
+                "total_batches": len(batches),
+                "completed_symbols": min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable)),
+                "resolved_symbols": len(resolvable),
+                "api_calls": total_api_calls,
+                "skipped_existing_symbols": sum(row.get("status") == "SKIPPED_EXISTING" for row in results),
+            }
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK(progress)
+            continue
+
+        # Batch ranges must be common per request, then deduplicate against Drive.
         batch_start = min(starts.values())
         try:
             fetched_by_symbol, calls = fetch_indstocks_5m_batch(
-                batch, batch_start, end, pause_seconds=args.pause_seconds,
+                active_batch, batch_start, end, pause_seconds=args.pause_seconds,
                 request_guard=REQUEST_GUARD,
                 progress_context={
                     "batch": batch_no,
@@ -340,14 +375,14 @@ def main(argv: list[str] | None = None) -> int:
             total_api_calls += calls
         except Exception as exc:
             detail = f"{type(exc).__name__}: {str(exc)[:300]}"
-            results.extend({"symbol": symbol, "status": "ERROR", "error": detail} for symbol, _ in batch)
+            results.extend({"symbol": symbol, "status": "ERROR", "error": detail} for symbol, _ in active_batch)
             try:
-                print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in batch]} error={detail}", flush=True)
+                print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in active_batch]} error={detail}", flush=True)
             except BrokenPipeError:
                 pass
             continue
 
-        for symbol, _ in batch:
+        for symbol, _ in active_batch:
             existing = existing_by_symbol[symbol]
             fetched = fetched_by_symbol.get(symbol, pd.DataFrame())
             fetched = normalize_indstocks_5m(
@@ -406,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             BACKFILL_PROGRESS_CALLBACK(progress)
 
     results.sort(key=lambda row: row["symbol"])
-    ready = [row for row in results if row.get("status") == "OK"]
+    ready = [row for row in results if row.get("status") in {"OK", "SKIPPED_EXISTING"} and row.get("fresh_latest_data") is True]
     with_200 = [row for row in results if int(row.get("usable_sessions") or 0) >= args.minimum_usable_sessions]
     required = max(1, int(math.ceil(len(symbols) * args.minimum_symbol_coverage)))
     report = {
