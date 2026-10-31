@@ -295,6 +295,8 @@ def main(argv: list[str] | None = None) -> int:
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
 
     for batch_no, batch in enumerate(batches, start=1):
+        if callable(REQUEST_GUARD):
+            REQUEST_GUARD()
         existing_by_symbol: dict[str, pd.DataFrame] = {}
         starts: dict[str, datetime] = {}
         for symbol, _ in batch:
