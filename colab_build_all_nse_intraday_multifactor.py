@@ -29,6 +29,7 @@ PERSISTENT_INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
 NATIVE_5M_SEED_REL = Path("production_data/nse_official/intraday_seed/olo_5m_archive/symbols")
 LIVE_5M_REL = Path("production_data/nse_official/intraday_5m_live")
+LIVE_5M_LOOKBACK_DAYS = 90
 MIN_SESSION_BARS = 50
 
 
@@ -229,14 +230,26 @@ def _close_labeled_5m(frame: pd.DataFrame) -> pd.DataFrame:
     return x.loc[mask, ["Open", "High", "Low", "Close", "Volume"]].copy()
 
 
-def load_live_history(root: Path) -> dict[str, pd.DataFrame]:
-    """Read slot files from the active worker's durable five-minute archive once."""
+def load_live_history(
+    root: Path,
+    now: pd.Timestamp | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Read recent worker slots; older history comes from the rolling 500-session seed."""
     archive = root / LIVE_5M_REL
     grouped: dict[str, list[pd.DataFrame]] = {}
     if not archive.exists():
         return {}
+    current = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    current = current.tz_localize(IST) if current.tzinfo is None else current.tz_convert(IST)
+    cutoff_date = (current - pd.Timedelta(days=LIVE_5M_LOOKBACK_DAYS)).date()
     for path in sorted(archive.rglob("*.parquet")):
         try:
+            date_parts = path.relative_to(archive).parts
+            slot_date = pd.Timestamp(
+                f"{date_parts[0]}-{date_parts[1]}-{date_parts[2]}"
+            ).date()
+            if slot_date < cutoff_date:
+                continue
             frame = pd.read_parquet(path)
             if frame is None or frame.empty or "symbol" not in frame.columns:
                 continue
