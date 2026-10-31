@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import json
 
 import pandas as pd
 
@@ -101,6 +102,25 @@ def main() -> int:
 
     complete_symbols: list[str] = []
     blocked_reasons: dict[str, int] = {}
+    gate_reason_counts: dict[str, int] = {}
+    readiness_value_counts: dict[str, dict[str, int]] = {}
+    for flag in (*CORE_READY_FLAGS, *KNOWN_STATE_FLAGS):
+        values = pd.to_numeric(pit[flag], errors="coerce")
+        readiness_value_counts[flag] = {
+            "ready_1": int(values.eq(1).sum()),
+            "known_0": int(values.eq(0).sum()),
+            "unknown": int(values.isna().sum()),
+        }
+    if "production_data_quality_gate_reasons" in pit.columns:
+        for raw in pit["production_data_quality_gate_reasons"].dropna():
+            try:
+                reasons = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                reasons = ["INVALID_QUALITY_GATE_REASON_JSON"]
+            if isinstance(reasons, list):
+                for reason in reasons:
+                    key = str(reason)
+                    gate_reason_counts[key] = gate_reason_counts.get(key, 0) + 1
     for symbol in sorted(universe):
         if symbol not in indexed.index:
             blocked_reasons["NO_PIT_ROW"] = blocked_reasons.get("NO_PIT_ROW", 0) + 1
@@ -139,6 +159,9 @@ def main() -> int:
         "complete_symbol_coverage_pct": complete_pct,
         "required_complete_symbol_coverage_pct": MIN_COMPLETE_SYMBOL_COVERAGE_PCT,
         "blocked_reason_counts": blocked_reasons,
+        "quality_gate_reason_counts": gate_reason_counts,
+        "readiness_flag_value_counts": readiness_value_counts,
+        "missing_pit_symbol_sample": sorted(universe - pit_symbols)[:30],
         "prediction_rows_written": 0,
         "drive_writes": 0,
     }
