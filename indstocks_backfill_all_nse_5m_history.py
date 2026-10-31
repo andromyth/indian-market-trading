@@ -272,15 +272,13 @@ def main() -> int:
             existing = _download_existing(store, remote, local)
             existing_by_symbol[symbol] = existing
             summary = usable_session_summary(existing, args.minimum_bars_per_session)
-            latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
-            if (
-                summary["usable_sessions"] >= args.minimum_usable_sessions
-                and pd.notna(latest)
-                and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
-            ):
-                starts[symbol] = end - timedelta(days=args.calendar_days)
-            else:
-                starts[symbol] = initial_start
+            starts[symbol] = choose_backfill_start(
+                summary,
+                end,
+                initial_start,
+                args.calendar_days,
+                args.sessions,
+            )
 
         # Batch ranges must be common per request. Fetch the earliest start needed
         # by any stock in this five-symbol group, then deduplicate against Drive.
