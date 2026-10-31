@@ -90,6 +90,24 @@ def usable_session_summary(frame: pd.DataFrame, minimum_bars: int = MIN_SESSION_
     }
 
 
+def choose_backfill_start(
+    summary: dict[str, Any],
+    end: datetime,
+    initial_start: datetime,
+    incremental_calendar_days: int,
+    target_sessions: int,
+) -> datetime:
+    """Use incremental catch-up only after the requested session target is full."""
+    latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
+    if (
+        int(summary.get("usable_sessions") or 0) >= int(target_sessions)
+        and pd.notna(latest)
+        and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
+    ):
+        return end - timedelta(days=int(incremental_calendar_days))
+    return initial_start
+
+
 def retain_latest_sessions(frame: pd.DataFrame, maximum_sessions: int = 500, minimum_bars: int = MIN_SESSION_BARS) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
@@ -177,17 +195,13 @@ def _process_symbol(
     try:
         existing = _download_existing(store, remote, local.with_name(f"{symbol}.existing.parquet"))
         existing_summary = usable_session_summary(existing, minimum_bars)
-        latest_existing = pd.to_datetime(
-            existing_summary.get("last_timestamp_ist"), errors="coerce"
+        start = choose_backfill_start(
+            existing_summary,
+            end,
+            initial_start,
+            incremental_calendar_days,
+            sessions,
         )
-        if (
-            existing_summary["usable_sessions"] >= minimum_sessions
-            and pd.notna(latest_existing)
-            and latest_existing >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
-        ):
-            start = end - timedelta(days=int(incremental_calendar_days))
-        else:
-            start = initial_start
         fetched = historical_intraday_range(
             config,
             security_id=security_id,
