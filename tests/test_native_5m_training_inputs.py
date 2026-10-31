@@ -61,7 +61,7 @@ def test_live_slot_archive_is_loaded_by_symbol_and_keeps_close_time(tmp_path):
     slot.mkdir(parents=True)
     bars.to_parquet(slot / "capture_20261030_1005.parquet", index=False)
 
-    loaded = load_live_history(tmp_path)
+    loaded = load_live_history(tmp_path, now=pd.Timestamp("2026-10-31 10:00", tz=IST))
 
     assert "RELIANCE" in loaded
     assert loaded["RELIANCE"].index.tolist() == index.tolist()
