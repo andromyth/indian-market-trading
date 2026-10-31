@@ -65,8 +65,10 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             DAYS=30
+            INITIAL_DAYS=1000
           else
             DAYS="${{ inputs.calendar_days }}"
+            INITIAL_DAYS="${{ inputs.calendar_days }}"
           fi
           SESSIONS="${{ inputs.sessions }}"
           MAX_SYMBOLS="${{ inputs.max_symbols }}"
@@ -75,7 +77,7 @@ jobs:
           python dhan_backfill_all_nse_5m_history.py \
             --sessions "${SESSIONS}" \
             --calendar-days "${DAYS}" \
-            --initial-calendar-days 1000 \
+            --initial-calendar-days "${INITIAL_DAYS}" \
             --minimum-usable-sessions 200 \
             --minimum-symbol-coverage 0.90 \
             --workers 2 \
