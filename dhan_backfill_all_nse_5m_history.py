@@ -336,13 +336,8 @@ def main() -> int:
         "production_model_changed": False,
     }
     manifest_path = local_root / "backfill_manifest.json"
-    manifest_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     store = GoogleDriveStore()
-    uploaded = store.upload_or_update(manifest_path, MANIFEST_REMOTE, mime_type="application/json")
-    if str(uploaded.get("status") or "").upper() != "OK":
-        raise RuntimeError(f"Backfill manifest Drive write not confirmed: {uploaded}")
     report["manifest_drive_path"] = MANIFEST_REMOTE
-    print(json.dumps({key: value for key, value in report.items() if key != "symbols"}, indent=2, sort_keys=True))
     required_ok = max(1, int(np.ceil(len(symbols) * args.minimum_symbol_coverage)))
     report["overall_status"] = "PASS" if len(ok) >= required_ok else "NEEDS_ATTENTION"
     report["required_symbols_with_200_plus_sessions_and_fresh_data"] = required_ok
