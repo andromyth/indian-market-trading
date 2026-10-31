@@ -330,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
                     "rows": int(len(existing)),
                     "usable_sessions": int(summary["usable_sessions"]),
                     "last_timestamp_ist": summary["last_timestamp_ist"],
+                    "fresh_latest_data": True,
                     "reason": "Existing Drive Parquet meets history and freshness requirements.",
                 })
                 continue
@@ -440,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             BACKFILL_PROGRESS_CALLBACK(progress)
 
     results.sort(key=lambda row: row["symbol"])
-    ready = [row for row in results if row.get("status") == "OK"]
+    ready = [row for row in results if row.get("status") in {"OK", "SKIPPED_EXISTING"} and row.get("fresh_latest_data") is True]
     with_200 = [row for row in results if int(row.get("usable_sessions") or 0) >= args.minimum_usable_sessions]
     required = max(1, int(math.ceil(len(symbols) * args.minimum_symbol_coverage)))
     report = {
