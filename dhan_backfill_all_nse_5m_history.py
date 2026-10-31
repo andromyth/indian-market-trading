@@ -137,8 +137,9 @@ def _process_symbol(
     symbol: str,
     security_id: str,
     config: Any,
-    start: datetime,
+    initial_start: datetime,
     end: datetime,
+    incremental_calendar_days: int,
     sessions: int,
     local_root: Path,
     pause_seconds: float,
@@ -153,6 +154,19 @@ def _process_symbol(
     local = local_root / f"symbol={symbol}" / f"{symbol}.parquet"
     local.parent.mkdir(parents=True, exist_ok=True)
     try:
+        existing = _download_existing(store, remote, local.with_name(f"{symbol}.existing.parquet"))
+        existing_summary = usable_session_summary(existing, minimum_bars)
+        latest_existing = pd.to_datetime(
+            existing_summary.get("last_timestamp_ist"), errors="coerce"
+        )
+        if (
+            existing_summary["usable_sessions"] >= minimum_sessions
+            and pd.notna(latest_existing)
+            and latest_existing >= pd.Timestamp(end) - pd.Timedelta(days=10)
+        ):
+            start = end - timedelta(days=int(incremental_calendar_days))
+        else:
+            start = initial_start
         fetched = historical_intraday_range(
             config,
             security_id=security_id,
@@ -166,7 +180,6 @@ def _process_symbol(
             pause_seconds=pause_seconds,
         )
         fetched = normalize_dhan_5m(fetched, cutoff=pd.Timestamp.now(tz=IST).floor("5min"))
-        existing = _download_existing(store, remote, local.with_name(f"{symbol}.existing.parquet"))
         parts = [part for part in (existing, fetched) if part is not None and not part.empty]
         merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
         merged = merged.loc[~merged.index.duplicated(keep="last")]
@@ -203,6 +216,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sessions", type=int, default=500)
     parser.add_argument("--calendar-days", type=int, default=1000)
+    parser.add_argument("--initial-calendar-days", type=int, default=1000)
     parser.add_argument("--minimum-usable-sessions", type=int, default=200)
     parser.add_argument("--minimum-bars-per-session", type=int, default=50)
     parser.add_argument("--workers", type=int, default=2)
@@ -244,7 +258,7 @@ def main() -> int:
         raise RuntimeError("NSE equity universe is empty.")
 
     end = pd.Timestamp(args.end_date, tz=IST).to_pydatetime() if args.end_date else datetime.now(IST)
-    start = end - timedelta(days=int(args.calendar_days))
+    initial_start = end - timedelta(days=int(args.initial_calendar_days))
     local_root = Path(args.work_root)
     local_root.mkdir(parents=True, exist_ok=True)
 
@@ -261,8 +275,8 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(
-                _process_symbol, symbol, security_id, config, start, end,
-                args.sessions, local_root, args.pause_seconds,
+                _process_symbol, symbol, security_id, config, initial_start, end,
+                args.calendar_days, args.sessions, local_root, args.pause_seconds,
                 args.minimum_usable_sessions, args.minimum_bars_per_session,
             ): symbol
             for symbol, security_id in resolved
@@ -286,7 +300,9 @@ def main() -> int:
         "target_sessions_per_symbol": args.sessions,
         "minimum_usable_sessions": args.minimum_usable_sessions,
         "calendar_days_requested": args.calendar_days,
-        "range_start_ist": start.isoformat(),
+        "range_start_ist": initial_start.isoformat(),
+        "incremental_calendar_days": args.calendar_days,
+        "initial_calendar_days": args.initial_calendar_days,
         "range_end_ist": end.isoformat(),
         "official_symbols_requested": len(symbols),
         "symbols_resolved": len(resolved),
