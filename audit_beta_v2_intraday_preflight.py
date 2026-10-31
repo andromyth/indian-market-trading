@@ -9,7 +9,6 @@ import argparse
 import json
 from datetime import datetime, timezone
 from io import BytesIO
-from pathlib import PurePosixPath
 
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -116,16 +115,29 @@ def main() -> int:
         ).execute().get("name"),
     }
 
-    universe = official_nse_symbols(force_refresh=True)
-    report["official_nse_universe"] = {
-        "symbol_count": len(universe),
-        "source": "official_nse_symbols(force_refresh=True)",
-    }
-    if not universe:
-        raise RuntimeError("Official NSE universe is empty; refusing to assess coverage.")
+    try:
+        universe = official_nse_symbols(force_refresh=True)
+        report["official_nse_universe"] = {
+            "symbol_count": len(universe),
+            "source": "official_nse_symbols(force_refresh=True)",
+            "status": "OK" if universe else "EMPTY",
+        }
+    except Exception as exc:
+        universe = []
+        report["official_nse_universe"] = {
+            "symbol_count": 0,
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     source_folder = resolve_folder(store, SOURCE_PATH)
-    if source_folder is None:
+    if not universe:
+        report["history_archive"] = {
+            "status": "UNIVERSE_UNAVAILABLE",
+            "coverage_pct": None,
+            "coverage_warning": "Official NSE universe could not be loaded; coverage cannot be certified.",
+        }
+    elif source_folder is None:
         report["history_archive"] = {
             "status": "MISSING",
             "eligible_symbol_folders": 0,
