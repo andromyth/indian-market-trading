@@ -137,8 +137,13 @@ def fetch_indstocks_5m_batch(
     accumulated: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol, _ in symbols_and_codes}
     cursor = start
     calls = 0
+    last_request_started = 0.0
     while cursor < end:
         window_end = min(end, cursor + timedelta(days=MAX_DAYS_PER_REQUEST))
+        wait = pause_seconds - (time.monotonic() - last_request_started)
+        if calls and wait > 0:
+            time.sleep(wait)
+        last_request_started = time.monotonic()
         response = _request(
             "GET",
             "/market/historical/5minute",
@@ -180,8 +185,6 @@ def fetch_indstocks_5m_batch(
                 accumulated[symbol].append(part)
         calls += 1
         cursor = window_end
-        if pause_seconds > 0:
-            time.sleep(pause_seconds)
 
     result: dict[str, pd.DataFrame] = {}
     for symbol, parts in accumulated.items():
