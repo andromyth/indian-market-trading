@@ -33,13 +33,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      DHAN_CLIENT_ID: \${{ secrets.DHAN_CLIENT_ID }}
-      DHAN_API_KEY: \${{ secrets.DHAN_API_KEY }}
-      DHAN_API_SECRET: \${{ secrets.DHAN_API_SECRET }}
-      DHAN_ACCESS_TOKEN: \${{ secrets.DHAN_ACCESS_TOKEN }}
-      GOOGLE_DRIVE_ROOT_ID: \${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
-      GDRIVE_ROOT_FOLDER_ID: \${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
-      GOOGLE_OAUTH_TOKEN_JSON: \${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+      DHAN_API_KEY: ${{ secrets.DHAN_API_KEY }}
+      DHAN_API_SECRET: ${{ secrets.DHAN_API_SECRET }}
+      DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -52,14 +52,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ -n "\${DHAN_CLIENT_ID}" || -n "\${DHAN_ACCESS_TOKEN}" ]] || { echo "Missing Dhan credentials"; exit 1; }
-          [[ -n "\${GOOGLE_DRIVE_ROOT_ID}" && -n "\${GOOGLE_OAUTH_TOKEN_JSON}" ]] || { echo "Missing Google Drive write credentials"; exit 1; }
+          [[ -n "${DHAN_CLIENT_ID}" || -n "${DHAN_ACCESS_TOKEN}" ]] || { echo "Missing Dhan credentials"; exit 1; }
+          [[ -n "${GOOGLE_DRIVE_ROOT_ID}" && -n "${GOOGLE_OAUTH_TOKEN_JSON}" ]] || { echo "Missing Google Drive write credentials"; exit 1; }
       - name: Backfill five-minute OHLCV and preserve the 500-session rolling archive
         run: |
           python dhan_backfill_all_nse_5m_history.py \
-            --sessions "\${{ inputs.sessions }}" \
-            --calendar-days "\${{ inputs.calendar_days }}" \
+            --sessions "${{ inputs.sessions }}" \
+            --calendar-days "${{ inputs.calendar_days }}" \
             --minimum-usable-sessions 200 \
             --workers 2 \
             --pause-seconds 0.55 \
-            --max-symbols "\${{ inputs.max_symbols }}"
+            --max-symbols "${{ inputs.max_symbols }}"
