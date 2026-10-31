@@ -137,3 +137,48 @@ def test_indstocks_batch_calls_guard_for_each_seven_day_window(monkeypatch):
     assert request_count == 3
     assert len(calls) == 3
     assert len(guards) == 3
+
+
+
+def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbol(monkeypatch, tmp_path):
+    import indstocks_client
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    class Response:
+        @staticmethod
+        def json():
+            return {
+                "success": True,
+                # API returned only one requested code; the absent code must not
+                # be mistaken for a complete, resumable empty-data window.
+                "data": {
+                    "NSE_100": {"candles": []},
+                },
+            }
+
+    class Store:
+        def __init__(self):
+            self.uploads = []
+
+        def upload_or_update(self, *args, **kwargs):
+            self.uploads.append(args)
+            return {"status": "OK"}
+
+    store = Store()
+    monkeypatch.setattr(indstocks_client, "_request", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(backfill.time, "sleep", lambda _: None)
+    symbols = [("RELIANCE", "NSE_100"), ("SBIN", "NSE_200")]
+    start = pd.Timestamp("2026-10-30 09:15", tz=IST).to_pydatetime()
+    end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
+
+    try:
+        fetch_indstocks_5m_batch(
+            symbols, start, end, pause_seconds=0,
+            store=store, checkpoint_root=tmp_path,
+        )
+    except RuntimeError as exc:
+        assert "omitted requested scrip codes" in str(exc)
+    else:
+        raise AssertionError("Incomplete API response must not be accepted as a checkpoint")
+
+    assert store.uploads == []
