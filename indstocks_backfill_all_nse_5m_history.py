@@ -144,15 +144,27 @@ def fetch_indstocks_5m_batch(
         if calls and wait > 0:
             time.sleep(wait)
         last_request_started = time.monotonic()
-        response = _request(
-            "GET",
-            "/market/historical/5minute",
-            params={
-                "scrip-codes": ",".join(symbols_by_code),
-                "start_time": int(cursor.timestamp() * 1000),
-                "end_time": int(window_end.timestamp() * 1000),
-            },
-        )
+        params = {
+            "scrip-codes": ",".join(symbols_by_code),
+            "start_time": int(cursor.timestamp() * 1000),
+            "end_time": int(window_end.timestamp() * 1000),
+        }
+        for attempt in range(3):
+            try:
+                response = _request("GET", "/market/historical/5minute", params=params)
+                break
+            except Exception as exc:
+                message = str(exc).upper()
+                retryable = any(
+                    marker in message
+                    for marker in (
+                        "HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+                        "NETWORKEXCEPTION", "REQUEST FAILED", "CONNECTIONERROR", "TIMEOUT",
+                    )
+                )
+                if not retryable or attempt == 2:
+                    raise
+                time.sleep(2 ** (attempt + 1))
         body = response.json()
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")
@@ -382,6 +394,9 @@ def main() -> int:
         "symbols_with_200_plus_sessions": len(with_200),
         "symbols_with_fresh_latest_data": sum(row.get("fresh_latest_data") is True for row in results),
         "symbols_with_200_plus_sessions_and_fresh_data": len(ready),
+        "symbols_with_500_sessions": sum(
+            int(row.get("usable_sessions") or 0) >= args.sessions for row in results
+        ),
         "symbols_with_data_after_2026_09_24": sum(
             bool(row.get("last_timestamp_ist")) and row["last_timestamp_ist"][:10] > "2026-09-24"
             for row in results
