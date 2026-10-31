@@ -6,15 +6,14 @@ import pandas as pd
 import colab_build_all_nse_delivery_multifactor_candidate as candidate
 
 
-def test_fno_join_is_exact_to_next_exchange_session_and_does_not_forward_fill(tmp_path, monkeypatch):
+def test_fno_join_uses_history_and_current_archive_without_forward_fill(tmp_path, monkeypatch):
     base = tmp_path / "market"
     monkeypatch.setattr(candidate, "BASE", base)
-    fno_path = base / "production_data/nse_official/fno/fno_daily_features_2026.parquet"
-    fno_path.parent.mkdir(parents=True)
-    pd.DataFrame({
-        "symbol": ["ABC"],
-        "date": pd.to_datetime(["2026-01-01"]),
-        "fno_pcr": [1.25],
+    fno_root = base / "production_data/nse_official/fno"
+    fno_root.mkdir(parents=True)
+    current_path = fno_root / "fno_daily_features_2026.parquet"
+    history_path = fno_root / "fno_daily_features_history_2016_2026.parquet"
+    columns = {
         "fno_oi_change": [12.0],
         "fno_iv_change": [0.15],
         "fno_available": [1],
@@ -22,11 +21,29 @@ def test_fno_join_is_exact_to_next_exchange_session_and_does_not_forward_fill(tm
         "fno_fut_basis": [0.01],
         "fno_fut_return": [0.02],
         "fno_fut_oi": [25000.0],
-    }).to_parquet(fno_path, index=False)
+    }
+    pd.DataFrame({
+        "symbol": ["ABC"],
+        "date": pd.to_datetime(["2026-01-01"]),
+        "fno_pcr": [1.25],
+        **columns,
+    }).to_parquet(current_path, index=False)
+    pd.DataFrame({
+        "symbol": ["ABC", "ABC"],
+        "date": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+        "fno_pcr": [0.90, 1.50],
+        "fno_oi_change": [8.0, 16.0],
+        "fno_iv_change": [0.10, 0.20],
+        "fno_available": [1, 1],
+        "fno_fut_close": [99.0, 102.0],
+        "fno_fut_basis": [0.01, 0.02],
+        "fno_fut_return": [0.01, 0.03],
+        "fno_fut_oi": [20000.0, 26000.0],
+    }).to_parquet(history_path, index=False)
 
     rows = []
     for symbol in ("ABC", "XYZ"):
-        for date in ("2026-01-01", "2026-01-02", "2026-01-05"):
+        for date in ("2026-01-01", "2026-01-02", "2026-01-05", "2026-01-06"):
             rows.append({
                 "symbol": symbol,
                 "date": pd.Timestamp(date),
@@ -36,16 +53,21 @@ def test_fno_join_is_exact_to_next_exchange_session_and_does_not_forward_fill(tm
     panel = pd.DataFrame(rows)
     panel["decision_timestamp"] = panel["decision_timestamp"].dt.tz_convert("UTC")
 
-    merged, audit = candidate._merge_broad_fno_pit(panel)
+    fno = candidate._load_fno_source_frame()
+    merged, audit = candidate._merge_broad_fno_pit(panel, fno)
     abc_jan2 = merged[(merged.symbol == "ABC") & (merged.date == pd.Timestamp("2026-01-02"))].iloc[0]
     xyz_jan2 = merged[(merged.symbol == "XYZ") & (merged.date == pd.Timestamp("2026-01-02"))].iloc[0]
     abc_jan5 = merged[(merged.symbol == "ABC") & (merged.date == pd.Timestamp("2026-01-05"))].iloc[0]
+    abc_jan6 = merged[(merged.symbol == "ABC") & (merged.date == pd.Timestamp("2026-01-06"))].iloc[0]
 
-    assert abc_jan2.fno_pcr == 1.25
-    assert int(xyz_jan2.fno_available) == 0  # covered session, no F&O contract for this symbol
-    assert pd.isna(abc_jan5.fno_available)  # no source archive for this target date; not a fake zero
-    assert pd.isna(abc_jan5.fno_pcr)       # yesterday's F&O value must not be carried forward
-    assert audit["covered_target_sessions"] == 1
+    assert abc_jan2.fno_pcr == 1.25  # current archive wins the duplicate history row
+    assert int(xyz_jan2.fno_available) == 0  # archive exists, but this symbol has no F&O contract
+    assert abc_jan5.fno_pcr == 1.50  # historical archive is joined to the next exchange session
+    assert pd.isna(abc_jan6.fno_available)  # no 5 Jan source archive; no forward-fill
+    assert pd.isna(abc_jan6.fno_pcr)
+    assert audit["covered_target_sessions"] == 2
+    assert audit["source_paths"]["history"]["source_dates"] == 2
+    assert audit["source_paths"]["current"]["source_dates"] == 1
 
 
 def test_fundamental_availability_index_uses_full_catalog_independently_of_parse(tmp_path, monkeypatch):
