@@ -1,6 +1,12 @@
 name: Backfill ALL-NSE native five-minute history
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/backfill_all_nse_native_5m.yml"
+      - "dhan_client.py"
+      - "dhan_backfill_all_nse_5m_history.py"
   schedule:
     - cron: "15 10 * * 1-5"
   workflow_dispatch:
@@ -66,12 +72,15 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             DAYS=30
             INITIAL_DAYS=1000
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            DAYS=1000
+            INITIAL_DAYS=1000
           else
             DAYS="${{ inputs.calendar_days }}"
             INITIAL_DAYS="${{ inputs.calendar_days }}"
           fi
-          SESSIONS="${{ inputs.sessions }}"
-          MAX_SYMBOLS="${{ inputs.max_symbols }}"
+          SESSIONS="${{ inputs.sessions || '500' }}"
+          MAX_SYMBOLS="${{ inputs.max_symbols || '0' }}"
           SESSIONS="${SESSIONS:-500}"
           MAX_SYMBOLS="${MAX_SYMBOLS:-0}"
           python dhan_backfill_all_nse_5m_history.py \
