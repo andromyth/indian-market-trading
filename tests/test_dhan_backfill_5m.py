@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from dhan_backfill_all_nse_5m_history import normalize_dhan_5m, retain_latest_sessions, usable_session_summary
+from dhan_backfill_all_nse_5m_history import choose_backfill_start, normalize_dhan_5m, retain_latest_sessions, usable_session_summary
 
 IST = "Asia/Kolkata"
 
@@ -61,3 +61,23 @@ def test_empty_dhan_history_is_safe():
     assert empty.empty
     assert usable_session_summary(empty)["usable_sessions"] == 0
     assert retain_latest_sessions(empty, 500).empty
+
+
+def test_backfill_uses_full_range_until_500_sessions_are_reached():
+    end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
+    initial = end - pd.Timedelta(days=1000)
+    summary = {
+        "usable_sessions": 250,
+        "last_timestamp_ist": pd.Timestamp("2026-10-30 15:30", tz=IST).isoformat(),
+    }
+    assert choose_backfill_start(summary, end, initial, 30, 500) == initial
+
+
+def test_backfill_uses_incremental_range_only_after_500_fresh_sessions():
+    end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
+    initial = end - pd.Timedelta(days=1000)
+    summary = {
+        "usable_sessions": 500,
+        "last_timestamp_ist": pd.Timestamp("2026-10-30 15:30", tz=IST).isoformat(),
+    }
+    assert choose_backfill_start(summary, end, initial, 30, 500) == end - pd.Timedelta(days=30)

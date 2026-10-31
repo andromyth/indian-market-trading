@@ -55,3 +55,17 @@ INDstocks' current documentation says a whitelisted static IP is required for or
 - The broker's daily, weekly and monthly history endpoint supports up to one year per call. Long-term bulk research should continue to use the project's existing persistent historical archive and official NSE ingestion.
 - A broker quote or candle is not by itself a validated prediction. Prediction quality still depends on feature readiness, the existing locked model/feature contract, correct timestamps, and out-of-sample validation.
 - This integration is a data-source change only. It does not create a new model version, alter trained model weights, or enable automated orders.
+
+## ALL-NSE five-minute history backfill fallback
+
+The repository backfill workflow prefers DhanHQ when Dhan credentials are configured. When Dhan is unavailable, it can use the INDstocks historical-data API instead.
+
+For a one-off backfill, create a dashboard-generated INDstocks access token and add it directly as the GitHub Actions repository secret:
+
+    INDSTOCKS_ACCESS_TOKEN
+
+Do not paste the token into chat, source files, workflow YAML, or logs. It expires after 24 hours; a normal backfill run is designed to complete within that lifetime. The workflow deliberately uses manual-token mode and does not generate an INDstocks TOTP token, because a new TOTP token invalidates the previous token and could disrupt the running Cloud Run worker.
+
+The backfill requests native `5minute` candles only. It batches up to five NSE instruments per request, walks the range in seven-day windows, and pauses between requests to stay below the documented five data requests per second. It writes the same per-symbol native five-minute Parquet archive as DhanHQ and applies the same 200–500 usable-session / 90% fresh-coverage gate.
+
+To run it, open **Actions → Backfill ALL-NSE native five-minute history → Run workflow**, choose `provider=indstocks` (or `auto` when Dhan credentials are unavailable), `sessions=500`, `calendar_days=1000`, and `max_symbols=0`. Completion is determined only by the Drive `backfill_manifest.json` reporting `overall_status=PASS`; starting the workflow is not proof that the backfill completed.
