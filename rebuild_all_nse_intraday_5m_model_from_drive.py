@@ -20,9 +20,8 @@ from pathlib import Path
 from typing import Any
 
 MODEL_REMOTE = "models/all_nse_intraday_5mbar_multifactor_replacement_2026"
-SEED_REMOTE = "production_data/nse_official/intraday_seed/olo_minute_archive/symbols"
-SEED_REL = Path(SEED_REMOTE)
 NATIVE_5M_SEED_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
+NATIVE_5M_SEED_REL = Path(NATIVE_5M_SEED_REMOTE)
 LIVE_5M_REMOTE = "production_data/nse_official/intraday_5m_live"
 MARKET_FILES = (
     "raw/2018_2025/NIFTY50-INDEX.parquet",
@@ -143,11 +142,11 @@ def _download_optional_tree(store: Any, remote_path: str, root: Path) -> tuple[i
     return _download_tree(store, folder_id, remote_path, root)
 
 
-def _download_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int, int]:
-    symbols_folder = _resolve_folder(store, SEED_REMOTE)
+def _download_native_5m_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int, int]:
+    symbols_folder = _resolve_folder(store, NATIVE_5M_SEED_REMOTE)
     if not symbols_folder:
         raise FileNotFoundError(
-            f"Required historical training seed folder is missing in Drive: {SEED_REMOTE}"
+            f"Required native five-minute training seed folder is missing in Drive: {NATIVE_5M_SEED_REMOTE}"
         )
 
     children = _list_children(store, symbols_folder)
@@ -165,17 +164,17 @@ def _download_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int,
 
     if not by_symbol:
         raise RuntimeError(
-            "Drive historical seed folder exists but contains no partitions matching the official NSE universe."
+            "Drive native five-minute seed folder contains no partitions matching the official NSE universe."
         )
 
-    base = root / SEED_REL
+    base = root / NATIVE_5M_SEED_REL
     downloaded_symbols = 0
     file_count = 0
     bytes_total = 0
     for position, (symbol, item) in enumerate(sorted(by_symbol.items()), 1):
         target_dir = base / f"symbol={symbol}"
         if item.get("mimeType") == "application/vnd.google-apps.folder":
-            count, size = _download_tree(store, item["id"], str(SEED_REL / f"symbol={symbol}"), root)
+            count, size = _download_tree(store, item["id"], str(NATIVE_5M_SEED_REL / f"symbol={symbol}"), root)
             if count:
                 downloaded_symbols += 1
                 file_count += count
@@ -187,8 +186,8 @@ def _download_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int,
             bytes_total += size
         if position % 100 == 0 or position == len(by_symbol):
             print(
-                f"SEED_DOWNLOAD progress={position}/{len(by_symbol)} "
-                f"symbols_with_files={downloaded_symbols} parquet_files={file_count}",
+                f"NATIVE_5M_DOWNLOAD progress={position}/{len(by_symbol)} "
+                f"native_5m_symbols_with_files={downloaded_symbols} parquet_files={file_count}",
                 flush=True,
             )
     return downloaded_symbols, file_count, bytes_total
@@ -197,7 +196,7 @@ def _download_seed(store: Any, root: Path, symbols: set[str]) -> tuple[int, int,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-root", required=True)
-    parser.add_argument("--min-symbol-coverage", type=float, default=0.50)
+    parser.add_argument("--min-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--min-trainable-symbols", type=int, default=100)
     parser.add_argument("--min-seed-universe-symbols", type=int, default=500)
     args = parser.parse_args()
@@ -228,68 +227,46 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
 
     store = GoogleDriveStore()
-    symbols_folder = _resolve_folder(store, SEED_REMOTE)
-    if not symbols_folder:
-        raise FileNotFoundError(
-            f"Required historical training seed folder is missing in Drive: {SEED_REMOTE}"
-        )
-    seed_children = _list_children(store, symbols_folder)
-    universe = {
-        str(item.get("name", "")).split("=", 1)[1].upper().replace(".NS", "").replace(".BO", "")
-        for item in seed_children
-        if item.get("mimeType") == "application/vnd.google-apps.folder"
-        and str(item.get("name", "")).startswith("symbol=")
-        and str(item.get("name", "")).split("=", 1)[1].strip()
-    }
-    universe.update(
-        Path(str(item.get("name", ""))).stem.upper().replace(".NS", "").replace(".BO", "")
-        for item in seed_children
-        if item.get("mimeType") != "application/vnd.google-apps.folder"
-        and str(item.get("name", "")).lower().endswith(".parquet")
-    )
-    native_folder = _resolve_folder(store, NATIVE_5M_SEED_REMOTE)
-    native_children = _list_children(store, native_folder) if native_folder else []
-    universe.update(
-        str(item.get("name", "")).split("=", 1)[1].upper().replace(".NS", "").replace(".BO", "")
-        for item in native_children
-        if item.get("mimeType") == "application/vnd.google-apps.folder"
-        and str(item.get("name", "")).startswith("symbol=")
-        and str(item.get("name", "")).split("=", 1)[1].strip()
-    )
-    universe = {s for s in universe if s and s not in {"NAN", "NONE"}}
+    from delivery_training_universe import official_nse_symbols
+    universe = sorted({
+        str(value).strip().upper().replace(".NS", "").replace(".BO", "")
+        for value in official_nse_symbols(force_refresh=True)
+        if str(value).strip()
+    })
     if len(universe) < args.min_seed_universe_symbols:
         raise RuntimeError(
-            f"Historical Drive seed universe is too small for all-NSE recovery: "
-            f"{len(universe)} symbols; minimum is {args.min_seed_universe_symbols}. "
-            "No model was trained or uploaded."
+            f"Official NSE equity universe is incomplete: {len(universe)} symbols; "
+            f"minimum is {args.min_seed_universe_symbols}. No model was trained or uploaded."
         )
     print("TRAINING_UNIVERSE=" + json.dumps({
         "symbol_count": len(universe),
-        "source": "GOOGLE_DRIVE_HISTORICAL_SEED_SYMBOL_PARTITIONS",
-        "official_current_roster_refresh": "UNAVAILABLE_IN_THIS_RUN",
+        "source": "NSE_OFFICIAL_CURRENT_EQUITY_UNIVERSE",
+        "official_current_roster_refresh": "PASS",
     }, sort_keys=True))
 
-    seed_symbols, seed_files, seed_bytes = _download_seed(store, root, universe)
-    native_files, native_bytes = _download_optional_tree(store, NATIVE_5M_SEED_REMOTE, root)
+    native_symbols, native_files, native_bytes = _download_native_5m_seed(
+        store, root, set(universe)
+    )
     live_files, live_bytes = _download_optional_tree(store, LIVE_5M_REMOTE, root)
-    coverage = seed_symbols / len(universe)
+    coverage = native_symbols / len(universe)
+    required_symbols = max(
+        args.min_trainable_symbols,
+        math.ceil(len(universe) * args.min_symbol_coverage),
+    )
     print("SEED_INPUT_SUMMARY=" + json.dumps({
         "official_nse_symbols": len(universe),
-        "seed_symbols_with_files": seed_symbols,
-        "seed_parquet_files": seed_files,
-        "seed_bytes": seed_bytes,
+        "native_5m_symbols_with_files": native_symbols,
         "native_5m_parquet_files": native_files,
         "native_5m_bytes": native_bytes,
         "live_5m_slot_files": live_files,
         "live_5m_bytes": live_bytes,
-        "seed_symbol_coverage_pct": round(coverage * 100, 4),
+        "native_5m_symbol_coverage_pct": round(coverage * 100, 4),
     }, sort_keys=True))
-    if seed_symbols < max(args.min_trainable_symbols, math.ceil(len(universe) * args.min_symbol_coverage)):
+    if native_symbols < required_symbols:
         raise RuntimeError(
-            f"Historical seed coverage is inadequate: {seed_symbols}/{len(universe)} symbols; "
-            f"minimum is {max(args.min_trainable_symbols, math.ceil(len(universe) * args.min_symbol_coverage))}."
+            f"Native five-minute archive coverage is inadequate: {native_symbols}/{len(universe)} "
+            f"symbols; minimum is {required_symbols}. Legacy one-minute data is not counted."
         )
-
     market_found = [_download_optional_path(store, path, root) for path in MARKET_FILES]
     if not any(market_found):
         raise RuntimeError("Neither expected historical NIFTY50 market-context Parquet file exists in Drive.")
@@ -297,7 +274,7 @@ def main() -> int:
     print("TRAINING_INPUTS=" + json.dumps({
         "nifty_market_context_files": [path for path, ok in zip(MARKET_FILES, market_found) if ok],
         "fno_daily_features_available": fno_found,
-        "historical_seed_symbols": seed_symbols,
+        "native_5m_symbols_with_files": native_symbols,
         "native_5m_parquet_files": native_files,
         "live_5m_slot_files": live_files,
     }, sort_keys=True))
@@ -348,10 +325,7 @@ def main() -> int:
         raise RuntimeError("Classifier SHA-256 does not match the trained manifest.")
     if manifest.get("regressor_sha256") != _sha256(regressor_path):
         raise RuntimeError("Regressor SHA-256 does not match the trained manifest.")
-    if int(manifest.get("training_symbol_count") or 0) < max(
-        args.min_trainable_symbols,
-        math.ceil(len(universe) * args.min_symbol_coverage),
-    ):
+    if int(manifest.get("training_symbol_count") or 0) < required_symbols:
         raise RuntimeError("Trainable symbol coverage is below the configured safety threshold.")
     for metric in ("accuracy", "roc_auc", "mean_abs_return_error"):
         value = manifest.get("validation", {}).get(metric)
@@ -411,9 +385,9 @@ def main() -> int:
         "validation": manifest.get("validation"),
         "classifier_sha256": manifest.get("classifier_sha256"),
         "regressor_sha256": manifest.get("regressor_sha256"),
-        "seed_symbols_with_files": seed_symbols,
-        "seed_parquet_files": seed_files,
-        "seed_symbol_coverage_pct": round(coverage * 100, 4),
+        "native_5m_symbols_with_files": native_symbols,
+        "native_5m_parquet_files": native_files,
+        "native_5m_symbol_coverage_pct": round(coverage * 100, 4),
         "no_auto_orders": True,
         "uploads": uploads,
     }
