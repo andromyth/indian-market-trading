@@ -155,21 +155,41 @@ def fetch_indstocks_5m_batch(
         window_key = f"{cursor:%Y%m%dT%H%M}_{window_end:%Y%m%dT%H%M}"
         checkpoint_remote = f"{REMOTE_ROOT}/window_checkpoints/{batch_key}/{window_key}.parquet"
         checkpoint_local = (checkpoint_root or Path("/tmp/nse_5m_checkpoints")) / batch_key / f"{window_key}.parquet"
+        checkpoint_manifest_remote = checkpoint_remote + ".json"
+        checkpoint_manifest_local = checkpoint_local.with_suffix(".parquet.json")
         checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if store is not None and checkpoint_root is not None else None
-        if checkpoint_item:
+        checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if store is not None and checkpoint_root is not None else None
+        expected_symbols = sorted(symbols_by_code.values())
+        if checkpoint_item and checkpoint_manifest_item:
             from googleapiclient.http import MediaIoBaseDownload
             checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-            request = store.service.files().get_media(fileId=checkpoint_item["id"])
-            with checkpoint_local.open("wb") as output:
-                downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
+            for item, destination in (
+                (checkpoint_item, checkpoint_local),
+                (checkpoint_manifest_item, checkpoint_manifest_local),
+            ):
+                request = store.service.files().get_media(fileId=item["id"])
+                with destination.open("wb") as output:
+                    downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+            manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
+            if (
+                manifest.get("status") != "COMPLETE"
+                or manifest.get("window_key") != window_key
+                or manifest.get("symbols") != expected_symbols
+            ):
+                raise RuntimeError(f"Drive checkpoint manifest is invalid for window {window_key}; refusing to skip it.")
             saved_window = pd.read_parquet(checkpoint_local)
-            if not saved_window.empty and "Symbol" in saved_window.columns:
+            if not saved_window.empty and (
+                "Symbol" not in saved_window.columns
+                or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
+            ):
+                raise RuntimeError(f"Drive checkpoint data contains unexpected symbols for window {window_key}.")
+            if not saved_window.empty:
                 saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
                 saved_window.index = saved_window.index.tz_localize(IST) if saved_window.index.tz is None else saved_window.index.tz_convert(IST)
-                for symbol in symbols_by_code.values():
+                for symbol in expected_symbols:
                     part = saved_window.loc[saved_window["Symbol"].eq(symbol), OHLCV]
                     if not part.empty:
                         accumulated[symbol].append(part)
@@ -211,11 +231,22 @@ def fetch_indstocks_5m_batch(
         body = response.json()
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")
-        data = body.get("data") or {}
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"INDstocks response data is not an object for window {window_key}.")
+        missing_codes = sorted(set(symbols_by_code) - set(data))
+        if missing_codes:
+            raise RuntimeError(
+                f"INDstocks response omitted requested scrip codes for window {window_key}: {missing_codes}"
+            )
         window_frames: list[pd.DataFrame] = []
+        row_counts: dict[str, int] = {}
         for code, symbol in symbols_by_code.items():
-            instrument = data.get(code) or {}
-            candles = instrument.get("candles") or []
+            instrument = data[code]
+            if not isinstance(instrument, dict) or not isinstance(instrument.get("candles"), list):
+                raise RuntimeError(f"INDstocks response omitted an explicit candles list for {symbol} in window {window_key}.")
+            candles = instrument["candles"]
+            row_counts[symbol] = len(candles)
             if not candles:
                 continue
             rows = pd.DataFrame(candles)
@@ -250,6 +281,22 @@ def fetch_indstocks_5m_batch(
             uploaded = store.upload_or_update(checkpoint_local, checkpoint_remote, mime_type="application/vnd.apache.parquet")
             if str(uploaded.get("status") or "").upper() != "OK":
                 raise RuntimeError(f"Drive checkpoint write failed for window {window_key}: {uploaded}")
+            # The manifest is the commit marker: only a fully written parquet plus
+            # a complete per-symbol API response may be skipped after a restart.
+            checkpoint_manifest_local.write_text(json.dumps({
+                "status": "COMPLETE",
+                "window_key": window_key,
+                "start": cursor.isoformat(),
+                "end": window_end.isoformat(),
+                "symbols": expected_symbols,
+                "row_counts": row_counts,
+                "checkpoint_remote": checkpoint_remote,
+            }, sort_keys=True), encoding="utf-8")
+            uploaded_manifest = store.upload_or_update(
+                checkpoint_manifest_local, checkpoint_manifest_remote, mime_type="application/json"
+            )
+            if str(uploaded_manifest.get("status") or "").upper() != "OK":
+                raise RuntimeError(f"Drive checkpoint manifest write failed for window {window_key}: {uploaded_manifest}")
         calls += 1
         cursor = window_end
         if callable(BACKFILL_PROGRESS_CALLBACK):
