@@ -44,20 +44,51 @@ jobs:
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_service_url_missing"; exit 1; }
-          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$INVOKER" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-          [[ -n "$TOKEN" ]] || { echo "ERROR=invoker_identity_token_unavailable"; exit 1; }
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          CALLER_IDENTITY=""
           for attempt in $(seq 1 60); do
-            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
-              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
-              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
-            if [[ "$CODE" == "200" ]]; then
-              echo "CLOUD_RUN_BACKFILL_ENDPOINT=READY"
-              echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_OUTPUT"
-              echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
-              echo "INVOKER_TOKEN_READY=true" >> "$GITHUB_ENV"
-              exit 0
+            ROUTE_WAIT=false
+            for SA in "SELF" "$INVOKER" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+              if [[ "$SA" == "SELF" ]]; then
+                TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+              else
+                TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+              fi
+              [[ -n "$TOKEN" ]] || continue
+              CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+                --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
+              if [[ "$CODE" == "200" ]]; then
+                PUBLIC_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 \
+                  --output /dev/null --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || PUBLIC_CODE=000
+                if [[ "$PUBLIC_CODE" == "200" ]]; then
+                  echo "ERROR=cloud_run_service_is_public; refusing to start backfill"
+                  exit 1
+                fi
+                if [[ "$PUBLIC_CODE" != "401" && "$PUBLIC_CODE" != "403" && "$PUBLIC_CODE" != "404" ]]; then
+                  echo "ERROR=unauthenticated_private_service_check_failed http=$PUBLIC_CODE"
+                  exit 1
+                fi
+                CALLER_IDENTITY="$SA"
+                echo "CLOUD_RUN_BACKFILL_ENDPOINT=READY"
+                echo "CLOUD_RUN_UNAUTHENTICATED_ACCESS=BLOCKED http=$PUBLIC_CODE"
+                echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+                echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
+                echo "CALLER_IDENTITY=$CALLER_IDENTITY" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              if [[ "$CODE" == "404" ]]; then
+                # IAM accepted this identity; the new route is not yet on the
+                # service's production URL, so wait and retry this identity.
+                CALLER_IDENTITY="$SA"
+                ROUTE_WAIT=true
+                break
+              fi
+            done
+            if [[ "$ROUTE_WAIT" == "false" && -z "$CALLER_IDENTITY" ]]; then
+              echo "ERROR=no_identity_could_invoke_private_cloud_run_service"
+              exit 1
             fi
             echo "Waiting for deployed endpoint attempt=$attempt/60 http=$CODE"
             sleep 30
@@ -69,8 +100,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$INVOKER" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-          [[ -n "$TOKEN" ]] || { echo "ERROR=invoker_identity_token_unavailable"; exit 1; }
+          if [[ "$CALLER_IDENTITY" == "SELF" ]]; then
+            TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          else
+            TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$CALLER_IDENTITY" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          fi
+          [[ -n "$TOKEN" ]] || { echo "ERROR=cloud_run_invoker_identity_token_unavailable"; exit 1; }
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
           CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
