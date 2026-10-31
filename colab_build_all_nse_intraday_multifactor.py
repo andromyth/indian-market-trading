@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Train the ALL-NSE 30-minute model on completed 5-minute OHLCV bars.
+"""Train the ALL-NSE 30-minute model using native completed five-minute OHLCV only.
 
-Historical minute-candle archives are resampled to complete five-minute bars
-before feature/label creation. Live inference uses the same five-minute bar
-contract. No orders are placed.
+Training and live inference share the same five-minute bar contract. Legacy
+one-minute archives are deliberately excluded. No orders are placed.
 """
 from __future__ import annotations
 
@@ -27,6 +26,10 @@ from all_nse_intraday_model import FEATURES
 IST = "Asia/Kolkata"
 PERSISTENT_INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
 SEED_REL = Path("production_data/nse_official/intraday_seed/olo_minute_archive/symbols")
+NATIVE_5M_SEED_REL = Path("production_data/nse_official/intraday_seed/olo_5m_archive/symbols")
+LIVE_5M_REL = Path("production_data/nse_official/intraday_5m_live")
+LIVE_5M_LOOKBACK_DAYS = 90
+MIN_SESSION_BARS = 50
 
 
 def _norm(q: pd.DataFrame) -> pd.DataFrame:
@@ -203,6 +206,62 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _merge_5m_parts(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    clean = [_norm(part)[["Open", "High", "Low", "Close", "Volume"]]
+             for part in parts if part is not None and not part.empty]
+    if not clean:
+        return pd.DataFrame()
+    merged = pd.concat(clean).sort_index()
+    return merged.loc[~merged.index.duplicated(keep="last")]
+
+
+def _close_labeled_5m(frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate true close-timestamped five-minute bars without resampling them."""
+    x = _norm(frame)
+    if x.empty:
+        return x
+    idx = pd.DatetimeIndex(x.index)
+    mask = (
+        (idx.time >= pd.Timestamp("09:20").time())
+        & (idx.time <= pd.Timestamp("15:30").time())
+        & (idx.minute % 5 == 0)
+    )
+    return x.loc[mask, ["Open", "High", "Low", "Close", "Volume"]].copy()
+
+
+def load_live_history(
+    root: Path,
+    now: pd.Timestamp | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Read recent worker slots; older history comes from the rolling 500-session seed."""
+    archive = root / LIVE_5M_REL
+    grouped: dict[str, list[pd.DataFrame]] = {}
+    if not archive.exists():
+        return {}
+    current = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    current = current.tz_localize(IST) if current.tzinfo is None else current.tz_convert(IST)
+    cutoff_date = (current - pd.Timedelta(days=LIVE_5M_LOOKBACK_DAYS)).date()
+    for path in sorted(archive.rglob("*.parquet")):
+        try:
+            date_parts = path.relative_to(archive).parts
+            slot_date = pd.Timestamp(
+                f"{date_parts[0]}-{date_parts[1]}-{date_parts[2]}"
+            ).date()
+            if slot_date < cutoff_date:
+                continue
+            frame = pd.read_parquet(path)
+            if frame is None or frame.empty or "symbol" not in frame.columns:
+                continue
+            frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+            for symbol, part in frame.groupby("symbol", sort=False):
+                bars = _close_labeled_5m(part.drop(columns=["symbol", "source"], errors="ignore"))
+                if not bars.empty:
+                    grouped.setdefault(symbol, []).append(bars)
+        except Exception as exc:
+            print(f"LIVE_5M_ARCHIVE_READ_ERROR path={path} error={type(exc).__name__}:{exc}", flush=True)
+    return {symbol: _merge_5m_parts(parts) for symbol, parts in grouped.items()}
+
+
 def load_symbol(root: Path, sym: str) -> pd.DataFrame:
     parts = []
     errors = []
@@ -263,6 +322,50 @@ def load_market(root: Path) -> pd.DataFrame:
         return pd.DataFrame()
     q = pd.concat(parts).sort_index()
     return q[~q.index.duplicated(keep="last")]
+
+
+def load_symbol_5m(
+    root: Path,
+    sym: str,
+    live_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Merge only native five-minute history and completed live five-minute bars."""
+    parts = []
+    native_dir = root / NATIVE_5M_SEED_REL / f"symbol={sym}"
+    if native_dir.exists():
+        for path in sorted(native_dir.rglob("*.parquet")):
+            try:
+                bars = _close_labeled_5m(pd.read_parquet(path))
+                if not bars.empty:
+                    parts.append(bars)
+            except Exception as exc:
+                print(f"NATIVE_5M_ARCHIVE_READ_ERROR symbol={sym} path={path} error={type(exc).__name__}:{exc}", flush=True)
+
+    if live_frame is not None and not live_frame.empty:
+        bars = _close_labeled_5m(live_frame)
+        if not bars.empty:
+            parts.append(bars)
+    return _merge_5m_parts(parts)
+
+
+def load_market_5m(root: Path, live_frame: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Return NIFTY context from native five-minute history and live five-minute bars."""
+    parts = []
+    native_dir = root / NATIVE_5M_SEED_REL / "symbol=__NIFTY50__"
+    if native_dir.exists():
+        for path in sorted(native_dir.rglob("*.parquet")):
+            try:
+                bars = _close_labeled_5m(pd.read_parquet(path))
+                if not bars.empty:
+                    parts.append(bars)
+            except Exception as exc:
+                print(f"NATIVE_5M_MARKET_ARCHIVE_READ_ERROR path={path} error={type(exc).__name__}:{exc}", flush=True)
+
+    if live_frame is not None and not live_frame.empty:
+        bars = _close_labeled_5m(live_frame)
+        if not bars.empty:
+            parts.append(bars)
+    return _merge_5m_parts(parts)
 
 
 def load_fno(root: Path) -> pd.DataFrame:
@@ -368,8 +471,7 @@ def fno_join_features(feature_frame: pd.DataFrame, fno: pd.DataFrame, sym: str) 
 def sample_decisions(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if frame.empty or minutes <= 1:
         return frame
-    # Use the last available observation in each clock bucket, which preserves
-    # minute-scale features while limiting the training matrix size.
+    # Use the last completed five-minute observation in each clock bucket.
     bucket = frame.index.floor(f"{int(minutes)}min")
     return frame.groupby(bucket, sort=True).tail(1)
 
@@ -381,7 +483,14 @@ def main():
     ap.add_argument("--min-rows-symbol", type=int, default=300)
     ap.add_argument("--sample-minutes", type=int, default=5)
     ap.add_argument("--max-train-rows-per-symbol", type=int, default=2000)
+    ap.add_argument("--min-usable-sessions", type=int, default=200)
+    ap.add_argument("--max-sessions", type=int, default=500)
+    ap.add_argument("--min-bars-per-session", type=int, default=50)
     args = ap.parse_args()
+    if not 1 <= args.min_usable_sessions <= args.max_sessions <= 500:
+        raise ValueError("Session limits must satisfy 1 <= min-usable-sessions <= max-sessions <= 500")
+    if args.min_bars_per_session < 50:
+        raise ValueError("--min-bars-per-session must be at least 50")
 
     root = Path(args.drive_root)
     out = Path(args.out)
@@ -407,13 +516,12 @@ def main():
     if not universe:
         raise RuntimeError("Intraday training universe is empty")
 
-    seed_root = root / SEED_REL
-    if not seed_root.exists():
-        raise RuntimeError(
-            "Historical intraday seed not found. Run seed_nse_intraday_history.py first."
-        )
+    native_seed_root = root / NATIVE_5M_SEED_REL
+    if not native_seed_root.exists():
+        raise RuntimeError("Native five-minute historical seed archive is missing; legacy one-minute data is not accepted.")
 
-    market = resample_completed_5m_bars(load_market(root))
+    live_history = load_live_history(root)
+    market = load_market_5m(root, live_history.get("__NIFTY50__"))
     fno = load_fno(root)
 
     # Colab RAM is limited, so never accumulate the complete five-minute-derived
@@ -432,14 +540,28 @@ def main():
     retained_rows = 0
 
     for i, sym in enumerate(universe, 1):
-        raw = resample_completed_5m_bars(load_symbol(root, sym))
+        raw = load_symbol_5m(root, sym, live_history.get(sym))
+        if raw.empty:
+            coverage.append((sym, 0, 0, "EXCLUDED_NO_HISTORY"))
+            continue
+        valid_bars = raw[["Open", "High", "Low", "Close"]].notna().all(axis=1)
+        session_counts = valid_bars.groupby(pd.Index(raw.index.date)).sum()
+        usable_dates = sorted(session_counts[session_counts >= args.min_bars_per_session].index)
+        usable_sessions = len(usable_dates)
+        if usable_sessions < args.min_usable_sessions:
+            coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_SESSIONS"))
+            continue
+        retained_date_list = usable_dates[-args.max_sessions:]
+        retained_dates = {str(day) for day in retained_date_list}
+        raw = raw.loc[pd.Index(raw.index.date).astype(str).isin(retained_dates)]
+        usable_sessions = len(retained_date_list)
         if len(raw) < args.min_rows_symbol:
-            coverage.append((sym, len(raw), "EXCLUDED_INSUFFICIENT_HISTORY"))
+            coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_ROWS"))
             continue
 
         feat = make_features(raw, market)
         if feat.empty:
-            coverage.append((sym, len(raw), "EXCLUDED_FEATURE_BUILD"))
+            coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_FEATURE_BUILD"))
             continue
 
         # Build features and labels from completed five-minute bars, then sample
@@ -450,7 +572,7 @@ def main():
         feat = feat.dropna(subset=["target_30m"])
 
         if feat.empty:
-            coverage.append((sym, len(raw), "EXCLUDED_NO_LABELS"))
+            coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_NO_LABELS"))
             continue
 
         # Spread retained observations across the whole available history rather
@@ -467,9 +589,9 @@ def main():
         frames.append(feat)
         trainable_symbols += 1
         retained_rows += len(feat)
-        coverage.append((sym, len(raw), "TRAINABLE"))
+        coverage.append((sym, len(raw), usable_sessions, "TRAINABLE"))
 
-        # Release the large 1-minute intermediates before continuing.
+        # Release the symbol's intermediates before continuing.
         del raw, feat
 
         if i % 100 == 0:
@@ -484,7 +606,7 @@ def main():
 
     if not frames:
         raise RuntimeError(
-            "No ALL-NSE intraday symbols have sufficient seeded 1-minute history."
+            "No ALL-NSE symbols have the required 200-500 usable five-minute sessions."
         )
 
     data = pd.concat(frames, axis=0, ignore_index=False)
@@ -544,6 +666,11 @@ def main():
         "training_symbol_count": trainable,
         "coverage_pct": round(100 * trainable / universe_size, 4) if universe_size else 0.0,
         "minimum_rows_per_symbol": args.min_rows_symbol,
+        "minimum_usable_sessions": args.min_usable_sessions,
+        "maximum_sessions_retained": args.max_sessions,
+        "minimum_bars_per_usable_session": args.min_bars_per_session,
+        "symbols_with_200_plus_sessions": int(sum(row[2] >= 200 for row in coverage)),
+        "symbols_with_500_sessions": int(sum(row[2] >= 500 for row in coverage)),
         "sample_minutes": args.sample_minutes,
         "max_train_rows_per_symbol": args.max_train_rows_per_symbol,
         "effective_per_symbol_cap": int(per_symbol_cap),
@@ -564,13 +691,12 @@ def main():
         "regressor_sha256": "",
         "no_auto_orders": True,
         "training_data_sources": [
-            "OLO_PUBLIC_NSE_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS",
-            "NSE_OFFICIAL_INTRADAY_MINUTE_ARCHIVE_RESAMPLED_TO_COMPLETE_5M_BARS_WHEN_AVAILABLE",
-            "NSE_OFFICIAL_NIFTY50_CONTEXT",
+            "DHAN_NSE_EQUITY_NATIVE_5M_HISTORICAL_ARCHIVE",
+            "INDSTOCKS_NATIVE_5M_LIVE_ARCHIVE_WITH_SOURCE_LABELS",
+            "NSE_OFFICIAL_NIFTY50_NATIVE_5M_CONTEXT_WHEN_AVAILABLE",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
-        "historical_seed_source_url": "https://github.com/olo-labs/olo-testdata-nse-min-candle",
-        "live_incremental_source": "NSE_OFFICIAL_CHART",
+        "live_incremental_source": "INDSTOCKS_HISTORICAL_5M",
         "point_in_time_fno": True,
         "volume_policy": "Use source-reported volume only; missing volume stays NaN.",
     }
@@ -591,7 +717,7 @@ def main():
     )
     pd.DataFrame(
         coverage,
-        columns=["symbol", "stored_rows", "status"],
+        columns=["symbol", "stored_rows", "usable_sessions", "status"],
     ).to_csv(out / "INTRADAY_TRAINING_COVERAGE.csv", index=False)
 
     print(json.dumps(manifest, indent=2))

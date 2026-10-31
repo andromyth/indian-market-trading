@@ -1,0 +1,94 @@
+name: Backfill ALL-NSE native five-minute history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/backfill_all_nse_native_5m.yml"
+      - "dhan_client.py"
+      - "dhan_backfill_all_nse_5m_history.py"
+  schedule:
+    - cron: "15 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      sessions:
+        description: "Maximum usable sessions retained per symbol (200-500)"
+        required: true
+        default: "500"
+        type: choice
+        options: ["200", "250", "300", "400", "500"]
+      calendar_days:
+        description: "Calendar-day lookback used to recover up to 500 sessions"
+        required: true
+        default: "1000"
+        type: choice
+        options: ["500", "750", "1000", "1250"]
+      max_symbols:
+        description: "0 = full official NSE equity universe; otherwise a test cap"
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nse-native-5m-history-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+      DHAN_PIN: ${{ secrets.DHAN_PIN }}
+      DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+      DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install backfill dependencies
+        run: pip install -r requirements.txt
+      - name: Validate credentials before any download
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${DHAN_ACCESS_TOKEN}" && ( -z "${DHAN_CLIENT_ID}" || -z "${DHAN_PIN}" || -z "${DHAN_TOTP_SECRET}" ) ]]; then
+            echo "Missing valid DHAN_ACCESS_TOKEN or Dhan TOTP credentials (DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET)"
+            exit 1
+          fi
+          [[ -n "${GOOGLE_DRIVE_ROOT_ID}" && -n "${GOOGLE_OAUTH_TOKEN_JSON}" ]] || { echo "Missing Google Drive write credentials"; exit 1; }
+      - name: Backfill or incrementally catch up five-minute OHLCV
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            DAYS=30
+            INITIAL_DAYS=1000
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            DAYS=1000
+            INITIAL_DAYS=1000
+          else
+            DAYS="${{ inputs.calendar_days }}"
+            INITIAL_DAYS="${{ inputs.calendar_days }}"
+          fi
+          SESSIONS="${{ inputs.sessions || '500' }}"
+          MAX_SYMBOLS="${{ inputs.max_symbols || '0' }}"
+          SESSIONS="${SESSIONS:-500}"
+          MAX_SYMBOLS="${MAX_SYMBOLS:-0}"
+          python dhan_backfill_all_nse_5m_history.py \
+            --sessions "${SESSIONS}" \
+            --calendar-days "${DAYS}" \
+            --initial-calendar-days "${INITIAL_DAYS}" \
+            --minimum-usable-sessions 200 \
+            --minimum-symbol-coverage 0.90 \
+            --workers 2 \
+            --pause-seconds 0.55 \
+            --max-symbols "${MAX_SYMBOLS}"

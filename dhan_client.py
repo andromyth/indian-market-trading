@@ -18,9 +18,13 @@ Current endpoints are based on DhanHQ v2 documentation:
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import socket
+import struct
 import time
 import webbrowser
 from dataclasses import dataclass
@@ -66,6 +70,8 @@ class DhanConfig:
     api_key: str | None = None
     api_secret: str | None = None
     access_token: str | None = None
+    pin: str | None = None
+    totp_secret: str | None = None
     redirect_url: str = "http://127.0.0.1:8765/callback"
     timeout_seconds: int = 30
 
@@ -103,6 +109,8 @@ class DhanConfig:
             api_key=setting("DHAN_API_KEY"),
             api_secret=setting("DHAN_API_SECRET"),
             access_token=setting("DHAN_ACCESS_TOKEN"),
+            pin=setting("DHAN_PIN"),
+            totp_secret=setting("DHAN_TOTP_SECRET"),
             redirect_url=setting("DHAN_REDIRECT_URL", "http://127.0.0.1:8765/callback") or "http://127.0.0.1:8765/callback",
             timeout_seconds=timeout,
         )
@@ -112,6 +120,9 @@ class DhanConfig:
 
     def has_any_credential(self) -> bool:
         return bool(self.access_token or self.has_api_key_flow())
+
+    def has_totp_flow(self) -> bool:
+        return bool(self.client_id and self.pin and self.totp_secret)
 
 
 def ensure_dirs() -> None:
@@ -173,7 +184,54 @@ def cached_token_valid(buffer_seconds: int = 120) -> bool:
         return False
 
 
+def totp_code(secret: str, at_time: float | None = None) -> str:
+    """Generate a six-digit RFC 6238 TOTP code using SHA-1 and a 30-second step."""
+    if not str(secret or "").strip():
+        raise ValueError("TOTP secret is empty")
+    normalized = "".join(str(secret).strip().split()).upper()
+    padding = "=" * ((8 - len(normalized) % 8) % 8)
+    try:
+        key = base64.b32decode(normalized + padding, casefold=True)
+    except Exception as exc:
+        raise ValueError("DHAN_TOTP_SECRET must be a valid Base32 secret") from exc
+    counter = int((time.time() if at_time is None else at_time) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{binary % 1_000_000:06d}"
+
+
+def generate_totp_access_token(config: DhanConfig) -> str:
+    """Obtain a fresh 24-hour access token through Dhan's documented TOTP endpoint."""
+    if not config.has_totp_flow():
+        raise RuntimeError("DHAN_CLIENT_ID, DHAN_PIN and DHAN_TOTP_SECRET are required for TOTP authentication.")
+    response = requests.post(
+        f"{AUTH_BASE}/generateAccessToken",
+        params={
+            "dhanClientId": config.client_id,
+            "pin": config.pin,
+            "totp": totp_code(config.totp_secret),
+        },
+        timeout=config.timeout_seconds,
+    )
+    payload = _response_json(response)
+    token = payload.get("accessToken")
+    expiry = payload.get("expiryTime")
+    if not token or not expiry:
+        raise RuntimeError("Dhan TOTP authentication did not return accessToken and expiryTime.")
+    payload["savedAt"] = datetime.now(timezone.utc).isoformat()
+    save_token(payload)
+    config.access_token = str(token)
+    return str(token)
+
+
 def get_access_token(config: DhanConfig) -> str | None:
+    if config.has_totp_flow():
+        cached = load_cached_token()
+        if cached and cached_token_valid():
+            config.access_token = str(cached["accessToken"])
+            return config.access_token
+        return generate_totp_access_token(config)
     if config.access_token:
         return config.access_token
     cached = load_cached_token()
