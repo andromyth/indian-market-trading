@@ -267,11 +267,49 @@ def main() -> int:
     if not 0.5 <= args.minimum_symbol_coverage <= 1.0:
         raise ValueError("--minimum-symbol-coverage must be between 0.5 and 1.0")
 
-    from dhan_client import DhanConfig, get_access_token, resolve_equity_symbol
+    from dhan_client import (
+        DhanConfig, get_access_token, historical_intraday_range,
+        profile, resolve_equity_symbol,
+    )
     from persistent_store import GoogleDriveStore, drive_status
     config = DhanConfig.from_env()
     if not (config.has_any_credential() or config.has_totp_flow()) or not get_access_token(config):
         raise RuntimeError("Dhan TOTP credentials or a valid access token are required.")
+
+    # Prove both token validity and historical five-minute Data API entitlement
+    # before starting a multi-hour all-universe run.
+    profile_payload = profile(config)
+    data_plan = profile_payload.get("dataPlan", profile_payload.get("data_plan"))
+    if data_plan is not None and str(data_plan).strip().lower() not in {"active", "enabled", "true"}:
+        raise RuntimeError(f"Dhan Data API plan is not active (dataPlan={data_plan!r}).")
+    probe_instrument = resolve_equity_symbol("RELIANCE")
+    probe_end = datetime.now(IST)
+    probe_start = probe_end - timedelta(days=14)
+    probe_bars = historical_intraday_range(
+        config,
+        security_id=str(probe_instrument["security_id"]),
+        interval=5,
+        start=probe_start,
+        end=probe_end,
+        max_days=90,
+        instrument="EQUITY",
+        exchange_segment="NSE_EQ",
+        oi=False,
+        pause_seconds=0.55,
+    )
+    if probe_bars is None or probe_bars.empty:
+        raise RuntimeError(
+            "Dhan authentication passed, but the five-minute historical Data API probe "
+            "returned no candles for RELIANCE; check Data API subscription and instrument access."
+        )
+    print("DHANHQ_5M_PREFLIGHT=" + json.dumps({
+        "profile_authentication": "PASS",
+        "data_plan": str(data_plan) if data_plan is not None else "NOT_REPORTED",
+        "reliance_5m_probe_rows": int(len(probe_bars)),
+        "latest_probe_timestamp": pd.Timestamp(probe_bars.index.max()).isoformat(),
+        "status": "PASS",
+    }, sort_keys=True), flush=True)
+
     preflight = drive_status(require_write=True)
     if not preflight.get("configured") or preflight.get("reachable") is not True or preflight.get("write_ready") is not True:
         raise RuntimeError("Google Drive read/write preflight failed: " + str(preflight.get("reason")))
