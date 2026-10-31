@@ -41,6 +41,7 @@ jobs:
           indstocks_smoke_test.py
           google_drive_oauth_login.py
           persistent_store.py
+          dhan_client.py
           five_minute_history_archive.py
           dhan_backfill_all_nse_5m_history.py
           validate_canonical_cash_research_view.py
@@ -149,6 +150,7 @@ jobs:
           tests/test_live_training_feature_parity.py
           tests/test_five_minute_history_archive.py
           tests/test_dhan_backfill_5m.py
+          tests/test_dhan_client_totp.py
           tests/test_native_5m_training_inputs.py
           tests/test_final_algorithm_data_readiness_v2.py
           tests/test_nse_fno_udiff_ingest.py
