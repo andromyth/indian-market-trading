@@ -67,6 +67,7 @@ WORKER = AutonomousIntradayWorker(
 ALL_NSE_MINUTE_PREDICTOR = AllNSEMinutePredictor(WORKER_ROOT)
 BACKFILL_START_LOCK = threading.Lock()
 BACKFILL_THREAD: threading.Thread | None = None
+BACKFILL_CONFIRMATION = "START_NATIVE_5M_BACKFILL"
 
 
 def _update_backfill_status(**fields: Any) -> None:
@@ -666,6 +667,26 @@ class WorkerHandler(BaseHTTPRequestHandler):
         global BACKFILL_THREAD
         route = self.path.rstrip("/")
         if route == "/backfill":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                content_length = 0
+            if content_length <= 0 or content_length > 1024:
+                self._send_json(400, {
+                    "status": "BACKFILL_CONFIRMATION_REQUIRED",
+                    "required_confirmation": BACKFILL_CONFIRMATION,
+                })
+                return
+            try:
+                request_payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                request_payload = {}
+            if not isinstance(request_payload, dict) or request_payload.get("confirm") != BACKFILL_CONFIRMATION:
+                self._send_json(400, {
+                    "status": "BACKFILL_CONFIRMATION_REQUIRED",
+                    "required_confirmation": BACKFILL_CONFIRMATION,
+                })
+                return
             if not BACKFILL_START_LOCK.acquire(blocking=False):
                 self._send_json(409, {"status": "BACKFILL_START_IN_PROGRESS"})
                 return
@@ -678,8 +699,18 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"status": "BACKFILL_ALREADY_RUNNING", "five_minute_backfill": STATE.get("five_minute_backfill")})
                     return
                 preflight = _preflight()
-                if not preflight.get("ready"):
-                    self._send_json(503, {"status": "DRIVE_PREFLIGHT_FAILED", "reason": preflight.get("reason")})
+                if not all(
+                    preflight.get(key) is True
+                    for key in ("ready", "configured", "reachable", "write_ready")
+                ):
+                    self._send_json(503, {
+                        "status": "DRIVE_PREFLIGHT_FAILED",
+                        "reason": preflight.get("reason") or "Drive read/write preflight must explicitly pass.",
+                        "checks": {
+                            key: preflight.get(key)
+                            for key in ("configured", "reachable", "write_ready")
+                        },
+                    })
                     return
                 from indstocks_client import configured
                 if not configured():
