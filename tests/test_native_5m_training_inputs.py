@@ -52,6 +52,17 @@ def test_existing_shared_loader_remains_one_minute_while_new_loader_merges_nativ
     assert merged.loc[pd.Timestamp("2026-10-30 09:20", tz=IST), "Close"] == 200.0
 
 
+def test_legacy_one_minute_archive_is_not_used_by_five_minute_training(tmp_path):
+    symbol = "TEST"
+    minute_index = pd.date_range("2026-10-30 09:15", periods=15, freq="min", tz=IST)
+    minute = _frame(minute_index, 100.0)
+    seed_dir = tmp_path / SEED_REL / f"symbol={symbol}"
+    seed_dir.mkdir(parents=True)
+    minute.to_parquet(seed_dir / f"{symbol}.parquet")
+
+    assert len(load_symbol(tmp_path, symbol)) == 15
+    assert load_symbol_5m(tmp_path, symbol).empty
+
 def test_live_slot_archive_is_loaded_by_symbol_and_keeps_close_time(tmp_path):
     index = pd.date_range("2026-10-30 10:00", periods=2, freq="5min", tz=IST)
     bars = _frame(index, 300.0).reset_index(names="Timestamp")
