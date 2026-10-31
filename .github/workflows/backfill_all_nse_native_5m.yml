@@ -36,8 +36,8 @@ jobs:
     timeout-minutes: 360
     env:
       DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
-      DHAN_API_KEY: ${{ secrets.DHAN_API_KEY }}
-      DHAN_API_SECRET: ${{ secrets.DHAN_API_SECRET }}
+      DHAN_PIN: ${{ secrets.DHAN_PIN }}
+      DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
       DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -54,8 +54,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${DHAN_ACCESS_TOKEN}" && ( -z "${DHAN_CLIENT_ID}" || -z "${DHAN_API_KEY}" || -z "${DHAN_API_SECRET}" ) ]]; then
-            echo "Missing Dhan access token or complete API-key credentials"
+          if [[ -z "${DHAN_ACCESS_TOKEN}" && ( -z "${DHAN_CLIENT_ID}" || -z "${DHAN_PIN}" || -z "${DHAN_TOTP_SECRET}" ) ]]; then
+            echo "Missing valid DHAN_ACCESS_TOKEN or Dhan TOTP credentials (DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET)"
             exit 1
           fi
           [[ -n "${GOOGLE_DRIVE_ROOT_ID}" && -n "${GOOGLE_OAUTH_TOKEN_JSON}" ]] || { echo "Missing Google Drive write credentials"; exit 1; }
