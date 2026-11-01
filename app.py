@@ -368,9 +368,9 @@ st.set_page_config(page_title="Indian Market Trading", layout="wide")
 
 interface_mode = st.sidebar.radio(
     "Interface",
-    ["Live Test", "Research / Diagnostics"],
+    ["Live Test", "Paper Trading", "Research / Diagnostics"],
     index=0,
-    help="Live Test is the production-facing screen. Research / Diagnostics contains replay, audits and legacy investigation tools.",
+    help="Live Test provides model research signals; Paper Trading simulates manual NSE cash-equity fills without broker orders; Research / Diagnostics contains audits and replay tools.",
 )
 
 if interface_mode == "Research / Diagnostics":
@@ -1239,6 +1239,132 @@ def _auto_watch_intraday(symbol: str) -> dict:
             "latest_candle_ist": latest_ts.isoformat(),
             "source": source,
         }
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_paper_trading_snapshot(
+    symbol: str,
+    refresh_revision: int = 0,
+    include_predictions: bool = True,
+) -> dict:
+    """Use the same broker-first current-session bars and freshness gates as Live Test."""
+    root = str(symbol).strip().upper().replace(".NS", "").replace(".BO", "")
+    canonical = f"{root}.NS"
+    try:
+        from signals import normalize_ohlcv_frame
+
+        raw, source = _live_5m_price_frame(canonical)
+        if raw is None or raw.empty:
+            return {
+                "symbol": root,
+                "source": source,
+                "price": None,
+                "price_fresh": False,
+                "price_freshness_status": "NO_LIVE_DATA",
+                "price_freshness_reason": "No intraday bars returned by the repository market-data adapter.",
+                "predictions": [],
+                "prediction_ready": False,
+            }
+
+        frame = normalize_ohlcv_frame(raw)
+        index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
+        valid = ~index.isna()
+        frame = frame.loc[valid].copy()
+        index = index[valid]
+        index = index.tz_localize("Asia/Kolkata") if index.tz is None else index.tz_convert("Asia/Kolkata")
+        frame.index = index
+        frame = frame.sort_index()
+        frame = frame[~frame.index.duplicated(keep="last")]
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        completed = frame.loc[frame.index < now.floor("min")].copy()
+        if completed.empty:
+            return {
+                "symbol": root,
+                "source": source,
+                "price": None,
+                "price_fresh": False,
+                "price_freshness_status": "WAITING_FOR_COMPLETED_BAR",
+                "price_freshness_reason": "No completed intraday bar is available yet.",
+                "predictions": [],
+                "prediction_ready": False,
+            }
+
+        latest = completed.iloc[-1]
+        price = pd.to_numeric(pd.Series([latest.get("Close")]), errors="coerce").iloc[0]
+        if pd.isna(price) or float(price) <= 0:
+            price = None
+        quote_timestamp = pd.Timestamp(completed.index[-1]).isoformat()
+        price_guard = latest_completed_bar_status(
+            completed,
+            now,
+            max_age_seconds=5 * 60,
+            require_current_session=True,
+        )
+        output = {
+            "symbol": root,
+            "source": str(source or "UNKNOWN"),
+            "price": float(price) if price is not None else None,
+            "quote_timestamp": quote_timestamp,
+            "price_fresh": bool(price_guard.get("ok")) and price is not None,
+            "price_freshness_status": str(price_guard.get("status") or "UNKNOWN"),
+            "price_freshness_reason": str(price_guard.get("reason") or ""),
+            "predictions": [],
+            "prediction_ready": False,
+        }
+
+        if not include_predictions:
+            return output
+
+        benchmark = benchmark_for_symbol(canonical)
+        market_frame = _cached_live_market_context(benchmark)
+        market_guard = latest_completed_bar_status(
+            market_frame,
+            now,
+            max_age_seconds=5 * 60,
+            require_current_session=True,
+        )
+        output["market_context_freshness_status"] = str(market_guard.get("status") or "UNKNOWN")
+        output["prediction_freshness_reason"] = (
+            ""
+            if market_guard.get("ok") and price_guard.get("ok")
+            else (
+                str(price_guard.get("reason") or "Stock price input is not fresh.")
+                if not price_guard.get("ok")
+                else f"{benchmark} market context is not fresh: {market_guard.get('reason') or market_guard.get('status')}"
+            )
+        )
+        if not price_guard.get("ok") or not market_guard.get("ok") or price is None:
+            return output
+
+        predictions = beta_intraday_predict(
+            canonical,
+            completed,
+            market_frame,
+            decision_interval_minutes=5,
+        )
+        output["predictions"] = [dict(item) for item in (predictions or [])]
+        output["prediction_ready"] = bool(output["predictions"])
+        if not output["prediction_ready"]:
+            output["prediction_freshness_reason"] = "The runtime returned no eligible horizon predictions."
+        return output
+    except Exception as exc:
+        return {
+            "symbol": root,
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "price": None,
+            "price_fresh": False,
+            "price_freshness_status": "ERROR",
+            "price_freshness_reason": str(exc)[:240],
+            "predictions": [],
+            "prediction_ready": False,
+        }
+
+
+if interface_mode == "Paper Trading":
+    from paper_trading import render_paper_trading
+
+    render_paper_trading(_cached_paper_trading_snapshot)
+    st.stop()
 
 
 if interface_mode == "Live Test":
