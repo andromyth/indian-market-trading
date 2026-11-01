@@ -80,6 +80,8 @@ jobs:
                 "jsonPayload": row.get("jsonPayload"),
               })
           print("BACKFILL_RELATED_LOG_COUNT=" + str(len(found)))
+          if found:
+            print("BACKFILL_LATEST_EVENT=" + json.dumps(found[0], sort_keys=True, default=str))
           for row in reversed(found[:250]):
             print("BACKFILL_LOG=" + json.dumps(row, sort_keys=True, default=str))
           if not found:
