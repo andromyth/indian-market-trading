@@ -4,7 +4,9 @@
 The provider permits at most five scrip codes and seven calendar days per request.
 This runner batches five stocks per request, walks the requested range in seven-day
 windows, respects the documented 5 requests/second data limit, and checkpoints each
-stock directly to the same Drive archive used by the DhanHQ backfill.
+stock directly to the same Drive archive used by the DhanHQ backfill. Provider-omitted
+instruments in successful historical responses are recorded as empty for that window,
+matching the live capture parser.
 """
 from __future__ import annotations
 
