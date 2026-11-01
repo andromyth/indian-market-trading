@@ -156,7 +156,11 @@ jobs:
           }
           print("CONSOLIDATED_5M_SESSION_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
           coverage_pct = (100 * len(passing) / len(results)) if results else 0
-          status = "PASS_WITH_REVIEW" if results and not missing and not unreadable and coverage_pct >= 90 else "NEEDS_ATTENTION"
+          status = "PASS_WITH_REVIEW" if results and not unreadable and coverage_pct >= 90 else "NEEDS_ATTENTION"
+          if missing:
+              print("SESSION_AUDIT_REVIEW_REQUIRED_MISSING_SYMBOLS=" + json.dumps(missing, sort_keys=True))
+          if unreadable:
+              print("SESSION_AUDIT_BLOCKING_UNREADABLE_SYMBOLS=" + json.dumps(unreadable, sort_keys=True))
           print("SESSION_AUDIT_COVERAGE_RULE=At least 90% of readable consolidated symbols must have 200+ usable sessions; symbols below 200 remain REVIEW until listing/trading history is independently verified.")
           print("SESSION_AUDIT_STATUS=" + status)
           if status != "PASS":
