@@ -1,6 +1,7 @@
 name: Check native five-minute backfill status
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -73,7 +74,9 @@ jobs:
           rows=json.load(open(sys.argv[1], encoding="utf-8"))
           keys=("indstocks_5m_backfill_progress","indstocks_5m_backfill_failed",
                 "indstocks_5m_backfill_completed","indstocks_5m_backfill_started",
-                "five_minute_backfill")
+                "five_minute_backfill","FETCHING_HISTORY","RESUMED_CHECKPOINT",
+                "api_calls_in_batch","checkpoint write failed","window_checkpoints",
+                "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED")
           found=[]
           for row in rows:
             rendered=json.dumps(row, sort_keys=True, default=str)
