@@ -1,0 +1,159 @@
+name: Audit consolidated five-minute sessions in Drive
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/audit_consolidated_5m_sessions.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Audit consolidated Parquet files in Google Drive
+        shell: bash
+        env:
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pandas pyarrow google-api-python-client google-auth
+          python - <<'PY'
+          import io, json, os, sys
+          import pandas as pd
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "")
+          root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
+          if not token_text or not root_id:
+              print("SESSION_AUDIT_STATUS=BLOCKED_MISSING_OAUTH_TOKEN_OR_ROOT_ID")
+              sys.exit(2)
+          info = json.loads(token_text)
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid:
+              creds.refresh(Request())
+          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+          folder_mime = "application/vnd.google-apps.folder"
+
+          def children(parent_id, name=None):
+              q = f"'{parent_id}' in parents and trashed = false"
+              if name is not None:
+                  q += " and name = " + json.dumps(name)
+              result_rows, page = [], None
+              while True:
+                  response = drive.files().list(
+                      q=q, pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)"
+                  ).execute()
+                  result_rows.extend(response.get("files", []))
+                  page = response.get("nextPageToken")
+                  if not page:
+                      return result_rows
+
+          def descend(parent_id, names):
+              current = parent_id
+              for name in names:
+                  matches = [f for f in children(current, name) if f["mimeType"] == folder_mime]
+                  if not matches:
+                      raise RuntimeError("Missing Drive folder: " + name)
+                  current = matches[0]["id"]
+              return current
+
+          archive_id = descend(root_id, ["production_data", "nse_official", "intraday_seed", "olo_5m_archive"])
+          archive_root = children(archive_id)
+          symbols_matches = [x for x in archive_root if x["name"] == "symbols" and x["mimeType"] == folder_mime]
+          if not symbols_matches:
+              raise RuntimeError("Missing archive symbols folder")
+          symbols_id = symbols_matches[0]["id"]
+          symbols_root = children(symbols_id)
+          symbol_dirs = [x for x in symbols_root if x["name"].startswith("symbol=") and x["mimeType"] == folder_mime]
+          results, missing, unreadable = [], [], []
+          for folder in sorted(symbol_dirs, key=lambda x: x["name"]):
+              symbol = folder["name"].split("=", 1)[1].strip().upper()
+              try:
+                  files = [x for x in children(folder["id"]) if x["name"] == f"{symbol}.parquet" and x["mimeType"] != folder_mime]
+                  if not files:
+                      missing.append(symbol)
+                      continue
+                  item = max(files, key=lambda x: x.get("modifiedTime", ""))
+                  buffer = io.BytesIO()
+                  downloader = MediaIoBaseDownload(buffer, drive.files().get_media(fileId=item["id"]), chunksize=8 * 1024 * 1024)
+                  done = False
+                  while not done:
+                      _, done = downloader.next_chunk()
+                  frame = pd.read_parquet(io.BytesIO(buffer.getvalue()))
+                  if "Timestamp" in frame.columns:
+                      idx = pd.to_datetime(frame.pop("Timestamp"), errors="coerce", utc=True)
+                  else:
+                      idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
+                  frame.index = pd.DatetimeIndex(idx)
+                  frame = frame.loc[~frame.index.isna()].copy()
+                  for col in ["Open", "High", "Low", "Close"]:
+                      if col not in frame.columns:
+                          frame[col] = float("nan")
+                      frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                  valid = frame[["Open", "High", "Low", "Close"]].notna().all(axis=1)
+                  valid &= frame[["Open", "High", "Low", "Close"]].gt(0).all(axis=1)
+                  valid_frame = frame.loc[valid]
+                  dates = pd.Index(valid_frame.index.tz_convert("Asia/Kolkata").date)
+                  daily_counts = pd.Series(1, index=dates).groupby(level=0).sum()
+                  usable = sorted(str(d) for d in daily_counts[daily_counts >= 50].index)
+                  results.append({
+                      "symbol": symbol,
+                      "drive_file_id": item["id"],
+                      "size_bytes": int(item.get("size") or 0),
+                      "modified_time": item.get("modifiedTime"),
+                      "rows_total": int(len(frame)),
+                      "valid_ohlc_rows": int(valid.sum()),
+                      "unique_timestamps": int(frame.index.nunique()),
+                      "raw_sessions": int(daily_counts.size),
+                      "usable_sessions_ge_50_valid_ohlc_bars": len(usable),
+                      "first_timestamp_ist": frame.index.min().tz_convert("Asia/Kolkata").isoformat() if len(frame) else None,
+                      "last_timestamp_ist": frame.index.max().tz_convert("Asia/Kolkata").isoformat() if len(frame) else None,
+                      "passes_200_sessions": len(usable) >= 200,
+                  })
+              except Exception as exc:
+                  unreadable.append({"symbol": symbol, "error": str(exc)[:500]})
+          passing = [r for r in results if r["passes_200_sessions"]]
+          below = sorted(
+              [{"symbol": r["symbol"], "usable_sessions": r["usable_sessions_ge_50_valid_ohlc_bars"], "rows": r["rows_total"]} for r in results if not r["passes_200_sessions"]],
+              key=lambda x: (x["usable_sessions"], x["symbol"])
+          )
+          report = {
+              "archive_path": "production_data/nse_official/intraday_seed/olo_5m_archive",
+              "audit_method": "downloaded each consolidated symbol Parquet from Drive and counted dates with at least 50 positive, non-null OHLC bars",
+              "symbol_folders": len(symbol_dirs),
+              "consolidated_parquets_readable": len(results),
+              "missing_consolidated_parquet": len(missing),
+              "unreadable_parquet": len(unreadable),
+              "symbols_with_200_or_more_usable_sessions": len(passing),
+              "symbols_below_200_usable_sessions": len(below),
+              "passing_percentage_of_readable": round(100 * len(passing) / len(results), 2) if results else 0,
+              "total_valid_ohlc_rows": sum(r["valid_ohlc_rows"] for r in results),
+              "total_usable_symbol_sessions": sum(r["usable_sessions_ge_50_valid_ohlc_bars"] for r in results),
+              "below_200_examples": below[:100],
+              "missing_symbols": missing[:100],
+              "unreadable_examples": unreadable[:50],
+              "per_symbol": results,
+              "root_backfill_manifest_present": any(x["name"] == "backfill_manifest.json" for x in archive_root),
+          }
+          print("CONSOLIDATED_5M_SESSION_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
+          status = "PASS" if results and not missing and not unreadable and len(passing) == len(results) else "NEEDS_ATTENTION"
+          print("SESSION_AUDIT_STATUS=" + status)
+          if status != "PASS":
+              sys.exit(1)
+          PY
