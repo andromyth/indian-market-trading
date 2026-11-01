@@ -11,9 +11,15 @@ on:
         options:
           - "no"
           - "yes"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/start_cloud_run_5m_backfill.yml"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: start-cloud-run-native-5m-backfill
@@ -21,7 +27,7 @@ concurrency:
 
 jobs:
   start-backfill:
-    if: github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes'
+    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -30,6 +36,32 @@ jobs:
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
     steps:
+      - name: Require successful deployment of the previous commit before starting backfill
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_DEPLOY_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${EXPECTED_DEPLOY_SHA}&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["EXPECTED_DEPLOY_SHA"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(runs,key=lambda r:r.get("created_at","")) if runs else {}))')"
+            RUN_ID="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              echo "DEPLOY_RUN_ID=$RUN_ID STATUS=$STATUS CONCLUSION=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                [[ "$CONCLUSION" == "success" ]] || { echo "Backfill start blocked: previous commit deployment failed."; exit 1; }
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Backfill start blocked: timed out waiting for previous-commit deployment."
+          exit 1
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
