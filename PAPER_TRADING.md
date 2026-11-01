@@ -4,9 +4,9 @@
 
 Run the existing Streamlit application:
 
-\`\`\`bash
+```bash
 streamlit run app.py
-\`\`\`
+```
 
 Choose **Paper Trading** from the Interface selector. The paper-trading page is part of the existing application; it is not a separate production service.
 
@@ -28,15 +28,15 @@ The account, settings, and immutable simulated fills are stored in SQLite, indep
 
 Default local path:
 
-\`\`\`text
+```text
 data/paper_trading.sqlite3
-\`\`\`
+```
 
-Set \`PAPER_TRADING_DB_PATH\` to a mounted persistent path when the hosting filesystem is ephemeral, for example:
+Set `PAPER_TRADING_DB_PATH` to a mounted persistent path when the hosting filesystem is ephemeral, for example:
 
-\`\`\`bash
+```bash
 PAPER_TRADING_DB_PATH=/mnt/persistent/paper_trading.sqlite3
-\`\`\`
+```
 
 Resetting the paper account deletes its fills and starts a new ledger; the UI requires an explicit confirmation checkbox.
 
@@ -44,7 +44,7 @@ Resetting the paper account deletes its fills and starts a new ledger; the UI re
 
 Run the focused ledger and risk-control tests:
 
-\`\`\`bash
+```bash
 pytest -q tests/test_paper_trading.py
 python -m compileall -q app.py paper_trading.py
-\`\`\`
+```
