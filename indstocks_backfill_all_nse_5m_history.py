@@ -241,18 +241,20 @@ def fetch_indstocks_5m_batch(
         data = body.get("data")
         if not isinstance(data, dict):
             raise RuntimeError(f"INDstocks response data is not an object for window {window_key}.")
+        # INDstocks may omit a requested code, or its candles field, when no
+        # candles exist for that instrument/window (for example before a listing).
+        # The live capture path uses the same empty-history interpretation. Keep
+        # this visible in the checkpoint manifest rather than failing valid peers.
         missing_codes = sorted(set(symbols_by_code) - set(data))
-        if missing_codes:
-            raise RuntimeError(
-                f"INDstocks response omitted requested scrip codes for window {window_key}: {missing_codes}"
-            )
         window_frames: list[pd.DataFrame] = []
         row_counts: dict[str, int] = {}
         for code, symbol in symbols_by_code.items():
-            instrument = data[code]
-            if not isinstance(instrument, dict) or not isinstance(instrument.get("candles"), list):
-                raise RuntimeError(f"INDstocks response omitted an explicit candles list for {symbol} in window {window_key}.")
-            candles = instrument["candles"]
+            instrument = data.get(code) or {}
+            if not isinstance(instrument, dict):
+                raise RuntimeError(f"INDstocks instrument response is invalid for {symbol} in window {window_key}.")
+            candles = instrument.get("candles") or []
+            if not isinstance(candles, list):
+                raise RuntimeError(f"INDstocks candles field is invalid for {symbol} in window {window_key}.")
             row_counts[symbol] = len(candles)
             if not candles:
                 continue
@@ -297,6 +299,7 @@ def fetch_indstocks_5m_batch(
                 "end": window_end.isoformat(),
                 "symbols": expected_symbols,
                 "row_counts": row_counts,
+                "provider_omitted_codes": missing_codes,
                 "checkpoint_remote": checkpoint_remote,
             }, sort_keys=True), encoding="utf-8")
             uploaded_manifest = store.upload_or_update(
