@@ -166,7 +166,7 @@ jobs:
               except Exception as exc:
                   bad_parquet.append({"name": item["name"], "issues": [type(exc).__name__ + ": " + str(exc)[:250]]})
                   parquet_detail.append({"name": item["name"], "read_error": type(exc).__name__ + ": " + str(exc)[:250]})
-                    by_name = {x["name"]: x for x in all_checkpoint_files}
+          by_name = {x["name"]: x for x in all_checkpoint_files}
           parquet_files = [x for x in all_checkpoint_files if x["name"].endswith(".parquet")]
           manifests = [x for x in all_checkpoint_files if x["name"].endswith(".parquet.json")]
           missing_pairs = [x["name"] for x in parquet_files if x["name"] + ".json" not in by_name]
