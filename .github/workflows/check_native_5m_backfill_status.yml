@@ -67,7 +67,7 @@ jobs:
               while True:
                   result = service.files().list(
                       q=q, pageSize=1000, pageToken=page,
-                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink)"
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,parents)"
                   ).execute()
                   rows.extend(result.get("files", []))
                   page = result.get("nextPageToken")
@@ -134,16 +134,25 @@ jobs:
                   time_col = next((c for c in timestamp_candidates if c in frame.columns), None)
                   time_min = time_max = None
                   invalid_times = None
+                  time_source = None
                   if time_col:
                       parsed = pd.to_datetime(frame[time_col], errors="coerce", utc=True)
-                      invalid_times = int(parsed.isna().sum())
-                      if parsed.notna().any():
-                          time_min, time_max = str(parsed.min()), str(parsed.max())
+                      time_source = "column:" + time_col
+                  elif isinstance(frame.index, pd.DatetimeIndex):
+                      parsed = pd.to_datetime(frame.index, errors="coerce", utc=True)
+                      time_source = "DatetimeIndex:" + str(frame.index.name or "unnamed")
+                  else:
+                      parsed = None
+                  if parsed is not None:
+                      invalid_times = int(pd.isna(parsed).sum())
+                      valid_times = parsed[~pd.isna(parsed)]
+                      if len(valid_times):
+                          time_min, time_max = str(valid_times.min()), str(valid_times.max())
                   reason = []
                   if len(frame) and not symbol_col: reason.append("nonempty_without_symbol_column")
-                  if len(symbols) > 5: reason.append("more_than_five_symbols_in_file")
-                  if not time_col: reason.append("no_recognized_timestamp_column")
-                  if time_col and invalid_times: reason.append("invalid_timestamps")
+                  # Checkpoint files intentionally aggregate multiple symbols per batch.
+                  if parsed is None: reason.append("no_recognized_timestamp_column_or_datetime_index")
+                  if parsed is not None and invalid_times: reason.append("invalid_timestamps")
                   name = item["name"]
                   stem = name[:-8] if name.endswith(".parquet") else name
                   patterns = [
@@ -156,7 +165,7 @@ jobs:
                   parquet_detail.append({
                       "name": name, "bytes": item.get("size"), "rows": int(len(frame)),
                       "columns": cols, "symbol_column": symbol_col, "symbols": symbols,
-                      "symbol_count": len(symbols), "timestamp_column": time_col,
+                      "symbol_count": len(symbols), "timestamp_column": time_col, "timestamp_source": time_source,
                       "timestamp_min_utc": time_min, "timestamp_max_utc": time_max,
                       "invalid_timestamp_count": invalid_times, "filename_pattern_id": pattern,
                       "filename_stem": stem, "issues": reason,
@@ -166,11 +175,14 @@ jobs:
               except Exception as exc:
                   bad_parquet.append({"name": item["name"], "issues": [type(exc).__name__ + ": " + str(exc)[:250]]})
                   parquet_detail.append({"name": item["name"], "read_error": type(exc).__name__ + ": " + str(exc)[:250]})
-          by_name = {x["name"]: x for x in all_checkpoint_files}
+          # Match parquet/manifests within the same Drive parent folder; filenames repeat across batches.
+          def file_key(x):
+              return ((x.get("parents") or [""])[0], x["name"])
+          by_key = {file_key(x): x for x in all_checkpoint_files}
           parquet_files = [x for x in all_checkpoint_files if x["name"].endswith(".parquet")]
           manifests = [x for x in all_checkpoint_files if x["name"].endswith(".parquet.json")]
-          missing_pairs = [x["name"] for x in parquet_files if x["name"] + ".json" not in by_name]
-          orphan_manifests = [x["name"] for x in manifests if x["name"][:-5] not in by_name]
+          missing_pairs = [x["name"] for x in parquet_files if (file_key(x)[0], x["name"] + ".json") not in by_key]
+          orphan_manifests = [x["name"] for x in manifests if (file_key(x)[0], x["name"][:-5]) not in by_key]
           complete, invalid, malformed, manifest_rows = 0, [], [], []
           for item in manifests:
               try:
