@@ -136,3 +136,5 @@ jobs:
                   raise SystemExit(0)
           raise SystemExit("BACKFILL_START_FAILED http="+code+" status="+str(body.get("status")))
           PY
+
+# Controlled repair run requested: verify checkpoint manifests, then resume the private backfill only if idle.
