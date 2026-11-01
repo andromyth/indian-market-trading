@@ -128,7 +128,18 @@ def _run_five_minute_backfill() -> None:
                 exit_code = backfill.main([])
                 break
             except Exception as exc:
-                if job_attempt == max_job_attempts:
+                message = str(exc).upper()
+                retryable = any(
+                    marker in message
+                    for marker in (
+                        "HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+                        "UNEXPECTED_EOF_WHILE_READING", "SSLEOFERROR",
+                        "REMOTEENDCLOSEDERROR", "CONNECTION RESET", "CONNECTIONRESETERROR",
+                        "CONNECTION ABORTED", "BROKEN PIPE", "CONNECTIONERROR",
+                        "NETWORKEXCEPTION", "TIMEOUT",
+                    )
+                )
+                if not retryable or job_attempt == max_job_attempts:
                     raise
                 detail = f"{type(exc).__name__}: {str(exc)[:240]}"
                 delay_seconds = 10 * job_attempt
