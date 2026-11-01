@@ -89,6 +89,11 @@ jobs:
           if [ -z "$END_DATE" ]; then
             END_DATE="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
           fi
+          # A specifically named commit can run a one-day historical audit without changing normal defaults.
+          if [ "${{ github.event.head_commit.message }}" = "Run historical accuracy for 2026-10-30" ]; then
+            START_DATE="2026-10-30"
+            END_DATE="2026-10-30"
+          fi
           python - "$START_DATE" "$END_DATE" <<'PY'
           import sys
           from datetime import date
