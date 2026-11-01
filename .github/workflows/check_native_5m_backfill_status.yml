@@ -13,7 +13,7 @@ permissions:
 jobs:
   status:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
@@ -37,13 +37,16 @@ jobs:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
         run: |
           set -euo pipefail
-          python -m pip install --quiet google-api-python-client google-auth
+          python -m pip install --quiet google-api-python-client google-auth pandas pyarrow
           python - <<'PY'
           import json, os, sys
           from google.oauth2.credentials import Credentials
           from google.auth.transport.requests import Request
           from googleapiclient.discovery import build
           from googleapiclient.errors import HttpError
+          import io, re, hashlib
+          import pandas as pd
+          from googleapiclient.http import MediaIoBaseDownload
 
           token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "")
           root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
@@ -104,7 +107,66 @@ jobs:
                       stack.append(item["id"])
                   else:
                       all_checkpoint_files.append(item)
-          by_name = {x["name"]: x for x in all_checkpoint_files}
+          # Deep-read every checkpoint Parquet; report each file separately.
+          parquet_detail = []
+          schema_counts = {}
+          column_counts = {}
+          symbol_union_by_batch = {}
+          bad_parquet = []
+          timestamp_candidates = ("Datetime", "datetime", "Timestamp", "timestamp", "Date", "date", "time")
+          for item in sorted([x for x in all_checkpoint_files if x["name"].endswith(".parquet")], key=lambda x: x["name"]):
+              batch = next((p for p in item.get("webViewLink", "").split("/") if False), None)
+              # Find containing batch folder by Drive parent lookup; keep this audit read-only.
+              try:
+                  raw = io.BytesIO()
+                  downloader = MediaIoBaseDownload(raw, service.files().get_media(fileId=item["id"]))
+                  done = False
+                  while not done:
+                      _, done = downloader.next_chunk()
+                  frame = pd.read_parquet(io.BytesIO(raw.getvalue()))
+                  cols = list(map(str, frame.columns))
+                  schema_key = "|".join(cols)
+                  schema_counts[schema_key] = schema_counts.get(schema_key, 0) + 1
+                  for col in cols:
+                      column_counts[col] = column_counts.get(col, 0) + 1
+                  symbol_col = next((c for c in ("Symbol", "symbol", "SYMBOL", "tradingsymbol") if c in frame.columns), None)
+                  symbols = sorted({str(v).strip().upper() for v in frame[symbol_col].dropna().unique() if str(v).strip()}) if symbol_col else []
+                  time_col = next((c for c in timestamp_candidates if c in frame.columns), None)
+                  time_min = time_max = None
+                  invalid_times = None
+                  if time_col:
+                      parsed = pd.to_datetime(frame[time_col], errors="coerce", utc=True)
+                      invalid_times = int(parsed.isna().sum())
+                      if parsed.notna().any():
+                          time_min, time_max = str(parsed.min()), str(parsed.max())
+                  reason = []
+                  if len(frame) and not symbol_col: reason.append("nonempty_without_symbol_column")
+                  if len(symbols) > 5: reason.append("more_than_five_symbols_in_file")
+                  if not time_col: reason.append("no_recognized_timestamp_column")
+                  if time_col and invalid_times: reason.append("invalid_timestamps")
+                  name = item["name"]
+                  stem = name[:-8] if name.endswith(".parquet") else name
+                  patterns = [
+                      r"^\\d{8}T\\d{4}_\\d{8}T\\d{4}$",
+                      r"^\\d{8}T\\d{6}_\\d{8}T\\d{6}$",
+                      r"^\\d{8}_\\d{8}$",
+                      r"^\\d{8}T\\d{4}__\\d{8}T\\d{4}$"
+                  ]
+                  pattern = next((i + 1 for i, pat in enumerate(patterns) if re.fullmatch(pat, stem)), None)
+                  parquet_detail.append({
+                      "name": name, "bytes": item.get("size"), "rows": int(len(frame)),
+                      "columns": cols, "symbol_column": symbol_col, "symbols": symbols,
+                      "symbol_count": len(symbols), "timestamp_column": time_col,
+                      "timestamp_min_utc": time_min, "timestamp_max_utc": time_max,
+                      "invalid_timestamp_count": invalid_times, "filename_pattern_id": pattern,
+                      "filename_stem": stem, "issues": reason,
+                      "modifiedTime": item.get("modifiedTime")
+                  })
+                  if reason: bad_parquet.append({"name": name, "issues": reason})
+              except Exception as exc:
+                  bad_parquet.append({"name": item["name"], "issues": [type(exc).__name__ + ": " + str(exc)[:250]]})
+                  parquet_detail.append({"name": item["name"], "read_error": type(exc).__name__ + ": " + str(exc)[:250]})
+                    by_name = {x["name"]: x for x in all_checkpoint_files}
           parquet_files = [x for x in all_checkpoint_files if x["name"].endswith(".parquet")]
           manifests = [x for x in all_checkpoint_files if x["name"].endswith(".parquet.json")]
           missing_pairs = [x["name"] for x in parquet_files if x["name"] + ".json" not in by_name]
@@ -156,9 +218,19 @@ jobs:
               "consolidated_symbol_folder_count": len(symbol_dirs),
               "root_backfill_manifest_present": bool(root_manifest),
               "recent_checkpoint_manifests": sorted(manifest_rows, key=lambda x: x.get("updated_at") or "", reverse=True)[:20],
+              "parquet_deep_audit": {
+                  "files_examined": len(parquet_detail),
+                  "read_error_or_content_issue_count": len(bad_parquet),
+                  "schema_variants": [{"columns": k.split("|") if k else [], "file_count": v} for k, v in sorted(schema_counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+                  "column_presence_counts": column_counts,
+                  "filename_pattern_counts": {str(i): sum(1 for x in parquet_detail if x.get("filename_pattern_id") == i) for i in range(1, 5)},
+                  "unrecognized_filename_count": sum(1 for x in parquet_detail if not x.get("filename_pattern_id")),
+                  "bad_parquet_examples": bad_parquet[:100],
+                  "every_file": parquet_detail
+              },
           }
           print("DRIVE_ARCHIVE_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
-          if missing_pairs or malformed or invalid:
+          if missing_pairs or malformed or invalid or bad_parquet:
               print("DRIVE_ARCHIVE_AUDIT_STATUS=NEEDS_ATTENTION")
           else:
               print("DRIVE_ARCHIVE_AUDIT_STATUS=STRUCTURAL_CHECKS_PASS")
