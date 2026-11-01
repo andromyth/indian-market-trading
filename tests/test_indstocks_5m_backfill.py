@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from indstocks_backfill_all_nse_5m_history import (
     fetch_indstocks_5m_batch,
@@ -186,3 +187,70 @@ def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbo
         raise AssertionError("Incomplete API response must not be accepted as a checkpoint")
 
     assert store.uploads == []
+
+
+
+def test_indstocks_batch_retries_transient_ssl_eof_before_succeeding(monkeypatch):
+    import indstocks_client
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    attempts = []
+    sleeps = []
+
+    class Response:
+        @staticmethod
+        def json():
+            return {
+                "success": True,
+                "data": {
+                    "NSE_100": {"candles": [{
+                        "ts": int(pd.Timestamp("2026-10-30 09:15", tz=IST).timestamp()),
+                        "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 1000,
+                    }]},
+                },
+            }
+
+    def flaky_request(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError(
+                "SSLError: [SSL: UNEXPECTED_EOF_WHILE_READING] unexpected eof while reading"
+            )
+        return Response()
+
+    monkeypatch.setattr(indstocks_client, "_request", flaky_request)
+    monkeypatch.setattr(backfill.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    start = pd.Timestamp("2026-10-30 09:15", tz=IST).to_pydatetime()
+    end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
+    frames, request_count = fetch_indstocks_5m_batch(
+        [("RELIANCE", "NSE_100")], start, end, pause_seconds=0,
+    )
+
+    assert len(attempts) == 3
+    assert sleeps == [2, 4]
+    assert request_count == 1
+    assert frames["RELIANCE"].iloc[0]["Close"] == 100.5
+
+
+def test_indstocks_batch_does_not_retry_nontransient_ssl_certificate_error(monkeypatch):
+    import indstocks_client
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    attempts = []
+
+    def bad_request(*args, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("SSLError: CERTIFICATE_VERIFY_FAILED")
+
+    monkeypatch.setattr(indstocks_client, "_request", bad_request)
+    monkeypatch.setattr(backfill.time, "sleep", lambda _: None)
+
+    start = pd.Timestamp("2026-10-30 09:15", tz=IST).to_pydatetime()
+    end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
+    with pytest.raises(RuntimeError, match="CERTIFICATE_VERIFY_FAILED"):
+        fetch_indstocks_5m_batch(
+            [("RELIANCE", "NSE_100")], start, end, pause_seconds=0,
+        )
+
+    assert len(attempts) == 1
