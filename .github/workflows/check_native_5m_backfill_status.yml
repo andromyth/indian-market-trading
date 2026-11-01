@@ -85,11 +85,16 @@ jobs:
               "production_data", "nse_official", "intraday_seed", "olo_5m_archive"
           ])
           root_files = children(archive_id)
-          checkpoint_dirs = [x for x in root_files if x["name"] == "window_checkpoints" and x["mimeType"] == "application/vnd.google-apps.folder"]
-          symbol_dirs = [x for x in root_files if x["name"].startswith("symbol=") and x["mimeType"] == "application/vnd.google-apps.folder"]
+          symbols_dirs = [x for x in root_files if x["name"] == "symbols" and x["mimeType"] == "application/vnd.google-apps.folder"]
+          if not symbols_dirs:
+              raise RuntimeError("symbols folder is missing under the archive")
+          symbols_id = symbols_dirs[0]["id"]
+          symbol_root_files = children(symbols_id)
+          checkpoint_dirs = [x for x in symbol_root_files if x["name"] == "window_checkpoints" and x["mimeType"] == "application/vnd.google-apps.folder"]
+          symbol_dirs = [x for x in symbol_root_files if x["name"].startswith("symbol=") and x["mimeType"] == "application/vnd.google-apps.folder"]
           root_manifest = [x for x in root_files if x["name"] == "backfill_manifest.json"]
           if not checkpoint_dirs:
-              raise RuntimeError("window_checkpoints folder is missing under the archive")
+              raise RuntimeError("symbols/window_checkpoints folder is missing under the archive")
           all_checkpoint_files = []
           stack = [checkpoint_dirs[0]["id"]]
           while stack:
@@ -134,6 +139,8 @@ jobs:
           report = {
               "archive_path": "production_data/nse_official/intraday_seed/olo_5m_archive",
               "archive_root_file_count": len(root_files),
+              "symbols_root_file_count": len(symbol_root_files),
+              "checkpoint_path": "production_data/nse_official/intraday_seed/olo_5m_archive/symbols/window_checkpoints",
               "checkpoint_subfolder_count": len([x for x in children(checkpoint_dirs[0]["id"]) if x["mimeType"] == "application/vnd.google-apps.folder"]),
               "checkpoint_file_count_recursive": len(all_checkpoint_files),
               "checkpoint_parquet_count": len(parquet_files),
