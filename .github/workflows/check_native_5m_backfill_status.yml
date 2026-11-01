@@ -30,6 +30,133 @@ jobs:
         with:
           project_id: indian-market-trading
 
+      - name: Audit Google Drive five-minute archive and checkpoint manifests
+        shell: bash
+        env:
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet google-api-python-client google-auth
+          python - <<'PY'
+          import json, os, sys
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
+
+          token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "")
+          root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
+          if not token_text or not root_id:
+              print("DRIVE_AUDIT_STATUS=BLOCKED_MISSING_OAUTH_TOKEN_OR_ROOT_ID")
+              sys.exit(2)
+          info = json.loads(token_text)
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+          if not creds.valid:
+              creds.refresh(Request())
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+          def children(parent_id, name=None):
+              q = f"'{parent_id}' in parents and trashed = false"
+              if name is not None:
+                  q += " and name = " + json.dumps(name)
+              rows, page = [], None
+              while True:
+                  result = service.files().list(
+                      q=q, pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink)"
+                  ).execute()
+                  rows.extend(result.get("files", []))
+                  page = result.get("nextPageToken")
+                  if not page:
+                      break
+              return rows
+
+          def descend(parent, names):
+              current = parent
+              for name in names:
+                  matches = [x for x in children(current, name) if x["mimeType"] == "application/vnd.google-apps.folder"]
+                  if not matches:
+                      raise RuntimeError("Drive folder path component not found: " + name)
+                  current = matches[0]["id"]
+              return current
+
+          archive_id = descend(root_id, [
+              "production_data", "nse_official", "intraday_seed", "olo_5m_archive"
+          ])
+          root_files = children(archive_id)
+          checkpoint_dirs = [x for x in root_files if x["name"] == "window_checkpoints" and x["mimeType"] == "application/vnd.google-apps.folder"]
+          symbol_dirs = [x for x in root_files if x["name"].startswith("symbol=") and x["mimeType"] == "application/vnd.google-apps.folder"]
+          root_manifest = [x for x in root_files if x["name"] == "backfill_manifest.json"]
+          if not checkpoint_dirs:
+              raise RuntimeError("window_checkpoints folder is missing under the archive")
+          all_checkpoint_files = []
+          stack = [checkpoint_dirs[0]["id"]]
+          while stack:
+              parent = stack.pop()
+              for item in children(parent):
+                  if item["mimeType"] == "application/vnd.google-apps.folder":
+                      stack.append(item["id"])
+                  else:
+                      all_checkpoint_files.append(item)
+          by_name = {x["name"]: x for x in all_checkpoint_files}
+          parquet_files = [x for x in all_checkpoint_files if x["name"].endswith(".parquet")]
+          manifests = [x for x in all_checkpoint_files if x["name"].endswith(".parquet.json")]
+          missing_pairs = [x["name"] for x in parquet_files if x["name"] + ".json" not in by_name]
+          orphan_manifests = [x["name"] for x in manifests if x["name"][:-5] not in by_name]
+          complete, invalid, malformed, manifest_rows = 0, [], [], []
+          for item in manifests:
+              try:
+                  req = service.files().get_media(fileId=item["id"])
+                  import io
+                  from googleapiclient.http import MediaIoBaseDownload
+                  buf = io.BytesIO()
+                  downloader = MediaIoBaseDownload(buf, req)
+                  done = False
+                  while not done:
+                      _, done = downloader.next_chunk()
+                  doc = json.loads(buf.getvalue().decode("utf-8"))
+                  status = doc.get("status")
+                  if status == "COMPLETE":
+                      complete += 1
+                  else:
+                      invalid.append({"manifest": item["name"], "status": status})
+                  manifest_rows.append({
+                      "manifest": item["name"], "status": status,
+                      "window_key": doc.get("window_key"),
+                      "symbols_count": len(doc.get("symbols") or []),
+                      "row_counts": doc.get("row_counts"),
+                      "provider_omitted_codes_count": len(doc.get("provider_omitted_codes") or []),
+                      "updated_at": item.get("modifiedTime"),
+                  })
+              except Exception as exc:
+                  malformed.append({"manifest": item["name"], "error": str(exc)[:300]})
+          report = {
+              "archive_path": "production_data/nse_official/intraday_seed/olo_5m_archive",
+              "archive_root_file_count": len(root_files),
+              "checkpoint_subfolder_count": len([x for x in children(checkpoint_dirs[0]["id"]) if x["mimeType"] == "application/vnd.google-apps.folder"]),
+              "checkpoint_file_count_recursive": len(all_checkpoint_files),
+              "checkpoint_parquet_count": len(parquet_files),
+              "checkpoint_manifest_count": len(manifests),
+              "complete_manifest_count": complete,
+              "parquet_missing_manifest_count": len(missing_pairs),
+              "parquet_missing_manifest_examples": missing_pairs[:30],
+              "orphan_manifest_count": len(orphan_manifests),
+              "invalid_manifest_count": len(invalid),
+              "invalid_manifest_examples": invalid[:20],
+              "malformed_manifest_count": len(malformed),
+              "malformed_manifest_examples": malformed[:20],
+              "consolidated_symbol_folder_count": len(symbol_dirs),
+              "root_backfill_manifest_present": bool(root_manifest),
+              "recent_checkpoint_manifests": sorted(manifest_rows, key=lambda x: x.get("updated_at") or "", reverse=True)[:20],
+          }
+          print("DRIVE_ARCHIVE_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
+          if missing_pairs or malformed or invalid:
+              print("DRIVE_ARCHIVE_AUDIT_STATUS=NEEDS_ATTENTION")
+          else:
+              print("DRIVE_ARCHIVE_AUDIT_STATUS=STRUCTURAL_CHECKS_PASS")
+          PY
+
       - name: Read live backfill state and recent Cloud Run progress logs
         shell: bash
         run: |
