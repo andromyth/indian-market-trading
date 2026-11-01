@@ -141,7 +141,8 @@ def test_indstocks_batch_calls_guard_for_each_seven_day_window(monkeypatch):
 
 
 
-def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbol(monkeypatch, tmp_path):
+def test_indstocks_checkpoint_records_omitted_code_as_empty_window(monkeypatch, tmp_path):
+    import json
     import indstocks_client
     import indstocks_backfill_all_nse_5m_history as backfill
 
@@ -150,10 +151,12 @@ def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbo
         def json():
             return {
                 "success": True,
-                # API returned only one requested code; the absent code must not
-                # be mistaken for a complete, resumable empty-data window.
+                # INDstocks may omit codes with no candles in an old window.
                 "data": {
-                    "NSE_100": {"candles": []},
+                    "NSE_100": {"candles": [{
+                        "ts": int(pd.Timestamp("2026-10-30 09:15", tz=IST).timestamp()),
+                        "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 1000,
+                    }]},
                 },
             }
 
@@ -176,18 +179,20 @@ def test_indstocks_checkpoint_is_not_written_when_response_omits_requested_symbo
     start = pd.Timestamp("2026-10-30 09:15", tz=IST).to_pydatetime()
     end = pd.Timestamp("2026-10-31 09:15", tz=IST).to_pydatetime()
 
-    try:
-        fetch_indstocks_5m_batch(
-            symbols, start, end, pause_seconds=0,
-            store=store, checkpoint_root=tmp_path,
-        )
-    except RuntimeError as exc:
-        assert "omitted requested scrip codes" in str(exc)
-    else:
-        raise AssertionError("Incomplete API response must not be accepted as a checkpoint")
+    frames, request_count = fetch_indstocks_5m_batch(
+        symbols, start, end, pause_seconds=0,
+        store=store, checkpoint_root=tmp_path,
+    )
 
-    assert store.uploads == []
-
+    assert request_count == 1
+    assert not frames["RELIANCE"].empty
+    assert frames["SBIN"].empty
+    assert len(store.uploads) == 2
+    manifests = list(tmp_path.rglob("*.parquet.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["provider_omitted_codes"] == ["NSE_200"]
+    assert manifest["row_counts"] == {"RELIANCE": 1, "SBIN": 0}
 
 
 def test_indstocks_batch_retries_transient_ssl_eof_before_succeeding(monkeypatch):
