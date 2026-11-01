@@ -148,6 +148,7 @@ def _run_five_minute_backfill() -> None:
         _update_backfill_status(
             status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS",
             exit_code=exit_code,
+            error=None,
             finished_at_utc=datetime.now(timezone.utc).isoformat(),
         )
         _log("indstocks_5m_backfill_finished", status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS", exit_code=exit_code)
