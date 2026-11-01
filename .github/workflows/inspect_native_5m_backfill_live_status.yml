@@ -80,7 +80,7 @@ jobs:
                 "jsonPayload": row.get("jsonPayload"),
               })
           print("BACKFILL_RELATED_LOG_COUNT=" + str(len(found)))
-          for row in reversed(found[-250:]):
+          for row in reversed(found[:250]):
             print("BACKFILL_LOG=" + json.dumps(row, sort_keys=True, default=str))
           if not found:
             print("BACKFILL_LOG_NOTE=No backfill progress/error events found in the last six hours.")
