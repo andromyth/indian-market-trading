@@ -75,7 +75,8 @@ jobs:
           keys=("indstocks_5m_backfill_progress","indstocks_5m_backfill_failed",
                 "indstocks_5m_backfill_completed","indstocks_5m_backfill_started",
                 "five_minute_backfill","FETCHING_HISTORY","RESUMED_CHECKPOINT",
-                "api_calls_in_batch","checkpoint write failed","window_checkpoints",
+                "api_calls_in_batch","api_calls","checkpoint write failed","window_checkpoints",
+                "provider_omitted_codes","checkpoint_remote","FETCHING_HISTORY",
                 "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED")
           found=[]
           for row in rows:
