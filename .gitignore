@@ -9,3 +9,6 @@ token.json
 google_drive_oauth_token.json
 client_secret*.json
 oauth_client_secret*.json
+
+# Local paper-trading account and SQLite WAL files
+data/paper_trading.sqlite3*
