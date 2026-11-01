@@ -1,5 +1,6 @@
 name: Inspect live native five-minute backfill state
 # Status-only diagnostic; this workflow reads state and logs without restarting the worker.
+# Fresh status probe requested 2026-11-01.
 
 on:
   workflow_dispatch:
