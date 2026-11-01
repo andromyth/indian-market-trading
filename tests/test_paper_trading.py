@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Unit tests for the paper-trading cash ledger and risk controls."""
+
 import pytest
 
 import paper_trading as paper
