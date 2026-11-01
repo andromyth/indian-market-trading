@@ -1,0 +1,87 @@
+name: Inspect live native five-minute backfill state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect_native_5m_backfill_live_status.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Read live backfill state and recent progress
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          RESPONSE="$(mktemp)"
+          LOGS="$(mktemp)"
+          trap 'rm -f "$RESPONSE" "$LOGS"; unset TOKEN' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")"
+          echo "BACKFILL_STATUS_HTTP=$CODE"
+          if [[ "$CODE" != "200" ]]; then cat "$RESPONSE"; exit 1; fi
+          python - "$RESPONSE" <<'PY'
+          import json, sys
+          body=json.load(open(sys.argv[1], encoding="utf-8"))
+          state=body.get("five_minute_backfill") or {}
+          progress=state.get("progress") or {}
+          print("BACKFILL_LIVE_STATE=" + json.dumps({
+            "status": body.get("status"),
+            "started_at_utc": state.get("started_at_utc"),
+            "updated_at_utc": state.get("updated_at_utc"),
+            "finished_at_utc": state.get("finished_at_utc"),
+            "exit_code": state.get("exit_code"),
+            "error": state.get("error"),
+            "progress": progress,
+          }, sort_keys=True, default=str))
+          PY
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)'"' \
+            --project="$PROJECT_ID" --limit=1500 --order=desc --format=json > "$LOGS"
+          python - "$LOGS" <<'PY'
+          import json, sys
+          rows=json.load(open(sys.argv[1], encoding="utf-8"))
+          keys=("indstocks_5m_backfill_progress","indstocks_5m_backfill_failed",
+                "indstocks_5m_backfill_completed","indstocks_5m_backfill_started",
+                "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED","BACKFILL_MANIFEST=")
+          found=[]
+          for row in rows:
+            rendered=json.dumps(row, sort_keys=True, default=str)
+            if any(k in rendered for k in keys):
+              found.append({
+                "timestamp": row.get("timestamp"),
+                "revision": (row.get("resource") or {}).get("labels",{}).get("revision_name"),
+                "severity": row.get("severity"),
+                "text": row.get("textPayload"),
+                "jsonPayload": row.get("jsonPayload"),
+              })
+          print("BACKFILL_RELATED_LOG_COUNT=" + str(len(found)))
+          for row in reversed(found[-250:]):
+            print("BACKFILL_LOG=" + json.dumps(row, sort_keys=True, default=str))
+          if not found:
+            print("BACKFILL_LOG_NOTE=No backfill progress/error events found in the last six hours.")
+          PY
