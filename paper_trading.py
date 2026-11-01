@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +36,19 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _connection():
+    connection = _connect()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _now_ist() -> str:
     return datetime.now(IST).isoformat(timespec="seconds")
 
@@ -53,7 +67,7 @@ def normalize_symbol(value: str) -> str:
 
 
 def init_db() -> None:
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS paper_account (
@@ -95,7 +109,7 @@ def init_db() -> None:
 
 def get_account() -> dict | None:
     init_db()
-    with _connect() as connection:
+    with _connection() as connection:
         row = connection.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
     return dict(row) if row else None
 
@@ -108,7 +122,7 @@ def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
     if values[0] <= 0 or values[1] < 0 or values[2] < 0 or values[1] > 500 or values[2] > 500:
         raise ValueError("Capital must be positive; fee and slippage must be between 0 and 500 bps.")
     init_db()
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             """
             INSERT INTO paper_account(id, initial_cash, fee_bps, slippage_bps, created_at)
@@ -127,7 +141,7 @@ def update_cost_settings(fee_bps: float, slippage_bps: float) -> None:
     fee, slippage = float(fee_bps), float(slippage_bps)
     if not math.isfinite(fee) or not math.isfinite(slippage) or not (0 <= fee <= 500) or not (0 <= slippage <= 500):
         raise ValueError("Fee and slippage must be between 0 and 500 bps.")
-    with _connect() as connection:
+    with _connection() as connection:
         cursor = connection.execute(
             "UPDATE paper_account SET fee_bps = ?, slippage_bps = ? WHERE id = 1",
             (fee, slippage),
@@ -140,7 +154,7 @@ def reset_account(initial_cash: float) -> None:
     capital = float(initial_cash)
     if not math.isfinite(capital) or capital <= 0:
         raise ValueError("Starting capital must be a positive finite amount.")
-    with _connect() as connection:
+    with _connection() as connection:
         account = connection.execute("SELECT fee_bps, slippage_bps FROM paper_account WHERE id = 1").fetchone()
         if not account:
             raise RuntimeError("Paper account is not initialized.")
@@ -158,7 +172,7 @@ def list_fills(limit: int | None = None) -> list[dict]:
     if limit is not None:
         query += " LIMIT ?"
         params = (max(1, int(limit)),)
-    with _connect() as connection:
+    with _connection() as connection:
         rows = connection.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
