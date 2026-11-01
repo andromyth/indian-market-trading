@@ -127,11 +127,6 @@ def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
             """
             INSERT INTO paper_account(id, initial_cash, fee_bps, slippage_bps, created_at)
             VALUES (1, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                initial_cash=excluded.initial_cash,
-                fee_bps=excluded.fee_bps,
-                slippage_bps=excluded.slippage_bps,
-                created_at=excluded.created_at
             """,
             (*values, _now_ist()),
         )
