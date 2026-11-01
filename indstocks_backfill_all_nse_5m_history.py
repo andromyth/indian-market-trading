@@ -212,7 +212,11 @@ def fetch_indstocks_5m_batch(
             "start_time": int(cursor.timestamp() * 1000),
             "end_time": int(window_end.timestamp() * 1000),
         }
-        for attempt in range(3):
+        # A transient TLS EOF previously terminated the whole backfill because
+        # SSL disconnects were not classified as retryable. Keep retries bounded,
+        # but allow enough time for the provider connection to recover.
+        max_request_attempts = 5
+        for attempt in range(max_request_attempts):
             try:
                 response = _request("GET", "/market/historical/5minute", params=params)
                 break
@@ -223,11 +227,14 @@ def fetch_indstocks_5m_batch(
                     for marker in (
                         "HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
                         "NETWORKEXCEPTION", "REQUEST FAILED", "CONNECTIONERROR", "TIMEOUT",
+                        "UNEXPECTED_EOF_WHILE_READING", "SSLEOFERROR",
+                        "REMOTEENDCLOSEDERROR", "CONNECTION RESET", "CONNECTIONRESETERROR",
+                        "CONNECTION ABORTED", "BROKEN PIPE",
                     )
                 )
-                if not retryable or attempt == 2:
+                if not retryable or attempt == max_request_attempts - 1:
                     raise
-                time.sleep(2 ** (attempt + 1))
+                time.sleep(min(2 ** (attempt + 1), 30))
         body = response.json()
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")

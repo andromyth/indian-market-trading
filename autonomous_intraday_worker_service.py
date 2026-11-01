@@ -119,10 +119,47 @@ def _run_five_minute_backfill() -> None:
             raise RuntimeError("INDstocks read-only credentials are not configured in Cloud Run.")
         backfill.REQUEST_GUARD = _wait_until_market_closed
         backfill.BACKFILL_PROGRESS_CALLBACK = _backfill_progress
-        exit_code = backfill.main([])
+        # If a transient provider/network failure outlasts the per-request retry
+        # budget, rerun the job from Drive checkpoints instead of requiring a
+        # manual trigger. Existing windows are skipped after integrity checks.
+        max_job_attempts = 3
+        for job_attempt in range(1, max_job_attempts + 1):
+            try:
+                exit_code = backfill.main([])
+                break
+            except Exception as exc:
+                message = str(exc).upper()
+                retryable = any(
+                    marker in message
+                    for marker in (
+                        "HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+                        "UNEXPECTED_EOF_WHILE_READING", "SSLEOFERROR",
+                        "REMOTEENDCLOSEDERROR", "CONNECTION RESET", "CONNECTIONRESETERROR",
+                        "CONNECTION ABORTED", "BROKEN PIPE", "CONNECTIONERROR",
+                        "NETWORKEXCEPTION", "TIMEOUT",
+                    )
+                )
+                if not retryable or job_attempt == max_job_attempts:
+                    raise
+                detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+                delay_seconds = 10 * job_attempt
+                _update_backfill_status(
+                    status="RUNNING",
+                    error=f"Transient attempt {job_attempt}/{max_job_attempts} failed; resuming from Drive checkpoints in {delay_seconds}s: {detail}",
+                )
+                _log(
+                    "indstocks_5m_backfill_retry_scheduled",
+                    failed_attempt=job_attempt,
+                    next_attempt=job_attempt + 1,
+                    max_attempts=max_job_attempts,
+                    delay_seconds=delay_seconds,
+                    error=detail,
+                )
+                time.sleep(delay_seconds)
         _update_backfill_status(
             status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS",
             exit_code=exit_code,
+            error=None,
             finished_at_utc=datetime.now(timezone.utc).isoformat(),
         )
         _log("indstocks_5m_backfill_finished", status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS", exit_code=exit_code)

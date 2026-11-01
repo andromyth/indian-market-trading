@@ -172,3 +172,32 @@ def test_backfill_starts_one_in_process_thread_after_all_gates_pass(monkeypatch)
     assert created[0].daemon is True
     assert created[0].started is True
     assert service.BACKFILL_THREAD is created[0]
+
+
+
+def test_backfill_job_retries_after_transient_failure_and_resumes(monkeypatch):
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    attempts = []
+    sleeps = []
+
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def flaky_main(_argv):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("SSLError: UNEXPECTED_EOF_WHILE_READING")
+        return 0
+
+    monkeypatch.setattr(backfill, "main", flaky_main)
+
+    service._run_five_minute_backfill()
+
+    assert len(attempts) == 2
+    assert sleeps == [10]
+    with service.STATE_LOCK:
+        status = dict(service.STATE["five_minute_backfill"])
+    assert status["status"] == "COMPLETED"
+    assert status["exit_code"] == 0
+    assert status["error"] is None or "Transient attempt" in status["error"]
