@@ -313,3 +313,4 @@ jobs:
           if not found:
             print("BACKFILL_LOG_NOTE=No matching backfill progress/error events found in the last 90 minutes.")
           PY
+# Trigger a read-only checkpoint audit; no runtime behavior change.
