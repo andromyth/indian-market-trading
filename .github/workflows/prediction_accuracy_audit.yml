@@ -2,6 +2,7 @@ name: Live prediction accuracy audit
 
 # Manual/commit-triggered only. No cron is enabled; this respects the request
 # to keep scheduled jobs paused while allowing an explicit month-to-date audit.
+# Controlled trigger: collect a fresh baseline accuracy report for matured predictions.
 on:
   workflow_dispatch:
     inputs:
