@@ -51,7 +51,7 @@ jobs:
               print("DRIVE_AUDIT_STATUS=BLOCKED_MISSING_OAUTH_TOKEN_OR_ROOT_ID")
               sys.exit(2)
           info = json.loads(token_text)
-          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
           if not creds.valid:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
