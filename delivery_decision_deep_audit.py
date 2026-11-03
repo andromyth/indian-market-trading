@@ -703,13 +703,28 @@ def _ranking_backtest(
                  "predicted_return_next_session", "_symbol"],
                 ascending=[False, False, False, True], kind="mergesort"
             )
-            take = max(1, int(math.ceil(len(group) * fraction)))
+            # Do not force a position when the requested percentile is less
+            # than one whole name; that would silently turn a 1% selection
+            # into 14-20% on sessions with only five to seven BUY candidates.
+            take = int(math.floor(len(group) * fraction))
+            if take < 1:
+                selected_per_session.append({
+                    "prediction_for_date": str(session),
+                    "buy_candidate_rows": int(len(group)),
+                    "selected_rows": 0,
+                    "actual_selection_fraction_pct": 0.0,
+                    "mean_gross_return_pct": None,
+                    "mean_net_return_pct_at_30bps": None,
+                    "positive_return_rate_pct": None,
+                })
+                continue
             selected = group.head(take).copy()
             selected_parts.append(selected)
             selected_per_session.append({
                 "prediction_for_date": str(session),
                 "buy_candidate_rows": int(len(group)),
                 "selected_rows": int(len(selected)),
+                "actual_selection_fraction_pct": float(len(selected) / len(group) * 100.0),
                 "mean_gross_return_pct": float(selected["_actual_return"].mean() * 100.0),
                 "mean_net_return_pct_at_30bps": float(
                     (selected["_actual_return"].mean() - ASSUMED_ROUND_TRIP_COST) * 100.0
@@ -742,6 +757,7 @@ def _ranking_backtest(
             "top_fraction_of_buy_aligned_candidates_per_session_pct": fraction * 100.0,
             "selected_rows": int(len(selected)),
             "sessions": int(selected["_target_date"].nunique()),
+            "decision_sessions_available": int(buys["_target_date"].nunique()),
             "mean_gross_return_pct": float(gross.mean() * 100.0),
             "median_gross_return_pct": float(gross.median() * 100.0),
             "mean_net_return_pct_after_assumed_cost": float(
@@ -1050,8 +1066,10 @@ def main() -> int:
         "step_5_within_session_ranking_and_cost_simulation": ranking,
         "important_limitations": [
             "ROC-AUC measures ranking of UP versus DOWN outcomes, not return magnitude or profitability.",
-            "The 30 bps cost is an explicit simulation assumption, not a measured broker-specific cost.",
-            "SELL-side returns assume symmetric short exposure; borrow availability and short-sale restrictions are not modelled.",
+            "The 10-50 bps round-trip cost grid is a sensitivity assumption, not a measured broker-specific execution-cost schedule.",
+            "Step 5 is long-only: SELL-aligned predictions are avoidance/exit diagnostics and are not booked as short trades.",
+            "The backtest uses equal-weight, one-session returns; it does not model capital compounding, overlapping positions, market impact, taxes, or portfolio capacity.",
+            "The available sample has only a small number of matured target sessions and is not sufficient to establish statistical reliability.",
             "No threshold, weight, model artifact, prediction ledger, validation ledger, or Drive source was modified."
         ],
     }
