@@ -763,6 +763,23 @@ def _cached_live_benchmark_summary(benchmark_symbol: str) -> dict:
     except Exception:
         return {"status": "ERROR"}
 
+def _usable_ohlcv_bars(frame: pd.DataFrame | None) -> pd.DataFrame:
+    """Keep only candles with finite, positive OHLC values before freshness checks."""
+    from signals import normalize_ohlcv_frame
+
+    try:
+        normalized = normalize_ohlcv_frame(frame)
+        if normalized is None or normalized.empty:
+            return pd.DataFrame()
+        required = ["Open", "High", "Low", "Close"]
+        numeric = normalized.loc[:, required].apply(pd.to_numeric, errors="coerce")
+        numeric = numeric.replace([np.inf, -np.inf], np.nan)
+        valid = numeric.notna().all(axis=1) & numeric.gt(0).all(axis=1)
+        return normalized.loc[valid].copy()
+    except (KeyError, TypeError, ValueError):
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
     """Fetch fresh intraday benchmark candles, with explicit source diagnostics.
@@ -797,7 +814,7 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
             force_refresh=True,
         )
         if candidate is not None:
-            primary_frame = candidate
+            primary_frame = _usable_ohlcv_bars(candidate)
         state = _freshness(primary_frame)
         attempts.append({
             "source": "get_historical",
@@ -837,7 +854,7 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
             threads=False,
             timeout=10,
         )
-        fallback_frame = _normalize_historical_frame(raw)
+        fallback_frame = _usable_ohlcv_bars(raw)
         state = _freshness(fallback_frame)
         attempts.append({
             "source": "yfinance_direct",
@@ -1251,8 +1268,6 @@ def _cached_paper_trading_snapshot(
     root = str(symbol).strip().upper().replace(".NS", "").replace(".BO", "")
     canonical = f"{root}.NS"
     try:
-        from signals import normalize_ohlcv_frame
-
         raw, source = _live_5m_price_frame(canonical)
         if raw is None or raw.empty:
             return {
@@ -1266,7 +1281,20 @@ def _cached_paper_trading_snapshot(
                 "prediction_ready": False,
             }
 
-        frame = normalize_ohlcv_frame(raw)
+        frame = _usable_ohlcv_bars(raw)
+        if frame.empty:
+            reason = "The market-data source returned candles, but none contains finite, positive Open, High, Low and Close values."
+            return {
+                "symbol": root,
+                "source": source,
+                "price": None,
+                "price_fresh": False,
+                "price_freshness_status": "NO_USABLE_PRICE",
+                "price_freshness_reason": reason,
+                "predictions": [],
+                "prediction_ready": False,
+                "prediction_freshness_reason": reason,
+            }
         index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
         valid = ~index.isna()
         frame = frame.loc[valid].copy()
