@@ -110,8 +110,17 @@ jobs:
           fi
           echo "=== Recent Cloud Run revisions ==="
           gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --sort-by='~metadata.creationTimestamp' --format='table(metadata.name,metadata.creationTimestamp,status.conditions[0].status,status.conditions[0].reason)' || true
-          echo "=== Safe runtime configuration: variable names and Secret Manager references only ==="
+          echo "=== Newly created Cloud Run revision readiness diagnostics ==="
+          CREATED_REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestCreatedRevisionName)' 2>/dev/null || true)"
           READY_REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)' 2>/dev/null || true)"
+          echo "LATEST_CREATED_REVISION=$CREATED_REVISION"
+          echo "LATEST_READY_REVISION=$READY_REVISION"
+          if [[ -n "$CREATED_REVISION" ]]; then
+            gcloud run revisions describe "$CREATED_REVISION" --project="$PROJECT_ID" --region="$REGION" --format='yaml(metadata.name,status.conditions,status.logUrl,spec.serviceAccountName)' || true
+            echo "=== Logs for latest created revision ==="
+            gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.revision_name=\"$CREATED_REVISION\"" --project="$PROJECT_ID" --limit=80 --order=desc --format='table(timestamp,severity,textPayload,jsonPayload.message,jsonPayload.error)' || true
+          fi
+          echo "=== Safe runtime configuration: variable names and Secret Manager references only ==="
           if [[ -n "$READY_REVISION" ]] && gcloud run revisions describe "$READY_REVISION" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/ready_revision.json 2>/dev/null; then
             python - /tmp/ready_revision.json <<'PY'
           import json, sys
