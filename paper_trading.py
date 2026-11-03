@@ -533,6 +533,43 @@ def _format_timestamp(value: str) -> str:
         return str(value)
 
 
+def _fetch_live_market_marks(
+    fills: list[dict],
+    selected_snapshot: dict,
+    snapshot_loader,
+    refresh_revision: int,
+) -> dict[str, float]:
+    """Fetch one usable mark per symbol held across all strategy books."""
+    symbols: list[str] = []
+    grouped: dict[str, list[dict]] = {name: [] for name in TRADING_SEGMENTS}
+    for fill in fills:
+        segment = str(fill.get("segment") or "LEGACY").upper()
+        if segment not in TRADING_SEGMENTS:
+            segment = "LEGACY"
+        grouped[segment].append(fill)
+    for rows in grouped.values():
+        book_state = calculate_portfolio(0.0, rows)
+        for symbol in book_state["positions"]:
+            if symbol not in symbols:
+                symbols.append(symbol)
+
+    selected_symbol = str((selected_snapshot or {}).get("symbol") or "").upper()
+    prices: dict[str, float] = {}
+    for symbol in symbols:
+        quote = None
+        if symbol == selected_symbol:
+            quote = _finite_or_none((selected_snapshot or {}).get("price"))
+        if quote is None or quote <= 0:
+            try:
+                other = snapshot_loader(f"{symbol}.NS", refresh_revision, False) or {}
+                quote = _finite_or_none(other.get("price"))
+            except Exception:
+                quote = None
+        if quote is not None and quote > 0:
+            prices[symbol] = float(quote)
+    return prices
+
+
 def _open_positions_with_marks(
     state: dict,
     snapshot: dict | None,
