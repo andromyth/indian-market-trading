@@ -220,15 +220,23 @@ def _normalize_historical_frame(df):
             rename[column] = aliases[key]
     frame = frame.rename(columns=rename)
 
-    # Canonicalize required numeric columns.  With duplicate canonical column
-    # names pandas returns a DataFrame; take the first column in that case.
+    # Yahoo can return both Close and Adj Close. Once both are renamed,
+    # remove duplicate canonical labels after choosing the first finite value
+    # per row, so callers always receive scalar OHLCV columns.
     for field in ["Open", "High", "Low", "Close", "Volume"]:
-        if field not in frame.columns:
-            continue
-        value = frame[field]
-        if isinstance(value, pd.DataFrame):
-            value = value.iloc[:, 0]
-        frame[field] = pd.to_numeric(value, errors="coerce")
+        positions = [i for i, name in enumerate(frame.columns) if str(name) == field]
+        if positions:
+            candidates = pd.concat(
+                [pd.to_numeric(frame.iloc[:, i], errors="coerce") for i in positions],
+                axis=1,
+            ).replace([float("inf"), float("-inf")], float("nan"))
+            resolved = candidates.bfill(axis=1).iloc[:, 0]
+            keep_positions = [
+                i for i, name in enumerate(frame.columns) if str(name) != field
+            ]
+            frame = frame.iloc[:, keep_positions].copy()
+            frame[field] = resolved
+    frame = frame.loc[:, ~frame.columns.duplicated(keep="first")]
 
     if "Close" not in frame.columns:
         # Handle any remaining case where Adj Close survived under its original
