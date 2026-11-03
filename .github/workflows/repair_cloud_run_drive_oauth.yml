@@ -2,6 +2,11 @@ name: Repair Cloud Run Google Drive OAuth secret
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/repair_cloud_run_drive_oauth.yml"
 
 permissions:
   contents: read
@@ -9,9 +14,10 @@ permissions:
 jobs:
   validate-and-repair-secret:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     env:
       PROJECT_ID: indian-market-trading
+      REGION: asia-south1
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -74,14 +80,188 @@ jobs:
           project_id: indian-market-trading
 
       - name: Add validated OAuth token as a new Secret Manager version
+        id: secret
         shell: bash
         run: |
           set -euo pipefail
-          # Pipe the validated secret from the GitHub Actions secret directly to
-          # Secret Manager. Never print it, write it to the workspace, or commit it.
-          printf '%s' "$GOOGLE_OAUTH_TOKEN_JSON" | \
+          # The token is piped directly from the GitHub secret; it is never logged
+          # or written to the repository workspace.
+          RESOURCE="$(printf '%s' "$GOOGLE_OAUTH_TOKEN_JSON" | \
             gcloud secrets versions add google-oauth-token-json \
               --project="$PROJECT_ID" \
-              --data-file=-
-          echo "Validated OAuth token was added as a new Secret Manager version."
-          echo "No versions.list permission is required for this recovery workflow."
+              --data-file=- \
+              --format='value(name)')"
+          VERSION="${RESOURCE##*/}"
+          [[ "$VERSION" =~ ^[0-9]+$ ]] || {
+            echo "Could not resolve the newly created Secret Manager version." >&2
+            exit 1
+          }
+          echo "SECRET_VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VALIDATED_OAUTH_SECRET_VERSION_CREATED=$VERSION"
+
+      - name: Create a new Cloud Run revision using the refreshed OAuth secret
+        shell: bash
+        env:
+          SECRET_VERSION: ${{ steps.secret.outputs.SECRET_VERSION }}
+        run: |
+          set -euo pipefail
+          [[ "$SECRET_VERSION" =~ ^[0-9]+$ ]] || {
+            echo "Invalid Secret Manager version number." >&2
+            exit 1
+          }
+
+          # Pin this revision to the just-validated version. Update only the Drive
+          # OAuth binding and a non-secret version marker; preserve INDstocks TOTP,
+          # scheduler identity, model settings, and all other service configuration.
+          gcloud run services update indian-market-intraday-worker \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --update-secrets "GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:$SECRET_VERSION" \
+            --update-env-vars "GOOGLE_OAUTH_TOKEN_SECRET_VERSION=$SECRET_VERSION" \
+            --quiet
+
+          gcloud run services describe indian-market-intraday-worker \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --format=json > /tmp/cloud-run-service.json
+
+          python - "$SECRET_VERSION" <<'PY'
+          import json
+          import sys
+
+          version = sys.argv[1]
+          service = json.load(open("/tmp/cloud-run-service.json", encoding="utf-8"))
+          status = service.get("status") or {}
+          created = status.get("latestCreatedRevisionName")
+          ready = status.get("latestReadyRevisionName")
+          print("CLOUD_RUN_OAUTH_REVISION:", json.dumps({
+              "latest_created_revision": created,
+              "latest_ready_revision": ready,
+              "oauth_secret_version": version,
+              "traffic": status.get("traffic"),
+          }, sort_keys=True))
+          if not created or created != ready:
+              raise SystemExit("Cloud Run's refreshed OAuth revision is not ready.")
+          PY
+
+      - name: Trigger and verify the next five-minute production capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import subprocess
+          import time
+          from datetime import datetime, timedelta, time as clock_time, timezone
+          from zoneinfo import ZoneInfo
+
+          project = "indian-market-trading"
+          region = "asia-south1"
+          ist = ZoneInfo("Asia/Kolkata")
+          now = datetime.now(ist)
+          if now.weekday() >= 5 or not (clock_time(9, 15) <= now.time() < clock_time(15, 30)):
+              print("NO_IMMEDIATE_TICK: outside NSE cash session; existing schedules remain enabled.")
+              raise SystemExit(0)
+
+          base = now.replace(second=0, microsecond=0)
+          next_minute = ((base.minute // 5) + 1) * 5
+          target = base.replace(minute=0) + timedelta(hours=1) if next_minute >= 60 else base.replace(minute=next_minute)
+          if target.time() >= clock_time(15, 30):
+              print("NO_IMMEDIATE_TICK: next five-minute anchor is outside NSE cash session.")
+              raise SystemExit(0)
+
+          delay = max(0.0, (target - now).total_seconds())
+          print(f"WAITING_FOR_NEXT_FIVE_MINUTE_ANCHOR: {target.isoformat()} sleep_seconds={delay:.1f}")
+          time.sleep(delay)
+
+          tick_time = datetime.now(ist)
+          hhmm = tick_time.hour * 100 + tick_time.minute
+          if 915 <= hhmm <= 959:
+              job = "intraday-worker-0915-0959"
+          elif 1000 <= hhmm <= 1459:
+              job = "intraday-worker-1000-1459"
+          elif 1500 <= hhmm <= 1525:
+              job = "intraday-worker-1500-1530"
+          else:
+              raise SystemExit(f"Unexpected NSE capture slot time: {tick_time.isoformat()}")
+
+          def describe():
+              raw = subprocess.run(
+                  ["gcloud", "scheduler", "jobs", "describe", job,
+                   "--project", project, "--location", region, "--format=json"],
+                  check=True, capture_output=True, text=True,
+              )
+              return json.loads(raw.stdout)
+
+          before = describe().get("lastAttemptTime")
+          request_started = datetime.now(timezone.utc)
+          subprocess.run(
+              ["gcloud", "scheduler", "jobs", "run", job,
+               "--project", project, "--location", region, "--quiet"],
+              check=True,
+          )
+
+          completed = None
+          for _ in range(40):
+              latest = describe()
+              raw_time = latest.get("lastAttemptTime")
+              try:
+                  attempted = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+              except (TypeError, ValueError):
+                  attempted = None
+              previous = None
+              try:
+                  previous = datetime.fromisoformat(str(before).replace("Z", "+00:00")) if before else None
+              except ValueError:
+                  pass
+              status = latest.get("lastAttemptStatus") or {}
+              is_new = attempted is not None and attempted >= request_started and attempted != previous
+              if is_new:
+                  code = status.get("code")
+                  message = str(status.get("message") or "")[:250]
+                  print("CLOUD_SCHEDULER_TICK_RESULT:", json.dumps({
+                      "job": job,
+                      "last_attempt_time": raw_time,
+                      "status_code": code,
+                      "status_message": message,
+                      "target_uri": (latest.get("httpTarget") or {}).get("uri"),
+                  }, sort_keys=True))
+                  if code is not None and int(code) != 0:
+                      raise SystemExit("Cloud Scheduler reported a failed worker request.")
+                  if code is None and message:
+                      raise SystemExit("Cloud Scheduler returned an error: " + message)
+                  completed = True
+                  break
+              time.sleep(3)
+          if not completed:
+              raise SystemExit("Timed out waiting for the Cloud Scheduler /tick result.")
+          print("REFRESHED_CLOUD_RUN_TICK_ACCEPTED=true")
+          PY
+
+          sleep 35
+          python -u audit_all_universe_minute_snapshots.py --date "$(TZ=Asia/Kolkata date +%F)" --sync-drive > /tmp/current-capture-audit.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("/tmp/current-capture-audit.json").read_text(encoding="utf-8"))
+          summary = {
+              key: report.get(key)
+              for key in (
+                  "session_date", "expected_minutes", "snapshot_files_present",
+                  "minute_manifests_present", "prediction_files_present",
+                  "prediction_manifests_present", "total_model_prediction_count",
+                  "capture_status_counts", "audit_status",
+                  "drive_json_write", "drive_csv_write",
+              )
+          }
+          print("POST_REFRESH_CAPTURE_AUDIT:", json.dumps(summary, sort_keys=True, default=str))
+          for key in ("drive_json_write", "drive_csv_write"):
+              if (report.get(key) or {}).get("status") != "OK":
+                  raise SystemExit(f"Audit report persistence failed: {key}")
+          if int(report.get("snapshot_files_present") or 0) < 1 or int(report.get("minute_manifests_present") or 0) < 1:
+              raise SystemExit("Cloud Run tick did not produce a persisted five-minute source snapshot and manifest.")
+          if int(report.get("prediction_files_present") or 0) < 1 or int(report.get("prediction_manifests_present") or 0) < 1 or int(report.get("total_model_prediction_count") or 0) < 1:
+              raise SystemExit("Source snapshot was stored, but no corresponding five-minute model predictions were confirmed.")
+          print("FIVE_MINUTE_SNAPSHOT_AND_PREDICTION_PERSISTENCE=PASS")
+          PY
