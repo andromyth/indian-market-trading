@@ -20,6 +20,9 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
+# Illustrative simulator assumptions; these are not exchange or broker margin rates.
+INITIAL_SHORT_MARGIN_RATE = 1.50
+MAINTENANCE_SHORT_MARGIN_RATE = 0.30
 
 
 def _database_path() -> Path:
@@ -172,49 +175,146 @@ def list_fills(limit: int | None = None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def calculate_portfolio(initial_cash: float, fills: list[dict]) -> dict:
-    """Rebuild cash, open positions and realised P&L solely from immutable fills."""
+def calculate_portfolio(
+    initial_cash: float,
+    fills: list[dict],
+    market_prices: dict[str, float] | None = None,
+) -> dict:
+    """Rebuild a netted long/short portfolio from immutable BUY/SELL fills.
+
+    BUY covers an existing short before opening a long. SELL closes an existing
+    long before opening a short. Entry charges are capitalised into position
+    basis; exit charges reduce realised P&L. Short-sale proceeds remain in cash
+    but are encumbered by the initial-margin reserve.
+    """
     cash = float(initial_cash)
     positions: dict[str, dict[str, float]] = {}
     realised = 0.0
+
     for fill in sorted(fills, key=lambda item: int(item.get("id", 0))):
         symbol = normalize_symbol(fill["symbol"])
-        side = str(fill["side"]).upper()
+        side = str(fill["side"]).strip().upper()
         quantity = int(fill["quantity"])
         fill_price = float(fill["fill_price"])
         gross = float(fill.get("gross", quantity * fill_price))
         charges = float(fill.get("charges", 0.0))
-        if quantity <= 0 or not all(math.isfinite(x) for x in (fill_price, gross, charges)) or fill_price <= 0 or gross < 0 or charges < 0:
-            raise ValueError("Paper fill ledger contains invalid numeric values.")
-        position = positions.setdefault(symbol, {"quantity": 0.0, "cost_basis": 0.0})
+        if (
+            quantity <= 0
+            or not all(math.isfinite(x) for x in (fill_price, gross, charges))
+            or fill_price <= 0
+            or gross < 0
+            or charges < 0
+            or side not in {"BUY", "SELL"}
+        ):
+            raise ValueError("Paper fill ledger contains invalid trade or numeric values.")
+
+        position = positions.setdefault(symbol, {"quantity": 0, "cost_basis": 0.0})
+        signed_qty = int(position["quantity"])
+        basis = float(position["cost_basis"])
+        fee_per_share = charges / quantity
+        remaining = quantity
+
         if side == "BUY":
             cash -= gross + charges
-            position["quantity"] += quantity
-            position["cost_basis"] += gross + charges
-        elif side == "SELL":
-            held = int(position["quantity"])
-            if quantity > held:
-                raise ValueError(f"Paper fill ledger would create a short position in {symbol}.")
-            average_cost = position["cost_basis"] / held if held else 0.0
+            # First cover any short shares. Short basis is net sale proceeds
+            # after the entry fee, so closing P&L includes both sides' charges.
+            if signed_qty < 0:
+                covered = min(remaining, -signed_qty)
+                short_basis_per_share = basis / (-signed_qty)
+                realised += (
+                    short_basis_per_share - fill_price - fee_per_share
+                ) * covered
+                basis -= short_basis_per_share * covered
+                signed_qty += covered
+                remaining -= covered
+            # Any excess BUY opens or adds to a long position.
+            if remaining:
+                signed_qty += remaining
+                basis += (fill_price + fee_per_share) * remaining
+
+        else:  # SELL
             cash += gross - charges
-            realised += gross - charges - average_cost * quantity
-            position["quantity"] -= quantity
-            position["cost_basis"] -= average_cost * quantity
+            # First close any existing long shares.
+            if signed_qty > 0:
+                closed = min(remaining, signed_qty)
+                long_basis_per_share = basis / signed_qty
+                realised += (
+                    fill_price - fee_per_share - long_basis_per_share
+                ) * closed
+                basis -= long_basis_per_share * closed
+                signed_qty -= closed
+                remaining -= closed
+            # Any excess SELL opens or adds to a short position. Proceeds are
+            # net of the entry fee and form the short position's cover basis.
+            if remaining:
+                signed_qty -= remaining
+                basis += (fill_price - fee_per_share) * remaining
+
+        if signed_qty == 0:
+            basis = 0.0
+        position["quantity"] = signed_qty
+        position["cost_basis"] = max(0.0, basis)
+
+    open_positions: dict[str, dict[str, float | int | str]] = {}
+    long_market_value = 0.0
+    short_liability = 0.0
+    unrealised = 0.0
+    market_prices = market_prices or {}
+
+    for symbol, values in positions.items():
+        quantity = int(values["quantity"])
+        if quantity == 0:
+            continue
+        basis = float(values["cost_basis"])
+        units = abs(quantity)
+        average_cost = basis / units
+        mark = _finite_or_none(market_prices.get(symbol))
+        if mark is None or mark <= 0:
+            mark = average_cost
+        position_value = units * mark
+        position_pnl = (
+            (mark - average_cost) * units
+            if quantity > 0
+            else (average_cost - mark) * units
+        )
+        unrealised += position_pnl
+        if quantity > 0:
+            long_market_value += position_value
+            side_name = "LONG"
         else:
-            raise ValueError(f"Unsupported paper fill side: {side}")
-    positions = {
-        symbol: {
-            "quantity": int(values["quantity"]),
-            "cost_basis": round(values["cost_basis"], 2),
-            "average_cost": (values["cost_basis"] / values["quantity"]) if values["quantity"] else 0.0,
+            short_liability += position_value
+            side_name = "SHORT"
+        open_positions[symbol] = {
+            "side": side_name,
+            "quantity": quantity,
+            "cost_basis": round(basis, 2),
+            "average_cost": average_cost,
+            "mark_price": mark,
+            "market_value": position_value,
+            "unrealised_pnl": position_pnl,
         }
-        for symbol, values in positions.items()
-        if values["quantity"] > 0
-    }
+
+    cash = round(cash, 2)
+    long_market_value = round(long_market_value, 2)
+    short_liability = round(short_liability, 2)
+    equity = round(cash + long_market_value - short_liability, 2)
+    initial_margin = round(short_liability * INITIAL_SHORT_MARGIN_RATE, 2)
+    maintenance_margin = round(short_liability * MAINTENANCE_SHORT_MARGIN_RATE, 2)
+    available_cash = round(cash - initial_margin, 2)
+    margin_excess = round(equity - maintenance_margin, 2)
     return {
-        "cash": round(cash, 2),
-        "positions": positions,
+        "cash": cash,
+        "positions": open_positions,
         "realised_pnl": round(realised, 2),
+        "unrealised_pnl": round(unrealised, 2),
+        "long_market_value": long_market_value,
+        "short_liability": short_liability,
+        "equity": equity,
+        "initial_margin_required": initial_margin,
+        "maintenance_margin_required": maintenance_margin,
+        "available_cash": available_cash,
+        "margin_excess": margin_excess,
+        "margin_status": "CALL" if margin_excess < -0.005 else "OK",
     }
 
 
@@ -229,7 +329,7 @@ def place_order(
     quote_timestamp: str = "",
     prediction: dict | None = None,
 ) -> dict:
-    """Create an immediate simulated fill; never calls a broker or order API."""
+    """Create a simulated long/short fill with cash and short-margin controls."""
     root = normalize_symbol(symbol)
     direction = str(side).strip().upper()
     if direction not in {"BUY", "SELL"}:
@@ -259,16 +359,45 @@ def place_order(
         fills = [
             dict(row) for row in connection.execute("SELECT * FROM paper_fills ORDER BY id").fetchall()
         ]
-        state = calculate_portfolio(float(current_account["initial_cash"]), fills)
-        held = int(state["positions"].get(root, {}).get("quantity", 0))
-        if direction == "BUY" and gross + charges > state["cash"] + 0.000001:
-            raise ValueError(
-                f"Insufficient paper cash. Required ₹{gross + charges:,.2f}; available ₹{state['cash']:,.2f}."
-            )
-        if direction == "SELL" and qty > held:
-            raise ValueError(f"Cannot sell {qty} {root}; only {held} shares are held. Short selling is disabled.")
+        initial_cash = float(current_account["initial_cash"])
+        mark_prices = {root: fill_price}
+        before = calculate_portfolio(initial_cash, fills, market_prices=mark_prices)
+        before_qty = int(before["positions"].get(root, {}).get("quantity", 0))
 
         model = prediction or {}
+        candidate = {
+            "id": max((int(item.get("id", 0)) for item in fills), default=0) + 1,
+            "symbol": root,
+            "side": direction,
+            "quantity": qty,
+            "fill_price": fill_price,
+            "gross": gross,
+            "charges": charges,
+        }
+        after = calculate_portfolio(
+            initial_cash,
+            fills + [candidate],
+            market_prices=mark_prices,
+        )
+        after_qty = int(after["positions"].get(root, {}).get("quantity", 0))
+        increased_long = max(after_qty, 0) > max(before_qty, 0)
+        increased_short = max(-after_qty, 0) > max(-before_qty, 0)
+
+        # Existing positions can always be reduced or closed, including during
+        # a margin call. New long or short exposure must fit available cash.
+        if (increased_long or increased_short) and after["available_cash"] < -0.005:
+            raise ValueError(
+                "Insufficient free cash after reserving initial short margin. "
+                f"Required reserve: ₹{after['initial_margin_required']:,.2f}; "
+                f"cash balance after order: ₹{after['cash']:,.2f}; "
+                f"free cash: ₹{after['available_cash']:,.2f}."
+            )
+        if increased_short and after["margin_excess"] < -0.005:
+            raise ValueError(
+                "Short order rejected: projected equity would fall below the "
+                f"maintenance-margin requirement by ₹{abs(after['margin_excess']):,.2f}."
+            )
+
         cursor = connection.execute(
             """
             INSERT INTO paper_fills(
@@ -324,17 +453,23 @@ def _format_timestamp(value: str) -> str:
         return str(value)
 
 
-def _open_positions_with_marks(state: dict, snapshot: dict | None, snapshot_loader, refresh_revision: int) -> tuple[pd.DataFrame, float]:
+def _open_positions_with_marks(
+    state: dict,
+    snapshot: dict | None,
+    snapshot_loader,
+    refresh_revision: int,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Fetch best available marks; unpriced positions fall back to entry basis."""
     rows = []
-    market_value = 0.0
-    selected_symbol = str((snapshot or {}).get("symbol") or "")
+    market_prices: dict[str, float] = {}
+    selected_symbol = str((snapshot or {}).get("symbol") or "").upper()
     for symbol, position in state["positions"].items():
         mark = None
         quote_time = ""
         if symbol == selected_symbol:
             mark = _finite_or_none((snapshot or {}).get("price"))
             quote_time = str((snapshot or {}).get("quote_timestamp") or "")
-        if mark is None:
+        if mark is None or mark <= 0:
             try:
                 other = snapshot_loader(f"{symbol}.NS", refresh_revision, False) or {}
                 mark = _finite_or_none(other.get("price"))
@@ -343,22 +478,36 @@ def _open_positions_with_marks(state: dict, snapshot: dict | None, snapshot_load
                 mark = None
         if mark is None or mark <= 0:
             mark = float(position["average_cost"])
-            quote_time = "Last available cost basis (no market mark)"
-        qty = int(position["quantity"])
-        value = qty * mark
-        pnl = value - float(position["cost_basis"])
-        market_value += value
+            quote_time = "Entry basis (no usable market mark)"
+        market_prices[symbol] = float(mark)
+
+        signed_qty = int(position["quantity"])
+        quantity = abs(signed_qty)
+        side = "LONG" if signed_qty > 0 else "SHORT"
+        value = quantity * mark
+        average_cost = float(position["average_cost"])
+        pnl = (
+            (mark - average_cost) * quantity
+            if signed_qty > 0
+            else (average_cost - mark) * quantity
+        )
         rows.append({
             "Symbol": symbol,
-            "Quantity": qty,
-            "Average cost": round(float(position["average_cost"]), 2),
+            "Position": side,
+            "Quantity": quantity,
+            "Average entry": round(average_cost, 2),
             "Mark price": round(mark, 2),
-            "Market value": round(value, 2),
+            "Long market value": round(value, 2) if signed_qty > 0 else 0.0,
+            "Short liability": round(value, 2) if signed_qty < 0 else 0.0,
             "Unrealised P&L": round(pnl, 2),
-            "Unrealised return %": round((pnl / float(position["cost_basis"]) * 100) if position["cost_basis"] else 0, 2),
+            "Unrealised return %": round(
+                pnl / float(position["cost_basis"]) * 100
+                if position["cost_basis"] else 0,
+                2,
+            ),
             "Price timestamp": quote_time,
         })
-    return pd.DataFrame(rows), market_value
+    return pd.DataFrame(rows), market_prices
 
 
 def render_paper_trading(snapshot_loader) -> None:
