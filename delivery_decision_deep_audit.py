@@ -237,6 +237,57 @@ def _current_batch_audit(report: dict[str, Any]) -> dict[str, Any]:
     current = rows.loc[gate].copy()
     pc = p.loc[gate]
     rc = r.loc[gate]
+    rc_pct = r_pct.loc[gate]
+
+    # Explicit Step 1 two-condition cross-tab. Evaluate the probability and
+    # predicted-return conditions independently, then cross-tab only rows
+    # with both inputs so the four cells reconcile exactly to that population.
+    probability_condition = pc.le(sell)
+    return_cutoff_pct = -min_return * 100.0
+    return_condition = rc_pct.lt(return_cutoff_pct)
+    paired_inputs = pc.notna() & rc_pct.notna()
+
+    def _distribution(series: pd.Series) -> dict[str, Any]:
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        if values.empty:
+            return {"count": 0, "mean": None, "min": None, "p25": None,
+                    "median": None, "p75": None, "max": None}
+        return {
+            "count": int(len(values)),
+            "mean": float(values.mean()),
+            "min": float(values.min()),
+            "p25": float(values.quantile(0.25)),
+            "median": float(values.quantile(0.50)),
+            "p75": float(values.quantile(0.75)),
+            "max": float(values.max()),
+        }
+
+    sell_condition_cross_tab = {
+        "probability_condition": f"probability_up <= {sell:.6f}",
+        "predicted_return_condition": f"predicted_return_pct < {return_cutoff_pct:.6f}",
+        "quality_approved_population": int(len(current)),
+        "rows_with_both_inputs": int(paired_inputs.sum()),
+        "rows_missing_probability": int(pc.isna().sum()),
+        "rows_missing_predicted_return": int(rc_pct.isna().sum()),
+        "probability_condition_count": int((probability_condition & pc.notna()).sum()),
+        "return_condition_count": int((return_condition & rc_pct.notna()).sum()),
+        "both_conditions": int((probability_condition & return_condition & paired_inputs).sum()),
+        "probability_condition_only": int((probability_condition & ~return_condition & paired_inputs).sum()),
+        "return_condition_only": int((~probability_condition & return_condition & paired_inputs).sum()),
+        "neither_condition": int((~probability_condition & ~return_condition & paired_inputs).sum()),
+    }
+    sell_condition_cross_tab["four_way_total"] = sum(
+        sell_condition_cross_tab[key] for key in (
+            "both_conditions", "probability_condition_only",
+            "return_condition_only", "neither_condition"
+        )
+    )
+
+    quality_approved_distributions = {
+        "probability_up": _distribution(pc),
+        "predicted_return_pct": _distribution(rc_pct),
+    }
+
     reason = pd.Series("MISSING_MODEL_INPUT", index=current.index, dtype="object")
     valid = pc.notna() & rc.notna()
     for idx in current.index[valid]:
@@ -282,6 +333,8 @@ def _current_batch_audit(report: dict[str, Any]) -> dict[str, Any]:
         "probability_up_q10_gate_pass": float(pc.quantile(0.10)) if pc.notna().any() else None,
         "probability_up_q90_gate_pass": float(pc.quantile(0.90)) if pc.notna().any() else None,
         "predicted_return_pct_median_gate_pass": float(r_pct.loc[gate].median()) if r_pct.loc[gate].notna().any() else None,
+        "sell_condition_cross_tab": sell_condition_cross_tab,
+        "quality_approved_distributions": quality_approved_distributions,
         "decision_thresholds": {
             "buy_probability_threshold": buy,
             "sell_probability_threshold": sell,
