@@ -134,14 +134,23 @@ jobs:
           status = service.get("status") or {}
           created = status.get("latestCreatedRevisionName")
           ready = status.get("latestReadyRevisionName")
+          traffic = status.get("traffic") or []
+          ready_traffic_pct = sum(
+              int(item.get("percent") or 0)
+              for item in traffic
+              if item.get("revisionName") == ready
+          )
           print("CLOUD_RUN_OAUTH_REVISION:", json.dumps({
               "latest_created_revision": created,
               "latest_ready_revision": ready,
+              "ready_revision_traffic_percent": ready_traffic_pct,
               "oauth_secret_version": version,
-              "traffic": status.get("traffic"),
+              "traffic": traffic,
           }, sort_keys=True))
-          if not created or created != ready:
-              raise SystemExit("Cloud Run's refreshed OAuth revision is not ready.")
+          if not ready or ready_traffic_pct != 100:
+              raise SystemExit(
+                  "Cloud Run refreshed OAuth revision is not confirmed ready at 100% traffic."
+              )
           PY
 
       - name: Trigger and verify the next five-minute production capture
