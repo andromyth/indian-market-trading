@@ -102,7 +102,7 @@ def resample_completed_5m_bars(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def session_aware_pct_change(c: pd.Series, n: int) -> pd.Series:
-    """Match live returns: stay within a session and carry prior-session return during warm-up."""
+    """Match live returns using one grouping pass over trading sessions."""
     values = pd.to_numeric(c, errors="coerce")
     result = pd.Series(np.nan, index=values.index, dtype=float)
     if values.empty:
@@ -111,9 +111,9 @@ def session_aware_pct_change(c: pd.Series, n: int) -> pd.Series:
     index = index.tz_localize(IST) if index.tz is None else index.tz_convert(IST)
     session_dates = pd.Index(index.date)
     previous_session_return = np.nan
-    for day in pd.unique(session_dates):
-        positions = np.flatnonzero(session_dates == day)
-        session = values.iloc[positions].dropna()
+    # Group once. The former per-day full-index boolean scan was O(days * rows).
+    for _, session in values.groupby(session_dates, sort=False):
+        session = session.dropna()
         if session.empty:
             previous_session_return = np.nan
             continue
@@ -137,7 +137,23 @@ def rsi_series(c: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
-def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+def make_market_context(market: pd.DataFrame) -> pd.DataFrame:
+    """Calculate shared NIFTY context once for reuse across every equity symbol."""
+    if market is None or market.empty:
+        return pd.DataFrame()
+    m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
+    context = pd.DataFrame(index=m.index)
+    for n in (1, 3, 5, 10, 15, 30):
+        context[f"market_ret_{n}"] = session_aware_pct_change(m["Close"], n)
+    context["market_rsi14"] = rsi_series(m["Close"])
+    return context
+
+
+def make_features(
+    g: pd.DataFrame,
+    market: pd.DataFrame,
+    market_context: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     x = _norm(g)
     if x.empty:
         return pd.DataFrame()
@@ -168,14 +184,24 @@ def make_features(g: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     out["tod_cos"] = np.cos(2 * np.pi * mins / 390.0)
 
     if market is not None and not market.empty:
-        m = market if isinstance(market.index, pd.DatetimeIndex) else _norm(market)
-        mc = m["Close"].reindex(x.index, method="ffill", tolerance=pd.Timedelta(minutes=2))
-        for n in (1, 3, 5, 10, 15, 30):
-            market_returns = session_aware_pct_change(m["Close"], n)
-            out[f"market_ret_{n}"] = market_returns.reindex(
-                x.index, method="ffill", tolerance=pd.Timedelta(minutes=2)
+        context = market_context if market_context is not None else make_market_context(market)
+        required_context_columns = [
+            *(f"market_ret_{n}" for n in (1, 3, 5, 10, 15, 30)),
+            "market_rsi14",
+        ]
+        missing_context_columns = [
+            column for column in required_context_columns if column not in context.columns
+        ]
+        if missing_context_columns:
+            raise ValueError(
+                "Precomputed NIFTY market context is missing columns: "
+                + ", ".join(missing_context_columns)
             )
-        out["market_rsi14"] = rsi_series(mc)
+        aligned_context = context[required_context_columns].reindex(
+            x.index, method="ffill", tolerance=pd.Timedelta(minutes=2)
+        )
+        for column in required_context_columns:
+            out[column] = aligned_context[column]
     else:
         for n in (1, 3, 5, 10, 15, 30):
             out[f"market_ret_{n}"] = np.nan
@@ -522,6 +548,24 @@ def main():
 
     live_history = load_live_history(root)
     market = load_market_5m(root, live_history.get("__NIFTY50__"))
+    if market.empty:
+        raise RuntimeError(
+            "NIFTY 50 five-minute market context is missing or unreadable; "
+            "refusing to train with all market-context features empty."
+        )
+    market_context = make_market_context(market)
+    print(
+        "NIFTY_MARKET_CONTEXT=" + json.dumps({
+            "rows": len(market_context),
+            "first_timestamp": str(market_context.index.min()),
+            "last_timestamp": str(market_context.index.max()),
+            "non_null": {
+                column: int(market_context[column].notna().sum())
+                for column in market_context.columns
+            },
+        }, sort_keys=True),
+        flush=True,
+    )
     fno = load_fno(root)
 
     # Colab RAM is limited, so never accumulate the complete five-minute-derived
@@ -559,7 +603,7 @@ def main():
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_INSUFFICIENT_ROWS"))
             continue
 
-        feat = make_features(raw, market)
+        feat = make_features(raw, market, market_context=market_context)
         if feat.empty:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_FEATURE_BUILD"))
             continue
@@ -693,7 +737,7 @@ def main():
         "training_data_sources": [
             "DHAN_NSE_EQUITY_NATIVE_5M_HISTORICAL_ARCHIVE",
             "INDSTOCKS_NATIVE_5M_LIVE_ARCHIVE_WITH_SOURCE_LABELS",
-            "NSE_OFFICIAL_NIFTY50_NATIVE_5M_CONTEXT_WHEN_AVAILABLE",
+            "KAGGLE_NIFTY50_CLOSE_ONLY_5M_MARKET_CONTEXT",
             "NSE_OFFICIAL_FNO_DAILY_WHEN_AVAILABLE",
         ],
         "live_incremental_source": "INDSTOCKS_HISTORICAL_5M",

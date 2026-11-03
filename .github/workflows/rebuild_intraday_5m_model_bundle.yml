@@ -1,4 +1,4 @@
-name: Recover ALL-NSE five-minute model bundle
+name: Train and validate ALL-NSE five-minute model bundle
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ on:
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 concurrency:
   group: all-nse-intraday-5m-model-recovery
@@ -56,6 +56,33 @@ jobs:
             all_nse_intraday_model.py \
             persistent_store.py
 
+      - name: Require successful Multi-factor candidate CI for this exact commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/multifactor_candidate_ci.yml/runs?branch=main&head_sha=${GITHUB_SHA}&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,sys; runs=json.load(sys.stdin).get("workflow_runs", []); print(json.dumps(max(runs, key=lambda r:r.get("created_at", "")) if runs else {}))')"
+            RUN_ID="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion", ""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              echo "CI_RUN_ID=$RUN_ID STATUS=$STATUS CONCLUSION=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                [[ "$CONCLUSION" == "success" ]] || {
+                  echo "Training blocked: CI for this exact commit did not pass."
+                  exit 1
+                }
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Training blocked: timed out waiting for CI for this exact commit."
+          exit 1
+
       - name: Verify Drive read/write access before downloading data
         run: |
           set -euo pipefail
@@ -83,11 +110,7 @@ jobs:
             --min-symbol-coverage 0.90 \
             --min-trainable-symbols 100
 
-      - name: Request guarded staged deployment
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Confirm deployment was not requested
         run: |
-          set -euo pipefail
-          gh workflow run deploy_intraday_worker_recovery.yml --ref main
-          echo "STAGED_DEPLOYMENT_WORKFLOW_DISPATCHED=true" >> "$GITHUB_STEP_SUMMARY"
-          echo "The deployment workflow will stage the revision at zero traffic, validate /modelz against the uploaded manifest and estimator hashes, and only then consider promotion." >> "$GITHUB_STEP_SUMMARY"
+          echo "MODEL_TRAINING_AND_DRIVE_UPLOAD=COMPLETE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Production deployment was intentionally not triggered by this training run." >> "$GITHUB_STEP_SUMMARY"
