@@ -328,6 +328,7 @@ def place_order(
     source: str = "",
     quote_timestamp: str = "",
     prediction: dict | None = None,
+    market_prices: dict[str, float] | None = None,
 ) -> dict:
     """Create a simulated long/short fill with cash and short-margin controls."""
     root = normalize_symbol(symbol)
@@ -360,7 +361,8 @@ def place_order(
             dict(row) for row in connection.execute("SELECT * FROM paper_fills ORDER BY id").fetchall()
         ]
         initial_cash = float(current_account["initial_cash"])
-        mark_prices = {root: fill_price}
+        mark_prices = dict(market_prices or {})
+        mark_prices[root] = fill_price
         before = calculate_portfolio(initial_cash, fills, market_prices=mark_prices)
         before_qty = int(before["positions"].get(root, {}).get("quantity", 0))
 
@@ -670,6 +672,11 @@ def render_paper_trading(snapshot_loader) -> None:
             else:
                 try:
                     attached_prediction = selected_prediction if selected_prediction else {}
+                    existing_fills = list_fills()
+                    existing_state = calculate_portfolio(float(account["initial_cash"]), existing_fills)
+                    _, current_market_prices = _open_positions_with_marks(
+                        existing_state, snapshot, snapshot_loader, revision
+                    )
                     fill = place_order(
                         symbol,
                         side,
@@ -679,6 +686,7 @@ def render_paper_trading(snapshot_loader) -> None:
                         source="MANUAL_REFERENCE" if manual_price > 0 else str(snapshot.get("source") or ""),
                         quote_timestamp="USER_ENTERED" if manual_price > 0 else str(snapshot.get("quote_timestamp") or ""),
                         prediction=attached_prediction,
+                        market_prices=current_market_prices,
                     )
                     st.success(
                         f"{fill['side']} {fill['quantity']} {fill['symbol']} filled at "
