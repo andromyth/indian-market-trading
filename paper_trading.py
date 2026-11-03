@@ -23,6 +23,7 @@ DEFAULT_SLIPPAGE_BPS = 5.0
 # Illustrative simulator assumptions; these are not exchange or broker margin rates.
 INITIAL_SHORT_MARGIN_RATE = 1.50
 MAINTENANCE_SHORT_MARGIN_RATE = 0.30
+TRADING_SEGMENTS = ("INTRADAY", "DELIVERY", "LEGACY")
 
 
 def _database_path() -> Path:
@@ -88,6 +89,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_ist TEXT NOT NULL,
                 symbol TEXT NOT NULL,
+                segment TEXT NOT NULL DEFAULT 'LEGACY',
                 side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
                 quantity INTEGER NOT NULL CHECK (quantity > 0),
                 reference_price REAL NOT NULL,
@@ -105,8 +107,21 @@ def init_db() -> None:
             )
             """
         )
+        # Existing fills have no strategy classification. Preserve them in an
+        # explicit LEGACY bucket instead of guessing Intraday or Delivery.
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(paper_fills)").fetchall()
+        }
+        if "segment" not in columns:
+            connection.execute(
+                "ALTER TABLE paper_fills ADD COLUMN segment TEXT NOT NULL DEFAULT 'LEGACY'"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_paper_fills_symbol_id ON paper_fills(symbol, id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_fills_segment_id ON paper_fills(segment, id)"
         )
 
 
@@ -163,15 +178,22 @@ def reset_account(initial_cash: float) -> None:
         )
 
 
-def list_fills(limit: int | None = None) -> list[dict]:
+def list_fills(limit: int | None = None, segment: str | None = None) -> list[dict]:
     init_db()
-    query = "SELECT * FROM paper_fills ORDER BY id DESC"
-    params: tuple = ()
+    query = "SELECT * FROM paper_fills"
+    params: list = []
+    if segment is not None:
+        normalized_segment = str(segment).strip().upper()
+        if normalized_segment not in TRADING_SEGMENTS:
+            raise ValueError("Segment must be INTRADAY, DELIVERY or LEGACY.")
+        query += " WHERE segment = ?"
+        params.append(normalized_segment)
+    query += " ORDER BY id DESC"
     if limit is not None:
         query += " LIMIT ?"
-        params = (max(1, int(limit)),)
+        params.append(max(1, int(limit)))
     with _connection() as connection:
-        rows = connection.execute(query, params).fetchall()
+        rows = connection.execute(query, tuple(params)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -318,6 +340,55 @@ def calculate_portfolio(
     }
 
 
+def calculate_segmented_portfolio(
+    initial_cash: float,
+    fills: list[dict],
+    market_prices: dict[str, float] | None = None,
+) -> dict:
+    """Calculate separate strategy books against one shared cash/margin pool.
+
+    Position netting is performed inside each segment only. Cash flows and
+    short-margin reserves are aggregated across all segments, preventing
+    duplicated buying power while keeping Intraday and Delivery P&L separate.
+    Unclassified historical fills remain in LEGACY.
+    """
+    grouped: dict[str, list[dict]] = {name: [] for name in TRADING_SEGMENTS}
+    for fill in fills:
+        segment = str(fill.get("segment") or "LEGACY").strip().upper()
+        if segment not in TRADING_SEGMENTS:
+            segment = "LEGACY"
+        grouped[segment].append(fill)
+
+    segment_states = {
+        name: calculate_portfolio(0.0, rows, market_prices=market_prices)
+        for name, rows in grouped.items()
+    }
+    cash = round(float(initial_cash) + sum(state["cash"] for state in segment_states.values()), 2)
+    long_market_value = round(sum(state["long_market_value"] for state in segment_states.values()), 2)
+    short_liability = round(sum(state["short_liability"] for state in segment_states.values()), 2)
+    realised = round(sum(state["realised_pnl"] for state in segment_states.values()), 2)
+    unrealised = round(sum(state["unrealised_pnl"] for state in segment_states.values()), 2)
+    initial_margin = round(sum(state["initial_margin_required"] for state in segment_states.values()), 2)
+    maintenance_margin = round(sum(state["maintenance_margin_required"] for state in segment_states.values()), 2)
+    equity = round(cash + long_market_value - short_liability, 2)
+    available_cash = round(cash - initial_margin, 2)
+    margin_excess = round(equity - maintenance_margin, 2)
+    return {
+        "cash": cash,
+        "segments": segment_states,
+        "realised_pnl": realised,
+        "unrealised_pnl": unrealised,
+        "long_market_value": long_market_value,
+        "short_liability": short_liability,
+        "equity": equity,
+        "initial_margin_required": initial_margin,
+        "maintenance_margin_required": maintenance_margin,
+        "available_cash": available_cash,
+        "margin_excess": margin_excess,
+        "margin_status": "CALL" if short_liability > 0 and margin_excess < -0.005 else "OK",
+    }
+
+
 def place_order(
     symbol: str,
     side: str,
@@ -329,9 +400,13 @@ def place_order(
     quote_timestamp: str = "",
     prediction: dict | None = None,
     market_prices: dict[str, float] | None = None,
+    segment: str = "DELIVERY",
 ) -> dict:
-    """Create a simulated long/short fill with cash and short-margin controls."""
+    """Create a simulated fill in the selected strategy book."""
     root = normalize_symbol(symbol)
+    selected_segment = str(segment).strip().upper()
+    if selected_segment not in {"INTRADAY", "DELIVERY"}:
+        raise ValueError("New fills must belong to INTRADAY or DELIVERY.")
     direction = str(side).strip().upper()
     if direction not in {"BUY", "SELL"}:
         raise ValueError("Side must be BUY or SELL.")
@@ -363,25 +438,28 @@ def place_order(
         initial_cash = float(current_account["initial_cash"])
         mark_prices = dict(market_prices or {})
         mark_prices[root] = fill_price
-        before = calculate_portfolio(initial_cash, fills, market_prices=mark_prices)
-        before_qty = int(before["positions"].get(root, {}).get("quantity", 0))
+        before = calculate_segmented_portfolio(initial_cash, fills, market_prices=mark_prices)
+        before_book = before["segments"][selected_segment]
+        before_qty = int(before_book["positions"].get(root, {}).get("quantity", 0))
 
         model = prediction or {}
         candidate = {
             "id": max((int(item.get("id", 0)) for item in fills), default=0) + 1,
             "symbol": root,
+            "segment": selected_segment,
             "side": direction,
             "quantity": qty,
             "fill_price": fill_price,
             "gross": gross,
             "charges": charges,
         }
-        after = calculate_portfolio(
+        after = calculate_segmented_portfolio(
             initial_cash,
             fills + [candidate],
             market_prices=mark_prices,
         )
-        after_qty = int(after["positions"].get(root, {}).get("quantity", 0))
+        after_book = after["segments"][selected_segment]
+        after_qty = int(after_book["positions"].get(root, {}).get("quantity", 0))
         increased_long = max(after_qty, 0) > max(before_qty, 0)
         increased_short = max(-after_qty, 0) > max(-before_qty, 0)
 
@@ -403,15 +481,15 @@ def place_order(
         cursor = connection.execute(
             """
             INSERT INTO paper_fills(
-                timestamp_ist, symbol, side, quantity, reference_price, fill_price,
+                timestamp_ist, symbol, segment, side, quantity, reference_price, fill_price,
                 gross, charges, source, quote_timestamp, prediction_signal,
                 prediction_probability_up, prediction_expected_return,
                 prediction_model_version, prediction_decision_timestamp,
                 prediction_horizon_min
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _now_ist(), root, direction, qty, reference, fill_price, gross, charges,
+                _now_ist(), root, selected_segment, direction, qty, reference, fill_price, gross, charges,
                 str(source or ""), str(quote_timestamp or ""),
                 str(model.get("signal") or ""),
                 _finite_or_none(model.get("probability_up")),
