@@ -63,4 +63,38 @@ jobs:
           } for x in rows]
           print("RESEARCH_DRIVE_ROOT_CHILDREN="+json.dumps(result,sort_keys=True))
           print("RESEARCH_DRIVE_ROOT_CHILD_COUNT="+str(len(result)))
+
+          # Check likely data-holding folders one level below the research root.
+          nested = []
+          for folder in rows:
+              if folder.get("mimeType") != "application/vnd.google-apps.folder":
+                  continue
+              folder_name = str(folder.get("name") or "").lower()
+              if folder_name not in {"raw", "processed", "production_data", "universe", "validated", "features"}:
+                  continue
+              page = None
+              while True:
+                  response = service.files().list(
+                      q=f"'{folder['id']}' in parents and trashed = false",
+                      pageSize=1000,
+                      pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+                  ).execute()
+                  for item in response.get("files", []):
+                      size = int(item.get("size") or 0)
+                      nested.append({
+                          "parent_folder": folder.get("name"),
+                          "name": item.get("name"),
+                          "type": "folder" if item.get("mimeType") == "application/vnd.google-apps.folder" else item.get("mimeType"),
+                          "size_bytes": size,
+                          "size_mib": round(size / (1024 * 1024), 2),
+                          "id": item.get("id"),
+                          "modifiedTime": item.get("modifiedTime"),
+                      })
+                  page = response.get("nextPageToken")
+                  if not page:
+                      break
+          nested.sort(key=lambda item: (item["size_bytes"], item["name"].lower()), reverse=True)
+          print("RESEARCH_DRIVE_NESTED_CANDIDATES=" + json.dumps(nested, sort_keys=True))
+          print("RESEARCH_DRIVE_NESTED_CHILD_COUNT=" + str(len(nested)))
           PY
