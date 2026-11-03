@@ -798,6 +798,7 @@ def render_paper_trading(snapshot_loader) -> None:
                     st.error(f"Paper order rejected: {type(exc).__name__}: {exc}")
 
     fills = list_fills()
+    _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
     unmarked_state = calculate_portfolio(float(account["initial_cash"]), fills)
     positions_frame, market_prices = _open_positions_with_marks(
         unmarked_state, snapshot, snapshot_loader, revision
