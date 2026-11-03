@@ -123,4 +123,37 @@ jobs:
           } for item in my_drive]
           print("MY_DRIVE_TOP_LEVEL=" + json.dumps(top_level, sort_keys=True))
           print("MY_DRIVE_TOP_LEVEL_COUNT=" + str(len(top_level)))
+
+          # Check likely Colab/download storage folders for the large source archive.
+          storage_candidates = []
+          for folder in my_drive:
+              if folder.get("mimeType") != "application/vnd.google-apps.folder":
+                  continue
+              if folder.get("name") not in {"Colab Notebooks", ".colab-github", "Desktop"}:
+                  continue
+              page = None
+              while True:
+                  response = service.files().list(
+                      q=f"'{folder['id']}' in parents and trashed = false",
+                      pageSize=1000,
+                      pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+                  ).execute()
+                  for item in response.get("files", []):
+                      size = int(item.get("size") or 0)
+                      storage_candidates.append({
+                          "parent_folder": folder.get("name"),
+                          "name": item.get("name"),
+                          "type": "folder" if item.get("mimeType") == "application/vnd.google-apps.folder" else item.get("mimeType"),
+                          "size_bytes": size,
+                          "size_mib": round(size / (1024 * 1024), 2),
+                          "id": item.get("id"),
+                          "modifiedTime": item.get("modifiedTime"),
+                      })
+                  page = response.get("nextPageToken")
+                  if not page:
+                      break
+          storage_candidates.sort(key=lambda item: item["size_bytes"], reverse=True)
+          print("COLAB_DESKTOP_STORAGE_CANDIDATES=" + json.dumps(storage_candidates, sort_keys=True))
+          print("COLAB_DESKTOP_STORAGE_COUNT=" + str(len(storage_candidates)))
           PY
