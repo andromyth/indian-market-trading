@@ -60,7 +60,7 @@ def _parse_timestamps(frame: pd.DataFrame, columns: dict[str, str]) -> pd.Series
     parsed = pd.to_datetime(values, errors="coerce")
     if isinstance(parsed.dtype, pd.DatetimeTZDtype):
         parsed = parsed.dt.tz_convert(IST).dt.tz_localize(None)
-    elif not pd.api.types.is_datetime64_ns_dtype(parsed.dtype):
+    elif not pd.api.types.is_datetime64_any_dtype(parsed.dtype):
         raise ValueError("Timestamp column contains mixed or unsupported timezone formats.")
     return parsed
 
