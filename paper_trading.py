@@ -588,7 +588,10 @@ def render_paper_trading(snapshot_loader) -> None:
     """Render the paper terminal. snapshot_loader(symbol, revision, include_predictions)."""
     init_db()
     st.title("Paper Trading")
-    st.caption("Simulated NSE cash-equity trading. Every fill is manual, simulated and stored separately from production data.")
+    st.caption(
+        "Simulated NSE cash-equity trading. Every fill is manual, simulated and stored separately from production data. "
+        "Live quotes use the project's NSE → authenticated broker → Dhan → Yahoo fallback chain."
+    )
 
     account = get_account()
     if account is None:
