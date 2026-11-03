@@ -249,3 +249,5 @@ jobs:
             --format='table(timestamp,severity,jsonPayload.event,jsonPayload.status,jsonPayload.error,jsonPayload.reason,jsonPayload.capture_status,jsonPayload.all_universe_capture.status,jsonPayload.all_universe_capture.expected_symbol_count,jsonPayload.all_universe_capture.quoted_symbol_count,jsonPayload.all_universe_capture.missing_quote_count,jsonPayload.all_nse_minute_predictions.status,jsonPayload.all_nse_minute_predictions.prediction_count,jsonPayload.all_nse_minute_predictions.error,textPayload)' || true
 
 # Post-version-6 OAuth deployment diagnostic refresh: 2026-11-03 12:51 IST.
+
+# Post-promotion runtime health recheck after revision 00075-gmb activation: 2026-11-03.
