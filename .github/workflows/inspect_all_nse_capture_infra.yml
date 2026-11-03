@@ -1,4 +1,6 @@
 name: Inspect all-NSE capture infrastructure
+
+# Runtime capture diagnosis after refreshed Cloud Run OAuth revision.
 # Follow-up read-only inspection after worker revision rollout.
 # A push to this workflow requests a fresh read-only capture/scheduler diagnostics run.
 # Post-current-deploy diagnostic request: 2026-10-29; verify staged revision, traffic, private invokers, and scheduler state without mutations.
