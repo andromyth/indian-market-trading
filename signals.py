@@ -104,8 +104,9 @@ def normalize_ohlcv_frame(df: pd.DataFrame, require_volume: bool = False) -> pd.
 
     # Several provider columns can collapse to the same canonical name
     # (notably Yahoo's Close and Adj Close). Merge duplicate fields row-wise,
-    # preferring the first finite numeric value, then remove duplicate labels
-    # so row["Close"] is always a scalar.
+    # preferring the first finite numeric value. Remove the old duplicate
+    # labels before assigning the resolved series so pandas cannot broadcast
+    # the first column back across every duplicate.
     for field in ["Open", "High", "Low", "Close", "Volume"]:
         positions = [i for i, name in enumerate(x.columns) if str(name) == field]
         if positions:
@@ -113,7 +114,12 @@ def normalize_ohlcv_frame(df: pd.DataFrame, require_volume: bool = False) -> pd.
                 [pd.to_numeric(x.iloc[:, i], errors="coerce") for i in positions],
                 axis=1,
             ).replace([float("inf"), float("-inf")], float("nan"))
-            x[field] = candidates.bfill(axis=1).iloc[:, 0]
+            resolved = candidates.bfill(axis=1).iloc[:, 0]
+            keep_positions = [
+                i for i, name in enumerate(x.columns) if str(name) != field
+            ]
+            x = x.iloc[:, keep_positions].copy()
+            x[field] = resolved
     x = x.loc[:, ~x.columns.duplicated(keep="first")]
 
     missing = [c for c in ["Open", "High", "Low", "Close"] if c not in x.columns]
