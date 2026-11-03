@@ -169,3 +169,83 @@ def test_existing_long_only_ledger_history_remains_readable_and_can_open_short(t
     assert len(new_fills) == 3
     assert state["positions"]["SBIN"]["quantity"] == 6
     assert state["positions"]["IDEA"]["quantity"] == -20
+
+
+def test_live_market_overview_uses_selected_and_watchlist_quotes(monkeypatch):
+    calls = []
+    class FakeSt:
+        def expander(self, *args, **kwargs):
+            from contextlib import nullcontext
+            return nullcontext()
+        def button(self, *args, **kwargs):
+            return False
+        def dataframe(self, frame, **kwargs):
+            self.frame = frame
+        def caption(self, value):
+            self.note = value
+        session_state = {}
+
+    fake = FakeSt()
+    monkeypatch.setattr(paper, "st", fake)
+    def loader(symbol, revision, include_predictions):
+        calls.append((symbol, include_predictions))
+        return {
+            "symbol": symbol.replace(".NS", ""),
+            "price": 125.5,
+            "price_fresh": True,
+            "source": "YFINANCE",
+            "quote_timestamp": "2026-11-03T10:00:00+05:30",
+            "change_percent": 1.25,
+        }
+
+    paper._render_live_market_overview(
+        [{"symbol": "IDEA"}],
+        {
+            "symbol": "SBIN",
+            "price": 800.0,
+            "price_fresh": True,
+            "source": "NSE",
+            "quote_timestamp": "2026-11-03T10:00:00+05:30",
+            "change_percent": -0.5,
+        },
+        loader,
+        1,
+    )
+    assert calls[0] == ("IDEA.NS", False)
+    assert all(include_predictions is False for _, include_predictions in calls)
+    frame = fake.frame
+    selected = frame.loc[frame["Symbol"] == "SBIN"].iloc[0]
+    assert selected["Last price"] == 800.0
+    assert selected["Source"] == "NSE"
+    assert selected["Status"] == "FRESH"
+    idea = frame.loc[frame["Symbol"] == "IDEA"].iloc[0]
+    assert idea["Last price"] == 125.5
+    assert idea["Change %"] == 1.25
+
+
+def test_live_market_overview_preserves_unavailable_quote_status(monkeypatch):
+    class FakeSt:
+        def expander(self, *args, **kwargs):
+            from contextlib import nullcontext
+            return nullcontext()
+        def button(self, *args, **kwargs):
+            return False
+        def dataframe(self, frame, **kwargs):
+            self.frame = frame
+        def caption(self, value):
+            self.note = value
+        session_state = {}
+
+    fake = FakeSt()
+    monkeypatch.setattr(paper, "st", fake)
+    paper._render_live_market_overview(
+        [],
+        {"symbol": "SBIN", "price": None, "price_fresh": False,
+         "price_freshness_status": "NO_USABLE_PRICE"},
+        lambda *args: {},
+        0,
+    )
+    row = fake.frame.loc[fake.frame["Symbol"] == "SBIN"].iloc[0]
+    assert pd.isna(row["Last price"])
+    assert row["Status"] == "NO_USABLE_PRICE"
+    assert row["Source"] == "UNAVAILABLE"
