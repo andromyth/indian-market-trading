@@ -90,9 +90,9 @@ def test_short_mark_to_market_flags_maintenance_margin_call():
         market_prices={"IDEA": 150},
     )
 
-    assert state["equity"] == pytest.approx(5_000)
+    assert state["equity"] == pytest.approx(0)
     assert state["maintenance_margin_required"] == pytest.approx(4_500)
-    assert state["margin_status"] == "OK"
+    assert state["margin_status"] == "CALL"
 
     stressed = paper.calculate_portfolio(
         10_000,
@@ -100,7 +100,7 @@ def test_short_mark_to_market_flags_maintenance_margin_call():
           "fill_price": 50, "gross": 5_000, "charges": 0}],
         market_prices={"IDEA": 250},
     )
-    assert stressed["equity"] == pytest.approx(-5_000)
+    assert stressed["equity"] == pytest.approx(-10_000)
     assert stressed["margin_status"] == "CALL"
 
 
