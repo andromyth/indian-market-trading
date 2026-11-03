@@ -50,7 +50,7 @@ jobs:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-          terms = ("kaggle", "nifty", "5minute", "5min", "ohlcv", "equity", "stock", "archive")
+          terms = ("kaggle", "nifty", "5minute", "5min", "5m", "ohlcv", "ohlc", "equity", "stock", "archive", "zip", "rar", "7z", "tar", "historical", "history", "intraday", "dataset", "data", "market", "nse", "parquet", "csv")
           found = {}
           for term in terms:
               query = f"trashed = false and name contains '{term}'"
@@ -67,7 +67,11 @@ jobs:
                   page = response.get("nextPageToken")
                   if not page:
                       break
-          rows = list(found.values())
+          rows = [
+              item for item in found.values()
+              if int(item.get("size") or 0) >= 50_000_000
+              or "kaggle" in str(item.get("name") or "").lower()
+          ]
           rows.sort(key=lambda item: int(item.get("size") or 0), reverse=True)
           result = []
           for item in rows:
