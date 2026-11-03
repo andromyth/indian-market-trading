@@ -874,7 +874,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
     quote_timestamp = str(snapshot.get("quote_timestamp") or "")
     if price is not None and price > 0:
         c1, c2, c3 = st.columns(3)
-        c1.metric("Current market value", f"₹{price:,.2f}")
+        c1.metric("Live market price", f"₹{price:,.2f}")
         c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
         c3.metric(
             "5-minute signal" if segment == "INTRADAY" else "Delivery signal",
