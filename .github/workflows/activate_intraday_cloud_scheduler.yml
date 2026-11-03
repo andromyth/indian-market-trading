@@ -1,6 +1,7 @@
 name: Activate Cloud Run intraday schedules
 
 # Recovery trigger: resume the existing worker schedules and verify one authenticated live tick.
+# Manual capture verification request: 2026-11-03 12:43 IST.
 
 # This is an explicit, manually dispatched activation task. It does not create
 # schedules; it resumes only existing Cloud Scheduler jobs targeting the known
@@ -149,8 +150,6 @@ jobs:
                   check=True,
               )
               print("ONE_OFF_TICK_REQUEST_ACCEPTED")
-              # Wait briefly for Cloud Scheduler to publish the actual HTTP result;
-              # "jobs run" by itself only confirms that the invocation was enqueued.
               latest_job = {}
               for _ in range(10):
                   described = subprocess.run(
