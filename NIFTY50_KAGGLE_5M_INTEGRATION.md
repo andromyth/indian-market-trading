@@ -25,7 +25,7 @@ python ingest_kaggle_nifty_5m_context.py \\
 The importer writes the close-only Parquet file and a provenance manifest to:
 
 \`\`\`
-production_data/nse_official/intraday_seed/olo_5m_archive/symbol=__NIFTY50__/
+production_data/nse_official/intraday_seed/olo_5m_archive/symbols/symbol=__NIFTY50__/
 \`\`\`
 
 ## Rebuild and prediction safety
