@@ -97,4 +97,30 @@ jobs:
           nested.sort(key=lambda item: (item["size_bytes"], item["name"].lower()), reverse=True)
           print("RESEARCH_DRIVE_NESTED_CANDIDATES=" + json.dumps(nested, sort_keys=True))
           print("RESEARCH_DRIVE_NESTED_CHILD_COUNT=" + str(len(nested)))
+
+          # List My Drive's top-level folders too; the archive may be outside the project root.
+          my_drive = []
+          page = None
+          while True:
+              response = service.files().list(
+                  q="'root' in parents and trashed = false",
+                  pageSize=1000,
+                  pageToken=page,
+                  fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+              ).execute()
+              my_drive.extend(response.get("files", []))
+              page = response.get("nextPageToken")
+              if not page:
+                  break
+          my_drive.sort(key=lambda item: (item.get("mimeType") != "application/vnd.google-apps.folder", item.get("name", "").lower()))
+          top_level = [{
+              "name": item.get("name"),
+              "type": "folder" if item.get("mimeType") == "application/vnd.google-apps.folder" else item.get("mimeType"),
+              "size_bytes": int(item.get("size") or 0),
+              "size_mib": round(int(item.get("size") or 0) / (1024 * 1024), 2),
+              "id": item.get("id"),
+              "modifiedTime": item.get("modifiedTime"),
+          } for item in my_drive]
+          print("MY_DRIVE_TOP_LEVEL=" + json.dumps(top_level, sort_keys=True))
+          print("MY_DRIVE_TOP_LEVEL_COUNT=" + str(len(top_level)))
           PY
