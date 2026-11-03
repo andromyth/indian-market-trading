@@ -300,3 +300,111 @@ def test_open_positions_marks_report_entry_basis_fallback():
     assert prices == {"IDEA": 100.0}
     assert frame.iloc[0]["Price source"] == "ENTRY_BASIS_FALLBACK"
     assert frame.iloc[0]["Mark price"] == 100.0
+
+
+
+def test_segmented_portfolio_keeps_intraday_and_delivery_positions_separate():
+    fills = [
+        {"id": 1, "segment": "INTRADAY", "symbol": "SBIN", "side": "BUY",
+         "quantity": 10, "fill_price": 100, "gross": 1000, "charges": 0},
+        {"id": 2, "segment": "DELIVERY", "symbol": "SBIN", "side": "SELL",
+         "quantity": 5, "fill_price": 100, "gross": 500, "charges": 0},
+    ]
+
+    state = paper.calculate_segmented_portfolio(
+        10_000, fills, market_prices={"SBIN": 110}
+    )
+
+    intraday = state["segments"]["INTRADAY"]
+    delivery = state["segments"]["DELIVERY"]
+    assert intraday["positions"]["SBIN"]["quantity"] == 10
+    assert delivery["positions"]["SBIN"]["quantity"] == -5
+    assert intraday["unrealised_pnl"] == pytest.approx(100)
+    assert delivery["unrealised_pnl"] == pytest.approx(-50)
+    assert state["cash"] == pytest.approx(9_500)
+    assert state["long_market_value"] == pytest.approx(1_100)
+    assert state["short_liability"] == pytest.approx(550)
+    assert state["unrealised_pnl"] == pytest.approx(50)
+    assert state["equity"] == pytest.approx(10_050)
+
+
+def test_place_order_persists_separate_intraday_and_delivery_books(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(10_000, fee_bps=0, slippage_bps=0)
+    account = paper.get_account()
+
+    intraday_fill = paper.place_order(
+        "SBIN", "BUY", 10, 100, account, segment="INTRADAY"
+    )
+    delivery_fill = paper.place_order(
+        "SBIN", "SELL", 5, 100, account, segment="DELIVERY"
+    )
+
+    assert intraday_fill["segment"] == "INTRADAY"
+    assert delivery_fill["segment"] == "DELIVERY"
+    assert len(paper.list_fills(segment="INTRADAY")) == 1
+    assert len(paper.list_fills(segment="DELIVERY")) == 1
+    assert paper.list_fills(segment="LEGACY") == []
+
+    state = paper.calculate_segmented_portfolio(
+        account["initial_cash"], paper.list_fills(), market_prices={"SBIN": 110}
+    )
+    assert state["segments"]["INTRADAY"]["positions"]["SBIN"]["quantity"] == 10
+    assert state["segments"]["DELIVERY"]["positions"]["SBIN"]["quantity"] == -5
+
+
+def test_existing_unclassified_database_fills_migrate_to_legacy_without_loss(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "paper.sqlite3"
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(db_path))
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE paper_account (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                initial_cash REAL NOT NULL,
+                fee_bps REAL NOT NULL,
+                slippage_bps REAL NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO paper_account VALUES (1, 10000, 10, 5, '2026-11-03T09:00:00+05:30')"""
+        )
+        connection.execute(
+            """CREATE TABLE paper_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ist TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                reference_price REAL NOT NULL,
+                fill_price REAL NOT NULL,
+                gross REAL NOT NULL,
+                charges REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                quote_timestamp TEXT NOT NULL DEFAULT '',
+                prediction_signal TEXT NOT NULL DEFAULT '',
+                prediction_probability_up REAL,
+                prediction_expected_return REAL,
+                prediction_model_version TEXT NOT NULL DEFAULT '',
+                prediction_decision_timestamp TEXT NOT NULL DEFAULT '',
+                prediction_horizon_min INTEGER
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO paper_fills(
+                timestamp_ist, symbol, side, quantity, reference_price,
+                fill_price, gross, charges
+            ) VALUES ('2026-11-03T09:10:00+05:30', 'SBIN', 'BUY', 2, 100, 100, 200, 0)"""
+        )
+
+    paper.init_db()
+    legacy = paper.list_fills(segment="LEGACY")
+    assert len(legacy) == 1
+    assert legacy[0]["symbol"] == "SBIN"
+    assert legacy[0]["quantity"] == 2
+    assert legacy[0]["segment"] == "LEGACY"
+    assert paper.list_fills(segment="INTRADAY") == []
+    assert paper.list_fills(segment="DELIVERY") == []
