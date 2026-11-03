@@ -1344,6 +1344,24 @@ def _cached_paper_trading_snapshot(
             "prediction_ready": False,
         }
 
+        # Keep the order quote independent from model eligibility. If the
+        # bar feed is unavailable, use a separate quote adapter for display
+        # and manual paper fills; do not pass that quote into model features.
+        if price is None:
+            quote_price = _finite_or_none(get_latest_price(canonical))
+            if quote_price is not None and quote_price > 0:
+                output["price"] = float(quote_price)
+                output["quote_timestamp"] = pd.Timestamp.now(tz="Asia/Kolkata").isoformat()
+                output["price_source"] = "NSE/BROKER/YAHOO_QUOTE_FALLBACK"
+                output["price_fresh"] = False
+                output["price_freshness_status"] = "QUOTE_ONLY_UNVERIFIED"
+                output["price_freshness_reason"] = (
+                    "A standalone quote was returned, but no fresh completed OHLC candle "
+                    "is available for model inference."
+                )
+            else:
+                output["price_source"] = "UNAVAILABLE"
+
         if not include_predictions:
             return output
 
@@ -1376,10 +1394,24 @@ def _cached_paper_trading_snapshot(
             market_frame,
             decision_interval_minutes=5,
         )
-        output["predictions"] = [dict(item) for item in (predictions or [])]
-        output["prediction_ready"] = bool(output["predictions"])
+        five_minute = [
+            dict(item) for item in (predictions or [])
+            if int(item.get("horizon_min", 0) or 0) == 5
+        ]
+        output["predictions"] = five_minute
+        output["prediction"] = five_minute[0] if five_minute else {}
+        output["prediction_ready"] = bool(five_minute)
+        output["prediction_horizon_min"] = 5
         if not output["prediction_ready"]:
-            output["prediction_freshness_reason"] = "The runtime returned no eligible horizon predictions."
+            reasons = [
+                str(item.get("reason") or item.get("signal_reason") or "")
+                for item in (predictions or [])
+                if int(item.get("horizon_min", 0) or 0) == 5
+            ]
+            output["prediction_freshness_reason"] = (
+                reasons[0] if reasons else
+                "The runtime returned no eligible 5-minute prediction."
+            )
         return output
     except Exception as exc:
         return {
