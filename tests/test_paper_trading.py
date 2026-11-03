@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Unit tests for the paper-trading cash ledger and risk controls."""
+"""Unit tests for long/short paper ledger, margin and backward compatibility."""
 
 import pytest
 
@@ -21,30 +21,121 @@ def test_calculate_portfolio_buy_then_partial_sell_includes_costs():
     assert state["cash"] == pytest.approx(99_478.52)
     assert state["realised_pnl"] == pytest.approx(79.12)
     assert state["positions"]["SBIN"]["quantity"] == 6
+    assert state["positions"]["SBIN"]["side"] == "LONG"
     assert state["positions"]["SBIN"]["average_cost"] == pytest.approx(100.1)
 
 
-def test_calculate_portfolio_rejects_short_position():
-    with pytest.raises(ValueError, match="short position"):
-        paper.calculate_portfolio(
-            10_000,
-            [{"id": 1, "symbol": "SBIN", "side": "SELL", "quantity": 1,
-              "fill_price": 100, "gross": 100, "charges": 0}],
-        )
+def test_calculate_portfolio_short_then_partial_buy_to_cover_includes_both_fees():
+    state = paper.calculate_portfolio(
+        10_000,
+        [
+            {"id": 1, "symbol": "IDEA", "side": "SELL", "quantity": 10,
+             "fill_price": 100, "gross": 1000, "charges": 1},
+            {"id": 2, "symbol": "IDEA", "side": "BUY", "quantity": 4,
+             "fill_price": 80, "gross": 320, "charges": 0.32},
+        ],
+    )
+
+    assert state["cash"] == pytest.approx(10_678.68)
+    assert state["realised_pnl"] == pytest.approx(79.28)
+    assert state["positions"]["IDEA"]["quantity"] == -6
+    assert state["positions"]["IDEA"]["side"] == "SHORT"
+    assert state["positions"]["IDEA"]["average_cost"] == pytest.approx(99.9)
 
 
-def test_place_order_rejects_insufficient_cash_and_overselling(tmp_path, monkeypatch):
+def test_sell_reverses_long_to_short_and_buy_reverses_short_to_long():
+    state = paper.calculate_portfolio(
+        1_000,
+        [
+            {"id": 1, "symbol": "SBIN", "side": "BUY", "quantity": 5,
+             "fill_price": 100, "gross": 500, "charges": 0},
+            {"id": 2, "symbol": "SBIN", "side": "SELL", "quantity": 8,
+             "fill_price": 120, "gross": 960, "charges": 0},
+            {"id": 3, "symbol": "SBIN", "side": "BUY", "quantity": 5,
+             "fill_price": 90, "gross": 450, "charges": 0},
+        ],
+    )
+
+    # SELL closes five longs and opens three shorts; BUY covers all three
+    # shorts and opens two longs.
+    assert state["positions"]["SBIN"]["quantity"] == 2
+    assert state["positions"]["SBIN"]["side"] == "LONG"
+    assert state["realised_pnl"] == pytest.approx(190.0)
+
+
+def test_short_position_marks_to_market_and_reserves_margin():
+    state = paper.calculate_portfolio(
+        10_000,
+        [{"id": 1, "symbol": "IDEA", "side": "SELL", "quantity": 100,
+          "fill_price": 50, "gross": 5_000, "charges": 0}],
+        market_prices={"IDEA": 60},
+    )
+
+    assert state["cash"] == pytest.approx(15_000)
+    assert state["short_liability"] == pytest.approx(6_000)
+    assert state["equity"] == pytest.approx(9_000)
+    assert state["unrealised_pnl"] == pytest.approx(-1_000)
+    assert state["initial_margin_required"] == pytest.approx(9_000)
+    assert state["maintenance_margin_required"] == pytest.approx(1_800)
+    assert state["available_cash"] == pytest.approx(6_000)
+    assert state["margin_excess"] == pytest.approx(7_200)
+    assert state["margin_status"] == "OK"
+
+
+def test_short_mark_to_market_flags_maintenance_margin_call():
+    state = paper.calculate_portfolio(
+        10_000,
+        [{"id": 1, "symbol": "IDEA", "side": "SELL", "quantity": 100,
+          "fill_price": 50, "gross": 5_000, "charges": 0}],
+        market_prices={"IDEA": 150},
+    )
+
+    assert state["equity"] == pytest.approx(5_000)
+    assert state["maintenance_margin_required"] == pytest.approx(4_500)
+    assert state["margin_status"] == "OK"
+
+    stressed = paper.calculate_portfolio(
+        10_000,
+        [{"id": 1, "symbol": "IDEA", "side": "SELL", "quantity": 100,
+          "fill_price": 50, "gross": 5_000, "charges": 0}],
+        market_prices={"IDEA": 250},
+    )
+    assert stressed["equity"] == pytest.approx(-5_000)
+    assert stressed["margin_status"] == "CALL"
+
+
+def test_place_order_rejects_insufficient_long_cash_but_allows_short_and_cover(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
     paper.init_db()
     paper.create_account(1_000, fee_bps=0, slippage_bps=0)
     account = paper.get_account()
 
-    with pytest.raises(ValueError, match="Insufficient paper cash"):
+    with pytest.raises(ValueError, match="Insufficient free cash"):
         paper.place_order("SBIN", "BUY", 11, 100, account)
 
-    paper.place_order("SBIN", "BUY", 5, 100, account)
-    with pytest.raises(ValueError, match="only 5 shares are held"):
-        paper.place_order("SBIN", "SELL", 6, 110, account)
+    short_fill = paper.place_order("IDEA", "SELL", 20, 100, account)
+    assert short_fill["side"] == "SELL"
+    state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
+    assert state["positions"]["IDEA"]["quantity"] == -20
+    assert state["available_cash"] == pytest.approx(0)
+
+    cover_fill = paper.place_order("IDEA", "BUY", 5, 90, account)
+    assert cover_fill["side"] == "BUY"
+    state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
+    assert state["positions"]["IDEA"]["quantity"] == -15
+
+
+def test_place_order_blocks_new_short_when_initial_margin_is_insufficient(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(1_000, fee_bps=0, slippage_bps=0)
+    account = paper.get_account()
+
+    with pytest.raises(ValueError, match="Insufficient free cash"):
+        paper.place_order("IDEA", "SELL", 21, 100, account)
+
+    fill = paper.place_order("IDEA", "SELL", 20, 100, account)
+    assert fill["quantity"] == 20
 
 
 def test_place_order_applies_buy_slippage_and_charges(tmp_path, monkeypatch):
@@ -56,3 +147,25 @@ def test_place_order_applies_buy_slippage_and_charges(tmp_path, monkeypatch):
     assert fill["fill_price"] == pytest.approx(1_000.5)
     assert fill["gross"] == pytest.approx(2_001.0)
     assert fill["charges"] == pytest.approx(2.0)
+
+
+def test_existing_long_only_ledger_history_remains_readable_and_can_open_short(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(5_000, fee_bps=0, slippage_bps=0)
+    account = paper.get_account()
+
+    # A legacy ledger created by the previous long-only implementation.
+    paper.place_order("SBIN", "BUY", 10, 100, account)
+    paper.place_order("SBIN", "SELL", 4, 110, account)
+    old_fills = paper.list_fills()
+    assert len(old_fills) == 2
+    assert paper.calculate_portfolio(5_000, old_fills)["positions"]["SBIN"]["quantity"] == 6
+
+    # Append a short on another symbol without resetting or migrating the ledger.
+    paper.place_order("IDEA", "SELL", 20, 100, account)
+    new_fills = paper.list_fills()
+    state = paper.calculate_portfolio(5_000, new_fills)
+    assert len(new_fills) == 3
+    assert state["positions"]["SBIN"]["quantity"] == 6
+    assert state["positions"]["IDEA"]["quantity"] == -20
