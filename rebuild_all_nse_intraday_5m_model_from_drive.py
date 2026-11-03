@@ -247,6 +247,37 @@ def main() -> int:
     native_symbols, native_files, native_bytes = _download_native_5m_seed(
         store, root, set(universe)
     )
+    # NIFTY is a market-context index, not an equity constituent. Download its
+    # dedicated partition separately so the canonical trainer's load_market_5m()
+    # can read it without adding it to the stock universe or equity coverage.
+    nifty_context_remote = f"{NATIVE_5M_SEED_REMOTE}/symbol=__NIFTY50__"
+    nifty_context_files, nifty_context_bytes = _download_optional_tree(
+        store, nifty_context_remote, root
+    )
+    if nifty_context_files < 1:
+        raise RuntimeError(
+            "NIFTY 50 five-minute context archive is missing or empty in Drive. "
+            "Run ingest_kaggle_nifty_5m_context.py first."
+        )
+    # Fetch and verify the import manifest so each trained candidate can be
+    # traced to the exact Kaggle CSV and Parquet bytes used for market context.
+    nifty_context_manifest_remote = (
+        f"{nifty_context_remote}/nifty50_kaggle_5m_close_only_manifest.json"
+    )
+    if not _download_optional_path(store, nifty_context_manifest_remote, root):
+        raise RuntimeError("NIFTY 50 market-context provenance manifest is missing in Drive.")
+    nifty_context_manifest_path = root / nifty_context_manifest_remote
+    nifty_context_manifest = json.loads(
+        nifty_context_manifest_path.read_text(encoding="utf-8")
+    )
+    nifty_context_output_name = str(nifty_context_manifest.get("output_file") or "")
+    if not nifty_context_output_name or Path(nifty_context_output_name).name != nifty_context_output_name:
+        raise RuntimeError("NIFTY 50 context manifest contains an invalid output_file.")
+    nifty_context_parquet = root / nifty_context_remote / nifty_context_output_name
+    if not nifty_context_parquet.is_file():
+        raise FileNotFoundError("NIFTY 50 close-only Parquet named by its manifest is missing.")
+    if _sha256(nifty_context_parquet) != nifty_context_manifest.get("output_sha256"):
+        raise RuntimeError("NIFTY 50 close-only Parquet SHA-256 does not match its import manifest.")
     live_files, live_bytes = _download_optional_tree(store, LIVE_5M_REMOTE, root)
     coverage = native_symbols / len(universe)
     required_symbols = max(
@@ -258,6 +289,10 @@ def main() -> int:
         "native_5m_symbols_with_files": native_symbols,
         "native_5m_parquet_files": native_files,
         "native_5m_bytes": native_bytes,
+        "nifty_context_files": nifty_context_files,
+        "nifty_context_bytes": nifty_context_bytes,
+        "nifty_context_output_sha256": nifty_context_manifest.get("output_sha256"),
+        "nifty_context_source_sha256": nifty_context_manifest.get("source_sha256"),
         "live_5m_slot_files": live_files,
         "live_5m_bytes": live_bytes,
         "native_5m_symbol_coverage_pct": round(coverage * 100, 4),
@@ -267,12 +302,19 @@ def main() -> int:
             f"Native five-minute archive coverage is inadequate: {native_symbols}/{len(universe)} "
             f"symbols; minimum is {required_symbols}. Legacy one-minute data is not counted."
         )
+    # These older daily index files remain optional auxiliary inputs. The
+    # canonical five-minute trainer obtains its intraday NIFTY context from the
+    # dedicated __NIFTY50__ native 5m partition checked above.
     market_found = [_download_optional_path(store, path, root) for path in MARKET_FILES]
-    if not any(market_found):
-        raise RuntimeError("Neither expected historical NIFTY50 market-context Parquet file exists in Drive.")
     fno_found = _download_optional_path(store, FNO_FILE, root)
     print("TRAINING_INPUTS=" + json.dumps({
         "nifty_market_context_files": [path for path, ok in zip(MARKET_FILES, market_found) if ok],
+        "nifty_5m_context_remote": nifty_context_remote,
+        "nifty_5m_context_files": nifty_context_files,
+        "nifty_5m_context_bytes": nifty_context_bytes,
+        "nifty_5m_context_source_url": nifty_context_manifest.get("source_url"),
+        "nifty_5m_context_source_sha256": nifty_context_manifest.get("source_sha256"),
+        "nifty_5m_context_output_sha256": nifty_context_manifest.get("output_sha256"),
         "fno_daily_features_available": fno_found,
         "native_5m_symbols_with_files": native_symbols,
         "native_5m_parquet_files": native_files,
@@ -387,6 +429,11 @@ def main() -> int:
         "regressor_sha256": manifest.get("regressor_sha256"),
         "native_5m_symbols_with_files": native_symbols,
         "native_5m_parquet_files": native_files,
+        "nifty_context_files": nifty_context_files,
+        "nifty_context_bytes": nifty_context_bytes,
+        "nifty_context_source_url": nifty_context_manifest.get("source_url"),
+        "nifty_context_source_sha256": nifty_context_manifest.get("source_sha256"),
+        "nifty_context_output_sha256": nifty_context_manifest.get("output_sha256"),
         "native_5m_symbol_coverage_pct": round(coverage * 100, 4),
         "no_auto_orders": True,
         "uploads": uploads,
