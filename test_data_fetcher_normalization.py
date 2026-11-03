@@ -48,11 +48,12 @@ def test_yahoo_close_and_adj_close_deduplicate_to_one_scalar_close():
         [100, 102, 99, 101, 100.5, 1000],
         [101, 103, 100, np.nan, 101.5, 1100],
     ])
-    out = normalize_ohlcv_frame(pd.DataFrame(values, index=idx, columns=columns))
-
-    assert out.columns.tolist().count('Close') == 1
-    assert out['Close'].tolist() == [101.0, 101.5]
-    assert not isinstance(out.iloc[-1]['Close'], pd.Series)
+    raw = pd.DataFrame(values, index=idx, columns=columns)
+    for normalizer in (_normalize_historical_frame, normalize_ohlcv_frame):
+        out = normalizer(raw)
+        assert out.columns.tolist().count('Close') == 1
+        assert out['Close'].tolist() == [101.0, 101.5]
+        assert not isinstance(out.iloc[-1]['Close'], pd.Series)
 
 
 def test_flat_lowercase_shape():
