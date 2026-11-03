@@ -32,6 +32,8 @@ production_data/nse_official/intraday_seed/olo_5m_archive/symbols/symbol=__NIFTY
 
 rebuild_all_nse_intraday_5m_model_from_drive.py downloads this special NIFTY partition separately from the equity-symbol partitions. The canonical trainer already reads it through load_market_5m() and derives NIFTY close returns/RSI. Equity stock partitions are unchanged.
 
-The rebuild uploads a candidate model bundle to its candidate Drive folder. It does **not** change the Streamlit/Cloud Run production model automatically. Promote only after the candidate passes the existing chronological holdout, feature-contract, inference-smoke and prediction-vs-actual validation gates.
+The rebuild writes the model bundle to the canonical artifact path consumed by `all_nse_intraday_model.py`. Therefore, do not run an ad-hoc rebuild/upload outside the guarded deployment sequence.
 
-This source is a public Kaggle dataset, not an official NSE data feed. Its direction agreement with the sampled public secondary reference was strong, but that does not establish exchange-level ground truth.
+Use the existing `.github/workflows/rebuild_intraday_5m_model_bundle.yml` workflow via **workflow_dispatch** after the data import. It rebuilds and validates the five-minute `target_30m` bundle, uploads the artifacts, and then requests `.github/workflows/deploy_intraday_worker_recovery.yml`. That workflow stages a new Cloud Run revision at zero traffic, validates `/modelz` (five-minute target, feature list, estimator hashes, and Drive readiness), and shifts production traffic only after those checks pass. The normal current-session NIFTY freshness guard remains active.
+
+The data source is a public Kaggle dataset, not an official NSE feed. Its directional agreement with the sampled public secondary reference was strong, but that does not establish exchange-level ground truth. The Kaggle history is historical through 18 May 2026; it is not a substitute for current-session live NIFTY data.
