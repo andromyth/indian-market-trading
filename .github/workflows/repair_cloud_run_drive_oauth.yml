@@ -43,7 +43,20 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import json
+          import os
+          from google.auth.transport.requests import Request
+          from google.oauth2.credentials import Credentials
           from persistent_store import drive_status
+
+          token_info = json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          credentials = Credentials.from_authorized_user_info(
+              token_info,
+              scopes=["https://www.googleapis.com/auth/drive"],
+          )
+          credentials.refresh(Request())
+          if not credentials.valid:
+              raise SystemExit("Repository OAuth token did not remain valid after forced refresh.")
+          print("REPOSITORY_OAUTH_REFRESH=PASS")
 
           result = drive_status(require_write=True)
           safe = {
