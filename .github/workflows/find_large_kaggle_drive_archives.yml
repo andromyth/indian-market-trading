@@ -50,7 +50,7 @@ jobs:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-          query = "trashed = false and (size > 700000000 or name contains 'kaggle' or name contains 'Kaggle' or name contains 'nifty' or name contains 'NIFTY')"
+          query = "trashed = false"
           rows = []
           token = None
           while True:
