@@ -843,8 +843,6 @@ def _cached_live_market_context(benchmark_symbol: str) -> pd.DataFrame:
     fallback_frame = pd.DataFrame()
     try:
         import yfinance as yf
-        from data_fetcher import _normalize_historical_frame
-
         raw = yf.download(
             str(benchmark_symbol).strip(),
             period="1d",
@@ -1319,7 +1317,7 @@ def _cached_paper_trading_snapshot(
 
         latest = completed.iloc[-1]
         price = pd.to_numeric(pd.Series([latest.get("Close")]), errors="coerce").iloc[0]
-        if pd.isna(price) or float(price) <= 0:
+        if pd.isna(price) or not np.isfinite(float(price)) or float(price) <= 0:
             price = None
         quote_timestamp = pd.Timestamp(completed.index[-1]).isoformat()
         price_guard = latest_completed_bar_status(
@@ -1328,6 +1326,12 @@ def _cached_paper_trading_snapshot(
             max_age_seconds=5 * 60,
             require_current_session=True,
         )
+        if price is None:
+            price_guard = {
+                "ok": False,
+                "status": "NO_USABLE_PRICE",
+                "reason": "The latest usable stock candle has no finite, positive Close price.",
+            }
         output = {
             "symbol": root,
             "source": str(source or "UNKNOWN"),
@@ -1352,15 +1356,17 @@ def _cached_paper_trading_snapshot(
             require_current_session=True,
         )
         output["market_context_freshness_status"] = str(market_guard.get("status") or "UNKNOWN")
-        output["prediction_freshness_reason"] = (
-            ""
-            if market_guard.get("ok") and price_guard.get("ok")
-            else (
-                str(price_guard.get("reason") or "Stock price input is not fresh.")
-                if not price_guard.get("ok")
-                else f"{benchmark} market context is not fresh: {market_guard.get('reason') or market_guard.get('status')}"
+        if price is None or not price_guard.get("ok"):
+            output["prediction_freshness_reason"] = str(
+                price_guard.get("reason") or "No usable fresh stock-price input is available."
             )
-        )
+        elif not market_guard.get("ok"):
+            output["prediction_freshness_reason"] = (
+                f"{benchmark} market context is not fresh: "
+                f"{market_guard.get('reason') or market_guard.get('status')}"
+            )
+        else:
+            output["prediction_freshness_reason"] = ""
         if not price_guard.get("ok") or not market_guard.get("ok") or price is None:
             return output
 
