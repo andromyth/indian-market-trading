@@ -586,130 +586,218 @@ def _historical_action_coverage(predictions: pd.DataFrame) -> dict[str, Any]:
     return {"by_model_version": by_version, "by_version_and_session": output}
 
 
-def _ranking_backtest(joined: pd.DataFrame) -> dict[str, Any]:
-    frame = joined[
-        joined["_model_version"].isin(ACTIVE_MODELS)
-        & joined["_gate_pass"]
-        & joined["_target_aligned"]
-        & joined["probability_up_next_session"].notna()
-        & joined["predicted_return_next_session"].notna()
-        & joined["actual_d1_return"].notna()
-        & joined["_actual_direction"].isin(["UP", "DOWN", "FLAT"])
-    ].copy()
+def _ranking_backtest(
+    verified_predictions: pd.DataFrame,
+    manifest_version: str,
+) -> dict[str, Any]:
+    """Long-only, cost-aware ranking test on manifest-verified live predictions.
+
+    SELL-aligned cases are reported as avoidance/exit diagnostics, not as
+    synthetic short positions. Only matured, quality-approved, target-aligned
+    predictions made before the target-session open are eligible.
+    """
+    required_mask = (
+        verified_predictions["_model_version"].astype(str).eq(str(manifest_version))
+        & verified_predictions["_gate_pass"]
+        & verified_predictions["_target_aligned"]
+        & verified_predictions["_decision_before_target_open"]
+        & verified_predictions["probability_up_next_session"].notna()
+        & verified_predictions["predicted_return_next_session"].notna()
+        & verified_predictions["actual_d1_return"].notna()
+    )
+    frame = verified_predictions.loc[required_mask].copy()
     if frame.empty:
-        return {"status": "NO_MATURED_QUALITY_APPROVED_ROWS"}
-    # A symbol/session must be represented only once, even if two model
-    # versions/revisions were validated for that target date.
+        return {
+            "status": "NO_MANIFEST_VERIFIED_MATURED_ROWS",
+            "model_version": manifest_version,
+            "long_only": True,
+        }
+
+    # Enforce one observation per symbol/target session and use only the
+    # current manifest-verified model; do not blend older model generations.
     frame["_created_order"] = pd.to_datetime(
         frame.get("created_at", pd.Series(pd.NaT, index=frame.index)),
         errors="coerce", utc=True
     )
     frame = frame.sort_values(
-        ["_target_date", "_symbol", "_created_order", "_model_version"],
+        ["_target_date", "_symbol", "_created_order"],
         kind="mergesort", na_position="first"
     ).drop_duplicates(["_target_date", "_symbol"], keep="last")
-    p = frame["probability_up_next_session"].astype(float)
-    pred = frame["predicted_return_next_session"].astype(float)
-    frame["_side"] = np.where(p >= 0.5, 1.0, -1.0)
-    frame["_realised_signed_return"] = frame["actual_d1_return"] * frame["_side"]
-    frame["_aligned_candidate"] = (pred * frame["_side"]) > 0
-    frame["_rank_score"] = (2.0 * p - 1.0) * pred
-    candidates = frame[frame["_aligned_candidate"]].copy()
-    if candidates.empty:
-        return {"status": "NO_DIRECTIONALLY_ALIGNED_CANDIDATES"}
-    candidates["_net_return_after_cost"] = (
-        candidates["_realised_signed_return"] - ASSUMED_ROUND_TRIP_COST
-    )
-    pool = {
-        "rows": int(len(candidates)),
-        "sessions": int(candidates["_target_date"].nunique()),
-        "mean_gross_signed_return_pct": float(candidates["_realised_signed_return"].mean() * 100.0),
-        "mean_net_signed_return_pct": float(candidates["_net_return_after_cost"].mean() * 100.0),
-        "median_net_signed_return_pct": float(candidates["_net_return_after_cost"].median() * 100.0),
-        "net_positive_rate_pct": float(candidates["_net_return_after_cost"].gt(0).mean() * 100.0),
+
+    probability = frame["probability_up_next_session"].astype(float)
+    predicted_return = frame["predicted_return_next_session"].astype(float)
+    actual_return = frame["actual_d1_return"].astype(float)
+    frame["_actual_return"] = actual_return
+    frame["_rank_score"] = (2.0 * probability - 1.0) * predicted_return
+
+    buy_mask = probability.ge(0.5) & predicted_return.gt(0)
+    sell_mask = probability.lt(0.5) & predicted_return.lt(0)
+    buys = frame.loc[buy_mask].copy()
+    sells = frame.loc[sell_mask].copy()
+
+    universe = {
+        "rows": int(len(frame)),
+        "sessions": int(frame["_target_date"].nunique()),
+        "mean_gross_return_pct": float(frame["_actual_return"].mean() * 100.0),
+        "median_gross_return_pct": float(frame["_actual_return"].median() * 100.0),
+        "positive_return_rate_pct": float(frame["_actual_return"].gt(0).mean() * 100.0),
     }
+    if buys.empty:
+        return {
+            "status": "NO_LONG_ONLY_BUY_CANDIDATES",
+            "model_version": manifest_version,
+            "eligible_universe": universe,
+            "sell_avoidance_diagnostic": {"rows": int(len(sells))},
+        }
+
+    buy_pool = {
+        "rows": int(len(buys)),
+        "sessions": int(buys["_target_date"].nunique()),
+        "mean_gross_return_pct": float(buys["_actual_return"].mean() * 100.0),
+        "median_gross_return_pct": float(buys["_actual_return"].median() * 100.0),
+        "positive_return_rate_pct": float(buys["_actual_return"].gt(0).mean() * 100.0),
+    }
+    sell_avoidance = {
+        "rows": int(len(sells)),
+        "sessions": int(sells["_target_date"].nunique()),
+        "mean_underlying_return_pct": (
+            float(sells["_actual_return"].mean() * 100.0) if len(sells) else None
+        ),
+        "median_underlying_return_pct": (
+            float(sells["_actual_return"].median() * 100.0) if len(sells) else None
+        ),
+        "underlying_downside_rate_pct": (
+            float(sells["_actual_return"].lt(0).mean() * 100.0) if len(sells) else None
+        ),
+        "actual_direction_down_rate_pct": (
+            float(sells["_actual_direction"].eq("DOWN").mean() * 100.0)
+            if len(sells) else None
+        ),
+        "interpretation": (
+            "SELL-aligned predictions are treated as avoid/exit observations. "
+            "No short-sale proceeds or symmetric short P&L are assumed."
+        ),
+    }
+
+    cost_scenarios_bps = (10, 20, 30, 40, 50)
     rankings = []
+    spearman_rows = []
+    for session, group in buys.groupby("_target_date", sort=True):
+        if len(group) >= 20 and group["_rank_score"].nunique() > 1:
+            corr = group["_rank_score"].corr(
+                group["_actual_return"], method="spearman"
+            )
+            if pd.notna(corr):
+                spearman_rows.append({
+                    "prediction_for_date": str(session),
+                    "buy_rows": int(len(group)),
+                    "spearman_rank_correlation_score_vs_realised_return": float(corr),
+                })
+
     for fraction in (0.01, 0.02, 0.05, 0.10):
         selected_parts = []
         selected_per_session = []
-        for session, group in candidates.groupby("_target_date", sort=True):
+        for session, group in buys.groupby("_target_date", sort=True):
             group = group.sort_values(
-                ["_rank_score", "probability_up_next_session", "_symbol"],
-                ascending=[False, False, True], kind="mergesort"
+                ["_rank_score", "probability_up_next_session",
+                 "predicted_return_next_session", "_symbol"],
+                ascending=[False, False, False, True], kind="mergesort"
             )
             take = max(1, int(math.ceil(len(group) * fraction)))
-            selected = group.head(take)
+            selected = group.head(take).copy()
             selected_parts.append(selected)
             selected_per_session.append({
                 "prediction_for_date": str(session),
-                "candidate_rows": int(len(group)),
+                "buy_candidate_rows": int(len(group)),
                 "selected_rows": int(len(selected)),
-                "selected_net_return_pct": float(
-                    selected["_net_return_after_cost"].mean() * 100.0
+                "mean_gross_return_pct": float(selected["_actual_return"].mean() * 100.0),
+                "mean_net_return_pct_at_30bps": float(
+                    (selected["_actual_return"].mean() - ASSUMED_ROUND_TRIP_COST) * 100.0
+                ),
+                "positive_return_rate_pct": float(
+                    selected["_actual_return"].gt(ASSUMED_ROUND_TRIP_COST).mean() * 100.0
                 ),
             })
+
         selected = pd.concat(selected_parts, ignore_index=True)
+        gross = selected["_actual_return"].astype(float)
+        session_gross = selected.groupby("_target_date")["_actual_return"].mean()
+        sensitivity = []
+        for cost_bps in cost_scenarios_bps:
+            cost_fraction = cost_bps / 10000.0
+            net = gross - cost_fraction
+            session_net = session_gross - cost_fraction
+            sensitivity.append({
+                "round_trip_cost_bps": cost_bps,
+                "mean_net_return_pct": float(net.mean() * 100.0),
+                "median_net_return_pct": float(net.median() * 100.0),
+                "net_positive_trade_rate_pct": float(net.gt(0).mean() * 100.0),
+                "mean_session_net_return_pct": float(session_net.mean() * 100.0),
+                "profitable_sessions": int(session_net.gt(0).sum()),
+                "sessions_tested": int(len(session_net)),
+            })
+
+        session_net_30bps = session_gross - ASSUMED_ROUND_TRIP_COST
         rankings.append({
-            "top_fraction_of_aligned_candidates_per_session_pct": fraction * 100.0,
+            "top_fraction_of_buy_aligned_candidates_per_session_pct": fraction * 100.0,
             "selected_rows": int(len(selected)),
             "sessions": int(selected["_target_date"].nunique()),
-            "mean_gross_signed_return_pct": float(
-                selected["_realised_signed_return"].mean() * 100.0
+            "mean_gross_return_pct": float(gross.mean() * 100.0),
+            "median_gross_return_pct": float(gross.median() * 100.0),
+            "mean_net_return_pct_after_assumed_cost": float(
+                (gross.mean() - ASSUMED_ROUND_TRIP_COST) * 100.0
             ),
-            "mean_net_signed_return_pct_after_assumed_cost": float(
-                selected["_net_return_after_cost"].mean() * 100.0
+            "median_net_return_pct_after_assumed_cost": float(
+                (gross.median() - ASSUMED_ROUND_TRIP_COST) * 100.0
             ),
-            "median_net_signed_return_pct_after_assumed_cost": float(
-                selected["_net_return_after_cost"].median() * 100.0
+            "net_positive_trade_rate_pct_after_assumed_cost": float(
+                gross.gt(ASSUMED_ROUND_TRIP_COST).mean() * 100.0
             ),
-            "net_positive_rate_pct": float(
-                selected["_net_return_after_cost"].gt(0).mean() * 100.0
+            "mean_session_net_return_pct_after_assumed_cost": float(
+                session_net_30bps.mean() * 100.0
             ),
+            "profitable_sessions_after_assumed_cost": int(
+                session_net_30bps.gt(0).sum()
+            ),
+            "cost_sensitivity": sensitivity,
             "per_session": selected_per_session,
         })
-    correlations = []
-    for session, group in frame.groupby("_target_date", sort=True):
-        if len(group) < 20 or group["_rank_score"].nunique() < 2:
-            continue
-        corr = group["_rank_score"].corr(
-            group["_realised_signed_return"], method="spearman"
-        )
-        if pd.notna(corr):
-            correlations.append({
-                "prediction_for_date": str(session),
-                "rows": int(len(group)),
-                "spearman_rank_correlation": float(corr),
-            })
+
     return {
         "status": "COMPUTED",
+        "model_version": str(manifest_version),
+        "method": "LONG_ONLY_DELIVERY; equal-weight positions within each target session",
         "sample_definition": (
-            "Matured, target-date-aligned, quality-approved latest prediction per "
-            "symbol/session across active Delivery model versions; ranked only where "
-            "the probability direction and predicted-return sign agree."
+            "Current manifest-verified model predictions only; matured, target-date-aligned, "
+            "quality-approved, and decision timestamp strictly before target session open. "
+            "Predicted UP plus positive predicted return are BUY candidates. Predicted DOWN "
+            "plus negative predicted return are SELL/avoid candidates."
         ),
+        "decision_time_guard_applied": True,
+        "synthetic_short_positions_used": False,
+        "rank_score": "(2 * probability_up_next_session - 1) * predicted_return_next_session",
         "assumed_round_trip_cost_pct": ASSUMED_ROUND_TRIP_COST * 100.0,
-        "short_side_caveat": (
-            "SELL outcomes are modelled as a symmetric short return (-actual return). "
-            "Borrow/short-sale availability, delivery restrictions, taxes, stamp duty, "
-            "and slippage beyond the assumed 30 bps are not modelled."
-        ),
-        "aligned_candidate_pool": pool,
-        "top_ranked_selection": rankings,
-        "session_spearman_rank": {
-            "sessions_with_correlation": int(len(correlations)),
+        "cost_sensitivity_bps": list(cost_scenarios_bps),
+        "eligible_universe": universe,
+        "buy_aligned_candidate_pool": buy_pool,
+        "sell_avoidance_diagnostic": sell_avoidance,
+        "top_ranked_long_only_selection": rankings,
+        "buy_side_session_spearman_rank": {
+            "sessions_with_correlation": int(len(spearman_rows)),
             "mean_spearman": (
-                float(np.mean([x["spearman_rank_correlation"] for x in correlations]))
-                if correlations else None
+                float(np.mean([x["spearman_rank_correlation_score_vs_realised_return"]
+                               for x in spearman_rows]))
+                if spearman_rows else None
             ),
             "positive_correlation_session_pct": (
                 float(np.mean([
-                    x["spearman_rank_correlation"] > 0 for x in correlations
-                ]) * 100.0) if correlations else None
+                    x["spearman_rank_correlation_score_vs_realised_return"] > 0
+                    for x in spearman_rows
+                ]) * 100.0) if spearman_rows else None
             ),
-            "by_session": correlations,
+            "by_session": spearman_rows,
         },
     }
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -833,7 +921,7 @@ def main() -> int:
         verified_by_session = []
 
     coverage = _historical_action_coverage(predictions)
-    ranking = _ranking_backtest(joined)
+    ranking = _ranking_backtest(verified_live, manifest_version)
 
     # Reproduce delivery_policy_update.py::_join() on the RAW append-only ledgers.
     # The policy updater does not first collapse symbol/session/model revisions.
