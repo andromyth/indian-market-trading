@@ -535,25 +535,61 @@ def main() -> int:
     coverage = _historical_action_coverage(predictions)
     ranking = _ranking_backtest(joined)
 
-    # Reconstruct the session-count guard used by delivery_policy_update.py:
-    # only rows with a parseable decision_timestamp count toward its 20-session
-    # minimum. Also report the explicit prediction target-session coverage.
-    policy_source = joined[
-        joined["_model_version"].isin(ACTIVE_MODELS)
-        & joined["_gate_pass"]
-        & joined["_actual_direction"].isin(["UP", "DOWN", "FLAT"])
-    ].copy()
-    decision_ts = pd.to_datetime(
-        policy_source.get("decision_timestamp", pd.Series(pd.NaT, index=policy_source.index)),
-        errors="coerce", utc=True
-    )
-    policy_source["_decision_session"] = (
-        decision_ts.dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d")
-    )
-    policy_rows = policy_source.dropna(subset=["_decision_session"])
-    policy_session_dates = sorted(policy_rows["_decision_session"].unique().tolist())
+    # Reproduce delivery_policy_update.py::_join() on the RAW append-only ledgers.
+    # The policy updater does not first collapse symbol/session/model revisions.
+    # Count only active, VALIDATED, gate-approved rows with usable timestamps and
+    # non-null model inputs, then deduplicate by prediction_id exactly as _join().
+    raw_p = pd.DataFrame(raw_predictions)
+    raw_v = pd.DataFrame(raw_validations)
+    if raw_p.empty or raw_v.empty:
+        policy_joined = pd.DataFrame()
+    else:
+        raw_p = raw_p[
+            raw_p["mode"].astype(str).str.lower().eq("delivery")
+            & raw_p["model_version"].astype(str).isin(ACTIVE_MODELS)
+        ].copy()
+        p_keep = [
+            "prediction_id", "symbol", "decision_timestamp",
+            "probability_up_next_session", "predicted_return_next_session",
+            "production_data_quality_gate", "model_version",
+        ]
+        raw_p = raw_p[[c for c in p_keep if c in raw_p.columns]]
+        v_keep = [
+            "prediction_id", "actual_direction_d1", "validation_status",
+            "actual_d1_return",
+        ]
+        raw_v = raw_v[[c for c in v_keep if c in raw_v.columns]]
+        policy_joined = raw_p.merge(raw_v, on="prediction_id", how="inner")
+        policy_joined = policy_joined[
+            policy_joined["validation_status"].eq("VALIDATED")
+        ].copy()
+        policy_joined = policy_joined[
+            policy_joined["production_data_quality_gate"].map(_bool)
+        ].copy()
+        policy_joined["decision_timestamp"] = pd.to_datetime(
+            policy_joined["decision_timestamp"], errors="coerce", utc=True
+        )
+        for col in (
+            "probability_up_next_session",
+            "predicted_return_next_session",
+            "actual_direction_d1",
+        ):
+            policy_joined = policy_joined.dropna(subset=[col])
+        policy_joined = (
+            policy_joined.sort_values("decision_timestamp")
+            .drop_duplicates("prediction_id", keep="last")
+        )
+    policy_session_dates = sorted(
+        policy_joined["decision_timestamp"].dt.tz_convert("Asia/Kolkata")
+        .dt.strftime("%Y-%m-%d").dropna().unique().tolist()
+    ) if not policy_joined.empty else []
     target_session_dates = sorted(
-        policy_source["_target_date"].dropna().unique().tolist()
+        joined.loc[
+            joined["_model_version"].isin(ACTIVE_MODELS)
+            & joined["_gate_pass"]
+            & joined["_target_aligned"],
+            "_target_date",
+        ].dropna().unique().tolist()
     )
     policy_session_count = len(policy_session_dates)
     holdout_available = (
