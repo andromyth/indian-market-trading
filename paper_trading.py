@@ -513,6 +513,77 @@ def _open_positions_with_marks(
     return pd.DataFrame(rows), market_prices
 
 
+def _render_live_market_overview(
+    fills: list[dict],
+    selected_snapshot: dict,
+    snapshot_loader,
+    revision: int,
+) -> None:
+    """Show live/last available marks for held shares and a compact NSE watchlist."""
+    symbols = list(dict.fromkeys(
+        [str(row.get("symbol") or "").upper() for row in fills]
+        + ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "IDEA"]
+    ))
+    selected_symbol = str((selected_snapshot or {}).get("symbol") or "").upper()
+    if selected_symbol:
+        symbols = [selected_symbol] + [value for value in symbols if value != selected_symbol]
+
+    with st.expander("Live NSE market watch", expanded=True):
+        refresh = st.button("Refresh market watch", key="paper_refresh_market_watch")
+        if refresh:
+            try:
+                snapshot_loader.clear()
+            except Exception:
+                pass
+            st.session_state["paper_refresh_revision"] = int(
+                st.session_state.get("paper_refresh_revision", revision)
+            ) + 1
+            st.rerun()
+
+        rows = []
+        for root in symbols:
+            try:
+                snapshot = (
+                    selected_snapshot if root == selected_symbol
+                    else snapshot_loader(f"{root}.NS", revision, False) or {}
+                )
+                quote = _finite_or_none(snapshot.get("price"))
+                if quote is None or quote <= 0:
+                    rows.append({
+                        "Symbol": root,
+                        "Last price": None,
+                        "Change %": None,
+                        "Source": snapshot.get("price_source") or snapshot.get("source") or "UNAVAILABLE",
+                        "Quote time": "Unavailable",
+                        "Status": snapshot.get("price_freshness_status") or "NO_DATA",
+                    })
+                    continue
+                change = _finite_or_none(snapshot.get("change_percent"))
+                rows.append({
+                    "Symbol": root,
+                    "Last price": round(float(quote), 2),
+                    "Change %": round(float(change), 2) if change is not None else None,
+                    "Source": snapshot.get("price_source") or snapshot.get("source") or "UNKNOWN",
+                    "Quote time": _format_timestamp(str(snapshot.get("quote_timestamp") or "")),
+                    "Status": (
+                        "FRESH" if snapshot.get("price_fresh")
+                        else snapshot.get("price_freshness_status") or "UNVERIFIED"
+                    ),
+                })
+            except Exception as exc:
+                rows.append({
+                    "Symbol": root, "Last price": None, "Change %": None,
+                    "Source": "ERROR", "Quote time": "—",
+                    "Status": f"{type(exc).__name__}",
+                })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Quotes are fetched through the project's configured NSE/broker/Yahoo adapter. "
+            "Freshness applies to the completed candle; standalone quote fallbacks are marked unverified."
+        )
+
+
 def render_paper_trading(snapshot_loader) -> None:
     """Render the paper terminal. snapshot_loader(symbol, revision, include_predictions)."""
     init_db()
