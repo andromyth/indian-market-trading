@@ -665,8 +665,8 @@ def _render_live_market_overview(
         )
 
 
-def render_paper_trading(snapshot_loader) -> None:
-    """Render the paper terminal. snapshot_loader(symbol, revision, include_predictions)."""
+def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> None:
+    """Render separate Intraday and Delivery books using existing project models."""
     init_db()
     st.title("Paper Trading")
     st.caption(
@@ -717,7 +717,7 @@ def render_paper_trading(snapshot_loader) -> None:
                     "New starting capital (₹)", min_value=1_000.0,
                     value=float(account["initial_cash"]), step=10_000.0,
                 )
-                confirm_reset = st.checkbox("I understand that reset permanently clears this paper ledger.")
+                confirm_reset = st.checkbox("I understand that reset permanently clears Intraday, Delivery and Legacy paper fills.")
                 reset = st.form_submit_button("Reset paper account")
             if reset:
                 if not confirm_reset:
@@ -725,10 +725,23 @@ def render_paper_trading(snapshot_loader) -> None:
                 else:
                     try:
                         reset_account(reset_capital)
-                        st.success("Paper ledger reset.")
+                        st.success("All paper-trading tracks reset.")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Could not reset account: {type(exc).__name__}: {exc}")
+
+    segment = st.radio(
+        "Trading track",
+        ["INTRADAY", "DELIVERY"],
+        horizontal=True,
+        key="paper_trading_segment",
+        format_func=lambda value: "Intraday · 5-minute model" if value == "INTRADAY" else "Delivery · Beta V2 Delivery model",
+    )
+    st.caption(
+        "Intraday and Delivery fills, positions and P&L are reported separately. "
+        "They share one account cash balance and one account-wide margin pool; no capital is duplicated. "
+        "Pre-existing unclassified fills remain in Legacy / Unassigned."
+    )
 
     symbol_text = st.text_input("NSE cash symbol", value="SBIN", key="paper_symbol_input")
     try:
@@ -745,9 +758,14 @@ def render_paper_trading(snapshot_loader) -> None:
     revision = int(st.session_state.get("paper_refresh_revision", 0))
 
     snapshot = {}
+    delivery_forecast = {}
     if symbol and not symbol_error:
         try:
-            snapshot = snapshot_loader(f"{symbol}.NS", revision, True) or {}
+            snapshot = snapshot_loader(
+                f"{symbol}.NS", revision, segment == "INTRADAY"
+            ) or {}
+            if segment == "DELIVERY" and delivery_prediction_loader is not None:
+                delivery_forecast = delivery_prediction_loader(symbol, revision) or {}
         except Exception as exc:
             snapshot = {"error": f"{type(exc).__name__}: {exc}"}
     with status_col:
@@ -764,19 +782,67 @@ def render_paper_trading(snapshot_loader) -> None:
 
     price = _finite_or_none(snapshot.get("price"))
     predictions = snapshot.get("predictions") or []
-    selected_prediction = snapshot.get("prediction") or next(
-        (item for item in predictions if int(item.get("horizon_min", 0) or 0) == 5),
-        {},
-    )
+    if segment == "INTRADAY":
+        selected_prediction = snapshot.get("prediction") or next(
+            (item for item in predictions if int(item.get("horizon_min", 0) or 0) == 5),
+            {},
+        )
+        prediction_status = "READY" if snapshot.get("prediction_ready") else "NOT READY"
+        prediction_unavailable_reason = snapshot.get("prediction_freshness_reason") or (
+            "Fresh stock and benchmark OHLC inputs are required."
+        )
+    else:
+        delivery_signal = (
+            delivery_forecast.get("prior_close_forecast_signal")
+            or delivery_forecast.get("signal")
+            or "UNAVAILABLE"
+        )
+        delivery_probability = (
+            delivery_forecast.get("prior_close_probability_up")
+            if delivery_forecast.get("prior_close_forecast_signal") is not None
+            else delivery_forecast.get("p")
+        )
+        selected_prediction = {
+            "signal": delivery_signal,
+            "probability_up": _finite_or_none(delivery_probability),
+            "expected_return": _finite_or_none(
+                delivery_forecast.get("expected_return")
+                or delivery_forecast.get("prediction_expected_return")
+            ),
+            "predicted_price": _finite_or_none(delivery_forecast.get("predicted_price")),
+            "model_version": (
+                delivery_forecast.get("model_version")
+                or delivery_forecast.get("champion_model_version")
+                or delivery_forecast.get("model_bundle")
+                or "Beta V2 Delivery"
+            ),
+            "decision_timestamp": (
+                delivery_forecast.get("forecast_as_of_utc")
+                or delivery_forecast.get("feature_cutoff_timestamp")
+                or ""
+            ),
+            "reason": delivery_forecast.get("signal_reason") or delivery_forecast.get("reason") or "",
+            "prediction_status": delivery_forecast.get("prediction_status") or "UNKNOWN",
+            "target_session_date": delivery_forecast.get("target_session_date"),
+        }
+        prediction_status = str(delivery_forecast.get("prediction_status") or "UNAVAILABLE")
+        prediction_unavailable_reason = (
+            delivery_forecast.get("signal_reason")
+            or delivery_forecast.get("reason")
+            or "The existing Beta V2 Delivery forecast is unavailable."
+        )
     fresh = bool(snapshot.get("price_fresh"))
-    model_fresh = bool(snapshot.get("prediction_ready"))
+    model_fresh = bool(snapshot.get("prediction_ready")) if segment == "INTRADAY" else prediction_status == "PASS"
     price_source = str(snapshot.get("price_source") or snapshot.get("source") or "UNKNOWN")
     quote_timestamp = str(snapshot.get("quote_timestamp") or "")
     if price is not None and price > 0:
         c1, c2, c3 = st.columns(3)
         c1.metric("Current market value", f"₹{price:,.2f}")
         c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
-        c3.metric("5-minute model signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+        c3.metric(
+            "5-minute signal" if segment == "INTRADAY" else "Delivery signal",
+            str(selected_prediction.get("signal") or "UNAVAILABLE"),
+        )
         st.caption(
             f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
         )
@@ -788,28 +854,36 @@ def render_paper_trading(snapshot_loader) -> None:
     elif snapshot:
         st.warning("No market quote is currently available. Enter a manual reference price to test the ledger.")
     else:
-        st.info("Enter an NSE symbol and refresh to load its current market value and 5-minute prediction.")
+        st.info(
+            "Enter an NSE symbol and refresh to load its current market value and "
+            + ("five-minute Intraday prediction." if segment == "INTRADAY" else "Delivery forecast.")
+        )
 
-    st.subheader("5-minute prediction")
-    if selected_prediction:
+    st.subheader("5-minute Intraday prediction" if segment == "INTRADAY" else "Delivery forecast")
+    if selected_prediction and (
+        segment == "INTRADAY" or prediction_status not in {"ERROR", "BLOCKED", "ABSTAIN", "UNAVAILABLE"}
+    ):
         prediction_row = {
-            "Horizon": "5 minutes",
+            "Track": segment,
+            "Horizon": "5 minutes" if segment == "INTRADAY" else "Next NSE session",
+            "Status": prediction_status,
             "Signal": selected_prediction.get("signal", "—"),
             "Probability up": _finite_or_none(selected_prediction.get("probability_up")),
             "Expected return": _finite_or_none(selected_prediction.get("expected_return")),
             "Predicted price": _finite_or_none(selected_prediction.get("predicted_price")),
+            "Target session": selected_prediction.get("target_session_date") or "—",
             "Model version": selected_prediction.get("model_version", "—"),
             "Decision time": selected_prediction.get("decision_timestamp", "—"),
             "Reason": selected_prediction.get("signal_reason") or selected_prediction.get("reason") or "",
         }
         st.dataframe(pd.DataFrame([prediction_row]), use_container_width=True, hide_index=True)
     else:
-        st.caption(
-            f"5-minute prediction unavailable: {snapshot.get('prediction_freshness_reason') or 'Fresh stock and benchmark OHLC inputs are required.'}"
-        )
+        st.caption(f"{segment.title()} prediction unavailable: {prediction_unavailable_reason}")
 
     st.subheader("Place a simulated order")
-    current_state = calculate_portfolio(float(account["initial_cash"]), list_fills())
+    current_state = calculate_portfolio(
+        0.0, list_fills(segment=segment)
+    )
     available_shares = int(current_state["positions"].get(symbol, {}).get("quantity", 0)) if symbol else 0
     current_side = "LONG" if available_shares > 0 else "SHORT" if available_shares < 0 else "FLAT"
     st.caption(
@@ -859,9 +933,8 @@ def render_paper_trading(snapshot_loader) -> None:
                 try:
                     attached_prediction = selected_prediction if selected_prediction else {}
                     existing_fills = list_fills()
-                    existing_state = calculate_portfolio(float(account["initial_cash"]), existing_fills)
-                    _, current_market_prices = _open_positions_with_marks(
-                        existing_state, snapshot, snapshot_loader, revision
+                    current_market_prices = _fetch_live_market_marks(
+                        existing_fills, snapshot, snapshot_loader, revision
                     )
                     fill = place_order(
                         symbol,
@@ -873,6 +946,7 @@ def render_paper_trading(snapshot_loader) -> None:
                         quote_timestamp="USER_ENTERED" if manual_price > 0 else str(snapshot.get("quote_timestamp") or ""),
                         prediction=attached_prediction,
                         market_prices=current_market_prices,
+                        segment=segment,
                     )
                     st.success(
                         f"{fill['side']} {fill['quantity']} {fill['symbol']} filled at "
@@ -883,11 +957,8 @@ def render_paper_trading(snapshot_loader) -> None:
 
     fills = list_fills()
     _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
-    unmarked_state = calculate_portfolio(float(account["initial_cash"]), fills)
-    positions_frame, market_prices = _open_positions_with_marks(
-        unmarked_state, snapshot, snapshot_loader, revision
-    )
-    state = calculate_portfolio(
+    market_prices = _fetch_live_market_marks(fills, snapshot, snapshot_loader, revision)
+    state = calculate_segmented_portfolio(
         float(account["initial_cash"]), fills, market_prices=market_prices
     )
     cash = float(state["cash"])
@@ -896,7 +967,7 @@ def render_paper_trading(snapshot_loader) -> None:
     unrealised = float(state["unrealised_pnl"])
 
     st.divider()
-    st.subheader("Paper account")
+    st.subheader("Combined paper account · shared cash and margin")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Cash balance", f"₹{cash:,.2f}")
     k2.metric("Free cash after margin", f"₹{state['available_cash']:,.2f}")
@@ -930,54 +1001,69 @@ def render_paper_trading(snapshot_loader) -> None:
     st.caption(
         f"Pricing source: {snapshot.get('source') or 'unavailable'} · "
         f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
-        f"5-minute model: {'READY' if snapshot.get('prediction_ready') else 'NOT READY'}"
+        f"{segment.title()} model: {prediction_status}"
     )
-    prediction = snapshot.get("prediction") or {}
-    if snapshot.get("prediction_ready") and prediction:
-        p1,p2,p3,p4 = st.columns(4)
-        p1.metric("5-minute signal", str(prediction.get("signal") or "ABSTAIN"))
-        probability = _finite_or_none(prediction.get("probability_up"))
-        p2.metric("5-minute P(up)", f"{probability:.1%}" if probability is not None else "—")
-        expected_return = _finite_or_none(prediction.get("expected_return"))
-        p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
-        predicted_price = _finite_or_none(prediction.get("predicted_price"))
-        p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
-        st.caption(
-            f"Model: {prediction.get('model_version') or 'unknown'} · "
-            f"Decision: {_format_timestamp(str(prediction.get('decision_timestamp') or ''))} · "
-            f"Horizon: 5 minutes"
-        )
-        st.caption(str(prediction.get("reason") or prediction.get("signal_reason") or ""))
-    elif snapshot.get("prediction_freshness_reason"):
-        st.info(f"5-minute model unavailable: {snapshot['prediction_freshness_reason']}")
+    probability = _finite_or_none(selected_prediction.get("probability_up"))
+    expected_return = _finite_or_none(selected_prediction.get("expected_return"))
+    predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
+    p1,p2,p3,p4 = st.columns(4)
+    p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+    p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
+    p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+    p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+    st.caption(
+        f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
+        f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
+        + ("Horizon: 5 minutes" if segment == "INTRADAY" else
+           f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
+    )
+    st.caption(str(selected_prediction.get("reason") or ""))
 
-    st.subheader("Open positions")
-    if positions_frame.empty:
-        st.caption("No open positions.")
-    else:
-        st.dataframe(positions_frame, use_container_width=True, hide_index=True)
+    st.subheader("Separate strategy books")
+    book_tabs = st.tabs(["Intraday", "Delivery", "Legacy / Unassigned"])
+    for book_name, book_tab in zip(TRADING_SEGMENTS, book_tabs):
+        with book_tab:
+            book_state = state["segments"][book_name]
+            book_fills = [row for row in fills if str(row.get("segment") or "LEGACY").upper() == book_name]
+            b1,b2,b3,b4 = st.columns(4)
+            b1.metric("Realised P&L", f"₹{book_state['realised_pnl']:,.2f}")
+            b2.metric("Unrealised P&L", f"₹{book_state['unrealised_pnl']:,.2f}")
+            b3.metric("Long market value", f"₹{book_state['long_market_value']:,.2f}")
+            b4.metric("Short liability", f"₹{book_state['short_liability']:,.2f}")
 
-    st.subheader("Trade ledger")
-    if fills:
-        ledger = pd.DataFrame(fills)
-        visible = {
-            "timestamp_ist": "Timestamp (IST)", "symbol": "Symbol", "side": "Side",
-            "quantity": "Qty", "reference_price": "Reference price", "fill_price": "Fill price",
-            "gross": "Turnover", "charges": "Estimated charges", "prediction_signal": "Model signal",
-            "prediction_horizon_min": "Model horizon (min)", "prediction_probability_up": "P(up)",
-            "prediction_model_version": "Model version", "source": "Price source",
-            "quote_timestamp": "Quote timestamp",
-        }
-        ledger = ledger[[column for column in visible if column in ledger.columns]].rename(columns=visible)
-        st.dataframe(ledger, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download paper-trade ledger CSV",
-            data=ledger.to_csv(index=False).encode("utf-8"),
-            file_name="paper_trade_ledger.csv",
-            mime="text/csv",
-        )
-    else:
-        st.caption("No simulated fills have been recorded yet.")
+            book_positions, _ = _open_positions_with_marks(
+                book_state, snapshot, snapshot_loader, revision
+            )
+            if not book_positions.empty:
+                book_positions.insert(0, "Track", book_name)
+                st.dataframe(book_positions, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No open positions in this track.")
+
+            st.markdown("**Trade ledger**")
+            if book_fills:
+                ledger = pd.DataFrame(book_fills)
+                visible = {
+                    "timestamp_ist": "Timestamp (IST)", "symbol": "Symbol", "side": "Side",
+                    "quantity": "Qty", "reference_price": "Reference price", "fill_price": "Fill price",
+                    "gross": "Turnover", "charges": "Estimated charges", "segment": "Track",
+                    "prediction_signal": "Model signal", "prediction_probability_up": "P(up)",
+                    "prediction_expected_return": "Expected return", "prediction_model_version": "Model version",
+                    "prediction_decision_timestamp": "Model decision time",
+                    "prediction_horizon_min": "Model horizon (min)", "source": "Price source",
+                    "quote_timestamp": "Quote timestamp",
+                }
+                ledger = ledger[[column for column in visible if column in ledger.columns]].rename(columns=visible)
+                st.dataframe(ledger, use_container_width=True, hide_index=True)
+                st.download_button(
+                    f"Download {book_name.lower()} ledger CSV",
+                    data=ledger.to_csv(index=False).encode("utf-8"),
+                    file_name=f"paper_trade_{book_name.lower()}.csv",
+                    mime="text/csv",
+                    key=f"paper_download_{book_name.lower()}",
+                )
+            else:
+                st.caption("No fills recorded in this track.")
 
     st.caption(
         "Simulation only: NSE cash-equity long/short accounting; no F&O or broker integration. "
