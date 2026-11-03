@@ -494,7 +494,7 @@ def render_paper_trading(snapshot_loader) -> None:
 
     st.subheader("Place a simulated order")
     with st.form("paper_place_order"):
-        side = st.selectbox("Side", ["BUY", "SELL"], horizontal=True)
+        side = st.radio("Side", ["BUY", "SELL"], horizontal=True)
         quantity = st.number_input("Quantity (shares)", min_value=1, max_value=1_000_000, value=1, step=1)
         manual_price = st.number_input(
             "Manual reference price (₹); use 0 for the latest market bar",
