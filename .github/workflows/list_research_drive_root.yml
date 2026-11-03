@@ -1,0 +1,66 @@
+name: List research Drive root
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/list_research_drive_root.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: list-research-drive-root
+  cancel-in-progress: false
+
+jobs:
+  list-root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check google-api-python-client google-auth google-auth-oauthlib
+      - name: List top-level research folders and files (read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+
+          token_text=os.environ.get("GOOGLE_OAUTH_TOKEN_JSON","").strip()
+          root_id=os.environ.get("GOOGLE_DRIVE_ROOT_ID","").strip()
+          if not token_text or not root_id:
+              raise SystemExit("Drive OAuth token or research root ID is not configured.")
+          info=json.loads(token_text)
+          creds=Credentials.from_authorized_user_info(info,scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid: creds.refresh(Request())
+          service=build("drive","v3",credentials=creds,cache_discovery=False)
+          rows=[]
+          page=None
+          while True:
+              response=service.files().list(
+                  q=f"'{root_id}' in parents and trashed = false",
+                  pageSize=1000,pageToken=page,
+                  fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+              ).execute()
+              rows.extend(response.get("files",[]))
+              page=response.get("nextPageToken")
+              if not page: break
+          rows.sort(key=lambda x:(x.get("mimeType")!="application/vnd.google-apps.folder",x.get("name","").lower()))
+          result=[{
+              "name":x.get("name"),"type":"folder" if x.get("mimeType")=="application/vnd.google-apps.folder" else x.get("mimeType"),
+              "size_bytes":int(x.get("size") or 0),"size_mib":round(int(x.get("size") or 0)/(1024*1024),2),
+              "id":x.get("id"),"modifiedTime":x.get("modifiedTime")
+          } for x in rows]
+          print("RESEARCH_DRIVE_ROOT_CHILDREN="+json.dumps(result,sort_keys=True))
+          print("RESEARCH_DRIVE_ROOT_CHILD_COUNT="+str(len(result)))
+          PY
