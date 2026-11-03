@@ -776,7 +776,23 @@ def render_paper_trading(snapshot_loader) -> None:
         f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
         f"5-minute model: {'READY' if snapshot.get('prediction_ready') else 'NOT READY'}"
     )
-    if snapshot.get("prediction_freshness_reason") and not snapshot.get("prediction_ready"):
+    prediction = snapshot.get("prediction") or {}
+    if snapshot.get("prediction_ready") and prediction:
+        p1,p2,p3,p4 = st.columns(4)
+        p1.metric("5-minute signal", str(prediction.get("signal") or "ABSTAIN"))
+        probability = _finite_or_none(prediction.get("probability_up"))
+        p2.metric("5-minute P(up)", f"{probability:.1%}" if probability is not None else "—")
+        expected_return = _finite_or_none(prediction.get("expected_return"))
+        p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+        predicted_price = _finite_or_none(prediction.get("predicted_price"))
+        p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+        st.caption(
+            f"Model: {prediction.get('model_version') or 'unknown'} · "
+            f"Decision: {_format_timestamp(str(prediction.get('decision_timestamp') or ''))} · "
+            f"Horizon: 5 minutes"
+        )
+        st.caption(str(prediction.get("reason") or prediction.get("signal_reason") or ""))
+    elif snapshot.get("prediction_freshness_reason"):
         st.info(f"5-minute model unavailable: {snapshot['prediction_freshness_reason']}")
 
     st.subheader("Open positions")
