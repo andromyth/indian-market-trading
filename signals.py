@@ -102,14 +102,19 @@ def normalize_ohlcv_frame(df: pd.DataFrame, require_volume: bool = False) -> pd.
             ren[c] = _OHLCV_ALIASES[key]
     x = x.rename(columns=ren)
 
-    # If both Close and Adj Close collapsed to Close, duplicate names can be
-    # produced. Keep the first usable numeric series for each canonical field.
+    # Several provider columns can collapse to the same canonical name
+    # (notably Yahoo's Close and Adj Close). Merge duplicate fields row-wise,
+    # preferring the first finite numeric value, then remove duplicate labels
+    # so row["Close"] is always a scalar.
     for field in ["Open", "High", "Low", "Close", "Volume"]:
-        if field in x.columns:
-            col = x[field]
-            if isinstance(col, pd.DataFrame):
-                col = col.iloc[:, 0]
-            x[field] = pd.to_numeric(col, errors="coerce")
+        positions = [i for i, name in enumerate(x.columns) if str(name) == field]
+        if positions:
+            candidates = pd.concat(
+                [pd.to_numeric(x.iloc[:, i], errors="coerce") for i in positions],
+                axis=1,
+            ).replace([float("inf"), float("-inf")], float("nan"))
+            x[field] = candidates.bfill(axis=1).iloc[:, 0]
+    x = x.loc[:, ~x.columns.duplicated(keep="first")]
 
     missing = [c for c in ["Open", "High", "Low", "Close"] if c not in x.columns]
     if missing:
