@@ -131,7 +131,7 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 36); do
             gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > /tmp/service-after.json
-            python - "$REVISION" <<'PY'
+            if python - "$REVISION" <<'PY'
           import json,sys
           revision=sys.argv[1]
           service=json.load(open("/tmp/service-after.json",encoding="utf-8"))
