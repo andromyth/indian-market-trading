@@ -42,6 +42,43 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
+      - name: Test the exact Cloud Run OAuth Secret Manager version without printing token data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --disable-pip-version-check google-auth
+          gcloud secrets versions access latest \
+            --secret=google-oauth-token-json \
+            --project="$PROJECT_ID" \
+            --out-file=/tmp/cloud-run-oauth-token.json
+          python - <<'PY'
+          import json
+          from google.auth.transport.requests import Request
+          from google.oauth2.credentials import Credentials
+
+          path = "/tmp/cloud-run-oauth-token.json"
+          with open(path, encoding="utf-8") as fh:
+              token_info = json.load(fh)
+          print("RUNTIME_SECRET_METADATA:", json.dumps({
+              "has_refresh_token": bool(token_info.get("refresh_token")),
+              "has_client_id": bool(token_info.get("client_id")),
+              "has_client_secret": bool(token_info.get("client_secret")),
+              "scopes_include_drive": "https://www.googleapis.com/auth/drive" in (token_info.get("scopes") or []),
+          }, sort_keys=True))
+          try:
+              credentials = Credentials.from_authorized_user_info(
+                  token_info,
+                  scopes=["https://www.googleapis.com/auth/drive"],
+              )
+              credentials.refresh(Request())
+          except Exception as exc:
+              print("RUNTIME_SECRET_REFRESH=FAIL")
+              print("RUNTIME_SECRET_REFRESH_ERROR:", type(exc).__name__, str(exc)[:300])
+              raise SystemExit(1)
+          print("RUNTIME_SECRET_REFRESH=PASS")
+          PY
+          rm -f /tmp/cloud-run-oauth-token.json
+
       - name: Inspect deployment revision, build and scheduled tick activity
         shell: bash
         run: |
