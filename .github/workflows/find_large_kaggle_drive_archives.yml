@@ -44,7 +44,7 @@ jobs:
               raise SystemExit("GOOGLE_OAUTH_TOKEN_JSON is not configured.")
           info = json.loads(token_text)
           creds = Credentials.from_authorized_user_info(
-              info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+              info, scopes=["https://www.googleapis.com/auth/drive"]
           )
           if not creds.valid:
               creds.refresh(Request())
