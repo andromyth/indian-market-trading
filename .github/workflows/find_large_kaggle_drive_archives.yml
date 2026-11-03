@@ -58,7 +58,6 @@ jobs:
                   q=query,
                   pageSize=1000,
                   pageToken=token,
-                  orderBy="size desc",
                   fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,webViewLink)"
               ).execute()
               rows.extend(response.get("files", []))
