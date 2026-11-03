@@ -1,0 +1,105 @@
+name: Live native five-minute backfill status
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/live_native_5m_backfill_status.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-native-5m-backfill-status
+  cancel-in-progress: false
+
+jobs:
+  read-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Read private live backfill state
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          [[ "$SERVICE_URL" == https://* ]] || { echo "Cloud Run service URL is unavailable."; exit 1; }
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")"
+          echo "BACKFILL_STATUS_HTTP=$CODE"
+          python - "$RESPONSE" "$CODE" <<'PY'
+          import json, sys
+          path, code = sys.argv[1:]
+          if code != "200":
+              raise SystemExit("Backfill status endpoint returned HTTP " + code)
+          body=json.load(open(path, encoding="utf-8"))
+          state=body.get("five_minute_backfill") or {}
+          progress=state.get("progress") or {}
+          summary={
+              "status": state.get("status", body.get("status")),
+              "started_at_utc": state.get("started_at_utc"),
+              "updated_at_utc": state.get("updated_at_utc"),
+              "finished_at_utc": state.get("finished_at_utc"),
+              "exit_code": state.get("exit_code"),
+              "error": state.get("error"),
+              "progress": progress,
+          }
+          print("LIVE_NATIVE_5M_BACKFILL_STATE=" + json.dumps(summary, sort_keys=True, default=str))
+          PY
+
+      - name: Read recent backfill progress events
+        shell: bash
+        run: |
+          set -euo pipefail
+          SINCE="$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'"${SINCE}"'"' \
+            --project="$PROJECT_ID" --limit=500 --order=desc --format=json > "$RUNNER_TEMP/backfill_logs.json"
+          python - "$RUNNER_TEMP/backfill_logs.json" <<'PY'
+          import json, sys
+          rows=json.load(open(sys.argv[1], encoding="utf-8"))
+          keys=(
+              "indstocks_5m_backfill_progress",
+              "indstocks_5m_backfill_failed",
+              "indstocks_5m_backfill_completed",
+              "indstocks_5m_backfill_started",
+              "indstocks_5m_backfill_retry_scheduled",
+              "indstocks_5m_backfill_paused_for_live_market",
+              "indstocks_5m_backfill_resumed_after_market",
+              "BACKFILL_BATCH_FAILED",
+          )
+          found=[]
+          for row in rows:
+              rendered=json.dumps(row, sort_keys=True, default=str)
+              if any(key in rendered for key in keys):
+                  found.append({
+                      "timestamp": row.get("timestamp"),
+                      "severity": row.get("severity"),
+                      "revision": (row.get("resource") or {}).get("labels", {}).get("revision_name"),
+                      "text": row.get("textPayload"),
+                      "jsonPayload": row.get("jsonPayload"),
+                  })
+          print("RECENT_BACKFILL_EVENT_COUNT=" + str(len(found)))
+          for item in reversed(found[-30:]):
+              print("RECENT_BACKFILL_EVENT=" + json.dumps(item, sort_keys=True, default=str))
+          PY
