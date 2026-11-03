@@ -43,11 +43,19 @@ def _parse_timestamps(frame: pd.DataFrame, columns: dict[str, str]) -> pd.Series
     else:
         date_name = columns.get("date")
         time_name = columns.get("time")
-        if date_name is None or time_name is None:
+        if date_name is None:
             raise ValueError(
-                "CSV must contain a timestamp/datetime column, or separate date and time columns."
+                "CSV must contain a timestamp/datetime column, or a date column."
             )
-        values = frame[date_name].astype(str).str.strip() + " " + frame[time_name].astype(str).str.strip()
+        if time_name is not None:
+            values = (
+                frame[date_name].astype(str).str.strip()
+                + " "
+                + frame[time_name].astype(str).str.strip()
+            )
+        else:
+            # Some exports name a full date-time value simply "Date".
+            values = frame[date_name]
 
     parsed = pd.to_datetime(values, errors="coerce")
     if isinstance(parsed.dtype, pd.DatetimeTZDtype):
