@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pandas as pd
 """Unit tests for long/short paper ledger, margin and backward compatibility."""
 
 import pytest
