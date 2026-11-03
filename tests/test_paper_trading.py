@@ -250,3 +250,53 @@ def test_live_market_overview_preserves_unavailable_quote_status(monkeypatch):
     assert pd.isna(row["Last price"])
     assert row["Status"] == "NO_USABLE_PRICE"
     assert row["Source"] == "UNAVAILABLE"
+
+
+
+def test_open_positions_marks_report_live_quote_source():
+    state = {
+        "positions": {
+            "SBIN": {"quantity": 10, "cost_basis": 1_000.0, "average_cost": 100.0},
+            "IDEA": {"quantity": -5, "cost_basis": 500.0, "average_cost": 100.0},
+        }
+    }
+
+    def loader(symbol, revision, include_predictions):
+        return {
+            "price": 90.0,
+            "quote_timestamp": "2026-11-03T12:00:00+05:30",
+        }
+
+    frame, prices = paper._open_positions_with_marks(
+        state,
+        {
+            "symbol": "SBIN",
+            "price": 110.0,
+            "quote_timestamp": "2026-11-03T12:01:00+05:30",
+        },
+        loader,
+        0,
+    )
+
+    assert prices == {"SBIN": 110.0, "IDEA": 90.0}
+    assert frame.set_index("Symbol").loc["SBIN", "Price source"] == "LIVE_QUOTE"
+    assert frame.set_index("Symbol").loc["IDEA", "Price source"] == "LIVE_QUOTE"
+
+
+def test_open_positions_marks_report_entry_basis_fallback():
+    state = {
+        "positions": {
+            "IDEA": {"quantity": -5, "cost_basis": 500.0, "average_cost": 100.0},
+        }
+    }
+
+    frame, prices = paper._open_positions_with_marks(
+        state,
+        {"symbol": "SBIN", "price": 800.0},
+        lambda *args: {},
+        0,
+    )
+
+    assert prices == {"IDEA": 100.0}
+    assert frame.iloc[0]["Price source"] == "ENTRY_BASIS_FALLBACK"
+    assert frame.iloc[0]["Mark price"] == 100.0
