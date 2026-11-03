@@ -10,6 +10,7 @@ from colab_build_all_nse_intraday_multifactor import (
     load_live_history,
     load_symbol,
     load_symbol_5m,
+    load_market_5m,
 )
 
 IST = "Asia/Kolkata"
@@ -76,3 +77,21 @@ def test_live_slot_archive_is_loaded_by_symbol_and_keeps_close_time(tmp_path):
 
     assert "RELIANCE" in loaded
     assert loaded["RELIANCE"].index.tolist() == index.tolist()
+
+def test_kaggle_nifty_close_only_partition_is_loaded_for_market_context(tmp_path):
+    index = pd.date_range("2026-05-14 09:25", periods=3, freq="5min")
+    frame = pd.DataFrame({
+        "Timestamp": index,
+        "Close": [23500.0, 23510.0, 23505.0],
+    })
+    archive = tmp_path / NATIVE_5M_SEED_REL / "symbol=__NIFTY50__"
+    archive.mkdir(parents=True)
+    frame.to_parquet(archive / "nifty50_kaggle_5m_close_only.parquet", index=False)
+
+    market = load_market_5m(tmp_path)
+
+    assert len(market) == 3
+    assert market.index.tz is not None
+    assert market.index[0] == pd.Timestamp("2026-05-14 09:25", tz=IST)
+    assert market["Close"].tolist() == [23500.0, 23510.0, 23505.0]
+    assert market[["Open", "High", "Low", "Volume"]].isna().all().all()
