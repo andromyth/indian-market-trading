@@ -1429,7 +1429,10 @@ def _cached_paper_trading_snapshot(
 if interface_mode == "Paper Trading":
     from paper_trading import render_paper_trading
 
-    render_paper_trading(_cached_paper_trading_snapshot)
+    render_paper_trading(
+        _cached_paper_trading_snapshot,
+        delivery_prediction_loader=_cached_watch_delivery_prediction,
+    )
     st.stop()
 
 
