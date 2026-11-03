@@ -314,7 +314,7 @@ def calculate_portfolio(
         "maintenance_margin_required": maintenance_margin,
         "available_cash": available_cash,
         "margin_excess": margin_excess,
-        "margin_status": "CALL" if margin_excess < -0.005 else "OK",
+        "margin_status": "CALL" if short_liability > 0 and margin_excess < -0.005 else "OK",
     }
 
 
@@ -729,7 +729,10 @@ def render_paper_trading(snapshot_loader) -> None:
             "requirement. Reduce or cover short exposure; new risk-increasing orders are blocked."
         )
     elif state["available_cash"] < -0.005:
-        st.warning("Initial short-margin reserve exceeds the cash balance. New risk-increasing orders are blocked.")
+        if state["short_liability"] > 0:
+            st.warning("Initial short-margin reserve exceeds the cash balance. New risk-increasing orders are blocked.")
+        else:
+            st.warning("The paper account has a cash funding deficit. New risk-increasing orders are blocked.")
     st.caption(
         f"Unrealised P&L: ₹{unrealised:,.2f} · "
         f"Estimated charges: {float(account['fee_bps']):g} bps · "
