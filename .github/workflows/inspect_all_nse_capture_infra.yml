@@ -251,3 +251,5 @@ jobs:
 # Post-version-6 OAuth deployment diagnostic refresh: 2026-11-03 12:51 IST.
 
 # Post-promotion runtime health recheck after revision 00075-gmb activation: 2026-11-03.
+
+# Explicit per-revision OAuth preflight log window after production traffic promotion, 2026-11-03.
