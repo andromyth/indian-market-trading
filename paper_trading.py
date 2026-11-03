@@ -653,6 +653,13 @@ def render_paper_trading(snapshot_loader) -> None:
         )
 
     st.subheader("Place a simulated order")
+    current_state = calculate_portfolio(float(account["initial_cash"]), list_fills())
+    available_shares = int(current_state["positions"].get(symbol, {}).get("quantity", 0)) if symbol else 0
+    current_side = "LONG" if available_shares > 0 else "SHORT" if available_shares < 0 else "FLAT"
+    st.caption(
+        f"Current {symbol or 'symbol'} position: {current_side} · {abs(available_shares):,} shares. "
+        "SELL closes longs then opens shorts; BUY covers shorts then opens longs."
+    )
     with st.form("paper_place_order"):
         side = st.radio("Side", ["BUY", "SELL"], horizontal=True)
         quantity = st.number_input("Quantity (shares)", min_value=1, max_value=1_000_000, value=1, step=1)
@@ -660,13 +667,27 @@ def render_paper_trading(snapshot_loader) -> None:
             "Manual reference price (₹); use 0 for the latest market bar",
             min_value=0.0, value=0.0, step=0.05,
         )
+        execution_price = manual_price if manual_price > 0 else price
+        estimated_fill = (
+            execution_price * (1 + float(account["slippage_bps"]) / 10_000)
+            if execution_price and side == "BUY"
+            else execution_price * (1 - float(account["slippage_bps"]) / 10_000)
+            if execution_price else 0.0
+        )
+        estimated_turnover = float(quantity) * estimated_fill
+        estimated_charges = estimated_turnover * float(account["fee_bps"]) / 10_000
+        estimated_cash_flow = (
+            -(estimated_turnover + estimated_charges)
+            if side == "BUY" else estimated_turnover - estimated_charges
+        )
+        st.caption(
+            f"Estimated fill: ₹{estimated_fill:,.2f} · Turnover: ₹{estimated_turnover:,.2f} · "
+            f"Charges: ₹{estimated_charges:,.2f} · "
+            f"{'Cash debit' if side == 'BUY' else 'Cash credit'}: ₹{abs(estimated_cash_flow):,.2f}"
+        )
         allow_stale = st.checkbox("Allow a stale / last-session price for this paper fill")
         confirm_order = st.checkbox("I confirm this is a simulated cash-equity order")
         submit_order = st.form_submit_button("Execute paper order")
-    st.caption(
-        "SELL closes existing long shares first, then opens or increases a short. "
-        "BUY covers existing short shares first, then opens or increases a long."
-    )
     if submit_order:
         if not symbol or symbol_error:
             st.error(symbol_error or "Enter a valid NSE symbol.")
@@ -749,6 +770,13 @@ def render_paper_trading(snapshot_loader) -> None:
         f"Simulator assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial short margin and "
         f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance margin against short liability."
     )
+    st.caption(
+        f"Pricing source: {snapshot.get('source') or 'unavailable'} · "
+        f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
+        f"5-minute model: {'READY' if snapshot.get('prediction_ready') else 'NOT READY'}"
+    )
+    if snapshot.get("prediction_freshness_reason") and not snapshot.get("prediction_ready"):
+        st.info(f"5-minute model unavailable: {snapshot['prediction_freshness_reason']}")
 
     st.subheader("Open positions")
     if positions_frame.empty:
