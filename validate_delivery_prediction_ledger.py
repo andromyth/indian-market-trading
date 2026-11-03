@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date
 from typing import Any
 
@@ -140,7 +141,31 @@ def main() -> int:
 
     results = validate_ledger(due, history_provider, ValidationConfig())
     rows = results.to_dict("records")
-    saved = save_validation_results(rows, sync_drive=True)
+    saved: dict[str, Any] = {}
+    retryable_markers = (
+        "429", "500", "502", "503", "504",
+        "TOO MANY REQUESTS", "BAD GATEWAY", "SERVICE UNAVAILABLE",
+        "GATEWAY TIMEOUT", "TIMEOUT", "TIMED OUT",
+        "CONNECTION RESET", "CONNECTION ABORTED", "CONNECTIONERROR",
+        "REMOTEENDCLOSEDERROR", "SSLEOFERROR", "UNEXPECTED EOF", "BROKEN PIPE",
+    )
+    for attempt in range(1, 5):
+        saved = save_validation_results(rows, sync_drive=True)
+        if saved.get("synced") is True:
+            break
+        sync_error = str(saved.get("sync_error") or "").upper()
+        if attempt == 4 or not any(marker in sync_error for marker in retryable_markers):
+            break
+        delay_seconds = 5 * (2 ** (attempt - 1))
+        print(json.dumps({
+            "event": "DRIVE_VALIDATION_LEDGER_RETRY",
+            "attempt": attempt,
+            "next_attempt": attempt + 1,
+            "delay_seconds": delay_seconds,
+            "sync_error": saved.get("sync_error"),
+        }, default=str))
+        time.sleep(delay_seconds)
+
     counts = results["validation_status"].astype(str).str.upper().value_counts().to_dict() if not results.empty else {}
     error_count = int(counts.get("ERROR", 0))
     report = {
@@ -156,6 +181,7 @@ def main() -> int:
         "validation_errors": error_count,
         "saved_validation_rows": saved.get("rows"),
         "drive_synced": saved.get("synced"),
+        "drive_sync_error": saved.get("sync_error"),
     }
     print(json.dumps(report, indent=2, default=str))
     return 0 if saved.get("synced") is True and error_count == 0 else 2
