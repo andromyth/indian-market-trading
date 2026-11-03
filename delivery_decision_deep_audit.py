@@ -196,14 +196,54 @@ def _join_matured(predictions: pd.DataFrame, validations: pd.DataFrame) -> pd.Da
     joined["_model_version"] = joined.get(
         "model_version", pd.Series("", index=joined.index)
     ).astype(str)
+    joined["_decision_timestamp"] = pd.to_datetime(
+        joined.get("decision_timestamp", pd.Series(pd.NaT, index=joined.index)),
+        errors="coerce", utc=True
+    )
+    # The next NSE session is not available at the preceding day's close.
+    # Require each prediction decision to precede the target session open
+    # (09:15 Asia/Kolkata), not merely its EOD close.
+    target_open_text = joined["_target_date"].astype(str) + "T09:15:00+05:30"
+    joined["_target_open_timestamp"] = pd.to_datetime(
+        target_open_text, errors="coerce", utc=True
+    )
+    joined["_decision_before_target_open"] = (
+        joined["_decision_timestamp"].notna()
+        & joined["_target_open_timestamp"].notna()
+        & joined["_decision_timestamp"].lt(joined["_target_open_timestamp"])
+    )
     return joined
 
 
 def _auc_row(group: pd.DataFrame, **labels: Any) -> dict[str, Any]:
     actual = group["_actual_direction"]
-    auc_frame = group[actual.isin(["UP", "DOWN"])]
-    up = int(auc_frame["_actual_direction"].eq("UP").sum())
-    down = int(auc_frame["_actual_direction"].eq("DOWN").sum())
+    auc_frame = group[actual.isin(["UP", "DOWN"])].copy()
+    probability = pd.to_numeric(
+        auc_frame["probability_up_next_session"], errors="coerce"
+    )
+    finite_probability = probability.notna() & np.isfinite(probability)
+    auc_frame = auc_frame.loc[finite_probability].copy()
+    probability = probability.loc[finite_probability].astype(float)
+    y = auc_frame["_actual_direction"].eq("UP").astype(int)
+    up = int(y.sum())
+    down = int(len(y) - up)
+    predicted_up = probability.ge(0.5)
+    directional_accuracy = (
+        float(predicted_up.eq(y.astype(bool)).mean()) if len(y) else None
+    )
+    up_recall = (
+        float((predicted_up & y.eq(1)).sum() / up) if up else None
+    )
+    down_recall = (
+        float((~predicted_up & y.eq(0)).sum() / down) if down else None
+    )
+    balanced_accuracy = (
+        float((up_recall + down_recall) / 2.0)
+        if up_recall is not None and down_recall is not None else None
+    )
+    majority_baseline = (
+        float(max(up, down) / len(y)) if len(y) else None
+    )
     result = {
         **labels,
         "validated_rows": int(len(group)),
@@ -211,15 +251,119 @@ def _auc_row(group: pd.DataFrame, **labels: Any) -> dict[str, Any]:
         "up_count": up,
         "down_count": down,
         "flat_count": int(actual.eq("FLAT").sum()),
+        "predicted_up_count_at_0_50": int(predicted_up.sum()),
+        "actual_up_rate": float(y.mean()) if len(y) else None,
+        "predicted_up_rate": float(predicted_up.mean()) if len(y) else None,
+        "directional_accuracy_at_0_50": directional_accuracy,
+        "balanced_accuracy_at_0_50": balanced_accuracy,
+        "majority_class_baseline_accuracy": majority_baseline,
+        "accuracy_lift_vs_majority_baseline": (
+            directional_accuracy - majority_baseline
+            if directional_accuracy is not None and majority_baseline is not None
+            else None
+        ),
+        "brier_score": (
+            float(np.mean(np.square(probability.to_numpy() - y.to_numpy())))
+            if len(y) else None
+        ),
         "roc_auc": (
-            float(roc_auc_score(
-                auc_frame["_actual_direction"].eq("UP").astype(int),
-                auc_frame["probability_up_next_session"]
-            ))
+            float(roc_auc_score(y, probability))
             if up > 0 and down > 0 else None
         ),
     }
     return result
+
+
+def _model_training_chronology(store: GoogleDriveStore) -> dict[str, Any]:
+    remote_path = (
+        "models/all_nse_delivery_multifactor_replacement_2026/"
+        "ALL_NSE_MULTIFACTOR_59_MODEL_MANIFEST_2026.json"
+    )
+    try:
+        manifest = _drive_read_json(store, remote_path)
+    except Exception as exc:
+        return {
+            "status": "UNVERIFIED_MANIFEST_UNAVAILABLE",
+            "manifest_path": remote_path,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    version = str(manifest.get("engine_version", ""))
+    artifact = (manifest.get("artifacts") or {}).get("next_session") or {}
+    metrics = artifact.get("metrics") or {}
+    sampling = metrics.get("sampling") or {}
+
+    def _utc(value: Any) -> pd.Timestamp | None:
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        return None if pd.isna(parsed) else parsed
+
+    cutoff = _utc(metrics.get("holdout_cutoff_timestamp"))
+    latest_train_target = _utc(metrics.get("train_latest_target_timestamp"))
+    first_holdout_decision = _utc(metrics.get("holdout_first_decision_timestamp"))
+    checks = {
+        "feature_count_is_59": len(manifest.get("features") or []) == 59,
+        "next_session_artifact_ready": artifact.get("status") == "CANDIDATE_READY",
+        "training_target_strictly_before_cutoff": bool(
+            cutoff is not None and latest_train_target is not None
+            and latest_train_target < cutoff
+        ),
+        "holdout_decisions_at_or_after_cutoff": bool(
+            cutoff is not None and first_holdout_decision is not None
+            and first_holdout_decision >= cutoff
+        ),
+        "boundary_rows_purged": (
+            int(metrics.get("purged_boundary_rows_in_fit_frame", 0)) >= 0
+            and cutoff is not None and latest_train_target is not None
+            and latest_train_target < cutoff
+        ),
+    }
+    passed = all(checks.values())
+    return {
+        "status": "PASS" if passed else "FAILED_OR_INCOMPLETE",
+        "manifest_path": remote_path,
+        "model_version": version,
+        "feature_count": len(manifest.get("features") or []),
+        "artifact_status": artifact.get("status"),
+        "classifier_sha256_present": bool(artifact.get("classifier_sha256")),
+        "regressor_sha256_present": bool(artifact.get("regressor_sha256")),
+        "training_rows": metrics.get("train_rows"),
+        "holdout_rows": metrics.get("holdout_rows"),
+        "holdout_cutoff_timestamp": (
+            cutoff.isoformat() if cutoff is not None else None
+        ),
+        "latest_training_target_timestamp": (
+            latest_train_target.isoformat()
+            if latest_train_target is not None else None
+        ),
+        "first_holdout_decision_timestamp": (
+            first_holdout_decision.isoformat()
+            if first_holdout_decision is not None else None
+        ),
+        "purged_boundary_rows": metrics.get("purged_boundary_rows_in_fit_frame"),
+        "holdout_metrics": {
+            key: metrics.get(key) for key in (
+                "holdout_roc_auc", "holdout_directional_accuracy_at_0_50",
+                "holdout_balanced_accuracy_at_0_50",
+                "holdout_majority_class_baseline_accuracy",
+                "holdout_positive_class_rate", "holdout_rows",
+            )
+        },
+        "training_sample_metadata": {
+            key: sampling.get(key) for key in (
+                "chronological_cutoff", "pre_cutoff_train_eligible_rows",
+                "purged_boundary_rows", "full_60_day_holdout",
+                "sample_rows_total", "label_policy",
+            ) if key in sampling
+        },
+        "checks": checks,
+        "chronological_training_evaluation_gate": "PASS" if passed else "NOT_CERTIFIED",
+        "interpretation": (
+            "Manifest records a purged split: training rows' target timestamps "
+            "must be strictly before the cutoff; holdout decisions must be at "
+            "or after it. This verifies the saved v2 model's documented split, "
+            "not independent historical universe membership."
+        ),
+    }
 
 
 def _current_batch_audit(report: dict[str, Any]) -> dict[str, Any]:
@@ -551,19 +695,32 @@ def main() -> int:
     validations = _load_latest_validations(raw_validations)
     joined = _join_matured(predictions, validations)
     current = _current_batch_audit(factor_audit)
+    model_chronology = _model_training_chronology(store)
 
-    # Per-session ROC-AUC uses only matured, target-date-aligned, quality-approved
-    # active-model rows; FLAT outcomes are excluded from the binary AUC.
-    auc_source = joined[
+    # Step 2 only scores matured, target-date-aligned, quality-approved records
+    # whose recorded decision timestamp precedes the target session open.
+    active_joined = joined[
         joined["_model_version"].isin(ACTIVE_MODELS)
         & joined["_gate_pass"]
         & joined["_target_aligned"]
         & joined["probability_up_next_session"].notna()
         & joined["_actual_direction"].isin(["UP", "DOWN", "FLAT"])
     ].copy()
-    by_session = []
-    for session, group in auc_source.groupby("_target_date", sort=True):
-        by_session.append(_auc_row(group, prediction_for_date=str(session)))
+    timing_valid = active_joined["_decision_before_target_open"]
+    auc_source = active_joined.loc[timing_valid].copy()
+    timing_audit = {
+        "active_matured_gate_approved_target_aligned_rows": int(len(active_joined)),
+        "decision_timestamps_missing_or_invalid": int(
+            active_joined["_decision_timestamp"].isna().sum()
+        ),
+        "decision_timestamp_not_before_target_open": int(
+            (~active_joined["_decision_before_target_open"]).sum()
+        ),
+        "rows_passing_decision_before_target_open": int(timing_valid.sum()),
+        "target_open_definition": "09:15:00 Asia/Kolkata on prediction_for_date",
+    }
+
+    # Version-specific session tables retain one model version at a time.
     by_session_version = []
     for (version, session), group in auc_source.groupby(
         ["_model_version", "_target_date"], sort=True
@@ -572,8 +729,8 @@ def main() -> int:
             group, model_version=str(version), prediction_for_date=str(session)
         ))
 
-    # Overall probability ranking on the newest active prediction per
-    # symbol/session avoids double-counting overlapping v1/v2 revisions.
+    # For overall per-session evaluation, retain only the latest active model
+    # prediction per symbol/session; never count overlapping v1/v2 revisions twice.
     latest_active = auc_source.copy()
     latest_active["_created_order"] = pd.to_datetime(
         latest_active.get("created_at", pd.Series(pd.NaT, index=latest_active.index)),
@@ -583,7 +740,51 @@ def main() -> int:
         ["_target_date", "_symbol", "_created_order", "_model_version"],
         kind="mergesort", na_position="first"
     ).drop_duplicates(["_target_date", "_symbol"], keep="last")
-    overall_auc = _auc_row(latest_active, scope="latest active version per symbol/session") if not latest_active.empty else {"validated_rows": 0, "roc_auc": None}
+    by_session = []
+    for session, group in latest_active.groupby("_target_date", sort=True):
+        by_session.append(_auc_row(group, prediction_for_date=str(session)))
+    overall_auc = (
+        _auc_row(latest_active, scope="latest active version per symbol/session")
+        if not latest_active.empty else {"validated_rows": 0, "roc_auc": None}
+    )
+
+    manifest_version = str(model_chronology.get("model_version", ""))
+    versioned_rows = latest_active[
+        latest_active["_model_version"].eq(manifest_version)
+    ].copy() if manifest_version else latest_active.iloc[0:0].copy()
+    cutoff = pd.to_datetime(
+        model_chronology.get("holdout_cutoff_timestamp"), errors="coerce", utc=True
+    )
+    train_first = pd.to_datetime(
+        model_chronology.get("first_holdout_decision_timestamp"),
+        errors="coerce", utc=True
+    )
+    if pd.notna(cutoff) and pd.notna(train_first) and model_chronology.get("status") == "PASS":
+        after_cutoff = versioned_rows["_decision_timestamp"].ge(cutoff)
+        after_first_holdout = versioned_rows["_decision_timestamp"].ge(train_first)
+        verified_mask = after_cutoff & after_first_holdout
+        verified_live = versioned_rows.loc[verified_mask].copy()
+        model_chronology["live_predictions_for_manifest_version"] = int(len(versioned_rows))
+        model_chronology["live_predictions_after_training_cutoff"] = int(after_cutoff.sum())
+        model_chronology["live_predictions_after_first_holdout_decision"] = int(after_first_holdout.sum())
+        model_chronology["live_predictions_passing_training_time_gate"] = int(verified_mask.sum())
+        model_chronology["live_prediction_time_gate"] = (
+            "PASS" if bool(verified_mask.all()) and len(versioned_rows) else "NOT_CERTIFIED"
+        )
+        verified_overall_auc = (
+            _auc_row(verified_live, scope="manifest-verified model version, latest prediction per symbol/session")
+            if not verified_live.empty else {"validated_rows": 0, "roc_auc": None}
+        )
+        verified_by_session = [
+            _auc_row(group, prediction_for_date=str(session))
+            for session, group in verified_live.groupby("_target_date", sort=True)
+        ]
+    else:
+        model_chronology["live_prediction_time_gate"] = "NOT_CERTIFIED"
+        model_chronology["live_predictions_for_manifest_version"] = int(len(versioned_rows))
+        model_chronology["live_predictions_passing_training_time_gate"] = 0
+        verified_overall_auc = {"validated_rows": 0, "roc_auc": None}
+        verified_by_session = []
 
     coverage = _historical_action_coverage(predictions)
     ranking = _ranking_backtest(joined)
@@ -675,11 +876,25 @@ def main() -> int:
         },
         "step_1_current_symbol_decision_breakdown": current,
         "step_2_session_level_auc": {
-            "scope": "Active ALL-NSE 59-feature Delivery models; gate-approved, matured, target-date-aligned validations.",
-            "flat_outcomes_excluded_from_auc": True,
-            "overall_latest_active_version_auc": overall_auc,
+            "scope": (
+                "Active ALL-NSE 59-feature Delivery models; gate-approved, matured, "
+                "target-date-aligned validations with a decision timestamp before "
+                "the target session open. FLAT outcomes are excluded from binary AUC "
+                "and directional-accuracy calculations."
+            ),
+            "flat_outcomes_excluded_from_auc_and_directional_accuracy": True,
+            "decision_timing_audit": timing_audit,
+            "model_training_chronology": model_chronology,
+            "overall_latest_active_version_auc_and_directional_metrics": overall_auc,
             "by_prediction_session": by_session,
             "by_model_version_and_session": by_session_version,
+            "manifest_verified_version_overall_auc_and_directional_metrics": verified_overall_auc,
+            "manifest_verified_version_by_prediction_session": verified_by_session,
+            "chronology_interpretation": (
+                "The current v2 manifest is checked for a purged chronological training split. "
+                "Rows from earlier active versions without a retained matching manifest remain "
+                "visible in the all-version table but are not treated as manifest-verified."
+            ),
         },
         "step_3_historical_action_coverage": coverage,
         "step_4_session_history_gate": {
