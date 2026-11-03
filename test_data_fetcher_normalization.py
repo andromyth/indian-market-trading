@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from data_fetcher import _normalize_historical_frame, _yahoo_chart_history
+from signals import normalize_ohlcv_frame
 import data_fetcher
 
 
@@ -36,6 +37,22 @@ def test_multiindex_ticker_field_shape():
     out = _normalize_historical_frame(pd.DataFrame(values, index=idx, columns=columns))
     assert {'Open', 'High', 'Low', 'Close', 'Volume'} <= set(out.columns)
     assert out['Close'].notna().all()
+
+
+def test_yahoo_close_and_adj_close_deduplicate_to_one_scalar_close():
+    idx = pd.date_range('2026-11-03 12:34', periods=2, freq='min')
+    columns = pd.MultiIndex.from_product([
+        ['SBIN.NS'], ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+    ])
+    values = np.array([
+        [100, 102, 99, 101, 100.5, 1000],
+        [101, 103, 100, np.nan, 101.5, 1100],
+    ])
+    out = normalize_ohlcv_frame(pd.DataFrame(values, index=idx, columns=columns))
+
+    assert out.columns.tolist().count('Close') == 1
+    assert out['Close'].tolist() == [101.0, 101.5]
+    assert not isinstance(out.iloc[-1]['Close'], pd.Series)
 
 
 def test_flat_lowercase_shape():
