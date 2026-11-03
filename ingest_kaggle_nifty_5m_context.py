@@ -20,7 +20,7 @@ import pandas as pd
 
 IST = "Asia/Kolkata"
 REMOTE_RELATIVE_DIR = Path(
-    "production_data/nse_official/intraday_seed/olo_5m_archive/symbol=__NIFTY50__"
+    "production_data/nse_official/intraday_seed/olo_5m_archive/symbols/symbol=__NIFTY50__"
 )
 OUTPUT_NAME = "nifty50_kaggle_5m_close_only.parquet"
 SOURCE_URL = "https://www.kaggle.com/datasets/debashis74017/nifty-50-minute-data/data"
