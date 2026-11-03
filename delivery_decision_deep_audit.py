@@ -815,6 +815,105 @@ def _ranking_backtest(
         },
     }
 
+
+def _probability_drift_diagnostic(verified_predictions: pd.DataFrame) -> dict[str, Any]:
+    """Read-only calibration, score-distribution and polarity diagnostics."""
+    required = {
+        "_target_date", "_symbol", "_actual_direction",
+        "probability_up_next_session", "predicted_return_next_session",
+        "actual_d1_return",
+    }
+    missing = sorted(required - set(verified_predictions.columns))
+    if missing:
+        return {"status": "MISSING_FIELDS", "missing_fields": missing}
+    frame = verified_predictions.copy()
+    frame = frame[
+        frame["_actual_direction"].isin(["UP", "DOWN"])
+        & frame["probability_up_next_session"].notna()
+        & frame["predicted_return_next_session"].notna()
+        & frame["actual_d1_return"].notna()
+    ].copy()
+    if frame.empty:
+        return {"status": "NO_SCORABLE_ROWS"}
+    frame["p_up"] = pd.to_numeric(frame["probability_up_next_session"], errors="coerce")
+    frame["predicted_return"] = pd.to_numeric(frame["predicted_return_next_session"], errors="coerce")
+    frame["actual_return"] = pd.to_numeric(frame["actual_d1_return"], errors="coerce")
+    frame = frame[
+        frame["p_up"].between(0.0, 1.0)
+        & np.isfinite(frame["predicted_return"])
+        & np.isfinite(frame["actual_return"])
+    ].copy()
+    frame["y_up"] = frame["_actual_direction"].eq("UP").astype(int)
+    if frame.empty or frame["y_up"].nunique() < 2:
+        return {"status": "INSUFFICIENT_BINARY_CLASSES", "rows": int(len(frame))}
+    frame["p_bin"] = pd.cut(
+        frame["p_up"], bins=[0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0000001],
+        right=True, include_lowest=True
+    )
+    bins = []
+    for interval, group in frame.groupby("p_bin", observed=False):
+        if len(group):
+            bins.append({
+                "probability_bin": str(interval),
+                "rows": int(len(group)),
+                "mean_predicted_probability_pct": float(group["p_up"].mean() * 100),
+                "observed_up_rate_pct": float(group["y_up"].mean() * 100),
+                "calibration_gap_percentage_points": float(
+                    (group["p_up"].mean() - group["y_up"].mean()) * 100
+                ),
+                "mean_actual_return_pct": float(group["actual_return"].mean() * 100),
+            })
+    ece = sum(
+        len(g) / len(frame) * abs(float(g["p_up"].mean() - g["y_up"].mean()))
+        for _, g in frame.groupby("p_bin", observed=True)
+    )
+    brier = float(np.mean((frame["p_up"] - frame["y_up"]) ** 2))
+    auc = float(roc_auc_score(frame["y_up"], frame["p_up"]))
+    per_session = []
+    for session, group in frame.groupby("_target_date", sort=True):
+        if group["y_up"].nunique() < 2:
+            continue
+        p_auc = float(roc_auc_score(group["y_up"], group["p_up"]))
+        per_session.append({
+            "prediction_for_date": str(session),
+            "rows": int(len(group)),
+            "actual_up_rate_pct": float(group["y_up"].mean() * 100),
+            "mean_predicted_up_probability_pct": float(group["p_up"].mean() * 100),
+            "probability_mean_minus_up_rate_pp": float(
+                (group["p_up"].mean() - group["y_up"].mean()) * 100
+            ),
+            "auc_probability_as_stored": p_auc,
+            "auc_probability_reversed_diagnostic_only": float(1.0 - p_auc),
+            "predicted_return_actual_return_spearman": (
+                float(group["predicted_return"].corr(group["actual_return"], method="spearman"))
+                if group["predicted_return"].nunique() > 1 and group["actual_return"].nunique() > 1
+                else None
+            ),
+        })
+    return {
+        "status": "COMPUTED",
+        "rows": int(len(frame)),
+        "sessions": int(frame["_target_date"].nunique()),
+        "actual_up_rate_pct": float(frame["y_up"].mean() * 100),
+        "mean_predicted_up_probability_pct": float(frame["p_up"].mean() * 100),
+        "probability_mean_minus_actual_up_rate_pp": float(
+            (frame["p_up"].mean() - frame["y_up"].mean()) * 100
+        ),
+        "brier_score": brier,
+        "expected_calibration_error_10_equal_width_bins": float(ece),
+        "pooled_auc_probability_as_stored": auc,
+        "pooled_auc_reversed_diagnostic_only": float(1.0 - auc),
+        "probability_bins": bins,
+        "per_session": per_session,
+        "interpretation_guard": (
+            "Reversed AUC is diagnostic only and must not be used to flip production "
+            "probabilities. Pooled AUC mixes dates; per-session AUC is the preferred "
+            "cross-sectional ranking comparison. Classifier artifact classes_ order "
+            "is not proven by the prediction ledger and must be checked separately."
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--snapshot-date", default="2026-11-02")
@@ -938,6 +1037,7 @@ def main() -> int:
 
     coverage = _historical_action_coverage(predictions)
     ranking = _ranking_backtest(verified_live, manifest_version)
+    probability_drift = _probability_drift_diagnostic(verified_live)
 
     # Reproduce delivery_policy_update.py::_join() on the RAW append-only ledgers.
     # The policy updater does not first collapse symbol/session/model revisions.
@@ -1046,6 +1146,7 @@ def main() -> int:
                 "visible in the all-version table but are not treated as manifest-verified."
             ),
         },
+        "step_5_probability_calibration_and_score_drift_diagnostic": probability_drift,
         "step_3_historical_action_coverage": coverage,
         "step_4_session_history_gate": {
             "policy_updater_session_definition": "distinct Asia/Kolkata dates parsed from decision_timestamp, matching delivery_policy_update.py",
