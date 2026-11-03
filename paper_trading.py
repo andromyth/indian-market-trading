@@ -1,4 +1,4 @@
-"""Long-only NSE cash-equity paper trading, isolated from broker execution.
+"""Long/short NSE cash-equity paper trading, isolated from broker execution.
 
 The ledger records simulated fills in SQLite. It never submits broker orders.
 """
@@ -652,6 +652,10 @@ def render_paper_trading(snapshot_loader) -> None:
         allow_stale = st.checkbox("Allow a stale / last-session price for this paper fill")
         confirm_order = st.checkbox("I confirm this is a simulated cash-equity order")
         submit_order = st.form_submit_button("Execute paper order")
+    st.caption(
+        "SELL closes existing long shares first, then opens or increases a short. "
+        "BUY covers existing short shares first, then opens or increases a long."
+    )
     if submit_order:
         if not symbol or symbol_error:
             st.error(symbol_error or "Enter a valid NSE symbol.")
@@ -684,27 +688,46 @@ def render_paper_trading(snapshot_loader) -> None:
                     st.error(f"Paper order rejected: {type(exc).__name__}: {exc}")
 
     fills = list_fills()
-    state = calculate_portfolio(float(account["initial_cash"]), fills)
-    positions_frame, market_value = _open_positions_with_marks(
-        state, snapshot, snapshot_loader, revision
+    unmarked_state = calculate_portfolio(float(account["initial_cash"]), fills)
+    positions_frame, market_prices = _open_positions_with_marks(
+        unmarked_state, snapshot, snapshot_loader, revision
+    )
+    state = calculate_portfolio(
+        float(account["initial_cash"]), fills, market_prices=market_prices
     )
     cash = float(state["cash"])
-    equity = cash + market_value
+    equity = float(state["equity"])
     total_pnl = equity - float(account["initial_cash"])
-    unrealised = float(positions_frame["Unrealised P&L"].sum()) if not positions_frame.empty else 0.0
+    unrealised = float(state["unrealised_pnl"])
 
     st.divider()
     st.subheader("Paper account")
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Cash available", f"₹{cash:,.2f}")
-    k2.metric("Open market value", f"₹{market_value:,.2f}")
-    k3.metric("Net liquidation value", f"₹{equity:,.2f}")
-    k4.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
-    k5.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{(total_pnl / float(account['initial_cash']) * 100):.2f}%")
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Cash balance", f"₹{cash:,.2f}")
+    k2.metric("Free cash after margin", f"₹{state['available_cash']:,.2f}")
+    k3.metric("Long market value", f"₹{state['long_market_value']:,.2f}")
+    k4.metric("Short liability", f"₹{state['short_liability']:,.2f}")
+    k5.metric("Net liquidation value", f"₹{equity:,.2f}")
+    k6.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{(total_pnl / float(account['initial_cash']) * 100):.2f}%")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
+    m2.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
+    m3.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
+    m4.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
+    if state["margin_status"] == "CALL":
+        st.error(
+            "MARGIN CALL: net liquidation value is below the maintenance-margin "
+            "requirement. Reduce or cover short exposure; new risk-increasing orders are blocked."
+        )
+    elif state["available_cash"] < -0.005:
+        st.warning("Initial short-margin reserve exceeds the cash balance. New risk-increasing orders are blocked.")
     st.caption(
         f"Unrealised P&L: ₹{unrealised:,.2f} · "
         f"Estimated charges: {float(account['fee_bps']):g} bps · "
-        f"Slippage: {float(account['slippage_bps']):g} bps"
+        f"Slippage: {float(account['slippage_bps']):g} bps · "
+        f"Simulator assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial short margin and "
+        f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance margin against short liability."
     )
 
     st.subheader("Open positions")
@@ -736,7 +759,9 @@ def render_paper_trading(snapshot_loader) -> None:
         st.caption("No simulated fills have been recorded yet.")
 
     st.caption(
-        "Simulation only. Cash-equity, long-only; no F&O, leverage, short selling, or broker integration. "
-        "Charges and slippage are configurable estimates, not an exchange or broker contract note. "
-        "Use a persistent mounted path via PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
+        "Simulation only: NSE cash-equity long/short accounting; no F&O or broker integration. "
+        "Short-sale proceeds are included in cash but reserved through the initial-margin calculation. "
+        "Initial/maintenance margin rates are illustrative simulator assumptions, not live exchange or broker requirements. "
+        "Charges and slippage are estimates, not a contract note. Use a persistent mounted path via "
+        "PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
     )
