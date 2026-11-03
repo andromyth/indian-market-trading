@@ -580,7 +580,7 @@ def render_paper_trading(snapshot_loader) -> None:
         symbol_error = ""
     except ValueError as exc:
         symbol, symbol_error = "", str(exc)
-    horizon = st.selectbox("Model horizon to associate with a trade", [5, 10, 15, 20, 25, 30], index=5, format_func=lambda value: f"{value} minutes")
+    horizon = 5
     refresh_col, status_col = st.columns([1, 3])
     with refresh_col:
         refresh = st.button("Refresh quote and model", type="primary")
@@ -608,40 +608,49 @@ def render_paper_trading(snapshot_loader) -> None:
 
     price = _finite_or_none(snapshot.get("price"))
     predictions = snapshot.get("predictions") or []
-    selected_prediction = next(
-        (item for item in predictions if int(item.get("horizon_min", 0) or 0) == int(horizon)),
+    selected_prediction = snapshot.get("prediction") or next(
+        (item for item in predictions if int(item.get("horizon_min", 0) or 0) == 5),
         {},
     )
     fresh = bool(snapshot.get("price_fresh"))
     model_fresh = bool(snapshot.get("prediction_ready"))
+    price_source = str(snapshot.get("price_source") or snapshot.get("source") or "UNKNOWN")
+    quote_timestamp = str(snapshot.get("quote_timestamp") or "")
     if price is not None and price > 0:
         c1, c2, c3 = st.columns(3)
-        c1.metric("Latest reference price", f"₹{price:,.2f}")
-        c2.metric("Market input", "FRESH" if fresh else "STALE / CLOSED")
-        c3.metric("Selected model signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+        c1.metric("Current market value", f"₹{price:,.2f}")
+        c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
+        c3.metric("5-minute model signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+        st.caption(
+            f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
+        )
         if not fresh:
             st.warning(
-                f"Latest price is not a fresh current-session quote. {snapshot.get('price_freshness_reason') or 'Use only with explicit stale-price override.'}"
+                f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
+                f"{snapshot.get('price_freshness_reason') or 'The price is display-only and cannot unlock model inference.'}"
             )
     elif snapshot:
-        st.warning("No usable market price is available. Enter a manual reference price in the order form to test the ledger.")
+        st.warning("No market quote is currently available. Enter a manual reference price to test the ledger.")
     else:
-        st.info("Enter a symbol and refresh the market snapshot to load its quote and prediction.")
+        st.info("Enter an NSE symbol and refresh to load its current market value and 5-minute prediction.")
 
-    if predictions:
-        prediction_rows = []
-        for item in predictions:
-            prediction_rows.append({
-                "Horizon": f"{item.get('horizon_min')} min",
-                "Signal": item.get("signal", "—"),
-                "P(up)": _finite_or_none(item.get("probability_up")),
-                "Expected return": _finite_or_none(item.get("expected_return")),
-                "Model version": item.get("model_version", "—"),
-                "Reason": item.get("signal_reason") or item.get("reason") or "",
-            })
-        st.dataframe(pd.DataFrame(prediction_rows), use_container_width=True, hide_index=True)
-    elif snapshot and not model_fresh:
-        st.caption(f"Model not run: {snapshot.get('prediction_freshness_reason') or 'fresh stock and benchmark inputs are required.'}")
+    st.subheader("5-minute prediction")
+    if selected_prediction:
+        prediction_row = {
+            "Horizon": "5 minutes",
+            "Signal": selected_prediction.get("signal", "—"),
+            "Probability up": _finite_or_none(selected_prediction.get("probability_up")),
+            "Expected return": _finite_or_none(selected_prediction.get("expected_return")),
+            "Predicted price": _finite_or_none(selected_prediction.get("predicted_price")),
+            "Model version": selected_prediction.get("model_version", "—"),
+            "Decision time": selected_prediction.get("decision_timestamp", "—"),
+            "Reason": selected_prediction.get("signal_reason") or selected_prediction.get("reason") or "",
+        }
+        st.dataframe(pd.DataFrame([prediction_row]), use_container_width=True, hide_index=True)
+    else:
+        st.caption(
+            f"5-minute prediction unavailable: {snapshot.get('prediction_freshness_reason') or 'Fresh stock and benchmark OHLC inputs are required.'}"
+        )
 
     st.subheader("Place a simulated order")
     with st.form("paper_place_order"):
