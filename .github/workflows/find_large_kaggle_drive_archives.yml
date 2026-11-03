@@ -50,21 +50,24 @@ jobs:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-          query = "trashed = false"
-          rows = []
-          token = None
-          while True:
-              response = service.files().list(
-                  q=query,
-                  pageSize=1000,
-                  pageToken=token,
-                  fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,webViewLink)"
-              ).execute()
-              rows.extend(response.get("files", []))
-              token = response.get("nextPageToken")
-              if not token:
-                  break
-
+          terms = ("kaggle", "nifty", "5minute", "5min", "ohlcv", "equity", "stock", "archive")
+          found = {}
+          for term in terms:
+              query = f"trashed = false and name contains '{term}'"
+              page = None
+              while True:
+                  response = service.files().list(
+                      q=query,
+                      pageSize=1000,
+                      pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,webViewLink)"
+                  ).execute()
+                  for item in response.get("files", []):
+                      found[item["id"]] = item
+                  page = response.get("nextPageToken")
+                  if not page:
+                      break
+          rows = list(found.values())
           rows.sort(key=lambda item: int(item.get("size") or 0), reverse=True)
           result = []
           for item in rows:
