@@ -1,0 +1,53 @@
+name: Delivery decision deep audit (read-only)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/delivery_decision_deep_audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: delivery-decision-deep-audit
+  cancel-in-progress: false
+
+jobs:
+  deep-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INDIAN_MARKET_RESEARCH_ROOT: ${{ runner.temp }}/delivery-deep-audit
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile delivery_decision_deep_audit.py
+
+      - name: Run read-only Delivery deep audit
+        run: |
+          python -u delivery_decision_deep_audit.py \
+            --snapshot-date 2026-11-02 \
+            --output delivery_decision_deep_audit_2026-11-03.json
+
+      - name: Upload full diagnostic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-decision-deep-audit-2026-11-03
+          path: delivery_decision_deep_audit_2026-11-03.json
+          if-no-files-found: error
+          retention-days: 30
