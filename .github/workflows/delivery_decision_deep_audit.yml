@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/delivery_decision_deep_audit.yml"
+      - "delivery_decision_deep_audit.py"
   workflow_dispatch:
 
 permissions:
