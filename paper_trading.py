@@ -494,6 +494,7 @@ def _open_positions_with_marks(
             else (average_cost - mark) * quantity
         )
         rows.append({
+            "Price source": mark_source,
             "Symbol": symbol,
             "Position": side,
             "Quantity": quantity,
