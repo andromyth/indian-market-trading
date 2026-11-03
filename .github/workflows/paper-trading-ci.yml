@@ -3,6 +3,7 @@ name: Paper Trading CI
 on:
   push:
     branches:
+      - main
       - "feature/paper-trading-*"
     paths:
       - "app.py"
