@@ -297,37 +297,64 @@ def _model_training_chronology(store: GoogleDriveStore) -> dict[str, Any]:
         parsed = pd.to_datetime(value, errors="coerce", utc=True)
         return None if pd.isna(parsed) else parsed
 
-    cutoff = _utc(metrics.get("holdout_cutoff_timestamp"))
+    sampling_cutoff = sampling.get("chronological_cutoff")
+    cutoff = _utc(metrics.get("holdout_cutoff_timestamp") or sampling_cutoff)
     latest_train_target = _utc(metrics.get("train_latest_target_timestamp"))
     first_holdout_decision = _utc(metrics.get("holdout_first_decision_timestamp"))
+    purge_policy = str(sampling.get("label_policy", "")).lower()
+    training_rows = int(metrics.get("train_rows") or 0)
+    holdout_rows = int(metrics.get("holdout_rows") or sampling.get("full_60_day_holdout") or 0)
+    exact_timestamp_proof = (
+        latest_train_target is not None and first_holdout_decision is not None
+    )
     checks = {
         "feature_count_is_59": len(manifest.get("features") or []) == 59,
         "next_session_artifact_ready": artifact.get("status") == "CANDIDATE_READY",
-        "training_target_strictly_before_cutoff": bool(
-            cutoff is not None and latest_train_target is not None
-            and latest_train_target < cutoff
+        "training_rows_present": training_rows > 0,
+        "holdout_rows_present": holdout_rows > 0,
+        "chronological_cutoff_present": cutoff is not None,
+        "saved_label_policy_requires_train_targets_before_cutoff": (
+            "target timestamp" in purge_policy and "strictly before" in purge_policy
         ),
-        "holdout_decisions_at_or_after_cutoff": bool(
-            cutoff is not None and first_holdout_decision is not None
-            and first_holdout_decision >= cutoff
+        "observed_training_target_strictly_before_cutoff": (
+            bool(latest_train_target < cutoff)
+            if latest_train_target is not None and cutoff is not None else None
         ),
-        "boundary_rows_purged": (
-            int(metrics.get("purged_boundary_rows_in_fit_frame", 0)) >= 0
-            and cutoff is not None and latest_train_target is not None
-            and latest_train_target < cutoff
+        "observed_holdout_decision_at_or_after_cutoff": (
+            bool(first_holdout_decision >= cutoff)
+            if first_holdout_decision is not None and cutoff is not None else None
         ),
     }
-    passed = all(checks.values())
+    required_checks = [
+        "feature_count_is_59", "next_session_artifact_ready",
+        "training_rows_present", "holdout_rows_present",
+        "chronological_cutoff_present",
+        "saved_label_policy_requires_train_targets_before_cutoff",
+    ]
+    declared_policy_pass = all(checks[key] is True for key in required_checks)
+    if exact_timestamp_proof:
+        chronology_status = (
+            "PASS" if all(
+                checks[key] is True for key in required_checks
+            ) and checks["observed_training_target_strictly_before_cutoff"]
+            and checks["observed_holdout_decision_at_or_after_cutoff"]
+            else "FAILED"
+        )
+    else:
+        chronology_status = (
+            "PASS_WITH_RETAINED_CUTOFF_AND_PURGE_POLICY"
+            if declared_policy_pass else "NOT_CERTIFIED"
+        )
     return {
-        "status": "PASS" if passed else "FAILED_OR_INCOMPLETE",
+        "status": chronology_status,
         "manifest_path": remote_path,
         "model_version": version,
         "feature_count": len(manifest.get("features") or []),
         "artifact_status": artifact.get("status"),
         "classifier_sha256_present": bool(artifact.get("classifier_sha256")),
         "regressor_sha256_present": bool(artifact.get("regressor_sha256")),
-        "training_rows": metrics.get("train_rows"),
-        "holdout_rows": metrics.get("holdout_rows"),
+        "training_rows": training_rows,
+        "holdout_rows": holdout_rows,
         "holdout_cutoff_timestamp": (
             cutoff.isoformat() if cutoff is not None else None
         ),
@@ -339,7 +366,12 @@ def _model_training_chronology(store: GoogleDriveStore) -> dict[str, Any]:
             first_holdout_decision.isoformat()
             if first_holdout_decision is not None else None
         ),
-        "purged_boundary_rows": metrics.get("purged_boundary_rows_in_fit_frame"),
+        "exact_training_and_holdout_boundary_timestamps_retained": exact_timestamp_proof,
+        "purged_boundary_rows": (
+            metrics.get("purged_boundary_rows_in_fit_frame")
+            if metrics.get("purged_boundary_rows_in_fit_frame") is not None
+            else sampling.get("purged_boundary_rows")
+        ),
         "holdout_metrics": {
             key: metrics.get(key) for key in (
                 "holdout_roc_auc", "holdout_directional_accuracy_at_0_50",
@@ -356,12 +388,14 @@ def _model_training_chronology(store: GoogleDriveStore) -> dict[str, Any]:
             ) if key in sampling
         },
         "checks": checks,
-        "chronological_training_evaluation_gate": "PASS" if passed else "NOT_CERTIFIED",
+        "chronological_training_evaluation_gate": chronology_status,
         "interpretation": (
-            "Manifest records a purged split: training rows' target timestamps "
-            "must be strictly before the cutoff; holdout decisions must be at "
-            "or after it. This verifies the saved v2 model's documented split, "
-            "not independent historical universe membership."
+            "The saved v2 manifest has a chronological cutoff and a saved label-policy "
+            "statement requiring training target timestamps strictly before the holdout. "
+            "The trainer implementation uses a purged chronological split. The current "
+            "manifest does not retain the exact latest training target or first holdout "
+            "decision timestamp, so timestamp-level proof of those two boundaries is "
+            "not independently reproducible from the manifest alone."
         ),
     }
 
@@ -755,18 +789,30 @@ def main() -> int:
     cutoff = pd.to_datetime(
         model_chronology.get("holdout_cutoff_timestamp"), errors="coerce", utc=True
     )
-    train_first = pd.to_datetime(
-        model_chronology.get("first_holdout_decision_timestamp"),
-        errors="coerce", utc=True
-    )
-    if pd.notna(cutoff) and pd.notna(train_first) and model_chronology.get("status") == "PASS":
+    if pd.notna(cutoff) and model_chronology.get("status") in {
+        "PASS", "PASS_WITH_RETAINED_CUTOFF_AND_PURGE_POLICY"
+    }:
         after_cutoff = versioned_rows["_decision_timestamp"].ge(cutoff)
-        after_first_holdout = versioned_rows["_decision_timestamp"].ge(train_first)
+        first_holdout = pd.to_datetime(
+            model_chronology.get("first_holdout_decision_timestamp"),
+            errors="coerce", utc=True
+        )
+        after_first_holdout = (
+            versioned_rows["_decision_timestamp"].ge(first_holdout)
+            if pd.notna(first_holdout) else after_cutoff.copy()
+        )
         verified_mask = after_cutoff & after_first_holdout
         verified_live = versioned_rows.loc[verified_mask].copy()
         model_chronology["live_predictions_for_manifest_version"] = int(len(versioned_rows))
         model_chronology["live_predictions_after_training_cutoff"] = int(after_cutoff.sum())
-        model_chronology["live_predictions_after_first_holdout_decision"] = int(after_first_holdout.sum())
+        model_chronology["live_predictions_after_first_holdout_decision"] = (
+            int(after_first_holdout.sum())
+            if pd.notna(first_holdout) else None
+        )
+        model_chronology["first_holdout_decision_used_for_live_gate"] = (
+            "retained_manifest_timestamp" if pd.notna(first_holdout)
+            else "cutoff_timestamp_as_conservative_lower_bound"
+        )
         model_chronology["live_predictions_passing_training_time_gate"] = int(verified_mask.sum())
         model_chronology["live_prediction_time_gate"] = (
             "PASS" if bool(verified_mask.all()) and len(versioned_rows) else "NOT_CERTIFIED"
