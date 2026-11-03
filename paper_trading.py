@@ -481,6 +481,9 @@ def _open_positions_with_marks(
         if mark is None or mark <= 0:
             mark = float(position["average_cost"])
             quote_time = "Entry basis (no usable market mark)"
+            mark_source = "ENTRY_BASIS_FALLBACK"
+        else:
+            mark_source = "LIVE_QUOTE"
         market_prices[symbol] = float(mark)
 
         signed_qty = int(position["quantity"])
