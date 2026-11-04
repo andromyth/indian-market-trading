@@ -218,13 +218,13 @@ def init_db() -> None:
                 has_legacy_fills = connection.execute(
                     "SELECT 1 FROM paper_fills WHERE segment = 'LEGACY' LIMIT 1"
                 ).fetchone() is not None
+                intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, total_capital)
+                residual_capital = total_capital - intraday_capital
                 if has_legacy_fills:
-                    intraday_capital = 0.0
                     delivery_capital = 0.0
-                    legacy_capital = total_capital
+                    legacy_capital = residual_capital
                 else:
-                    intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, total_capital)
-                    delivery_capital = total_capital - intraday_capital
+                    delivery_capital = residual_capital
                     legacy_capital = 0.0
                 connection.execute(
                     """
@@ -1001,7 +1001,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         st.info("Create a virtual account. No broker account or real money is involved.")
         with st.form("paper_create_account"):
             capital = st.number_input("Starting virtual capital (₹)", min_value=1_000.0, value=DEFAULT_CAPITAL, step=10_000.0)
-            fee = st.number_input("Estimated charges (bps of turnover)", min_value=0.0, max_value=500.0, value=DEFAULT_FEE_BPS, step=1.0)
+            fee = st.number_input("Brokerage estimate (bps of turnover)", min_value=0.0, max_value=500.0, value=DEFAULT_FEE_BPS, step=1.0)
             slippage = st.number_input("Simulated slippage (bps)", min_value=0.0, max_value=500.0, value=DEFAULT_SLIPPAGE_BPS, step=1.0)
             submitted = st.form_submit_button("Create paper account", type="primary")
         if submitted:
@@ -1018,7 +1018,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         with left:
             with st.form("paper_cost_settings"):
                 fee_value = st.number_input(
-                    "Estimated charges (bps of turnover)", min_value=0.0, max_value=500.0,
+                    "Brokerage estimate (bps of turnover)", min_value=0.0, max_value=500.0,
                     value=float(account["fee_bps"]), step=1.0,
                 )
                 slippage_value = st.number_input(
@@ -1052,6 +1052,39 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                     except Exception as exc:
                         st.error(f"Could not reset account: {type(exc).__name__}: {exc}")
 
+    segment_capitals = _segment_capitals_from_account(account)
+    with st.expander("Strategy cash allocations", expanded=False):
+        st.caption(
+            f"Allocate the total starting capital of ₹{float(account['initial_cash']):,.2f} "
+            "across Intraday, Delivery and Legacy. The three values must add up to the "
+            "account starting capital. This changes book allocations only; it does not "
+            "delete or rewrite previous fills."
+        )
+        with st.form("paper_capital_allocations"):
+            alloc1, alloc2, alloc3 = st.columns(3)
+            intraday_allocation = alloc1.number_input(
+                "Intraday starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["INTRADAY"]), step=500.0,
+            )
+            delivery_allocation = alloc2.number_input(
+                "Delivery starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["DELIVERY"]), step=1_000.0,
+            )
+            legacy_allocation = alloc3.number_input(
+                "Legacy starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["LEGACY"]), step=500.0,
+            )
+            save_allocations = st.form_submit_button("Save cash allocations")
+        if save_allocations:
+            try:
+                update_segment_capital_allocations(
+                    intraday_allocation, delivery_allocation, legacy_allocation
+                )
+                st.success("Strategy cash allocations saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save cash allocations: {type(exc).__name__}: {exc}")
+
     segment = st.radio(
         "Trading track",
         ["INTRADAY", "DELIVERY"],
@@ -1060,9 +1093,8 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         format_func=lambda value: "Intraday · 5-minute model" if value == "INTRADAY" else "Delivery · Beta V2 Delivery model",
     )
     st.caption(
-        "Intraday and Delivery fills, positions and P&L are reported separately. "
-        "They share one account cash balance and one account-wide margin pool; no capital is duplicated. "
-        "Pre-existing unclassified fills remain in Legacy / Unassigned."
+        "Intraday, Delivery and Legacy use separately allocated cash and margin. "
+        "The combined account adds the three books without duplicating starting capital."
     )
 
     symbol_text = st.text_input("NSE cash symbol", value="SBIN", key="paper_symbol_input")
@@ -1278,18 +1310,21 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                     st.error(f"Paper order rejected: {type(exc).__name__}: {exc}")
 
     fills = list_fills()
-    _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
+    with st.expander("Live quote watchlist (optional)", expanded=False):
+        _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
     market_prices = _fetch_live_market_marks(fills, snapshot, snapshot_loader, revision)
+    segment_capitals = _segment_capitals_from_account(account)
     state = calculate_segmented_portfolio(
-        float(account["initial_cash"]), fills, market_prices=market_prices
+        float(account["initial_cash"]), fills, market_prices=market_prices,
+        segment_capitals=segment_capitals,
     )
     cash = float(state["cash"])
     equity = float(state["equity"])
-    total_pnl = equity - float(account["initial_cash"])
+    total_pnl = round(float(state["realised_pnl"]) + float(state["unrealised_pnl"]), 2)
     unrealised = float(state["unrealised_pnl"])
 
     st.divider()
-    st.subheader("Combined paper account · shared cash and margin")
+    st.subheader("Combined paper account · all strategy books")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Cash balance", f"₹{cash:,.2f}")
     k2.metric("Free cash after margin", f"₹{state['available_cash']:,.2f}")
@@ -1315,31 +1350,33 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             st.warning("The paper account has a cash funding deficit. New risk-increasing orders are blocked.")
     st.caption(
         f"Unrealised P&L: ₹{unrealised:,.2f} · "
-        f"Estimated charges: {float(account['fee_bps']):g} bps · "
+        f"Brokerage estimate: {float(account['fee_bps']):g} bps · "
         f"Slippage: {float(account['slippage_bps']):g} bps · "
-        f"Simulator assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial short margin and "
-        f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance margin against short liability."
+        f"Recorded trade charges: ₹{sum(float(fill.get('charges') or 0.0) for fill in fills):,.2f} · "
+        f"Short margin assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial / "
+        f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance."
     )
     st.caption(
         f"Pricing source: {snapshot.get('source') or 'unavailable'} · "
         f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
         f"{segment.title()} model: {prediction_status}"
     )
-    probability = _finite_or_none(selected_prediction.get("probability_up"))
-    expected_return = _finite_or_none(selected_prediction.get("expected_return"))
-    predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
-    p1,p2,p3,p4 = st.columns(4)
-    p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
-    p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
-    p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
-    p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
-    st.caption(
-        f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-        f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
-        + ("Horizon: 5 minutes" if segment == "INTRADAY" else
-           f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
-    )
-    st.caption(str(selected_prediction.get("reason") or ""))
+    with st.expander(f"{segment.title()} model information (optional)", expanded=False):
+        probability = _finite_or_none(selected_prediction.get("probability_up"))
+        expected_return = _finite_or_none(selected_prediction.get("expected_return"))
+        predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
+        p1,p2,p3,p4 = st.columns(4)
+        p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+        p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
+        p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+        p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+        st.caption(
+            f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
+            f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
+            + ("Horizon: 5 minutes" if segment == "INTRADAY" else
+               f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
+        )
+        st.caption(str(selected_prediction.get("reason") or ""))
 
     st.subheader("Separate strategy books")
     book_tabs = st.tabs(["Intraday", "Delivery", "Legacy / Unassigned"])
@@ -1347,11 +1384,16 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         with book_tab:
             book_state = state["segments"][book_name]
             book_fills = [row for row in fills if str(row.get("segment") or "LEGACY").upper() == book_name]
-            b1,b2,b3,b4 = st.columns(4)
-            b1.metric("Realised P&L", f"₹{book_state['realised_pnl']:,.2f}")
-            b2.metric("Unrealised P&L", f"₹{book_state['unrealised_pnl']:,.2f}")
-            b3.metric("Long market value", f"₹{book_state['long_market_value']:,.2f}")
-            b4.metric("Short liability", f"₹{book_state['short_liability']:,.2f}")
+            b1,b2,b3,b4,b5,b6 = st.columns(6)
+            b1.metric("Starting allocation", f"₹{segment_capitals[book_name]:,.2f}")
+            b2.metric("Cash balance", f"₹{book_state['cash']:,.2f}")
+            b3.metric("Free cash after margin", f"₹{book_state['available_cash']:,.2f}")
+            b4.metric("Realised P&L", f"₹{book_state['realised_pnl']:,.2f}")
+            b5.metric("Unrealised P&L", f"₹{book_state['unrealised_pnl']:,.2f}")
+            b6.metric("Margin excess", f"₹{book_state['margin_excess']:,.2f}")
+            v1, v2 = st.columns(2)
+            v1.metric("Long market value", f"₹{book_state['long_market_value']:,.2f}")
+            v2.metric("Short liability", f"₹{book_state['short_liability']:,.2f}")
 
             book_positions, _ = _open_positions_with_marks(
                 book_state, snapshot, snapshot_loader, revision
@@ -1368,7 +1410,11 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                 visible = {
                     "timestamp_ist": "Timestamp (IST)", "symbol": "Symbol", "side": "Side",
                     "quantity": "Qty", "reference_price": "Reference price", "fill_price": "Fill price",
-                    "gross": "Turnover", "charges": "Estimated charges", "segment": "Track",
+                    "gross": "Turnover", "brokerage": "Brokerage", "stt": "STT",
+                    "stamp_duty": "Stamp duty", "exchange_charges": "NSE charges",
+                    "sebi_charges": "SEBI fee", "ipft_charges": "IPFT",
+                    "gst": "GST", "charges": "Total charges", "charge_model_version": "Charge model",
+                    "segment": "Track",
                     "prediction_signal": "Model signal", "prediction_probability_up": "P(up)",
                     "prediction_expected_return": "Expected return", "prediction_model_version": "Model version",
                     "prediction_decision_timestamp": "Model decision time",
@@ -1389,8 +1435,10 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
 
     st.caption(
         "Simulation only: NSE cash-equity long/short accounting; no F&O or broker integration. "
-        "Short-sale proceeds are included in cash but reserved through the initial-margin calculation. "
-        "Initial/maintenance margin rates are illustrative simulator assumptions, not live exchange or broker requirements. "
-        "Charges and slippage are estimates, not a contract note. Use a persistent mounted path via "
-        "PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
+        "Cash and margin are allocated independently to Intraday, Delivery and Legacy. "
+        "Each fill records estimated brokerage, STT, stamp duty, NSE transaction/IPFT, SEBI fee and GST; "
+        "entry charges are included in position cost basis and exit charges reduce realised P&L. "
+        "Broker-specific per-order caps, DP charges, penalties and other contract-note items are not modelled. "
+        "Legacy fills retain historic unitemized fees. These amounts are estimates, not a contract note. "
+        "Use a persistent mounted path via PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
     )
