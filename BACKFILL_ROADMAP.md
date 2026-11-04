@@ -4,7 +4,7 @@
 
 **Execution mode:** Run exactly one numbered step per separate development-agent chat. Do not skip ahead. Each step has its own objective, constraints, deliverables, acceptance checks and copy/paste prompt.
 
-**Current status:** Step 0 PASS — verified baseline committed as `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`. Step 1 is the next authorized task. See `backfill_baseline.md` and `backfill_baseline.json`.
+**Current status:** Step 0 PASS — verified baseline committed as `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`. Step 1 BLOCKED — the original full Kaggle archive is not accessible to this session; no original archive metadata or member inventory is claimed. See `backfill_baseline.md`, `backfill_baseline.json` and the Step 1 inventory reports.
 
 ---
 
@@ -256,6 +256,20 @@ Execute ROADMAP Step 1 only. Read BACKFILL_ROADMAP.md and the Step 0 checkpoint.
 ```
 
 **Checkpoint:** original archive path, byte size, SHA-256, archive-member inventory, completeness/sample determination, unresolved access blockers.
+
+### Step 1 execution record — 4 November 2026: BLOCKED
+
+The original full Kaggle equity archive was not accessible from this session. The Step 0 handoff identifies it as residing on the user's device and explicitly prohibits substituting the previously referenced approximately 11 MB sample/partial upload.
+
+Read-only checks found no archive candidate in the mounted runtime locations checked (`/mnt/data`, `/home/oai/share`, `/tmp`), and the available conversation/Library file search returned no compressed archive candidate. This session has no direct access to the user's device filesystem. The earlier small upload was not present in this runtime and was not treated as the original.
+
+Therefore the original archive's filename, path, exact byte size, SHA-256, archive format, compression, members, folder structure and contents remain **UNKNOWN / NOT INSPECTED**. These unknowns are explicitly recorded in `kaggle_archive_inventory.json`; the human-readable findings are in `kaggle_archive_inventory.md`.
+
+No archive was extracted or modified. No Google Drive path was read or written. No market data was imported. No repository code, production model, deployment, Cloud Run service or Scheduler job was changed. No historical backfill or model training was started.
+
+**Required action:** Supply the original full Kaggle archive to an accessible runtime and resume Step 1 only. Do not substitute the approximately 11 MB sample. Step 2 remains unauthorized until the original archive inventory meets all Step 1 acceptance criteria.
+
+**Step 1 result: BLOCKED — awaiting original archive access.**
 
 ---
 
@@ -564,7 +578,7 @@ Update this ledger only after the evidence and acceptance checks for that step h
 | Step | Description | Status | Commit / evidence | Artifact path | Date |
 |---:|---|---|---|---|---|
 | 0 | Freeze scope and baseline | PASS | Commit `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`; Drive inventory; production model SHA-256 match; live Cloud Run/Scheduler retained | `backfill_baseline.json`; `backfill_baseline.md` | 2026-11-04 |
-| 1 | Original Kaggle archive inventory | NOT STARTED | — | — | — |
+| 1 | Original Kaggle archive inventory | BLOCKED | Reports committed in `996723a82a449fefeb8b1f1b945076ed862f1571`; original archive inaccessible; metadata not inferred | `kaggle_archive_inventory.json`; `kaggle_archive_inventory.md` | 2026-11-04 |
 | 2 | Kaggle source/data-quality audit | NOT STARTED | — | — | — |
 | 3 | Existing Drive archive inventory | NOT STARTED | — | — | — |
 | 4 | Canonical schema and Kaggle staging | NOT STARTED | — | — | — |
