@@ -810,6 +810,19 @@ def _int_or_none(value):
         return None
 
 
+def _select_prediction_for_horizon(
+    predictions: list[dict],
+    horizon_min: int,
+    preferred: dict | None = None,
+) -> dict:
+    """Select only a prediction that explicitly matches the requested minute horizon."""
+    candidates = ([preferred] if isinstance(preferred, dict) and preferred else []) + list(predictions or [])
+    for item in candidates:
+        if _int_or_none(item.get("horizon_min")) == int(horizon_min):
+            return dict(item)
+    return {}
+
+
 def _format_timestamp(value: str) -> str:
     if not value:
         return "—"
@@ -1091,7 +1104,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         ["INTRADAY", "DELIVERY"],
         horizontal=True,
         key="paper_trading_segment",
-        format_func=lambda value: "Intraday · 5-minute model" if value == "INTRADAY" else "Delivery · Beta V2 Delivery model",
+        format_func=lambda value: "Intraday · 30-minute forecast" if value == "INTRADAY" else "Delivery · 7-session OHLC forecast",
     )
     st.caption(
         "Intraday, Delivery and Legacy use separately allocated cash and margin. "
@@ -1104,7 +1117,6 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         symbol_error = ""
     except ValueError as exc:
         symbol, symbol_error = "", str(exc)
-    horizon = 5
     refresh_col, status_col = st.columns([1, 3])
     with refresh_col:
         refresh = st.button("Refresh quote and model", type="primary")
@@ -1138,56 +1150,30 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
     price = _finite_or_none(snapshot.get("price"))
     predictions = snapshot.get("predictions") or []
     if segment == "INTRADAY":
-        selected_prediction = snapshot.get("prediction") or next(
-            (item for item in predictions if int(item.get("horizon_min", 0) or 0) == 5),
-            {},
+        selected_prediction = _select_prediction_for_horizon(
+            predictions, 30, snapshot.get("prediction")
         )
-        prediction_status = "READY" if snapshot.get("prediction_ready") else "NOT READY"
+        prediction_status = "READY" if selected_prediction and snapshot.get("prediction_ready") else "NOT READY"
         prediction_unavailable_reason = snapshot.get("prediction_freshness_reason") or (
-            "Fresh stock and benchmark OHLC inputs are required."
+            "A fresh completed stock bar and fresh benchmark context are required for the 30-minute model."
         )
     else:
-        delivery_signal = (
-            delivery_forecast.get("prior_close_forecast_signal")
-            or delivery_forecast.get("signal")
-            or "UNAVAILABLE"
-        )
-        delivery_probability = (
-            delivery_forecast.get("prior_close_probability_up")
-            if delivery_forecast.get("prior_close_forecast_signal") is not None
-            else delivery_forecast.get("p")
-        )
+        delivery_rows = delivery_forecast.get("forecasts", []) or []
         selected_prediction = {
-            "signal": delivery_signal,
-            "probability_up": _finite_or_none(delivery_probability),
-            "expected_return": _finite_or_none(
-                delivery_forecast.get("expected_return")
-                or delivery_forecast.get("prediction_expected_return")
-            ),
-            "predicted_price": _finite_or_none(delivery_forecast.get("predicted_price")),
-            "model_version": (
-                delivery_forecast.get("model_version")
-                or delivery_forecast.get("champion_model_version")
-                or delivery_forecast.get("model_bundle")
-                or "Beta V2 Delivery"
-            ),
-            "decision_timestamp": (
-                delivery_forecast.get("forecast_as_of_utc")
-                or delivery_forecast.get("feature_cutoff_timestamp")
-                or ""
-            ),
-            "reason": delivery_forecast.get("signal_reason") or delivery_forecast.get("reason") or "",
-            "prediction_status": delivery_forecast.get("prediction_status") or "UNKNOWN",
-            "target_session_date": delivery_forecast.get("target_session_date"),
+            "signal": "7-SESSION OHLC" if delivery_forecast.get("status") == "CALCULATED" and delivery_rows else "UNAVAILABLE",
+            "probability_up": None,
+            "expected_return": None,
+            "predicted_price": _finite_or_none(delivery_rows[-1].get("close")) if delivery_rows else None,
+            "model_version": delivery_forecast.get("model") or "7-session daily OHLC model",
+            "decision_timestamp": delivery_forecast.get("as_of_date") or "",
+            "reason": delivery_forecast.get("reason") or "",
         }
-        prediction_status = str(delivery_forecast.get("prediction_status") or "UNAVAILABLE")
+        prediction_status = str(delivery_forecast.get("status") or "UNAVAILABLE").upper()
         prediction_unavailable_reason = (
-            delivery_forecast.get("signal_reason")
-            or delivery_forecast.get("reason")
-            or "The existing Beta V2 Delivery forecast is unavailable."
+            delivery_forecast.get("reason")
+            or f"Seven-session OHLC forecast status: {prediction_status}."
         )
     fresh = bool(snapshot.get("price_fresh"))
-    model_fresh = bool(snapshot.get("prediction_ready")) if segment == "INTRADAY" else prediction_status == "PASS"
     price_source = str(snapshot.get("price_source") or snapshot.get("source") or "UNKNOWN")
     quote_timestamp = str(snapshot.get("quote_timestamp") or "")
     if price is not None and price > 0:
@@ -1195,24 +1181,98 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         c1.metric("Live market price", f"₹{price:,.2f}")
         c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
         c3.metric(
-            "5-minute signal" if segment == "INTRADAY" else "Delivery signal",
+            "30-minute signal" if segment == "INTRADAY" else "7-session forecast",
             str(selected_prediction.get("signal") or "UNAVAILABLE"),
         )
         st.caption(
             f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
         )
         if not fresh:
-            st.warning(
-                f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
-                f"{snapshot.get('price_freshness_reason') or 'The price is display-only and cannot unlock model inference.'}"
-            )
+            if segment == "INTRADAY":
+                st.warning(
+                    f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
+                    f"{snapshot.get('price_freshness_reason') or 'The 30-minute intraday model requires fresh stock and benchmark inputs.'}"
+                )
+            else:
+                st.caption(
+                    "The intraday quote is stale or unverified. The Delivery forecast uses completed daily OHLC "
+                    "history and is checked separately for source-session freshness."
+                )
     elif snapshot:
         st.warning("No market quote is currently available. Enter a manual reference price to test the ledger.")
     else:
         st.info(
             "Enter an NSE symbol and refresh to load its current market value and "
-            + ("five-minute Intraday prediction." if segment == "INTRADAY" else "Delivery forecast.")
+            + ("30-minute Intraday prediction." if segment == "INTRADAY" else "seven-session Delivery OHLC forecast.")
         )
+
+    if segment == "INTRADAY":
+        st.subheader("30-minute Intraday prediction")
+        if prediction_status == "READY":
+            p1, p2, p3, p4 = st.columns(4)
+            probability = _finite_or_none(selected_prediction.get("probability_up"))
+            expected_return = _finite_or_none(selected_prediction.get("expected_return"))
+            predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
+            p1.metric("Signal", str(selected_prediction.get("signal") or "ABSTAIN"))
+            p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
+            p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+            p4.metric("Forecast price (+30 min)", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+            prediction_caption = (
+                f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
+                f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))}"
+            )
+            feature_coverage = _finite_or_none(selected_prediction.get("feature_coverage"))
+            if feature_coverage is not None:
+                prediction_caption += f" · Feature coverage: {feature_coverage:.1%}"
+            st.caption(prediction_caption)
+            if selected_prediction.get("price_forecast_status"):
+                st.caption(f"Price forecast validation: {selected_prediction['price_forecast_status']}")
+            if selected_prediction.get("reason") or selected_prediction.get("signal_reason"):
+                st.caption(str(selected_prediction.get("reason") or selected_prediction.get("signal_reason")))
+        else:
+            st.warning(f"30-minute prediction unavailable: {prediction_unavailable_reason}")
+    else:
+        st.subheader("Delivery forecast · next 7 NSE sessions")
+        forecasts = delivery_forecast.get("forecasts", []) or []
+        target_dates = delivery_forecast.get("target_sessions", []) or []
+        if prediction_status == "CALCULATED" and forecasts:
+            rows = []
+            for index, item in enumerate(forecasts):
+                skill = _finite_or_none(item.get("mean_mae_skill_vs_median"))
+                rows.append({
+                    "Horizon": f"+{int(item.get('horizon', index + 1))} session(s)",
+                    "Target date": target_dates[index] if index < len(target_dates) else "—",
+                    "Open (₹)": _finite_or_none(item.get("open")),
+                    "High (₹)": _finite_or_none(item.get("high")),
+                    "Low (₹)": _finite_or_none(item.get("low")),
+                    "Close (₹)": _finite_or_none(item.get("close")),
+                    "Validation skill vs median": f"{skill:.1%}" if skill is not None else "—",
+                    "Validation": item.get("validation_status") or "NOT_EVALUATED",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            skill = _finite_or_none(delivery_forecast.get("overall_mean_mae_skill_vs_median"))
+            st.caption(
+                f"History as of: {delivery_forecast.get('as_of_date') or '—'} · "
+                f"Holdout skill vs median: {skill:.1%}" if skill is not None
+                else f"History as of: {delivery_forecast.get('as_of_date') or '—'}"
+            )
+            st.caption(
+                "Forecasts are for future NSE trading sessions, not calendar dates. "
+                "The +1 session is omitted once that session is already underway."
+            )
+            if delivery_forecast.get("active_session_target_omitted"):
+                st.info(
+                    f"The {delivery_forecast['active_session_target_omitted']} session has already started; "
+                    "its +1 forecast is withheld. The table shows the remaining future modelled sessions."
+                )
+            st.caption(
+                f"Validation: {delivery_forecast.get('validation_status') or 'NOT_EVALUATED'} · "
+                f"Trading eligibility: {delivery_forecast.get('trade_eligibility') or 'NOT_ELIGIBLE'}"
+            )
+            if delivery_forecast.get("reason"):
+                st.warning(str(delivery_forecast["reason"]))
+        else:
+            st.warning(f"Seven-session Delivery forecast withheld: {prediction_unavailable_reason}")
 
     st.subheader("Place a simulated order")
     current_state = calculate_portfolio(
@@ -1379,23 +1439,6 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         d3.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
         d4.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
         d5.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
-    with st.expander(f"{segment.title()} model information (optional)", expanded=False):
-        probability = _finite_or_none(selected_prediction.get("probability_up"))
-        expected_return = _finite_or_none(selected_prediction.get("expected_return"))
-        predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
-        p1,p2,p3,p4 = st.columns(4)
-        p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
-        p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
-        p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
-        p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
-        st.caption(
-            f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-            f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
-            + ("Horizon: 5 minutes" if segment == "INTRADAY" else
-               f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
-        )
-        st.caption(str(selected_prediction.get("reason") or ""))
-
     st.subheader("Separate strategy books")
     book_tabs = st.tabs(["Intraday", "Delivery", "Legacy / Unassigned"])
     for book_name, book_tab in zip(TRADING_SEGMENTS, book_tabs):
