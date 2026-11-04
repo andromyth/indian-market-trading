@@ -10,6 +10,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,12 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
+DEFAULT_INTRADAY_ALLOCATION = 5_000.0
+# NSE cash-market rates currently in force (2026).
+NSE_TRANSACTION_CHARGE_RATE = 0.000030699
+NSE_IPFT_CHARGE_RATE = 0.000000001
+SEBI_TURNOVER_FEE_RATE = 0.000001
+GST_RATE = 0.18
 # Illustrative simulator assumptions; these are not exchange or broker margin rates.
 INITIAL_SHORT_MARGIN_RATE = 1.50
 MAINTENANCE_SHORT_MARGIN_RATE = 0.30
@@ -57,6 +64,64 @@ def _now_ist() -> str:
     return datetime.now(IST).isoformat(timespec="seconds")
 
 
+def _money(value: float) -> float:
+    """Round a rupee amount to paise using financial half-up rounding."""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def calculate_trade_charges(
+    segment: str,
+    side: str,
+    turnover: float,
+    brokerage_bps: float,
+) -> dict[str, float | str]:
+    """Estimate Indian NSE cash-equity charges for a single executed side.
+
+    Per-fill paise rounding is a simulator estimate; broker/exchange contract
+    note aggregation may differ by a few paise. Brokerage is configurable.
+    """
+    selected_segment = str(segment).strip().upper()
+    direction = str(side).strip().upper()
+    amount = float(turnover)
+    brokerage_rate = float(brokerage_bps)
+    if selected_segment not in {"INTRADAY", "DELIVERY"}:
+        raise ValueError("Charges can only be estimated for INTRADAY or DELIVERY.")
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("Side must be BUY or SELL.")
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("Turnover must be a finite non-negative amount.")
+    if not math.isfinite(brokerage_rate) or not 0 <= brokerage_rate <= 500:
+        raise ValueError("Brokerage rate must be between 0 and 500 bps.")
+
+    brokerage = _money(amount * brokerage_rate / 10_000.0)
+    if selected_segment == "INTRADAY":
+        stt = _money(amount * 0.00025) if direction == "SELL" else 0.0
+        stamp_duty = _money(amount * 0.00003) if direction == "BUY" else 0.0
+    else:
+        stt = _money(amount * 0.001)
+        stamp_duty = _money(amount * 0.00015) if direction == "BUY" else 0.0
+
+    exchange_charges = _money(amount * NSE_TRANSACTION_CHARGE_RATE)
+    sebi_charges = _money(amount * SEBI_TURNOVER_FEE_RATE)
+    ipft_charges = _money(amount * NSE_IPFT_CHARGE_RATE)
+    gst = _money((brokerage + exchange_charges + sebi_charges + ipft_charges) * GST_RATE)
+    total = _money(
+        brokerage + stt + stamp_duty + exchange_charges
+        + sebi_charges + ipft_charges + gst
+    )
+    return {
+        "brokerage": brokerage,
+        "stt": stt,
+        "stamp_duty": stamp_duty,
+        "exchange_charges": exchange_charges,
+        "sebi_charges": sebi_charges,
+        "ipft_charges": ipft_charges,
+        "gst": gst,
+        "total_charges": total,
+        "charge_model_version": "NSE_CASH_EQUITY_2026",
+    }
+
+
 def normalize_symbol(value: str) -> str:
     """Return a bare NSE symbol; the simulator intentionally excludes indices."""
     symbol = str(value or "").strip().upper()
@@ -79,7 +144,10 @@ def init_db() -> None:
                 initial_cash REAL NOT NULL,
                 fee_bps REAL NOT NULL,
                 slippage_bps REAL NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                intraday_initial_cash REAL NOT NULL DEFAULT 0,
+                delivery_initial_cash REAL NOT NULL DEFAULT 0,
+                legacy_initial_cash REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -96,6 +164,14 @@ def init_db() -> None:
                 fill_price REAL NOT NULL,
                 gross REAL NOT NULL,
                 charges REAL NOT NULL,
+                brokerage REAL,
+                stt REAL,
+                stamp_duty REAL,
+                exchange_charges REAL,
+                sebi_charges REAL,
+                ipft_charges REAL,
+                gst REAL,
+                charge_model_version TEXT,
                 source TEXT NOT NULL DEFAULT '',
                 quote_timestamp TEXT NOT NULL DEFAULT '',
                 prediction_signal TEXT NOT NULL DEFAULT '',
@@ -124,12 +200,135 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_paper_fills_segment_id ON paper_fills(segment, id)"
         )
 
+        account_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(paper_account)").fetchall()
+        }
+        added_allocations = False
+        for column in ("intraday_initial_cash", "delivery_initial_cash", "legacy_initial_cash"):
+            if column not in account_columns:
+                connection.execute(
+                    f"ALTER TABLE paper_account ADD COLUMN {column} REAL NOT NULL DEFAULT 0"
+                )
+                added_allocations = True
+        if added_allocations:
+            account = connection.execute(
+                "SELECT initial_cash FROM paper_account WHERE id = 1"
+            ).fetchone()
+            if account:
+                total_capital = float(account["initial_cash"])
+                has_legacy_fills = connection.execute(
+                    "SELECT 1 FROM paper_fills WHERE segment = 'LEGACY' LIMIT 1"
+                ).fetchone() is not None
+                intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, total_capital)
+                residual_capital = total_capital - intraday_capital
+                if has_legacy_fills:
+                    delivery_capital = 0.0
+                    legacy_capital = residual_capital
+                else:
+                    delivery_capital = residual_capital
+                    legacy_capital = 0.0
+                connection.execute(
+                    """
+                    UPDATE paper_account
+                    SET intraday_initial_cash = ?,
+                        delivery_initial_cash = ?,
+                        legacy_initial_cash = ?
+                    WHERE id = 1
+                    """,
+                    (intraday_capital, delivery_capital, legacy_capital),
+                )
+
+        fill_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(paper_fills)").fetchall()
+        }
+        charge_columns = {
+            "brokerage": "REAL",
+            "stt": "REAL",
+            "stamp_duty": "REAL",
+            "exchange_charges": "REAL",
+            "sebi_charges": "REAL",
+            "ipft_charges": "REAL",
+            "gst": "REAL",
+            "charge_model_version": "TEXT",
+        }
+        for column, definition in charge_columns.items():
+            if column not in fill_columns:
+                connection.execute(
+                    f"ALTER TABLE paper_fills ADD COLUMN {column} {definition}"
+                )
+
+        old_charge_rows = connection.execute(
+            """
+            SELECT id, segment, side, gross, charges
+            FROM paper_fills
+            WHERE charge_model_version IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in old_charge_rows:
+            segment = str(row["segment"] or "LEGACY").upper()
+            if segment in {"INTRADAY", "DELIVERY"}:
+                # Preserve historic estimate as brokerage, then add statutory
+                # levies that the previous one-rate model omitted.
+                brokerage = _money(max(0.0, float(row["charges"])) )
+                statutory = calculate_trade_charges(
+                    segment, str(row["side"]), float(row["gross"]), 0.0
+                )
+                exchange = float(statutory["exchange_charges"])
+                sebi = float(statutory["sebi_charges"])
+                ipft = float(statutory["ipft_charges"])
+                gst = _money((brokerage + exchange + sebi + ipft) * GST_RATE)
+                stt = float(statutory["stt"])
+                stamp_duty = float(statutory["stamp_duty"])
+                total = _money(
+                    brokerage + stt + stamp_duty + exchange + sebi + ipft + gst
+                )
+                connection.execute(
+                    """
+                    UPDATE paper_fills
+                    SET brokerage = ?, stt = ?, stamp_duty = ?,
+                        exchange_charges = ?, sebi_charges = ?,
+                        ipft_charges = ?, gst = ?, charges = ?,
+                        charge_model_version = 'NSE_CASH_EQUITY_2026_MIGRATED'
+                    WHERE id = ?
+                    """,
+                    (
+                        brokerage, stt, stamp_duty, exchange, sebi,
+                        ipft, gst, total, int(row["id"]),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE paper_fills
+                    SET charge_model_version = 'LEGACY_UNITEMIZED'
+                    WHERE id = ?
+                    """,
+                    (int(row["id"]),),
+                )
+
 
 def get_account() -> dict | None:
     init_db()
     with _connection() as connection:
         row = connection.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
     return dict(row) if row else None
+
+
+def _segment_capitals_from_account(account: dict) -> dict[str, float]:
+    total = float(account["initial_cash"])
+    values = {
+        "INTRADAY": float(account.get("intraday_initial_cash", min(DEFAULT_INTRADAY_ALLOCATION, total))),
+        "DELIVERY": float(account.get("delivery_initial_cash", max(0.0, total - DEFAULT_INTRADAY_ALLOCATION))),
+        "LEGACY": float(account.get("legacy_initial_cash", 0.0)),
+    }
+    if any(not math.isfinite(value) or value < 0 for value in values.values()):
+        raise ValueError("Paper account contains an invalid strategy cash allocation.")
+    if abs(sum(values.values()) - total) > 0.01:
+        raise ValueError("Strategy cash allocations must equal total starting capital.")
+    return values
 
 
 def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
@@ -139,14 +338,51 @@ def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
         raise ValueError("Account settings must be finite numbers.")
     if values[0] <= 0 or values[1] < 0 or values[2] < 0 or values[1] > 500 or values[2] > 500:
         raise ValueError("Capital must be positive; fee and slippage must be between 0 and 500 bps.")
+    intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, values[0])
+    delivery_capital = values[0] - intraday_capital
     init_db()
     with _connection() as connection:
         connection.execute(
             """
-            INSERT INTO paper_account(id, initial_cash, fee_bps, slippage_bps, created_at)
-            VALUES (1, ?, ?, ?, ?)
+            INSERT INTO paper_account(
+                id, initial_cash, fee_bps, slippage_bps, created_at,
+                intraday_initial_cash, delivery_initial_cash, legacy_initial_cash
+            )
+            VALUES (1, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (*values, _now_ist()),
+            (*values, _now_ist(), intraday_capital, delivery_capital),
+        )
+
+
+def update_segment_capital_allocations(
+    intraday_initial_cash: float,
+    delivery_initial_cash: float,
+    legacy_initial_cash: float = 0.0,
+) -> None:
+    values = tuple(float(value) for value in (
+        intraday_initial_cash, delivery_initial_cash, legacy_initial_cash
+    ))
+    if not all(math.isfinite(value) and value >= 0 for value in values):
+        raise ValueError("Strategy allocations must be finite, non-negative amounts.")
+    with _connection() as connection:
+        account = connection.execute(
+            "SELECT initial_cash FROM paper_account WHERE id = 1"
+        ).fetchone()
+        if not account:
+            raise RuntimeError("Paper account is not initialized.")
+        total = float(account["initial_cash"])
+        if abs(sum(values) - total) > 0.01:
+            raise ValueError(
+                f"Allocations must total ₹{total:,.2f}; supplied total is ₹{sum(values):,.2f}."
+            )
+        connection.execute(
+            """
+            UPDATE paper_account
+            SET intraday_initial_cash = ?, delivery_initial_cash = ?,
+                legacy_initial_cash = ?
+            WHERE id = 1
+            """,
+            values,
         )
 
 
@@ -172,9 +408,17 @@ def reset_account(initial_cash: float) -> None:
         if not account:
             raise RuntimeError("Paper account is not initialized.")
         connection.execute("DELETE FROM paper_fills")
+        intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, capital)
+        delivery_capital = capital - intraday_capital
         connection.execute(
-            "UPDATE paper_account SET initial_cash = ?, created_at = ? WHERE id = 1",
-            (capital, _now_ist()),
+            """
+            UPDATE paper_account
+            SET initial_cash = ?, created_at = ?,
+                intraday_initial_cash = ?, delivery_initial_cash = ?,
+                legacy_initial_cash = 0
+            WHERE id = 1
+            """,
+            (capital, _now_ist(), intraday_capital, delivery_capital),
         )
 
 
@@ -233,6 +477,7 @@ def calculate_portfolio(
         position = positions.setdefault(symbol, {"quantity": 0, "cost_basis": 0.0})
         signed_qty = int(position["quantity"])
         basis = float(position["cost_basis"])
+        unit_gross = gross / quantity
         fee_per_share = charges / quantity
         remaining = quantity
 
@@ -244,7 +489,7 @@ def calculate_portfolio(
                 covered = min(remaining, -signed_qty)
                 short_basis_per_share = basis / (-signed_qty)
                 realised += (
-                    short_basis_per_share - fill_price - fee_per_share
+                    short_basis_per_share - unit_gross - fee_per_share
                 ) * covered
                 basis -= short_basis_per_share * covered
                 signed_qty += covered
@@ -252,7 +497,7 @@ def calculate_portfolio(
             # Any excess BUY opens or adds to a long position.
             if remaining:
                 signed_qty += remaining
-                basis += (fill_price + fee_per_share) * remaining
+                basis += (unit_gross + fee_per_share) * remaining
 
         else:  # SELL
             cash += gross - charges
@@ -261,7 +506,7 @@ def calculate_portfolio(
                 closed = min(remaining, signed_qty)
                 long_basis_per_share = basis / signed_qty
                 realised += (
-                    fill_price - fee_per_share - long_basis_per_share
+                    unit_gross - fee_per_share - long_basis_per_share
                 ) * closed
                 basis -= long_basis_per_share * closed
                 signed_qty -= closed
@@ -270,7 +515,7 @@ def calculate_portfolio(
             # net of the entry fee and form the short position's cover basis.
             if remaining:
                 signed_qty -= remaining
-                basis += (fill_price - fee_per_share) * remaining
+                basis += (unit_gross - fee_per_share) * remaining
 
         if signed_qty == 0:
             basis = 0.0
@@ -309,26 +554,24 @@ def calculate_portfolio(
         open_positions[symbol] = {
             "side": side_name,
             "quantity": quantity,
-            "cost_basis": round(basis, 2),
+            "cost_basis": _money(basis),
             "average_cost": average_cost,
             "mark_price": mark,
             "market_value": position_value,
             "unrealised_pnl": position_pnl,
         }
 
-    cash = round(cash, 2)
-    long_market_value = round(long_market_value, 2)
-    short_liability = round(short_liability, 2)
-    equity = round(cash + long_market_value - short_liability, 2)
-    initial_margin = round(short_liability * INITIAL_SHORT_MARGIN_RATE, 2)
-    maintenance_margin = round(short_liability * MAINTENANCE_SHORT_MARGIN_RATE, 2)
-    available_cash = round(cash - initial_margin, 2)
-    margin_excess = round(equity - maintenance_margin, 2)
+    equity = cash + long_market_value - short_liability
+    initial_margin = short_liability * INITIAL_SHORT_MARGIN_RATE
+    maintenance_margin = short_liability * MAINTENANCE_SHORT_MARGIN_RATE
+    available_cash = cash - initial_margin
+    margin_excess = equity - maintenance_margin
     return {
+        "starting_capital": float(initial_cash),
         "cash": cash,
         "positions": open_positions,
-        "realised_pnl": round(realised, 2),
-        "unrealised_pnl": round(unrealised, 2),
+        "realised_pnl": realised,
+        "unrealised_pnl": unrealised,
         "long_market_value": long_market_value,
         "short_liability": short_liability,
         "equity": equity,
@@ -344,13 +587,12 @@ def calculate_segmented_portfolio(
     initial_cash: float,
     fills: list[dict],
     market_prices: dict[str, float] | None = None,
+    segment_capitals: dict[str, float] | None = None,
 ) -> dict:
-    """Calculate separate strategy books against one shared cash/margin pool.
+    """Calculate isolated books and aggregate their cash and equity.
 
-    Position netting is performed inside each segment only. Cash flows and
-    short-margin reserves are aggregated across all segments, preventing
-    duplicated buying power while keeping Intraday and Delivery P&L separate.
-    Unclassified historical fills remain in LEGACY.
+    If segment_capitals is supplied, each book starts with its own allocation.
+    Omitting it retains compatibility with previous callers.
     """
     grouped: dict[str, list[dict]] = {name: [] for name in TRADING_SEGMENTS}
     for fill in fills:
@@ -359,32 +601,55 @@ def calculate_segmented_portfolio(
             segment = "LEGACY"
         grouped[segment].append(fill)
 
+    capital_map: dict[str, float] | None = None
+    if segment_capitals is not None:
+        capital_map = {
+            name: float(segment_capitals.get(name, 0.0))
+            for name in TRADING_SEGMENTS
+        }
+        if any(not math.isfinite(value) or value < 0 for value in capital_map.values()):
+            raise ValueError("Strategy allocations must be finite, non-negative amounts.")
+        if abs(sum(capital_map.values()) - float(initial_cash)) > 0.01:
+            raise ValueError("Strategy allocations must equal total starting capital.")
+
     segment_states = {
-        name: calculate_portfolio(0.0, rows, market_prices=market_prices)
+        name: calculate_portfolio(
+            capital_map[name] if capital_map is not None else 0.0,
+            rows,
+            market_prices=market_prices,
+        )
         for name, rows in grouped.items()
     }
-    cash = round(float(initial_cash) + sum(state["cash"] for state in segment_states.values()), 2)
-    long_market_value = round(sum(state["long_market_value"] for state in segment_states.values()), 2)
-    short_liability = round(sum(state["short_liability"] for state in segment_states.values()), 2)
-    realised = round(sum(state["realised_pnl"] for state in segment_states.values()), 2)
-    unrealised = round(sum(state["unrealised_pnl"] for state in segment_states.values()), 2)
-    initial_margin = round(sum(state["initial_margin_required"] for state in segment_states.values()), 2)
-    maintenance_margin = round(sum(state["maintenance_margin_required"] for state in segment_states.values()), 2)
-    equity = round(cash + long_market_value - short_liability, 2)
-    available_cash = round(cash - initial_margin, 2)
-    margin_excess = round(equity - maintenance_margin, 2)
+    starting_capital = (
+        sum(capital_map.values()) if capital_map is not None else float(initial_cash)
+    )
+    cash = (
+        sum(state["cash"] for state in segment_states.values())
+        if capital_map is not None
+        else starting_capital + sum(state["cash"] for state in segment_states.values())
+    )
+    long_market_value = sum(state["long_market_value"] for state in segment_states.values())
+    short_liability = sum(state["short_liability"] for state in segment_states.values())
+    realised = sum(state["realised_pnl"] for state in segment_states.values())
+    unrealised = sum(state["unrealised_pnl"] for state in segment_states.values())
+    initial_margin = sum(state["initial_margin_required"] for state in segment_states.values())
+    maintenance_margin = sum(state["maintenance_margin_required"] for state in segment_states.values())
+    equity = cash + long_market_value - short_liability
+    available_cash = cash - initial_margin
+    margin_excess = equity - maintenance_margin
     return {
-        "cash": cash,
+        "starting_capital": round(starting_capital, 2),
+        "cash": _money(cash),
         "segments": segment_states,
-        "realised_pnl": realised,
-        "unrealised_pnl": unrealised,
-        "long_market_value": long_market_value,
-        "short_liability": short_liability,
-        "equity": equity,
-        "initial_margin_required": initial_margin,
-        "maintenance_margin_required": maintenance_margin,
-        "available_cash": available_cash,
-        "margin_excess": margin_excess,
+        "realised_pnl": _money(realised),
+        "unrealised_pnl": _money(unrealised),
+        "long_market_value": _money(long_market_value),
+        "short_liability": _money(short_liability),
+        "equity": _money(equity),
+        "initial_margin_required": _money(initial_margin),
+        "maintenance_margin_required": _money(maintenance_margin),
+        "available_cash": _money(available_cash),
+        "margin_excess": _money(margin_excess),
         "margin_status": "CALL" if short_liability > 0 and margin_excess < -0.005 else "OK",
     }
 
@@ -422,9 +687,12 @@ def place_order(
     if not all(math.isfinite(x) and 0 <= x <= 500 for x in (fee_bps, slippage_bps)):
         raise ValueError("Invalid account fee or slippage settings.")
     impact = slippage_bps / 10_000.0
-    fill_price = reference * (1.0 + impact if direction == "BUY" else 1.0 - impact)
-    gross = round(qty * fill_price, 2)
-    charges = round(gross * fee_bps / 10_000.0, 2)
+    fill_price = _money(reference * (1.0 + impact if direction == "BUY" else 1.0 - impact))
+    gross = _money(qty * fill_price)
+    charge_breakdown = calculate_trade_charges(
+        selected_segment, direction, gross, fee_bps
+    )
+    charges = float(charge_breakdown["total_charges"])
 
     connection = _connect()
     try:
@@ -436,9 +704,13 @@ def place_order(
             dict(row) for row in connection.execute("SELECT * FROM paper_fills ORDER BY id").fetchall()
         ]
         initial_cash = float(current_account["initial_cash"])
+        segment_capitals = _segment_capitals_from_account(dict(current_account))
         mark_prices = dict(market_prices or {})
         mark_prices[root] = fill_price
-        before = calculate_segmented_portfolio(initial_cash, fills, market_prices=mark_prices)
+        before = calculate_segmented_portfolio(
+            initial_cash, fills, market_prices=mark_prices,
+            segment_capitals=segment_capitals,
+        )
         before_book = before["segments"][selected_segment]
         before_qty = int(before_book["positions"].get(root, {}).get("quantity", 0))
 
@@ -457,6 +729,7 @@ def place_order(
             initial_cash,
             fills + [candidate],
             market_prices=mark_prices,
+            segment_capitals=segment_capitals,
         )
         after_book = after["segments"][selected_segment]
         after_qty = int(after_book["positions"].get(root, {}).get("quantity", 0))
@@ -465,31 +738,44 @@ def place_order(
 
         # Existing positions can always be reduced or closed, including during
         # a margin call. New long or short exposure must fit available cash.
-        if (increased_long or increased_short) and after["available_cash"] < -0.005:
+        if (increased_long or increased_short) and after_book["available_cash"] < -0.005:
             raise ValueError(
-                "Insufficient free cash after reserving initial short margin. "
-                f"Required reserve: ₹{after['initial_margin_required']:,.2f}; "
-                f"cash balance after order: ₹{after['cash']:,.2f}; "
-                f"free cash: ₹{after['available_cash']:,.2f}."
+                f"Insufficient free cash in the {selected_segment.title()} book after "
+                "reserving initial short margin. "
+                f"Book cash: ₹{after_book['cash']:,.2f}; "
+                f"required reserve: ₹{after_book['initial_margin_required']:,.2f}; "
+                f"free cash: ₹{after_book['available_cash']:,.2f}."
             )
-        if increased_short and after["margin_excess"] < -0.005:
+        if increased_short and after_book["margin_excess"] < -0.005:
             raise ValueError(
-                "Short order rejected: projected equity would fall below the "
-                f"maintenance-margin requirement by ₹{abs(after['margin_excess']):,.2f}."
+                f"Short order rejected: projected {selected_segment.title()} equity "
+                "would fall below its maintenance-margin requirement by "
+                f"₹{abs(after_book['margin_excess']):,.2f}."
             )
 
         cursor = connection.execute(
             """
             INSERT INTO paper_fills(
                 timestamp_ist, symbol, segment, side, quantity, reference_price, fill_price,
-                gross, charges, source, quote_timestamp, prediction_signal,
+                gross, charges, brokerage, stt, stamp_duty, exchange_charges,
+                sebi_charges, ipft_charges, gst, charge_model_version,
+                source, quote_timestamp, prediction_signal,
                 prediction_probability_up, prediction_expected_return,
                 prediction_model_version, prediction_decision_timestamp,
                 prediction_horizon_min
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _now_ist(), root, selected_segment, direction, qty, reference, fill_price, gross, charges,
+                _now_ist(), root, selected_segment, direction, qty, reference,
+                fill_price, gross, charges,
+                float(charge_breakdown["brokerage"]),
+                float(charge_breakdown["stt"]),
+                float(charge_breakdown["stamp_duty"]),
+                float(charge_breakdown["exchange_charges"]),
+                float(charge_breakdown["sebi_charges"]),
+                float(charge_breakdown["ipft_charges"]),
+                float(charge_breakdown["gst"]),
+                str(charge_breakdown["charge_model_version"]),
                 str(source or ""), str(quote_timestamp or ""),
                 str(model.get("signal") or ""),
                 _finite_or_none(model.get("probability_up")),
@@ -716,7 +1002,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         st.info("Create a virtual account. No broker account or real money is involved.")
         with st.form("paper_create_account"):
             capital = st.number_input("Starting virtual capital (₹)", min_value=1_000.0, value=DEFAULT_CAPITAL, step=10_000.0)
-            fee = st.number_input("Estimated charges (bps of turnover)", min_value=0.0, max_value=500.0, value=DEFAULT_FEE_BPS, step=1.0)
+            fee = st.number_input("Brokerage estimate (bps of turnover)", min_value=0.0, max_value=500.0, value=DEFAULT_FEE_BPS, step=1.0)
             slippage = st.number_input("Simulated slippage (bps)", min_value=0.0, max_value=500.0, value=DEFAULT_SLIPPAGE_BPS, step=1.0)
             submitted = st.form_submit_button("Create paper account", type="primary")
         if submitted:
@@ -733,7 +1019,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         with left:
             with st.form("paper_cost_settings"):
                 fee_value = st.number_input(
-                    "Estimated charges (bps of turnover)", min_value=0.0, max_value=500.0,
+                    "Brokerage estimate (bps of turnover)", min_value=0.0, max_value=500.0,
                     value=float(account["fee_bps"]), step=1.0,
                 )
                 slippage_value = st.number_input(
@@ -767,6 +1053,39 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                     except Exception as exc:
                         st.error(f"Could not reset account: {type(exc).__name__}: {exc}")
 
+    segment_capitals = _segment_capitals_from_account(account)
+    with st.expander("Strategy cash allocations", expanded=False):
+        st.caption(
+            f"Allocate the total starting capital of ₹{float(account['initial_cash']):,.2f} "
+            "across Intraday, Delivery and Legacy. The three values must add up to the "
+            "account starting capital. This changes book allocations only; it does not "
+            "delete or rewrite previous fills."
+        )
+        with st.form("paper_capital_allocations"):
+            alloc1, alloc2, alloc3 = st.columns(3)
+            intraday_allocation = alloc1.number_input(
+                "Intraday starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["INTRADAY"]), step=500.0,
+            )
+            delivery_allocation = alloc2.number_input(
+                "Delivery starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["DELIVERY"]), step=1_000.0,
+            )
+            legacy_allocation = alloc3.number_input(
+                "Legacy starting cash (₹)", min_value=0.0,
+                value=float(segment_capitals["LEGACY"]), step=500.0,
+            )
+            save_allocations = st.form_submit_button("Save cash allocations")
+        if save_allocations:
+            try:
+                update_segment_capital_allocations(
+                    intraday_allocation, delivery_allocation, legacy_allocation
+                )
+                st.success("Strategy cash allocations saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save cash allocations: {type(exc).__name__}: {exc}")
+
     segment = st.radio(
         "Trading track",
         ["INTRADAY", "DELIVERY"],
@@ -775,9 +1094,8 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         format_func=lambda value: "Intraday · 5-minute model" if value == "INTRADAY" else "Delivery · Beta V2 Delivery model",
     )
     st.caption(
-        "Intraday and Delivery fills, positions and P&L are reported separately. "
-        "They share one account cash balance and one account-wide margin pool; no capital is duplicated. "
-        "Pre-existing unclassified fills remain in Legacy / Unassigned."
+        "Intraday, Delivery and Legacy use separately allocated cash and margin. "
+        "The combined account adds the three books without duplicating starting capital."
     )
 
     symbol_text = st.text_input("NSE cash symbol", value="SBIN", key="paper_symbol_input")
@@ -896,27 +1214,6 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             + ("five-minute Intraday prediction." if segment == "INTRADAY" else "Delivery forecast.")
         )
 
-    st.subheader("5-minute Intraday prediction" if segment == "INTRADAY" else "Delivery forecast")
-    if selected_prediction and (
-        segment == "INTRADAY" or prediction_status not in {"ERROR", "BLOCKED", "ABSTAIN", "UNAVAILABLE"}
-    ):
-        prediction_row = {
-            "Track": segment,
-            "Horizon": "5 minutes" if segment == "INTRADAY" else "Next NSE session",
-            "Status": prediction_status,
-            "Signal": selected_prediction.get("signal", "—"),
-            "Probability up": _finite_or_none(selected_prediction.get("probability_up")),
-            "Expected return": _finite_or_none(selected_prediction.get("expected_return")),
-            "Predicted price": _finite_or_none(selected_prediction.get("predicted_price")),
-            "Target session": selected_prediction.get("target_session_date") or "—",
-            "Model version": selected_prediction.get("model_version", "—"),
-            "Decision time": selected_prediction.get("decision_timestamp", "—"),
-            "Reason": selected_prediction.get("signal_reason") or selected_prediction.get("reason") or "",
-        }
-        st.dataframe(pd.DataFrame([prediction_row]), use_container_width=True, hide_index=True)
-    else:
-        st.caption(f"{segment.title()} prediction unavailable: {prediction_unavailable_reason}")
-
     st.subheader("Place a simulated order")
     current_state = calculate_portfolio(
         0.0, list_fills(segment=segment)
@@ -936,21 +1233,30 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         )
         execution_price = manual_price if manual_price > 0 else price
         estimated_fill = (
-            execution_price * (1 + float(account["slippage_bps"]) / 10_000)
-            if execution_price and side == "BUY"
-            else execution_price * (1 - float(account["slippage_bps"]) / 10_000)
+            round(
+                execution_price * (1 + float(account["slippage_bps"]) / 10_000)
+                if side == "BUY"
+                else execution_price * (1 - float(account["slippage_bps"]) / 10_000),
+                2,
+            )
             if execution_price else 0.0
         )
-        estimated_turnover = float(quantity) * estimated_fill
-        estimated_charges = estimated_turnover * float(account["fee_bps"]) / 10_000
+        estimated_turnover = round(float(quantity) * estimated_fill, 2)
+        estimated_costs = calculate_trade_charges(
+            segment, side, estimated_turnover, float(account["fee_bps"])
+        )
+        estimated_charges = float(estimated_costs["total_charges"])
         estimated_cash_flow = (
             -(estimated_turnover + estimated_charges)
             if side == "BUY" else estimated_turnover - estimated_charges
         )
         st.caption(
             f"Estimated fill: ₹{estimated_fill:,.2f} · Turnover: ₹{estimated_turnover:,.2f} · "
-            f"Charges: ₹{estimated_charges:,.2f} · "
-            f"{'Cash debit' if side == 'BUY' else 'Cash credit'}: ₹{abs(estimated_cash_flow):,.2f}"
+            f"Brokerage ₹{estimated_costs['brokerage']:,.2f} · STT ₹{estimated_costs['stt']:,.2f} · "
+            f"Stamp ₹{estimated_costs['stamp_duty']:,.2f} · "
+            f"NSE/SEBI/IPFT ₹{estimated_costs['exchange_charges'] + estimated_costs['sebi_charges'] + estimated_costs['ipft_charges']:,.2f} · "
+            f"GST ₹{estimated_costs['gst']:,.2f} · Total ₹{estimated_charges:,.2f} · "
+            f"{'Cash debit' if side == 'BUY' else 'Cash credit'} ₹{abs(estimated_cash_flow):,.2f}"
         )
         allow_stale = st.checkbox("Allow a stale / last-session price for this paper fill")
         confirm_order = st.checkbox("I confirm this is a simulated cash-equity order")
@@ -993,68 +1299,102 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                     st.error(f"Paper order rejected: {type(exc).__name__}: {exc}")
 
     fills = list_fills()
-    _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
+    with st.expander("Live quote watchlist (optional)", expanded=False):
+        _render_live_market_overview(fills, snapshot, snapshot_loader, revision)
     market_prices = _fetch_live_market_marks(fills, snapshot, snapshot_loader, revision)
+    segment_capitals = _segment_capitals_from_account(account)
     state = calculate_segmented_portfolio(
-        float(account["initial_cash"]), fills, market_prices=market_prices
+        float(account["initial_cash"]), fills, market_prices=market_prices,
+        segment_capitals=segment_capitals,
     )
-    cash = float(state["cash"])
-    equity = float(state["equity"])
-    total_pnl = equity - float(account["initial_cash"])
-    unrealised = float(state["unrealised_pnl"])
+    selected_book_state = state["segments"][segment]
+    selected_book_capital = float(segment_capitals[segment])
+    selected_book_pnl = _money(
+        float(selected_book_state["realised_pnl"])
+        + float(selected_book_state["unrealised_pnl"])
+    )
+    selected_book_return = (
+        selected_book_pnl / selected_book_capital * 100
+        if selected_book_capital > 0 else 0.0
+    )
+    selected_book_fills = [
+        fill for fill in fills
+        if str(fill.get("segment") or "LEGACY").upper() == segment
+    ]
 
     st.divider()
-    st.subheader("Combined paper account · shared cash and margin")
+    st.subheader(f"{segment.title()} paper account")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Cash balance", f"₹{cash:,.2f}")
-    k2.metric("Free cash after margin", f"₹{state['available_cash']:,.2f}")
-    k3.metric("Long market value", f"₹{state['long_market_value']:,.2f}")
-    k4.metric("Short liability", f"₹{state['short_liability']:,.2f}")
-    k5.metric("Net liquidation value", f"₹{equity:,.2f}")
-    k6.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{(total_pnl / float(account['initial_cash']) * 100):.2f}%")
+    k1.metric("Cash balance", f"₹{selected_book_state['cash']:,.2f}")
+    k2.metric("Free cash after margin", f"₹{selected_book_state['available_cash']:,.2f}")
+    k3.metric("Long market value", f"₹{selected_book_state['long_market_value']:,.2f}")
+    k4.metric("Short liability", f"₹{selected_book_state['short_liability']:,.2f}")
+    k5.metric("Net liquidation value", f"₹{selected_book_state['equity']:,.2f}")
+    k6.metric("Total P&L", f"₹{selected_book_pnl:,.2f}", f"{selected_book_return:.2f}%")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
-    m2.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
-    m3.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
-    m4.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
-    if state["margin_status"] == "CALL":
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Starting allocation", f"₹{selected_book_capital:,.2f}")
+    m2.metric("Initial short margin", f"₹{selected_book_state['initial_margin_required']:,.2f}")
+    m3.metric("Maintenance margin", f"₹{selected_book_state['maintenance_margin_required']:,.2f}")
+    m4.metric("Margin excess", f"₹{selected_book_state['margin_excess']:,.2f}")
+    m5.metric("Realised P&L", f"₹{selected_book_state['realised_pnl']:,.2f}")
+    if selected_book_state["margin_status"] == "CALL":
         st.error(
-            "MARGIN CALL: net liquidation value is below the maintenance-margin "
-            "requirement. Reduce or cover short exposure; new risk-increasing orders are blocked."
+            f"{segment.title()} MARGIN CALL: net liquidation value is below the "
+            "maintenance-margin requirement. Reduce or cover short exposure."
         )
-    elif state["available_cash"] < -0.005:
-        if state["short_liability"] > 0:
-            st.warning("Initial short-margin reserve exceeds the cash balance. New risk-increasing orders are blocked.")
+    elif selected_book_state["available_cash"] < -0.005:
+        if selected_book_state["short_liability"] > 0:
+            st.warning("This book's initial short-margin reserve exceeds its cash balance.")
         else:
-            st.warning("The paper account has a cash funding deficit. New risk-increasing orders are blocked.")
+            st.warning("This book has a cash funding deficit. New risk-increasing orders are blocked.")
     st.caption(
-        f"Unrealised P&L: ₹{unrealised:,.2f} · "
-        f"Estimated charges: {float(account['fee_bps']):g} bps · "
+        f"Unrealised P&L: ₹{selected_book_state['unrealised_pnl']:,.2f} · "
+        f"Brokerage estimate: {float(account['fee_bps']):g} bps · "
         f"Slippage: {float(account['slippage_bps']):g} bps · "
-        f"Simulator assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial short margin and "
-        f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance margin against short liability."
+        f"Recorded charges in this book: ₹{sum(float(fill.get('charges') or 0.0) for fill in selected_book_fills):,.2f} · "
+        f"Short margin assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial / "
+        f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance."
     )
     st.caption(
-        f"Pricing source: {snapshot.get('source') or 'unavailable'} · "
-        f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
-        f"{segment.title()} model: {prediction_status}"
+        f"Price source: {snapshot.get('source') or 'unavailable'} · "
+        f"Quote status: {snapshot.get('price_freshness_status') or 'UNKNOWN'}"
     )
-    probability = _finite_or_none(selected_prediction.get("probability_up"))
-    expected_return = _finite_or_none(selected_prediction.get("expected_return"))
-    predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
-    p1,p2,p3,p4 = st.columns(4)
-    p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
-    p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
-    p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
-    p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
-    st.caption(
-        f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-        f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
-        + ("Horizon: 5 minutes" if segment == "INTRADAY" else
-           f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
-    )
-    st.caption(str(selected_prediction.get("reason") or ""))
+
+    combined_pnl = _money(float(state["realised_pnl"]) + float(state["unrealised_pnl"]))
+    with st.expander("Combined account · all strategy books", expanded=False):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Combined cash", f"₹{state['cash']:,.2f}")
+        c2.metric("Combined free cash", f"₹{state['available_cash']:,.2f}")
+        c3.metric("Long market value", f"₹{state['long_market_value']:,.2f}")
+        c4.metric("Short liability", f"₹{state['short_liability']:,.2f}")
+        c5.metric("Net liquidation value", f"₹{state['equity']:,.2f}")
+        c6.metric(
+            "Total P&L", f"₹{combined_pnl:,.2f}",
+            f"{combined_pnl / float(account['initial_cash']) * 100:.2f}%",
+        )
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Starting capital", f"₹{state['starting_capital']:,.2f}")
+        d2.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
+        d3.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
+        d4.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
+        d5.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
+    with st.expander(f"{segment.title()} model information (optional)", expanded=False):
+        probability = _finite_or_none(selected_prediction.get("probability_up"))
+        expected_return = _finite_or_none(selected_prediction.get("expected_return"))
+        predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
+        p1,p2,p3,p4 = st.columns(4)
+        p1.metric(f"{segment.title()} signal", str(selected_prediction.get("signal") or "UNAVAILABLE"))
+        p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
+        p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+        p4.metric("Forecast price", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+        st.caption(
+            f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
+            f"Decision: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
+            + ("Horizon: 5 minutes" if segment == "INTRADAY" else
+               f"Target NSE session: {selected_prediction.get('target_session_date') or '—'}")
+        )
+        st.caption(str(selected_prediction.get("reason") or ""))
 
     st.subheader("Separate strategy books")
     book_tabs = st.tabs(["Intraday", "Delivery", "Legacy / Unassigned"])
@@ -1062,11 +1402,16 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         with book_tab:
             book_state = state["segments"][book_name]
             book_fills = [row for row in fills if str(row.get("segment") or "LEGACY").upper() == book_name]
-            b1,b2,b3,b4 = st.columns(4)
-            b1.metric("Realised P&L", f"₹{book_state['realised_pnl']:,.2f}")
-            b2.metric("Unrealised P&L", f"₹{book_state['unrealised_pnl']:,.2f}")
-            b3.metric("Long market value", f"₹{book_state['long_market_value']:,.2f}")
-            b4.metric("Short liability", f"₹{book_state['short_liability']:,.2f}")
+            b1,b2,b3,b4,b5,b6 = st.columns(6)
+            b1.metric("Starting allocation", f"₹{segment_capitals[book_name]:,.2f}")
+            b2.metric("Cash balance", f"₹{book_state['cash']:,.2f}")
+            b3.metric("Free cash after margin", f"₹{book_state['available_cash']:,.2f}")
+            b4.metric("Realised P&L", f"₹{book_state['realised_pnl']:,.2f}")
+            b5.metric("Unrealised P&L", f"₹{book_state['unrealised_pnl']:,.2f}")
+            b6.metric("Margin excess", f"₹{book_state['margin_excess']:,.2f}")
+            v1, v2 = st.columns(2)
+            v1.metric("Long market value", f"₹{book_state['long_market_value']:,.2f}")
+            v2.metric("Short liability", f"₹{book_state['short_liability']:,.2f}")
 
             book_positions, _ = _open_positions_with_marks(
                 book_state, snapshot, snapshot_loader, revision
@@ -1083,7 +1428,11 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
                 visible = {
                     "timestamp_ist": "Timestamp (IST)", "symbol": "Symbol", "side": "Side",
                     "quantity": "Qty", "reference_price": "Reference price", "fill_price": "Fill price",
-                    "gross": "Turnover", "charges": "Estimated charges", "segment": "Track",
+                    "gross": "Turnover", "brokerage": "Brokerage", "stt": "STT",
+                    "stamp_duty": "Stamp duty", "exchange_charges": "NSE charges",
+                    "sebi_charges": "SEBI fee", "ipft_charges": "IPFT",
+                    "gst": "GST", "charges": "Total charges", "charge_model_version": "Charge model",
+                    "segment": "Track",
                     "prediction_signal": "Model signal", "prediction_probability_up": "P(up)",
                     "prediction_expected_return": "Expected return", "prediction_model_version": "Model version",
                     "prediction_decision_timestamp": "Model decision time",
@@ -1104,8 +1453,10 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
 
     st.caption(
         "Simulation only: NSE cash-equity long/short accounting; no F&O or broker integration. "
-        "Short-sale proceeds are included in cash but reserved through the initial-margin calculation. "
-        "Initial/maintenance margin rates are illustrative simulator assumptions, not live exchange or broker requirements. "
-        "Charges and slippage are estimates, not a contract note. Use a persistent mounted path via "
-        "PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
+        "Cash and margin are allocated independently to Intraday, Delivery and Legacy. "
+        "Each fill records estimated brokerage, STT, stamp duty, NSE transaction/IPFT, SEBI fee and GST; "
+        "entry charges are included in position cost basis and exit charges reduce realised P&L. "
+        "Broker-specific per-order caps, DP charges, penalties and other contract-note items are not modelled. "
+        "Legacy fills retain historic unitemized fees. These amounts are estimates, not a contract note. "
+        "Use a persistent mounted path via PAPER_TRADING_DB_PATH if the hosting filesystem is ephemeral."
     )
