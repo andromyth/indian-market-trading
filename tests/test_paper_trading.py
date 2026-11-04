@@ -147,7 +147,7 @@ def test_place_order_applies_buy_slippage_and_charges(tmp_path, monkeypatch):
 
     assert fill["fill_price"] == pytest.approx(1_000.5)
     assert fill["gross"] == pytest.approx(2_001.0)
-    assert fill["charges"] == pytest.approx(2.73)
+    assert fill["charges"] == pytest.approx(4.73)
     assert fill["brokerage"] == pytest.approx(2.00)
     assert fill["stt"] == pytest.approx(2.00)
     assert fill["stamp_duty"] == pytest.approx(0.30)
