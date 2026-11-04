@@ -476,6 +476,7 @@ def calculate_portfolio(
         position = positions.setdefault(symbol, {"quantity": 0, "cost_basis": 0.0})
         signed_qty = int(position["quantity"])
         basis = float(position["cost_basis"])
+        unit_gross = gross / quantity
         fee_per_share = charges / quantity
         remaining = quantity
 
@@ -487,7 +488,7 @@ def calculate_portfolio(
                 covered = min(remaining, -signed_qty)
                 short_basis_per_share = basis / (-signed_qty)
                 realised += (
-                    short_basis_per_share - fill_price - fee_per_share
+                    short_basis_per_share - unit_gross - fee_per_share
                 ) * covered
                 basis -= short_basis_per_share * covered
                 signed_qty += covered
@@ -495,7 +496,7 @@ def calculate_portfolio(
             # Any excess BUY opens or adds to a long position.
             if remaining:
                 signed_qty += remaining
-                basis += (fill_price + fee_per_share) * remaining
+                basis += (unit_gross + fee_per_share) * remaining
 
         else:  # SELL
             cash += gross - charges
@@ -504,7 +505,7 @@ def calculate_portfolio(
                 closed = min(remaining, signed_qty)
                 long_basis_per_share = basis / signed_qty
                 realised += (
-                    fill_price - fee_per_share - long_basis_per_share
+                    unit_gross - fee_per_share - long_basis_per_share
                 ) * closed
                 basis -= long_basis_per_share * closed
                 signed_qty -= closed
@@ -513,7 +514,7 @@ def calculate_portfolio(
             # net of the entry fee and form the short position's cover basis.
             if remaining:
                 signed_qty -= remaining
-                basis += (fill_price - fee_per_share) * remaining
+                basis += (unit_gross - fee_per_share) * remaining
 
         if signed_qty == 0:
             basis = 0.0
@@ -559,15 +560,13 @@ def calculate_portfolio(
             "unrealised_pnl": position_pnl,
         }
 
-    cash = round(cash, 2)
-    long_market_value = round(long_market_value, 2)
-    short_liability = round(short_liability, 2)
-    equity = round(cash + long_market_value - short_liability, 2)
-    initial_margin = round(short_liability * INITIAL_SHORT_MARGIN_RATE, 2)
-    maintenance_margin = round(short_liability * MAINTENANCE_SHORT_MARGIN_RATE, 2)
-    available_cash = round(cash - initial_margin, 2)
-    margin_excess = round(equity - maintenance_margin, 2)
+    equity = cash + long_market_value - short_liability
+    initial_margin = short_liability * INITIAL_SHORT_MARGIN_RATE
+    maintenance_margin = short_liability * MAINTENANCE_SHORT_MARGIN_RATE
+    available_cash = cash - initial_margin
+    margin_excess = equity - maintenance_margin
     return {
+        "starting_capital": float(initial_cash),
         "cash": cash,
         "positions": open_positions,
         "realised_pnl": round(realised, 2),
@@ -587,13 +586,12 @@ def calculate_segmented_portfolio(
     initial_cash: float,
     fills: list[dict],
     market_prices: dict[str, float] | None = None,
+    segment_capitals: dict[str, float] | None = None,
 ) -> dict:
-    """Calculate separate strategy books against one shared cash/margin pool.
+    """Calculate isolated books and aggregate their cash and equity.
 
-    Position netting is performed inside each segment only. Cash flows and
-    short-margin reserves are aggregated across all segments, preventing
-    duplicated buying power while keeping Intraday and Delivery P&L separate.
-    Unclassified historical fills remain in LEGACY.
+    If segment_capitals is supplied, each book starts with its own allocation.
+    Omitting it retains compatibility with previous callers.
     """
     grouped: dict[str, list[dict]] = {name: [] for name in TRADING_SEGMENTS}
     for fill in fills:
@@ -602,32 +600,55 @@ def calculate_segmented_portfolio(
             segment = "LEGACY"
         grouped[segment].append(fill)
 
+    capital_map: dict[str, float] | None = None
+    if segment_capitals is not None:
+        capital_map = {
+            name: float(segment_capitals.get(name, 0.0))
+            for name in TRADING_SEGMENTS
+        }
+        if any(not math.isfinite(value) or value < 0 for value in capital_map.values()):
+            raise ValueError("Strategy allocations must be finite, non-negative amounts.")
+        if abs(sum(capital_map.values()) - float(initial_cash)) > 0.01:
+            raise ValueError("Strategy allocations must equal total starting capital.")
+
     segment_states = {
-        name: calculate_portfolio(0.0, rows, market_prices=market_prices)
+        name: calculate_portfolio(
+            capital_map[name] if capital_map is not None else 0.0,
+            rows,
+            market_prices=market_prices,
+        )
         for name, rows in grouped.items()
     }
-    cash = round(float(initial_cash) + sum(state["cash"] for state in segment_states.values()), 2)
-    long_market_value = round(sum(state["long_market_value"] for state in segment_states.values()), 2)
-    short_liability = round(sum(state["short_liability"] for state in segment_states.values()), 2)
-    realised = round(sum(state["realised_pnl"] for state in segment_states.values()), 2)
-    unrealised = round(sum(state["unrealised_pnl"] for state in segment_states.values()), 2)
-    initial_margin = round(sum(state["initial_margin_required"] for state in segment_states.values()), 2)
-    maintenance_margin = round(sum(state["maintenance_margin_required"] for state in segment_states.values()), 2)
-    equity = round(cash + long_market_value - short_liability, 2)
-    available_cash = round(cash - initial_margin, 2)
-    margin_excess = round(equity - maintenance_margin, 2)
+    starting_capital = (
+        sum(capital_map.values()) if capital_map is not None else float(initial_cash)
+    )
+    cash = (
+        sum(state["cash"] for state in segment_states.values())
+        if capital_map is not None
+        else starting_capital + sum(state["cash"] for state in segment_states.values())
+    )
+    long_market_value = sum(state["long_market_value"] for state in segment_states.values())
+    short_liability = sum(state["short_liability"] for state in segment_states.values())
+    realised = sum(state["realised_pnl"] for state in segment_states.values())
+    unrealised = sum(state["unrealised_pnl"] for state in segment_states.values())
+    initial_margin = sum(state["initial_margin_required"] for state in segment_states.values())
+    maintenance_margin = sum(state["maintenance_margin_required"] for state in segment_states.values())
+    equity = cash + long_market_value - short_liability
+    available_cash = cash - initial_margin
+    margin_excess = equity - maintenance_margin
     return {
-        "cash": cash,
+        "starting_capital": round(starting_capital, 2),
+        "cash": round(cash, 2),
         "segments": segment_states,
-        "realised_pnl": realised,
-        "unrealised_pnl": unrealised,
-        "long_market_value": long_market_value,
-        "short_liability": short_liability,
-        "equity": equity,
-        "initial_margin_required": initial_margin,
-        "maintenance_margin_required": maintenance_margin,
-        "available_cash": available_cash,
-        "margin_excess": margin_excess,
+        "realised_pnl": round(realised, 2),
+        "unrealised_pnl": round(unrealised, 2),
+        "long_market_value": round(long_market_value, 2),
+        "short_liability": round(short_liability, 2),
+        "equity": round(equity, 2),
+        "initial_margin_required": round(initial_margin, 2),
+        "maintenance_margin_required": round(maintenance_margin, 2),
+        "available_cash": round(available_cash, 2),
+        "margin_excess": round(margin_excess, 2),
         "margin_status": "CALL" if short_liability > 0 and margin_excess < -0.005 else "OK",
     }
 
@@ -665,9 +686,12 @@ def place_order(
     if not all(math.isfinite(x) and 0 <= x <= 500 for x in (fee_bps, slippage_bps)):
         raise ValueError("Invalid account fee or slippage settings.")
     impact = slippage_bps / 10_000.0
-    fill_price = reference * (1.0 + impact if direction == "BUY" else 1.0 - impact)
+    fill_price = round(reference * (1.0 + impact if direction == "BUY" else 1.0 - impact), 2)
     gross = round(qty * fill_price, 2)
-    charges = round(gross * fee_bps / 10_000.0, 2)
+    charge_breakdown = calculate_trade_charges(
+        selected_segment, direction, gross, fee_bps
+    )
+    charges = float(charge_breakdown["total_charges"])
 
     connection = _connect()
     try:
@@ -679,9 +703,13 @@ def place_order(
             dict(row) for row in connection.execute("SELECT * FROM paper_fills ORDER BY id").fetchall()
         ]
         initial_cash = float(current_account["initial_cash"])
+        segment_capitals = _segment_capitals_from_account(dict(current_account))
         mark_prices = dict(market_prices or {})
         mark_prices[root] = fill_price
-        before = calculate_segmented_portfolio(initial_cash, fills, market_prices=mark_prices)
+        before = calculate_segmented_portfolio(
+            initial_cash, fills, market_prices=mark_prices,
+            segment_capitals=segment_capitals,
+        )
         before_book = before["segments"][selected_segment]
         before_qty = int(before_book["positions"].get(root, {}).get("quantity", 0))
 
@@ -700,6 +728,7 @@ def place_order(
             initial_cash,
             fills + [candidate],
             market_prices=mark_prices,
+            segment_capitals=segment_capitals,
         )
         after_book = after["segments"][selected_segment]
         after_qty = int(after_book["positions"].get(root, {}).get("quantity", 0))
@@ -708,31 +737,44 @@ def place_order(
 
         # Existing positions can always be reduced or closed, including during
         # a margin call. New long or short exposure must fit available cash.
-        if (increased_long or increased_short) and after["available_cash"] < -0.005:
+        if (increased_long or increased_short) and after_book["available_cash"] < -0.005:
             raise ValueError(
-                "Insufficient free cash after reserving initial short margin. "
-                f"Required reserve: ₹{after['initial_margin_required']:,.2f}; "
-                f"cash balance after order: ₹{after['cash']:,.2f}; "
-                f"free cash: ₹{after['available_cash']:,.2f}."
+                f"Insufficient free cash in the {selected_segment.title()} book after "
+                "reserving initial short margin. "
+                f"Book cash: ₹{after_book['cash']:,.2f}; "
+                f"required reserve: ₹{after_book['initial_margin_required']:,.2f}; "
+                f"free cash: ₹{after_book['available_cash']:,.2f}."
             )
-        if increased_short and after["margin_excess"] < -0.005:
+        if increased_short and after_book["margin_excess"] < -0.005:
             raise ValueError(
-                "Short order rejected: projected equity would fall below the "
-                f"maintenance-margin requirement by ₹{abs(after['margin_excess']):,.2f}."
+                f"Short order rejected: projected {selected_segment.title()} equity "
+                "would fall below its maintenance-margin requirement by "
+                f"₹{abs(after_book['margin_excess']):,.2f}."
             )
 
         cursor = connection.execute(
             """
             INSERT INTO paper_fills(
                 timestamp_ist, symbol, segment, side, quantity, reference_price, fill_price,
-                gross, charges, source, quote_timestamp, prediction_signal,
+                gross, charges, brokerage, stt, stamp_duty, exchange_charges,
+                sebi_charges, ipft_charges, gst, charge_model_version,
+                source, quote_timestamp, prediction_signal,
                 prediction_probability_up, prediction_expected_return,
                 prediction_model_version, prediction_decision_timestamp,
                 prediction_horizon_min
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _now_ist(), root, selected_segment, direction, qty, reference, fill_price, gross, charges,
+                _now_ist(), root, selected_segment, direction, qty, reference,
+                fill_price, gross, charges,
+                float(charge_breakdown["brokerage"]),
+                float(charge_breakdown["stt"]),
+                float(charge_breakdown["stamp_duty"]),
+                float(charge_breakdown["exchange_charges"]),
+                float(charge_breakdown["sebi_charges"]),
+                float(charge_breakdown["ipft_charges"]),
+                float(charge_breakdown["gst"]),
+                str(charge_breakdown["charge_model_version"]),
                 str(source or ""), str(quote_timestamp or ""),
                 str(model.get("signal") or ""),
                 _finite_or_none(model.get("probability_up")),
