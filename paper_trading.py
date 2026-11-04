@@ -1213,27 +1213,6 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             + ("five-minute Intraday prediction." if segment == "INTRADAY" else "Delivery forecast.")
         )
 
-    st.subheader("5-minute Intraday prediction" if segment == "INTRADAY" else "Delivery forecast")
-    if selected_prediction and (
-        segment == "INTRADAY" or prediction_status not in {"ERROR", "BLOCKED", "ABSTAIN", "UNAVAILABLE"}
-    ):
-        prediction_row = {
-            "Track": segment,
-            "Horizon": "5 minutes" if segment == "INTRADAY" else "Next NSE session",
-            "Status": prediction_status,
-            "Signal": selected_prediction.get("signal", "—"),
-            "Probability up": _finite_or_none(selected_prediction.get("probability_up")),
-            "Expected return": _finite_or_none(selected_prediction.get("expected_return")),
-            "Predicted price": _finite_or_none(selected_prediction.get("predicted_price")),
-            "Target session": selected_prediction.get("target_session_date") or "—",
-            "Model version": selected_prediction.get("model_version", "—"),
-            "Decision time": selected_prediction.get("decision_timestamp", "—"),
-            "Reason": selected_prediction.get("signal_reason") or selected_prediction.get("reason") or "",
-        }
-        st.dataframe(pd.DataFrame([prediction_row]), use_container_width=True, hide_index=True)
-    else:
-        st.caption(f"{segment.title()} prediction unavailable: {prediction_unavailable_reason}")
-
     st.subheader("Place a simulated order")
     current_state = calculate_portfolio(
         0.0, list_fills(segment=segment)
@@ -1253,21 +1232,30 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         )
         execution_price = manual_price if manual_price > 0 else price
         estimated_fill = (
-            execution_price * (1 + float(account["slippage_bps"]) / 10_000)
-            if execution_price and side == "BUY"
-            else execution_price * (1 - float(account["slippage_bps"]) / 10_000)
+            round(
+                execution_price * (1 + float(account["slippage_bps"]) / 10_000)
+                if side == "BUY"
+                else execution_price * (1 - float(account["slippage_bps"]) / 10_000),
+                2,
+            )
             if execution_price else 0.0
         )
-        estimated_turnover = float(quantity) * estimated_fill
-        estimated_charges = estimated_turnover * float(account["fee_bps"]) / 10_000
+        estimated_turnover = round(float(quantity) * estimated_fill, 2)
+        estimated_costs = calculate_trade_charges(
+            segment, side, estimated_turnover, float(account["fee_bps"])
+        )
+        estimated_charges = float(estimated_costs["total_charges"])
         estimated_cash_flow = (
             -(estimated_turnover + estimated_charges)
             if side == "BUY" else estimated_turnover - estimated_charges
         )
         st.caption(
             f"Estimated fill: ₹{estimated_fill:,.2f} · Turnover: ₹{estimated_turnover:,.2f} · "
-            f"Charges: ₹{estimated_charges:,.2f} · "
-            f"{'Cash debit' if side == 'BUY' else 'Cash credit'}: ₹{abs(estimated_cash_flow):,.2f}"
+            f"Brokerage ₹{estimated_costs['brokerage']:,.2f} · STT ₹{estimated_costs['stt']:,.2f} · "
+            f"Stamp ₹{estimated_costs['stamp_duty']:,.2f} · "
+            f"NSE/SEBI/IPFT ₹{estimated_costs['exchange_charges'] + estimated_costs['sebi_charges'] + estimated_costs['ipft_charges']:,.2f} · "
+            f"GST ₹{estimated_costs['gst']:,.2f} · Total ₹{estimated_charges:,.2f} · "
+            f"{'Cash debit' if side == 'BUY' else 'Cash credit'} ₹{abs(estimated_cash_flow):,.2f}"
         )
         allow_stale = st.checkbox("Allow a stale / last-session price for this paper fill")
         confirm_order = st.checkbox("I confirm this is a simulated cash-equity order")
@@ -1357,9 +1345,8 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance."
     )
     st.caption(
-        f"Pricing source: {snapshot.get('source') or 'unavailable'} · "
-        f"Selected-symbol quote: {snapshot.get('price_freshness_status') or 'UNKNOWN'} · "
-        f"{segment.title()} model: {prediction_status}"
+        f"Price source: {snapshot.get('source') or 'unavailable'} · "
+        f"Quote status: {snapshot.get('price_freshness_status') or 'UNKNOWN'}"
     )
     with st.expander(f"{segment.title()} model information (optional)", expanded=False):
         probability = _finite_or_none(selected_prediction.get("probability_up"))
