@@ -2,7 +2,7 @@
   "report_version": 1,
   "step": 0,
   "title": "Freeze scope and record baseline",
-  "status": "BLOCKED",
+  "status": "PASS",
   "audited_at_utc": "2026-11-04T16:20:00Z",
   "repository": "andromyth/indian-market-trading",
   "branch": "backfill-roadmap",
@@ -10,7 +10,7 @@
   "branch_head_before_url": "https://github.com/andromyth/indian-market-trading/commit/542cf790d2472a4be1493114785b142019e37364",
   "parent_main_commit": "9342de9e029f74d0bd763082f7e6a4376cc41ca0",
   "roadmap_blob_sha": "762e2b520d8d5a27537508f1e67cd99a3aebc59f",
-  "repository_working_tree": "NOT APPLICABLE: user confirms all project files/work are maintained on GitHub; no local laptop checkout exists. GitHub remote branch and commit are the authoritative state.",
+  "repository_working_tree": "NOT APPLICABLE: user confirms all project files/work are maintained on GitHub; no local laptop checkout exists. GitHub remote branch and commit are authoritative.",
   "source_inspection": {
     "indstocks_backfill_all_nse_5m_history_py": "f38b434a11cdcf57f4dce18faf57f687f43806cb",
     "indstocks_client_py": "793885903eae7caacb015888f9e0c9f361b5a60f",
@@ -20,30 +20,68 @@
     "nifty_context_document_blob_sha": "541d2079dd0e8e12536b65caf2226798ea8ae09d"
   },
   "historical_archive": {
-    "expected_drive_root": "Google Drive: Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive",
-    "access_status": "NOT ACCESSIBLE from this chat's connected tools",
-    "files_count": "NOT VERIFIED",
-    "symbol_count": "NOT VERIFIED",
-    "bytes": "NOT VERIFIED",
-    "manifest_path": "Expected under the existing Drive archive/backfill storage, exact current path and contents NOT VERIFIED",
-    "manifest_status": "NOT VERIFIED",
-    "last_updated": "NOT VERIFIED",
-    "prior_context_only": "A 2026-10-31 audit mentioned 187 readable symbol Parquet files and 6,397,281 valid OHLC rows; this is historical evidence and is not treated as today's baseline."
+    "drive_root": "/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive",
+    "access_status": "VERIFIED by user's read-only Colab inventory",
+    "parquet_files": 2821,
+    "recognized_symbol_partitions": 188,
+    "nifty_context_partition": "__NIFTY50__",
+    "non_nifty_symbol_partitions": 187,
+    "total_parquet_bytes": 122786077,
+    "latest_parquet_modified_utc": "2026-11-03T15:25:26+00:00",
+    "expected_backfill_manifest_path": "/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive/backfill_manifest.json",
+    "expected_backfill_manifest_status": "NOT FOUND in recursive *.json inventory",
+    "manifests_found": [
+      {
+        "path": "/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive/symbols/symbol=__NIFTY50__/nifty50_kaggle_5m_close_only_manifest.json",
+        "bytes": 1177,
+        "modified_utc": "2026-11-03T15:25:26+00:00",
+        "role": "NIFTY 50 market-context manifest; not the equity backfill manifest"
+      }
+    ],
+    "coverage_metadata": "No historical equity backfill_manifest.json was present in the inventory, so no manifest-derived per-symbol session coverage is claimed at Step 0. Preserve as an explicit item for Step 3/6 investigation.",
+    "prior_context_only": "The 2026-10-31 audit mentioned 187 readable symbol files and 6,397,281 valid OHLC rows; historical only, not substituted for today's counts."
   },
   "active_backfill": {
-    "github_actions_query": "GET /repos/andromyth/indian-market-trading/actions/runs?per_page=100",
-    "runs_returned": 100,
-    "active_queued_or_in_progress_runs_in_returned_page": 0,
-    "branch_specific_runs": "No runs returned for branch backfill-roadmap",
-    "latest_seen_native_5m_backfill_run": {
-      "id": 41796785284,
-      "url": "https://github.com/andromyth/indian-market-trading/actions/runs/41796785284",
-      "branch": "main",
-      "status": "completed",
-      "conclusion": "failure",
-      "created_at_utc": "2026-11-04T08:05:04Z"
+    "github_actions": {
+      "branch": "backfill-roadmap",
+      "in_progress_runs": 0,
+      "queued_runs": 0,
+      "waiting_runs": 0,
+      "check": "GitHub Actions API status-filtered queries"
     },
-    "cloud_run_active_job": "NOT VERIFIED; Cloud Run service/jobs/logs are not connected"
+    "cloud_run_jobs": {
+      "region": "asia-south1",
+      "listed_jobs": 0
+    },
+    "cloud_run_service": {
+      "service": "indian-market-intraday-worker",
+      "region": "asia-south1",
+      "ready": true,
+      "latest_ready_revision": "indian-market-intraday-worker-00075-gmb",
+      "production_traffic_revision": "indian-market-intraday-worker-00075-gmb",
+      "production_traffic_percent": 100,
+      "tagged_preflight_revisions": [
+        "indian-market-intraday-worker-00065-tuj",
+        "indian-market-intraday-worker-00076-tef"
+      ]
+    },
+    "scheduler": {
+      "region": "asia-south1",
+      "enabled_intraday_jobs": [
+        "intraday-worker-finalize-1532",
+        "intraday-worker-1000-1459",
+        "intraday-worker-0915-0959",
+        "intraday-worker-1500-1530"
+      ],
+      "interpretation": "Expected live intraday collection schedules; left enabled"
+    },
+    "logs": {
+      "query_window": "last 24 hours",
+      "query_filter": "Cloud Run revision logs for indian-market-intraday-worker, filtered for backfill/historical/INDSTOCKS/progress/start/complete/pause terms",
+      "matching_lines_returned": 0,
+      "interpretation": "No matching backfill log lines were returned by the supplied filter; this is supporting evidence, not proof that all unfiltered service logs are empty."
+    },
+    "conclusion": "No active GitHub Actions run, Cloud Run Job, or matching historical backfill log was observed in the supplied checks. The live intraday service and schedules remain active."
   },
   "production_model": {
     "manifest_path_in_repo": "production_model/DEPLOYMENT_MODEL_MANIFEST_2026.json",
@@ -51,10 +89,11 @@
     "model_family": "logistic_regression",
     "feature_count": 137,
     "declared_model_sha256": "c2d7067f5ea3daa006eaa0ecb0c5aca75f3084591712ea27b6486ef4873d4271",
-    "declared_drive_model_path": "/content/drive/MyDrive/Indian_Market_Research/processed/universe_expansion_2026_v4/production_models_v2/deployment_classifier_logistic_regression_2026.joblib",
-    "drive_model_hash_currently_verified": false,
-    "repo_model_blob_sha": "d2836360e2f5fa46282a99760805f42173fcff7b",
-    "change_guard": "No model file, source code, deployment, credential, or market-data archive was modified during the inspection."
+    "actual_drive_model_path": "/content/drive/MyDrive/Indian_Market_Research/processed/universe_expansion_2026_v4/production_models_v2/deployment_classifier_logistic_regression_2026.joblib",
+    "actual_drive_model_size_bytes": 9617,
+    "actual_drive_model_sha256": "c2d7067f5ea3daa006eaa0ecb0c5aca75f3084591712ea27b6486ef4873d4271",
+    "checksum_match": true,
+    "change_guard": "No model file, source code, deployment, credential, or market-data file was modified during the inspection."
   },
   "scope_guard": {
     "native_interval": "5-minute equity OHLCV only",
@@ -69,18 +108,27 @@
     "repository_and_commit_verified": true,
     "code_paths_inspected": true,
     "active_github_actions_checked": true,
-    "drive_archive_inventory_verified": false,
-    "cloud_run_active_job_verified": false,
-    "production_model_drive_hash_reverified": false,
-    "reproducible_complete_baseline": false,
-    "overall_step_status": "BLOCKED",
-    "local_working_tree_status": "NOT APPLICABLE (no local checkout; GitHub is authoritative)"
+    "drive_archive_inventory_verified": true,
+    "cloud_run_active_job_checked": true,
+    "production_model_drive_hash_reverified": true,
+    "reproducible_baseline_saved": true,
+    "local_working_tree_status": "NOT APPLICABLE (no local checkout; GitHub is authoritative)",
+    "backfill_manifest": "Expected root manifest absent; accurately recorded as a baseline exception for later source/archive investigation",
+    "overall_step_status": "PASS"
   },
-  "blockers": [
-    "Google Drive is not connected to this chat, so the current archive inventory, manifest, per-symbol counts, bytes and modification times cannot be verified.",
-    "Google Cloud/Cloud Run access is not connected, so an active Cloud Run backfill job cannot be ruled out.",
-    "The repository API does not expose a local working tree; only the remote branch and commit were verified.",
-    "The model SHA-256 is declared by the repository manifest but the actual Drive model bytes could not be read and re-hashed."
+  "blockers": [],
+  "next_allowed_step": "Step 1 — Locate and inventory the original Kaggle equity archive. Step 1 must inspect the original large device-only archive; do not substitute the 11 MB sample/partial upload.",
+  "audit_date_local": "2026-11-04",
+  "baseline_exceptions": [
+    "The expected archive-root backfill_manifest.json was not present in the recursive JSON inventory; only the separate NIFTY context manifest was found. Do not treat the NIFTY manifest as an equity manifest. Investigate in Step 3/6; do not infer per-symbol complete-session coverage from file counts.",
+    "The Cloud Run log filter returned no matching historical-backfill lines; this is recorded as no matching evidence, not proof that the entire unfiltered log stream is empty."
   ],
-  "next_allowed_step": "Remain on Step 0 until the user runs the read-only Drive/Cloud Run preflight and supplies its output; then update the baseline and only proceed to Step 1 after Step 0 PASS."
+  "drive_paths_read": [
+    "/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive",
+    "/content/drive/MyDrive/Indian_Market_Research/processed/universe_expansion_2026_v4/production_models_v2/deployment_classifier_logistic_regression_2026.joblib"
+  ],
+  "drive_paths_written": [],
+  "backfill_started": false,
+  "model_training_started": false,
+  "model_or_threshold_changes": false
 }
