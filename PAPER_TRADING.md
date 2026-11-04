@@ -51,7 +51,7 @@ Set `PAPER_TRADING_DB_PATH` to a mounted persistent path when the hosting filesy
 PAPER_TRADING_DB_PATH=/mnt/persistent/paper_trading.sqlite3
 ```
 
-The existing fill history is retained. Existing untagged BUY/SELL fills replay in Legacy / Unassigned and are not reclassified. For an existing account, the allocation migration assigns ₹5,000 to Intraday and the remaining opening capital to Legacy when unclassified fills exist, otherwise to Delivery. Classified historical fills retain their strategy tag. The combined account summary aggregates cash, market value, liabilities and P&L across books; each book tab also displays its own starting allocation, cash, free cash, margin excess, positions, P&L and itemised ledger.
+The existing fill history is retained. Existing untagged BUY/SELL fills replay in Legacy / Unassigned and are not reclassified. For an existing account, the allocation migration assigns ₹5,000 to Intraday and the remaining opening capital to Legacy when unclassified fills exist, otherwise to Delivery. Classified historical fills retain their strategy tag. The active strategy book is the main account summary; combined cash, market value, liabilities and P&L are available in a collapsed combined-account section. Each book tab also displays its own starting allocation, cash, free cash, margin excess, positions, P&L and itemised ledger.
 
 The schema migration preserves old fill rows. For already classified Intraday/Delivery fills, the previous generic charges estimate is retained as the brokerage component and missing statutory levies are added once; unclassified Legacy fills retain their previous unitemised charge value. Resetting the paper account clears every book and still requires an explicit confirmation checkbox.
 
