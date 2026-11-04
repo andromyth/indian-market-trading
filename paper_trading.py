@@ -1309,10 +1309,9 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
     )
     selected_book_state = state["segments"][segment]
     selected_book_capital = float(segment_capitals[segment])
-    selected_book_pnl = round(
+    selected_book_pnl = _money(
         float(selected_book_state["realised_pnl"])
-        + float(selected_book_state["unrealised_pnl"]),
-        2,
+        + float(selected_book_state["unrealised_pnl"])
     )
     selected_book_return = (
         selected_book_pnl / selected_book_capital * 100
@@ -1362,7 +1361,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         f"Quote status: {snapshot.get('price_freshness_status') or 'UNKNOWN'}"
     )
 
-    combined_pnl = round(float(state["realised_pnl"]) + float(state["unrealised_pnl"]), 2)
+    combined_pnl = _money(float(state["realised_pnl"]) + float(state["unrealised_pnl"]))
     with st.expander("Combined account · all strategy books", expanded=False):
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Combined cash", f"₹{state['cash']:,.2f}")
