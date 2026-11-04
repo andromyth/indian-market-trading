@@ -4,7 +4,7 @@
 
 **Execution mode:** Run exactly one numbered step per separate development-agent chat. Do not skip ahead. Each step has its own objective, constraints, deliverables, acceptance checks and copy/paste prompt.
 
-**Current status:** ROADMAP PREPARED — execution has not been performed by this document.
+**Current status:** Step 0 PASS — baseline recorded on `backfill-roadmap`; next allowed step is Step 1. See `backfill_baseline.md` and `backfill_baseline.json`.
 
 ---
 
@@ -185,6 +185,10 @@ Before using **GitHub → Actions → Run workflow**, verify the workflow name a
 # 3. Step-by-step execution plan
 
 ## Step 0 — Freeze the scope and record the baseline
+
+**Final execution record (2026-11-04): PASS.** User-supplied read-only Colab output verified the archive root (2,821 Parquet files; 188 `symbol=` partitions including the separate `__NIFTY50__` partition; 122,786,077 bytes; latest modification 2026-11-03 15:25:26 UTC) and confirmed the actual Drive production model SHA-256 matches the repository manifest. Cloud checks found zero Cloud Run Jobs, a Ready live intraday service and four enabled live intraday Scheduler jobs; the supplied last-24-hour filtered log query returned no matching historical-backfill lines. GitHub Actions status-filtered queries returned zero in-progress, queued or waiting runs. No backfill/model work was started and live collection was left enabled.
+
+**Recorded exception:** the repository helper expects `production_data/nse_official/intraday_seed/olo_5m_archive/backfill_manifest.json`, but the recursive Drive inventory found only the separate NIFTY context manifest. The equity backfill manifest is recorded as NOT FOUND; no complete-session coverage is inferred. Investigate this exception in Step 3/Step 6. It does not prevent Step 0's baseline objective from passing because the absence itself is now explicitly recorded.
 
 **Environment clarification (2026-11-04):** User confirms the project is maintained on GitHub and there is no local laptop checkout. Local `git status` is not required and is not a Step 0 blocker; the verified remote branch HEAD is authoritative.
 
@@ -543,7 +547,7 @@ Update this ledger only after the evidence and acceptance checks for that step h
 
 | Step | Description | Status | Commit / evidence | Artifact path | Date |
 |---:|---|---|---|---|---|
-| 0 | Freeze scope and baseline | BLOCKED | `542cf790d2472a4be1493114785b142019e37364` (inspection start); baseline commits recorded on branch | `backfill_baseline.json`; `backfill_baseline.md` | 2026-11-04 |
+| 0 | Freeze scope and baseline | PASS | Verified Drive inventory and model SHA-256; zero queued/in-progress/waiting Actions runs and zero Cloud Run Jobs | `backfill_baseline.json`; `backfill_baseline.md` | 2026-11-04 |
 | 1 | Original Kaggle archive inventory | NOT STARTED | — | — | — |
 | 2 | Kaggle source/data-quality audit | NOT STARTED | — | — | — |
 | 3 | Existing Drive archive inventory | NOT STARTED | — | — | — |
