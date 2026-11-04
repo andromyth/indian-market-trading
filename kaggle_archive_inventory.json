@@ -1,0 +1,84 @@
+{
+  "report_version": 1,
+  "step": 1,
+  "title": "Locate and inventory the original Kaggle equity archive",
+  "status": "BLOCKED",
+  "audit_date_local": "2026-11-04",
+  "repository": "andromyth/indian-market-trading",
+  "branch": "backfill-roadmap",
+  "branch_head_before": "3cbaa1080033bb2bf49e1628b7458a52866b397e",
+  "access_check": {
+    "user_device_filesystem": "NOT ACCESSIBLE from this ChatGPT session",
+    "mounted_runtime_paths_checked": [
+      "/mnt/data",
+      "/home/oai/share",
+      "/tmp"
+    ],
+    "mounted_archive_candidates_found": 0,
+    "conversation_and_library_archive_search": "No compressed archive candidates were returned for ZIP/7z/RAR/TAR/GZ searches.",
+    "interpretation": "The original archive is described in the Step 0 handoff as residing on the user's device. No archive bytes or device path were available to inspect in this session."
+  },
+  "original_archive": {
+    "expected_role": "Original full Kaggle equity-history archive",
+    "exact_path": null,
+    "filename": null,
+    "size_bytes": null,
+    "sha256": null,
+    "archive_format": null,
+    "compression": null,
+    "member_count": null,
+    "members": [],
+    "inspection_status": "NOT ACCESSIBLE",
+    "reason": "The original archive was not attached or mounted in the current runtime. Its identity, byte size, checksum and contents therefore remain unverified."
+  },
+  "previously_referenced_small_upload": {
+    "reported_size_description": "approximately 11 MB",
+    "present_in_current_runtime": false,
+    "treated_as_original": false,
+    "completeness": "NOT DETERMINED",
+    "note": "The Step 0 handoff explicitly warns not to substitute this earlier small upload for the original. Its bytes were not available for comparison in this session."
+  },
+  "member_inventory": {
+    "archive_member_list": "NOT INSPECTED",
+    "file_formats": [],
+    "compression_methods": [],
+    "folder_structure": "NOT INSPECTED",
+    "equity_data_presence": "NOT DETERMINED",
+    "index_data_presence": "NOT DETERMINED",
+    "metadata_or_documentation_presence": "NOT DETERMINED",
+    "unrelated_files_presence": "NOT DETERMINED"
+  },
+  "work_performed": [
+    "Read BACKFILL_ROADMAP.md directly from the backfill-roadmap branch.",
+    "Read the Step 0 handoff reports backfill_baseline.md and backfill_baseline.json.",
+    "Verified that the backfill-roadmap branch exists and resolved its current head to 3cbaa1080033bb2bf49e1628b7458a52866b397e before this Step 1 report.",
+    "Checked the mounted runtime paths /mnt/data, /home/oai/share and /tmp for archive candidates; none were found.",
+    "Searched available conversation and Library files for compressed Kaggle archive candidates; none were returned."
+  ],
+  "acceptance": {
+    "original_file_identity_recorded": false,
+    "exact_byte_size_recorded": false,
+    "sha256_recorded": false,
+    "archive_members_inventoried": false,
+    "formats_compression_and_folder_structure_inventoried": false,
+    "original_vs_small_sample_determined": false,
+    "overall": "BLOCKED — original archive is inaccessible"
+  },
+  "scope_guard": {
+    "archive_modified": false,
+    "archive_extracted": false,
+    "market_data_imported": false,
+    "google_drive_paths_read": [],
+    "google_drive_paths_written": [],
+    "repository_code_changed": false,
+    "historical_backfill_started": false,
+    "model_training_started": false,
+    "production_model_or_threshold_changed": false,
+    "live_collection_or_scheduler_changed": false
+  },
+  "blockers": [
+    "The original full Kaggle archive is on the user's device and is not accessible to this session."
+  ],
+  "required_user_action": "Attach the original full Kaggle archive to this conversation, or place it in a runtime-accessible location and provide that exact path. Do not substitute the previously referenced approximately 11 MB upload.",
+  "next_allowed_step": "Resume Step 1 only after the original archive is accessible. Step 2 remains unauthorized until the Step 1 inventory passes."
+}
