@@ -10,6 +10,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -63,6 +64,11 @@ def _now_ist() -> str:
     return datetime.now(IST).isoformat(timespec="seconds")
 
 
+def _money(value: float) -> float:
+    """Round a rupee amount to paise using financial half-up rounding."""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def calculate_trade_charges(
     segment: str,
     side: str,
@@ -87,25 +93,21 @@ def calculate_trade_charges(
     if not math.isfinite(brokerage_rate) or not 0 <= brokerage_rate <= 500:
         raise ValueError("Brokerage rate must be between 0 and 500 bps.")
 
-    brokerage = round(amount * brokerage_rate / 10_000.0, 2)
+    brokerage = _money(amount * brokerage_rate / 10_000.0)
     if selected_segment == "INTRADAY":
-        stt = round(amount * 0.00025, 2) if direction == "SELL" else 0.0
-        stamp_duty = round(amount * 0.00003, 2) if direction == "BUY" else 0.0
+        stt = _money(amount * 0.00025) if direction == "SELL" else 0.0
+        stamp_duty = _money(amount * 0.00003) if direction == "BUY" else 0.0
     else:
-        stt = round(amount * 0.001, 2)
-        stamp_duty = round(amount * 0.00015, 2) if direction == "BUY" else 0.0
+        stt = _money(amount * 0.001)
+        stamp_duty = _money(amount * 0.00015) if direction == "BUY" else 0.0
 
-    exchange_charges = round(amount * NSE_TRANSACTION_CHARGE_RATE, 2)
-    sebi_charges = round(amount * SEBI_TURNOVER_FEE_RATE, 2)
-    ipft_charges = round(amount * NSE_IPFT_CHARGE_RATE, 2)
-    gst = round(
-        (brokerage + exchange_charges + sebi_charges + ipft_charges) * GST_RATE,
-        2,
-    )
-    total = round(
+    exchange_charges = _money(amount * NSE_TRANSACTION_CHARGE_RATE)
+    sebi_charges = _money(amount * SEBI_TURNOVER_FEE_RATE)
+    ipft_charges = _money(amount * NSE_IPFT_CHARGE_RATE)
+    gst = _money((brokerage + exchange_charges + sebi_charges + ipft_charges) * GST_RATE)
+    total = _money(
         brokerage + stt + stamp_duty + exchange_charges
-        + sebi_charges + ipft_charges + gst,
-        2,
+        + sebi_charges + ipft_charges + gst
     )
     return {
         "brokerage": brokerage,
@@ -270,19 +272,18 @@ def init_db() -> None:
             if segment in {"INTRADAY", "DELIVERY"}:
                 # Preserve historic estimate as brokerage, then add statutory
                 # levies that the previous one-rate model omitted.
-                brokerage = round(max(0.0, float(row["charges"])), 2)
+                brokerage = _money(max(0.0, float(row["charges"])) )
                 statutory = calculate_trade_charges(
                     segment, str(row["side"]), float(row["gross"]), 0.0
                 )
                 exchange = float(statutory["exchange_charges"])
                 sebi = float(statutory["sebi_charges"])
                 ipft = float(statutory["ipft_charges"])
-                gst = round((brokerage + exchange + sebi + ipft) * GST_RATE, 2)
+                gst = _money((brokerage + exchange + sebi + ipft) * GST_RATE)
                 stt = float(statutory["stt"])
                 stamp_duty = float(statutory["stamp_duty"])
-                total = round(
-                    brokerage + stt + stamp_duty + exchange + sebi + ipft + gst,
-                    2,
+                total = _money(
+                    brokerage + stt + stamp_duty + exchange + sebi + ipft + gst
                 )
                 connection.execute(
                     """
@@ -553,7 +554,7 @@ def calculate_portfolio(
         open_positions[symbol] = {
             "side": side_name,
             "quantity": quantity,
-            "cost_basis": round(basis, 2),
+            "cost_basis": _money(basis),
             "average_cost": average_cost,
             "mark_price": mark,
             "market_value": position_value,
@@ -638,17 +639,17 @@ def calculate_segmented_portfolio(
     margin_excess = equity - maintenance_margin
     return {
         "starting_capital": round(starting_capital, 2),
-        "cash": round(cash, 2),
+        "cash": _money(cash),
         "segments": segment_states,
-        "realised_pnl": round(realised, 2),
-        "unrealised_pnl": round(unrealised, 2),
-        "long_market_value": round(long_market_value, 2),
-        "short_liability": round(short_liability, 2),
-        "equity": round(equity, 2),
-        "initial_margin_required": round(initial_margin, 2),
-        "maintenance_margin_required": round(maintenance_margin, 2),
-        "available_cash": round(available_cash, 2),
-        "margin_excess": round(margin_excess, 2),
+        "realised_pnl": _money(realised),
+        "unrealised_pnl": _money(unrealised),
+        "long_market_value": _money(long_market_value),
+        "short_liability": _money(short_liability),
+        "equity": _money(equity),
+        "initial_margin_required": _money(initial_margin),
+        "maintenance_margin_required": _money(maintenance_margin),
+        "available_cash": _money(available_cash),
+        "margin_excess": _money(margin_excess),
         "margin_status": "CALL" if short_liability > 0 and margin_excess < -0.005 else "OK",
     }
 
@@ -686,8 +687,8 @@ def place_order(
     if not all(math.isfinite(x) and 0 <= x <= 500 for x in (fee_bps, slippage_bps)):
         raise ValueError("Invalid account fee or slippage settings.")
     impact = slippage_bps / 10_000.0
-    fill_price = round(reference * (1.0 + impact if direction == "BUY" else 1.0 - impact), 2)
-    gross = round(qty * fill_price, 2)
+    fill_price = _money(reference * (1.0 + impact if direction == "BUY" else 1.0 - impact))
+    gross = _money(qty * fill_price)
     charge_breakdown = calculate_trade_charges(
         selected_segment, direction, gross, fee_bps
     )
