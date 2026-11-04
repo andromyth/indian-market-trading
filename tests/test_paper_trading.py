@@ -505,3 +505,27 @@ def test_segment_cash_and_risk_are_not_shared(tmp_path, monkeypatch):
     )
     assert state["segments"]["DELIVERY"]["cash"] == pytest.approx(95_000)
     assert state["cash"] == pytest.approx(95_000 + 5_000 - fill["gross"] - fill["charges"])
+
+
+
+def test_paper_trading_selects_exact_30_minute_prediction():
+    predictions = [
+        {"horizon_min": 5, "signal": "BUY_5M"},
+        {"horizon_min": 15, "signal": "HOLD_15M"},
+        {"horizon_min": 30, "signal": "SELL_30M"},
+    ]
+    selected = paper._select_prediction_for_horizon(
+        predictions,
+        30,
+        preferred={"horizon_min": 5, "signal": "WRONG_PREFERRED_5M"},
+    )
+    assert selected["horizon_min"] == 30
+    assert selected["signal"] == "SELL_30M"
+
+
+def test_paper_trading_does_not_substitute_wrong_horizon_when_30m_missing():
+    predictions = [
+        {"horizon_min": 5, "signal": "BUY_5M"},
+        {"horizon_min": 15, "signal": "HOLD_15M"},
+    ]
+    assert paper._select_prediction_for_horizon(predictions, 30) == {}
