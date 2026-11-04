@@ -1188,10 +1188,16 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
         )
         if not fresh:
-            st.warning(
-                f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
-                f"{snapshot.get('price_freshness_reason') or 'The price is display-only and cannot unlock model inference.'}"
-            )
+            if segment == "INTRADAY":
+                st.warning(
+                    f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
+                    f"{snapshot.get('price_freshness_reason') or 'The 30-minute intraday model requires fresh stock and benchmark inputs.'}"
+                )
+            else:
+                st.caption(
+                    "The intraday quote is stale or unverified. The Delivery forecast uses completed daily OHLC "
+                    "history and is checked separately for source-session freshness."
+                )
     elif snapshot:
         st.warning("No market quote is currently available. Enter a manual reference price to test the ledger.")
     else:
