@@ -1126,6 +1126,24 @@ def _cached_7day_ohlc_forecast(symbol: str, refresh_revision: int = 0) -> dict:
     return forecast_next_sessions(frame, n_sessions=7)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_paper_trading_7day_forecast(symbol: str, refresh_revision: int = 0) -> dict:
+    """Return the guarded seven-session OHLC forecast used by the Delivery paper book."""
+    result = _cached_7day_ohlc_forecast(symbol, refresh_revision)
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    as_of = result.get("as_of_date")
+    candidate_dates = (
+        _next_nse_session_dates(as_of, len(result.get("forecasts", []) or []) or 7)
+        if as_of else []
+    )
+    return guard_daily_forecast_for_display(
+        result,
+        expected_latest_session=latest_completed_nse_session(now.to_pydatetime()),
+        now_ist=now,
+        target_sessions=candidate_dates,
+    )
+
+
 def _next_nse_session_dates(as_of_date, count: int = 7) -> list:
     """Return future weekdays excluding the project's known NSE holiday dates."""
     try:
@@ -1394,23 +1412,23 @@ def _cached_paper_trading_snapshot(
             market_frame,
             decision_interval_minutes=5,
         )
-        five_minute = [
+        thirty_minute = [
             dict(item) for item in (predictions or [])
-            if int(item.get("horizon_min", 0) or 0) == 5
+            if int(item.get("horizon_min", 0) or 0) == 30
         ]
-        output["predictions"] = five_minute
-        output["prediction"] = five_minute[0] if five_minute else {}
-        output["prediction_ready"] = bool(five_minute)
-        output["prediction_horizon_min"] = 5
+        output["predictions"] = thirty_minute
+        output["prediction"] = thirty_minute[0] if thirty_minute else {}
+        output["prediction_ready"] = bool(thirty_minute)
+        output["prediction_horizon_min"] = 30
         if not output["prediction_ready"]:
             reasons = [
                 str(item.get("reason") or item.get("signal_reason") or "")
                 for item in (predictions or [])
-                if int(item.get("horizon_min", 0) or 0) == 5
+                if int(item.get("horizon_min", 0) or 0) == 30
             ]
             output["prediction_freshness_reason"] = (
                 reasons[0] if reasons else
-                "The runtime returned no eligible 5-minute prediction."
+                "The runtime returned no eligible 30-minute prediction."
             )
         return output
     except Exception as exc:
@@ -1431,7 +1449,7 @@ if interface_mode == "Paper Trading":
 
     render_paper_trading(
         _cached_paper_trading_snapshot,
-        delivery_prediction_loader=_cached_watch_delivery_prediction,
+        delivery_prediction_loader=_cached_paper_trading_7day_forecast,
     )
     st.stop()
 
