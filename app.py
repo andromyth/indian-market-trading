@@ -1412,22 +1412,24 @@ def _cached_paper_trading_snapshot(
             market_frame,
             decision_interval_minutes=5,
         )
-        thirty_minute = [
-            dict(item) for item in (predictions or [])
-            if int(item.get("horizon_min", 0) or 0) == 30
+        requested_horizons = (5, 10, 15, 20, 25, 30)
+        intraday_horizons = {
+            int(item.get("horizon_min", 0) or 0): dict(item)
+            for item in (predictions or [])
+            if int(item.get("horizon_min", 0) or 0) in requested_horizons
+        }
+        output["predictions"] = [
+            intraday_horizons[horizon]
+            for horizon in requested_horizons
+            if horizon in intraday_horizons
         ]
-        output["predictions"] = thirty_minute
-        output["prediction"] = thirty_minute[0] if thirty_minute else {}
+        thirty_minute = intraday_horizons.get(30, {})
+        output["prediction"] = thirty_minute
         output["prediction_ready"] = bool(thirty_minute)
         output["prediction_horizon_min"] = 30
-        if not output["prediction_ready"]:
-            reasons = [
-                str(item.get("reason") or item.get("signal_reason") or "")
-                for item in (predictions or [])
-                if int(item.get("horizon_min", 0) or 0) == 30
-            ]
+        output["prediction_horizons_returned"] = sorted(intraday_horizons)
+        if not thirty_minute:
             output["prediction_freshness_reason"] = (
-                reasons[0] if reasons else
                 "The runtime returned no eligible 30-minute prediction."
             )
         return output
