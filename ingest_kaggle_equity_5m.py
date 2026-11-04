@@ -18,7 +18,7 @@ IST = "Asia/Kolkata"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 MIN_SESSION_BARS = 50
 REMOTE = Path("production_data/nse_official/intraday_seed/olo_5m_archive/symbols")
-INDEX_SYMBOLS = {"NIFTY", "NIFTY50", "NIFTY_50", "NIFTY50INDEX", "NIFTYBANK", "BANKNIFTY", "NIFTYIT"}
+INDEX_SYMBOLS = {"NIFTY", "NIFTY50", "NIFTY_50", "NIFTY50INDEX", "NIFTY50_INDEX", "NIFTY_INDEX", "NIFTYBANK", "NIFTY_BANK", "BANKNIFTY", "NIFTYIT"}
 ALIASES = {
     "Open": ("open", "o", "openprice"),
     "High": ("high", "h", "highprice"),
@@ -109,9 +109,9 @@ def csv_streams(source: Path) -> Iterator[tuple[str, TextIO]]:
             if not members:
                 raise ValueError("ZIP contains no CSV members.")
             for member in members:
-                # A standalone index file is deliberately handled by its own importer.
-                if "nifty" in Path(member).stem.lower() and "symbol" not in Path(member).stem.lower():
-                    continue
+                # Do not skip a combined equity file merely because its name
+                # contains "NIFTY" (e.g. NIFTY500 stocks). Index rows are
+                # excluded by normalized symbol identity instead.
                 with archive.open(member) as raw:
                     with io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace") as stream:
                         yield member, stream
@@ -125,8 +125,6 @@ def csv_streams(source: Path) -> Iterator[tuple[str, TextIO]]:
     if not paths:
         raise ValueError("Input contains no CSV files.")
     for path in paths:
-        if "nifty" in path.stem.lower() and "symbol" not in path.stem.lower():
-            continue
         with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
             yield str(path.relative_to(source)) if source.is_dir() else path.name, stream
 
