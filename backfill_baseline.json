@@ -3,14 +3,14 @@
   "step": 0,
   "title": "Freeze scope and record baseline",
   "status": "BLOCKED",
-  "audited_at_utc": "2026-11-04T16:00:00Z",
+  "audited_at_utc": "2026-11-04T16:20:00Z",
   "repository": "andromyth/indian-market-trading",
   "branch": "backfill-roadmap",
   "branch_head_before": "542cf790d2472a4be1493114785b142019e37364",
   "branch_head_before_url": "https://github.com/andromyth/indian-market-trading/commit/542cf790d2472a4be1493114785b142019e37364",
   "parent_main_commit": "9342de9e029f74d0bd763082f7e6a4376cc41ca0",
   "roadmap_blob_sha": "762e2b520d8d5a27537508f1e67cd99a3aebc59f",
-  "repository_working_tree": "NOT OBSERVABLE through the GitHub repository API; no local checkout is attached",
+  "repository_working_tree": "NOT APPLICABLE: user confirms all project files/work are maintained on GitHub; no local laptop checkout exists. GitHub remote branch and commit are the authoritative state.",
   "source_inspection": {
     "indstocks_backfill_all_nse_5m_history_py": "f38b434a11cdcf57f4dce18faf57f687f43806cb",
     "indstocks_client_py": "793885903eae7caacb015888f9e0c9f361b5a60f",
@@ -73,7 +73,8 @@
     "cloud_run_active_job_verified": false,
     "production_model_drive_hash_reverified": false,
     "reproducible_complete_baseline": false,
-    "overall_step_status": "BLOCKED"
+    "overall_step_status": "BLOCKED",
+    "local_working_tree_status": "NOT APPLICABLE (no local checkout; GitHub is authoritative)"
   },
   "blockers": [
     "Google Drive is not connected to this chat, so the current archive inventory, manifest, per-symbol counts, bytes and modification times cannot be verified.",
