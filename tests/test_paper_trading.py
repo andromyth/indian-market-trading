@@ -114,7 +114,7 @@ def test_place_order_rejects_insufficient_long_cash_but_allows_short_and_cover(t
     with pytest.raises(ValueError, match="Insufficient free cash"):
         paper.place_order("SBIN", "BUY", 11, 100, account, segment="INTRADAY")
 
-    short_fill = paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
+    short_fill = paper.place_order("IDEA", "SELL", 19, 100, account, segment="INTRADAY")
     assert short_fill["side"] == "SELL"
     state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
     assert state["positions"]["IDEA"]["quantity"] == -19
