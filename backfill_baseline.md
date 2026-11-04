@@ -21,7 +21,7 @@ This chat has no connected Google Drive or Google Cloud/Cloud Run tool. Therefor
 
 `Google Drive / Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive`
 
-An older 2026-10-31 report mentioned 187 readable symbol files and 6,397,281 valid OHLC rows. Those historical figures are not substituted for the current baseline. The GitHub API also cannot report a local checkout's uncommitted working-tree status.
+An older 2026-10-31 report mentioned 187 readable symbol files and 6,397,281 valid OHLC rows. Those historical figures are not substituted for the current baseline. The user confirmed that no local checkout exists and all project files/work are maintained on GitHub; therefore local working-tree status is not applicable. The remote branch HEAD is the authoritative repository state.
 
 ## Required action to unblock
 
