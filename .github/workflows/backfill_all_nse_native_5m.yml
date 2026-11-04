@@ -39,6 +39,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: nse-native-5m-history-backfill
