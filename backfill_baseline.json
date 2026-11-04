@@ -1,0 +1,85 @@
+{
+  "report_version": 1,
+  "step": 0,
+  "title": "Freeze scope and record baseline",
+  "status": "BLOCKED",
+  "audited_at_utc": "2026-11-04T16:00:00Z",
+  "repository": "andromyth/indian-market-trading",
+  "branch": "backfill-roadmap",
+  "branch_head_before": "542cf790d2472a4be1493114785b142019e37364",
+  "branch_head_before_url": "https://github.com/andromyth/indian-market-trading/commit/542cf790d2472a4be1493114785b142019e37364",
+  "parent_main_commit": "9342de9e029f74d0bd763082f7e6a4376cc41ca0",
+  "roadmap_blob_sha": "762e2b520d8d5a27537508f1e67cd99a3aebc59f",
+  "repository_working_tree": "NOT OBSERVABLE through the GitHub repository API; no local checkout is attached",
+  "source_inspection": {
+    "indstocks_backfill_all_nse_5m_history_py": "f38b434a11cdcf57f4dce18faf57f687f43806cb",
+    "indstocks_client_py": "793885903eae7caacb015888f9e0c9f361b5a60f",
+    "persistent_store_py": "0bfc3164c2875a9b331842c79bf913dc225064f5",
+    "autonomous_intraday_worker_service_py": "cf257e59a9788f9c8559b83e78cd215de51bb4e5",
+    "nifty_context_document": "NIFTY50_KAGGLE_5M_INTEGRATION.md",
+    "nifty_context_document_blob_sha": "541d2079dd0e8e12536b65caf2226798ea8ae09d"
+  },
+  "historical_archive": {
+    "expected_drive_root": "Google Drive: Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive",
+    "access_status": "NOT ACCESSIBLE from this chat's connected tools",
+    "files_count": "NOT VERIFIED",
+    "symbol_count": "NOT VERIFIED",
+    "bytes": "NOT VERIFIED",
+    "manifest_path": "Expected under the existing Drive archive/backfill storage, exact current path and contents NOT VERIFIED",
+    "manifest_status": "NOT VERIFIED",
+    "last_updated": "NOT VERIFIED",
+    "prior_context_only": "A 2026-10-31 audit mentioned 187 readable symbol Parquet files and 6,397,281 valid OHLC rows; this is historical evidence and is not treated as today's baseline."
+  },
+  "active_backfill": {
+    "github_actions_query": "GET /repos/andromyth/indian-market-trading/actions/runs?per_page=100",
+    "runs_returned": 100,
+    "active_queued_or_in_progress_runs_in_returned_page": 0,
+    "branch_specific_runs": "No runs returned for branch backfill-roadmap",
+    "latest_seen_native_5m_backfill_run": {
+      "id": 41796785284,
+      "url": "https://github.com/andromyth/indian-market-trading/actions/runs/41796785284",
+      "branch": "main",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at_utc": "2026-11-04T08:05:04Z"
+    },
+    "cloud_run_active_job": "NOT VERIFIED; Cloud Run service/jobs/logs are not connected"
+  },
+  "production_model": {
+    "manifest_path_in_repo": "production_model/DEPLOYMENT_MODEL_MANIFEST_2026.json",
+    "manifest_blob_sha": "6f3157890986b6d2651c3bcf5a7b27af45a9e5de",
+    "model_family": "logistic_regression",
+    "feature_count": 137,
+    "declared_model_sha256": "c2d7067f5ea3daa006eaa0ecb0c5aca75f3084591712ea27b6486ef4873d4271",
+    "declared_drive_model_path": "/content/drive/MyDrive/Indian_Market_Research/processed/universe_expansion_2026_v4/production_models_v2/deployment_classifier_logistic_regression_2026.joblib",
+    "drive_model_hash_currently_verified": false,
+    "repo_model_blob_sha": "d2836360e2f5fa46282a99760805f42173fcff7b",
+    "change_guard": "No model file, source code, deployment, credential, or market-data archive was modified during the inspection."
+  },
+  "scope_guard": {
+    "native_interval": "5-minute equity OHLCV only",
+    "primary_historical_source": "Kaggle equity history only after source/data integrity audit",
+    "gap_fill_source": "INDstocks only for gaps established by a later approved gap audit",
+    "nifty_csv": "Separate market-context data; never merge into equity OHLCV",
+    "backfill_started": false,
+    "model_training_started": false,
+    "model_or_threshold_changes": false
+  },
+  "acceptance": {
+    "repository_and_commit_verified": true,
+    "code_paths_inspected": true,
+    "active_github_actions_checked": true,
+    "drive_archive_inventory_verified": false,
+    "cloud_run_active_job_verified": false,
+    "production_model_drive_hash_reverified": false,
+    "reproducible_complete_baseline": false,
+    "overall_step_status": "BLOCKED"
+  },
+  "blockers": [
+    "Google Drive is not connected to this chat, so the current archive inventory, manifest, per-symbol counts, bytes and modification times cannot be verified.",
+    "Google Cloud/Cloud Run access is not connected, so an active Cloud Run backfill job cannot be ruled out.",
+    "The repository API does not expose a local working tree; only the remote branch and commit were verified.",
+    "The model SHA-256 is declared by the repository manifest but the actual Drive model bytes could not be read and re-hashed."
+  ],
+  "next_allowed_step": "Remain on Step 0 until the user runs the read-only Drive/Cloud Run preflight and supplies its output; then update the baseline and only proceed to Step 1 after Step 0 PASS."
+}
