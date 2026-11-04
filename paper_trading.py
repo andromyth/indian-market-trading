@@ -1211,15 +1211,14 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
             p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
             p4.metric("Forecast price (+30 min)", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
-            st.caption(
+            prediction_caption = (
                 f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-                f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))} · "
-                f"Feature coverage: "
-                f"{float(selected_prediction.get('feature_coverage')):.1%}"
-                if _finite_or_none(selected_prediction.get("feature_coverage")) is not None
-                else f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-                     f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))}"
+                f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))}"
             )
+            feature_coverage = _finite_or_none(selected_prediction.get("feature_coverage"))
+            if feature_coverage is not None:
+                prediction_caption += f" · Feature coverage: {feature_coverage:.1%}"
+            st.caption(prediction_caption)
             if selected_prediction.get("price_forecast_status"):
                 st.caption(f"Price forecast validation: {selected_prediction['price_forecast_status']}")
             if selected_prediction.get("reason") or selected_prediction.get("signal_reason"):
