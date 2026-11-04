@@ -4,7 +4,7 @@
 
 **Execution mode:** Run exactly one numbered step per separate development-agent chat. Do not skip ahead. Each step has its own objective, constraints, deliverables, acceptance checks and copy/paste prompt.
 
-**Current status:** Step 0 PASS — baseline recorded on `backfill-roadmap`; next allowed step is Step 1. See `backfill_baseline.md` and `backfill_baseline.json`.
+**Current status:** Step 0 PASS — verified baseline committed as `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`. Step 1 is the next authorized task. See `backfill_baseline.md` and `backfill_baseline.json`.
 
 ---
 
@@ -217,6 +217,22 @@ Execute ROADMAP Step 0 only. Read BACKFILL_ROADMAP.md. Inspect the current repos
 **Checkpoint to carry forward:** repository URL, branch, commit SHA, working-tree state, active-job status, Drive archive root, manifest path, baseline report paths, production model version/hash.
 
 ---
+
+
+
+### Step 0 verified handoff — completed 4 November 2026
+
+Step 0 is recorded as **PASS** in the GitHub branch, based on the supplied read-only Colab/Google Cloud checks. The authoritative report is `backfill_baseline.md`; machine-readable evidence is `backfill_baseline.json`.
+
+- Verified Drive archive root: `/content/drive/MyDrive/Indian_Market_Research/production_data/nse_official/intraday_seed/olo_5m_archive`.
+- Inventory: 2,821 Parquet files; 188 recognized `symbol=` partitions, including the separate `__NIFTY50__` partition; 187 other symbol partitions; 122,786,077 bytes; latest modification 2026-11-03 15:25:26 UTC.
+- The root equity `backfill_manifest.json` was NOT FOUND in the supplied recursive JSON inventory. Only the separate NIFTY context manifest was found. This remains an explicit exception for Step 3 / Step 6; no completeness inference is permitted from the file counts.
+- Production Logistic Regression model: 137 features. Actual Google Drive model SHA-256 matched the repository manifest: `c2d7067f5ea3daa006eaa0ecb0c5aca75f3084591712ea27b6486ef4873d4271`.
+- Cloud Run service was Ready, with revision `indian-market-intraday-worker-00075-gmb` receiving 100% traffic. Four regular intraday Scheduler jobs remained enabled. Zero Cloud Run Jobs were listed. No matching historical-backfill lines were returned by the supplied filtered log query. The live schedules must remain enabled.
+- No backfill, training, model modification, market-data write or deployment change was made.
+- Step 0 completion commit: `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`.
+
+**Next authorized task:** Step 1 only — inventory the original full Kaggle equity archive. It is on the user's device and is not currently available to this chat. Do not substitute the previously uploaded approximately 11 MB partial/sample file. Do not start backfill, extract/import into production Drive, modify code or retrain models in Step 1.
 
 ## Step 1 — Locate and inventory the original Kaggle equity archive
 
@@ -547,7 +563,7 @@ Update this ledger only after the evidence and acceptance checks for that step h
 
 | Step | Description | Status | Commit / evidence | Artifact path | Date |
 |---:|---|---|---|---|---|
-| 0 | Freeze scope and baseline | PASS | Verified Drive inventory and model SHA-256; zero queued/in-progress/waiting Actions runs and zero Cloud Run Jobs | `backfill_baseline.json`; `backfill_baseline.md` | 2026-11-04 |
+| 0 | Freeze scope and baseline | PASS | Commit `823021900ff34b9ce45dbce7ce2d44a7db1a52f8`; Drive inventory; production model SHA-256 match; live Cloud Run/Scheduler retained | `backfill_baseline.json`; `backfill_baseline.md` | 2026-11-04 |
 | 1 | Original Kaggle archive inventory | NOT STARTED | — | — | — |
 | 2 | Kaggle source/data-quality audit | NOT STARTED | — | — | — |
 | 3 | Existing Drive archive inventory | NOT STARTED | — | — | — |
