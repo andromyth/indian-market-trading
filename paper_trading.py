@@ -1201,6 +1201,11 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
 
     price = _finite_or_none(snapshot.get("price"))
     predictions = snapshot.get("predictions") or []
+    intraday_horizons_returned = {
+        int(item.get("horizon_min", 0) or 0)
+        for item in predictions
+        if int(item.get("horizon_min", 0) or 0) in (5, 10, 15, 20, 25, 30)
+    }
     if segment == "INTRADAY":
         selected_prediction = _select_prediction_for_horizon(
             predictions, 30, snapshot.get("prediction")
@@ -1235,7 +1240,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         c3.metric(
             "Intraday horizons" if segment == "INTRADAY" else "7-session forecast",
             (
-                f"{len({int(item.get('horizon_min', 0) or 0) for item in predictions if int(item.get('horizon_min', 0) or 0) in (5, 10, 15, 20, 25, 30)})}/6 returned"
+                f"{len(intraday_horizons_returned)}/6 returned"
                 if segment == "INTRADAY" else
                 str(selected_prediction.get("signal") or "UNAVAILABLE")
             ),
@@ -1268,11 +1273,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             predictions,
             unavailable_reason=prediction_unavailable_reason,
         )
-        returned_horizons = {
-            int(item.get("horizon_min", 0) or 0)
-            for item in predictions
-            if int(item.get("horizon_min", 0) or 0) in (5, 10, 15, 20, 25, 30)
-        }
+        returned_horizons = intraday_horizons_returned
         st.caption(
             f"Model outputs received: {len(returned_horizons)}/6 · "
             "Each horizon is evaluated independently from the same latest eligible decision anchor."
