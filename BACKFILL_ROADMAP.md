@@ -186,6 +186,8 @@ Before using **GitHub → Actions → Run workflow**, verify the workflow name a
 
 ## Step 0 — Freeze the scope and record the baseline
 
+**Environment clarification (2026-11-04):** User confirms the project is maintained on GitHub and there is no local laptop checkout. Local `git status` is not required and is not a Step 0 blocker; the verified remote branch HEAD is authoritative.
+
 **Execution record (2026-11-04): BLOCKED.** Remote repository inspection completed and recorded in `backfill_baseline.json` and `backfill_baseline.md`. GitHub Actions query showed no queued/in-progress run in the latest 100 returned runs; latest visible native 5-minute backfill run 41796785284 on `main` had completed with failure. This does not establish Cloud Run inactivity. Google Drive and Google Cloud/Cloud Run are not connected to this chat, so the current archive inventory/manifest, live job state, and actual Drive model checksum could not be verified. Do not mark Step 0 PASS or begin Step 1 until those read-only checks are supplied and the baseline is completed. No backfill or training was started.
 
 **Objective:** Establish exactly which repository version and Drive archive are being worked on, and protect the live prediction system from incidental changes.
