@@ -57,6 +57,7 @@ jobs:
           colab_build_all_nse_intraday_multifactor.py
           rebuild_all_nse_intraday_5m_model_from_drive.py
           ingest_kaggle_nifty_5m_context.py
+          ingest_kaggle_equity_5m.py
           directional_ensemble.py
           prediction_validation.py
           prediction_ledger.py
@@ -156,6 +157,7 @@ jobs:
           tests/test_dhan_client_totp.py
           tests/test_native_5m_training_inputs.py
           tests/test_kaggle_nifty_5m_context.py
+          tests/test_kaggle_equity_5m_ingest.py
           tests/test_final_algorithm_data_readiness_v2.py
           tests/test_nse_fno_udiff_ingest.py
           tests/test_production_model_adapter.py
