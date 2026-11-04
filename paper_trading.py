@@ -823,7 +823,59 @@ def _select_prediction_for_horizon(
     return {}
 
 
-def _format_timestamp(value: str) -> str:
+def _intraday_horizon_table_rows(
+    predictions: list[dict] | None,
+    unavailable_reason: str = "",
+) -> list[dict]:
+    """Build a stable six-row table; missing horizons remain explicitly unavailable."""
+    by_horizon = {}
+    for item in predictions or []:
+        horizon = _int_or_none(item.get("horizon_min"))
+        if horizon in (5, 10, 15, 20, 25, 30):
+            by_horizon[horizon] = dict(item)
+
+    rows = []
+    for horizon in (5, 10, 15, 20, 25, 30):
+        item = by_horizon.get(horizon)
+        if item is None:
+            rows.append({
+                "Horizon": f"+{horizon} min",
+                "Signal": "UNAVAILABLE",
+                "P(up)": "—",
+                "Expected return": "—",
+                "Forecast price": "—",
+                "Feature coverage": "—",
+                "Model status": "NOT RUN",
+                "Reason": unavailable_reason or "No output returned for this horizon.",
+            })
+            continue
+
+        probability = _finite_or_none(item.get("probability_up"))
+        expected_return = _finite_or_none(item.get("expected_return"))
+        predicted_price = _finite_or_none(item.get("predicted_price"))
+        coverage = _finite_or_none(item.get("feature_coverage"))
+        signal = str(item.get("signal") or "ABSTAIN").upper()
+        reason = str(item.get("reason") or item.get("signal_reason") or "")
+        if signal == "ABSTAIN":
+            model_status = "ABSTAIN"
+        elif predicted_price is None:
+            model_status = str(item.get("price_forecast_status") or "SIGNAL ONLY")
+        else:
+            model_status = "OUTPUT"
+        rows.append({
+            "Horizon": f"+{horizon} min",
+            "Signal": signal,
+            "P(up)": f"{probability:.1%}" if probability is not None else "—",
+            "Expected return": f"{expected_return:+.2%}" if expected_return is not None else "—",
+            "Forecast price": f"₹{predicted_price:,.2f}" if predicted_price is not None else "—",
+            "Feature coverage": f"{coverage:.1%}" if coverage is not None else "—",
+            "Model status": model_status,
+            "Reason": reason,
+        })
+    return rows
+
+
+def _format_timestamp(value: str):
     if not value:
         return "—"
     try:
@@ -1181,8 +1233,12 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         c1.metric("Live market price", f"₹{price:,.2f}")
         c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
         c3.metric(
-            "30-minute signal" if segment == "INTRADAY" else "7-session forecast",
-            str(selected_prediction.get("signal") or "UNAVAILABLE"),
+            "Intraday horizons" if segment == "INTRADAY" else "7-session forecast",
+            (
+                f"{len({int(item.get('horizon_min', 0) or 0) for item in predictions if int(item.get('horizon_min', 0) or 0) in (5, 10, 15, 20, 25, 30)})}/6 returned"
+                if segment == "INTRADAY" else
+                str(selected_prediction.get("signal") or "UNAVAILABLE")
+            ),
         )
         st.caption(
             f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
@@ -1207,30 +1263,40 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         )
 
     if segment == "INTRADAY":
-        st.subheader("30-minute Intraday prediction")
-        if prediction_status == "READY":
-            p1, p2, p3, p4 = st.columns(4)
-            probability = _finite_or_none(selected_prediction.get("probability_up"))
-            expected_return = _finite_or_none(selected_prediction.get("expected_return"))
-            predicted_price = _finite_or_none(selected_prediction.get("predicted_price"))
-            p1.metric("Signal", str(selected_prediction.get("signal") or "ABSTAIN"))
-            p2.metric("P(up)", f"{probability:.1%}" if probability is not None else "—")
-            p3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
-            p4.metric("Forecast price (+30 min)", f"₹{predicted_price:,.2f}" if predicted_price is not None else "—")
+        st.subheader("Intraday predictions · 5, 10, 15, 20, 25 and 30 minutes")
+        intraday_rows = _intraday_horizon_table_rows(
+            predictions,
+            unavailable_reason=prediction_unavailable_reason,
+        )
+        returned_horizons = {
+            int(item.get("horizon_min", 0) or 0)
+            for item in predictions
+            if int(item.get("horizon_min", 0) or 0) in (5, 10, 15, 20, 25, 30)
+        }
+        st.caption(
+            f"Model outputs received: {len(returned_horizons)}/6 · "
+            "Each horizon is evaluated independently from the same latest eligible decision anchor."
+        )
+        st.dataframe(
+            pd.DataFrame(intraday_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if not returned_horizons:
+            st.warning(
+                "No intraday horizon could be calculated. All six horizons are shown as unavailable; "
+                + (prediction_unavailable_reason or "fresh stock and benchmark OHLC bars are required.")
+            )
+        elif len(returned_horizons) < 6:
+            missing = sorted(set((5, 10, 15, 20, 25, 30)) - returned_horizons)
+            st.warning(f"Missing model outputs for: {', '.join(f'{value} min' for value in missing)}.")
+        if selected_prediction:
             prediction_caption = (
+                f"Order annotation default: +30 min · "
                 f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
                 f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))}"
             )
-            feature_coverage = _finite_or_none(selected_prediction.get("feature_coverage"))
-            if feature_coverage is not None:
-                prediction_caption += f" · Feature coverage: {feature_coverage:.1%}"
             st.caption(prediction_caption)
-            if selected_prediction.get("price_forecast_status"):
-                st.caption(f"Price forecast validation: {selected_prediction['price_forecast_status']}")
-            if selected_prediction.get("reason") or selected_prediction.get("signal_reason"):
-                st.caption(str(selected_prediction.get("reason") or selected_prediction.get("signal_reason")))
-        else:
-            st.warning(f"30-minute prediction unavailable: {prediction_unavailable_reason}")
     else:
         st.subheader("Delivery forecast · next 7 NSE sessions")
         forecasts = delivery_forecast.get("forecasts", []) or []
