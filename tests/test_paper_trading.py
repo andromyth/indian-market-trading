@@ -112,15 +112,15 @@ def test_place_order_rejects_insufficient_long_cash_but_allows_short_and_cover(t
     account = paper.get_account()
 
     with pytest.raises(ValueError, match="Insufficient free cash"):
-        paper.place_order("SBIN", "BUY", 11, 100, account)
+        paper.place_order("SBIN", "BUY", 11, 100, account, segment="INTRADAY")
 
-    short_fill = paper.place_order("IDEA", "SELL", 20, 100, account)
+    short_fill = paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
     assert short_fill["side"] == "SELL"
     state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
     assert state["positions"]["IDEA"]["quantity"] == -20
     assert state["available_cash"] == pytest.approx(0)
 
-    cover_fill = paper.place_order("IDEA", "BUY", 5, 90, account)
+    cover_fill = paper.place_order("IDEA", "BUY", 5, 90, account, segment="INTRADAY")
     assert cover_fill["side"] == "BUY"
     state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
     assert state["positions"]["IDEA"]["quantity"] == -15
@@ -133,9 +133,9 @@ def test_place_order_blocks_new_short_when_initial_margin_is_insufficient(tmp_pa
     account = paper.get_account()
 
     with pytest.raises(ValueError, match="Insufficient free cash"):
-        paper.place_order("IDEA", "SELL", 21, 100, account)
+        paper.place_order("IDEA", "SELL", 21, 100, account, segment="INTRADAY")
 
-    fill = paper.place_order("IDEA", "SELL", 20, 100, account)
+    fill = paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
     assert fill["quantity"] == 20
 
 
@@ -147,7 +147,11 @@ def test_place_order_applies_buy_slippage_and_charges(tmp_path, monkeypatch):
 
     assert fill["fill_price"] == pytest.approx(1_000.5)
     assert fill["gross"] == pytest.approx(2_001.0)
-    assert fill["charges"] == pytest.approx(2.0)
+    assert fill["charges"] == pytest.approx(2.73)
+    assert fill["brokerage"] == pytest.approx(2.00)
+    assert fill["stt"] == pytest.approx(2.00)
+    assert fill["stamp_duty"] == pytest.approx(0.30)
+    assert fill["gst"] == pytest.approx(0.37)
 
 
 def test_existing_long_only_ledger_history_remains_readable_and_can_open_short(tmp_path, monkeypatch):
@@ -157,14 +161,14 @@ def test_existing_long_only_ledger_history_remains_readable_and_can_open_short(t
     account = paper.get_account()
 
     # A legacy ledger created by the previous long-only implementation.
-    paper.place_order("SBIN", "BUY", 10, 100, account)
-    paper.place_order("SBIN", "SELL", 4, 110, account)
+    paper.place_order("SBIN", "BUY", 10, 100, account, segment="INTRADAY")
+    paper.place_order("SBIN", "SELL", 4, 110, account, segment="INTRADAY")
     old_fills = paper.list_fills()
     assert len(old_fills) == 2
     assert paper.calculate_portfolio(5_000, old_fills)["positions"]["SBIN"]["quantity"] == 6
 
     # Append a short on another symbol without resetting or migrating the ledger.
-    paper.place_order("IDEA", "SELL", 20, 100, account)
+    paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
     new_fills = paper.list_fills()
     state = paper.calculate_portfolio(5_000, new_fills)
     assert len(new_fills) == 3
@@ -408,3 +412,92 @@ def test_existing_unclassified_database_fills_migrate_to_legacy_without_loss(tmp
     assert legacy[0]["segment"] == "LEGACY"
     assert paper.list_fills(segment="INTRADAY") == []
     assert paper.list_fills(segment="DELIVERY") == []
+
+
+
+def test_nse_cash_equity_charge_rates_are_side_and_segment_specific():
+    intraday_buy = paper.calculate_trade_charges("INTRADAY", "BUY", 100_000, 0)
+    intraday_sell = paper.calculate_trade_charges("INTRADAY", "SELL", 100_000, 0)
+    delivery_buy = paper.calculate_trade_charges("DELIVERY", "BUY", 100_000, 0)
+    delivery_sell = paper.calculate_trade_charges("DELIVERY", "SELL", 100_000, 0)
+
+    assert intraday_buy["stt"] == 0
+    assert intraday_buy["stamp_duty"] == pytest.approx(3.00)
+    assert intraday_sell["stt"] == pytest.approx(25.00)
+    assert intraday_sell["stamp_duty"] == 0
+    assert delivery_buy["stt"] == pytest.approx(100.00)
+    assert delivery_buy["stamp_duty"] == pytest.approx(15.00)
+    assert delivery_sell["stt"] == pytest.approx(100.00)
+    assert delivery_sell["stamp_duty"] == 0
+    assert intraday_buy["exchange_charges"] == pytest.approx(3.07)
+    assert intraday_buy["sebi_charges"] == pytest.approx(0.10)
+    assert intraday_buy["ipft_charges"] == 0
+
+
+def test_realised_pnl_deducts_entry_and_exit_statutory_charges(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(5_000, fee_bps=10, slippage_bps=0)
+    account = paper.get_account()
+
+    buy = paper.place_order(
+        "SBIN", "BUY", 10, 100, account, segment="INTRADAY"
+    )
+    sell = paper.place_order(
+        "SBIN", "SELL", 10, 110, account, segment="INTRADAY"
+    )
+    state = paper.calculate_portfolio(5_000, paper.list_fills())
+
+    expected = 100.00 - buy["charges"] - sell["charges"]
+    assert state["positions"] == {}
+    assert state["realised_pnl"] == pytest.approx(expected)
+    assert state["realised_pnl"] == pytest.approx(97.14)
+    assert state["cash"] == pytest.approx(5_000 + expected)
+
+
+def test_cash_allocations_are_separate_and_sum_to_total(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(100_000, fee_bps=0, slippage_bps=0)
+    account = paper.get_account()
+
+    allocations = paper._segment_capitals_from_account(account)
+    assert allocations == {
+        "INTRADAY": 5_000.0,
+        "DELIVERY": 95_000.0,
+        "LEGACY": 0.0,
+    }
+
+    paper.update_segment_capital_allocations(7_500, 92_500, 0)
+    updated = paper.get_account()
+    assert paper._segment_capitals_from_account(updated) == {
+        "INTRADAY": 7_500.0,
+        "DELIVERY": 92_500.0,
+        "LEGACY": 0.0,
+    }
+
+
+def test_segment_cash_and_risk_are_not_shared(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_DB_PATH", str(tmp_path / "paper.sqlite3"))
+    paper.init_db()
+    paper.create_account(100_000, fee_bps=0, slippage_bps=0)
+    account = paper.get_account()
+
+    # Intraday cannot use the unused ₹95,000 Delivery allocation.
+    with pytest.raises(ValueError, match="Insufficient free cash in the Intraday book"):
+        paper.place_order(
+            "SBIN", "BUY", 51, 100, account, segment="INTRADAY"
+        )
+
+    fill = paper.place_order(
+        "SBIN", "BUY", 50, 100, account, segment="INTRADAY"
+    )
+    assert fill["segment"] == "INTRADAY"
+    state = paper.calculate_segmented_portfolio(
+        100_000,
+        paper.list_fills(),
+        segment_capitals=paper._segment_capitals_from_account(account),
+    )
+    assert state["segments"]["INTRADAY"]["cash"] == pytest.approx(0)
+    assert state["segments"]["DELIVERY"]["cash"] == pytest.approx(95_000)
+    assert state["cash"] == pytest.approx(95_000)
