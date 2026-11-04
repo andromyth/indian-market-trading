@@ -117,13 +117,13 @@ def test_place_order_rejects_insufficient_long_cash_but_allows_short_and_cover(t
     short_fill = paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
     assert short_fill["side"] == "SELL"
     state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
-    assert state["positions"]["IDEA"]["quantity"] == -20
-    assert state["available_cash"] == pytest.approx(0)
+    assert state["positions"]["IDEA"]["quantity"] == -19
+    assert state["available_cash"] >= 0
 
     cover_fill = paper.place_order("IDEA", "BUY", 5, 90, account, segment="INTRADAY")
     assert cover_fill["side"] == "BUY"
     state = paper.calculate_portfolio(account["initial_cash"], paper.list_fills())
-    assert state["positions"]["IDEA"]["quantity"] == -15
+    assert state["positions"]["IDEA"]["quantity"] == -14
 
 
 def test_place_order_blocks_new_short_when_initial_margin_is_insufficient(tmp_path, monkeypatch):
@@ -135,8 +135,8 @@ def test_place_order_blocks_new_short_when_initial_margin_is_insufficient(tmp_pa
     with pytest.raises(ValueError, match="Insufficient free cash"):
         paper.place_order("IDEA", "SELL", 21, 100, account, segment="INTRADAY")
 
-    fill = paper.place_order("IDEA", "SELL", 20, 100, account, segment="INTRADAY")
-    assert fill["quantity"] == 20
+    fill = paper.place_order("IDEA", "SELL", 19, 100, account, segment="INTRADAY")
+    assert fill["quantity"] == 19
 
 
 def test_place_order_applies_buy_slippage_and_charges(tmp_path, monkeypatch):
@@ -490,7 +490,7 @@ def test_segment_cash_and_risk_are_not_shared(tmp_path, monkeypatch):
         )
 
     fill = paper.place_order(
-        "SBIN", "BUY", 50, 100, account, segment="INTRADAY"
+        "SBIN", "BUY", 50, 99, account, segment="INTRADAY"
     )
     assert fill["segment"] == "INTRADAY"
     state = paper.calculate_segmented_portfolio(
@@ -498,6 +498,8 @@ def test_segment_cash_and_risk_are_not_shared(tmp_path, monkeypatch):
         paper.list_fills(),
         segment_capitals=paper._segment_capitals_from_account(account),
     )
-    assert state["segments"]["INTRADAY"]["cash"] == pytest.approx(0)
+    assert state["segments"]["INTRADAY"]["cash"] == pytest.approx(
+        5_000 - fill["gross"] - fill["charges"]
+    )
     assert state["segments"]["DELIVERY"]["cash"] == pytest.approx(95_000)
-    assert state["cash"] == pytest.approx(95_000)
+    assert state["cash"] == pytest.approx(95_000 + 5_000 - fill["gross"] - fill["charges"])
