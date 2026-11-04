@@ -418,6 +418,19 @@ def main(argv: list[str] | None = None) -> int:
             remote = f"{REMOTE_ROOT}/symbol={symbol}/{symbol}.parquet"
             local = local_root / f"symbol={symbol}" / f"{symbol}.existing.parquet"
             existing = _download_existing(store, remote, local)
+            # Merge Kaggle primary history before deciding what INDstocks must
+            # backfill. The two sources remain in separate Drive files.
+            kaggle_remote = (
+                f"{REMOTE_ROOT}/symbol={symbol}/source=KAGGLE/"
+                f"{symbol}_kaggle_5m.parquet"
+            )
+            kaggle_local = local.with_name(f"{symbol}.kaggle.parquet")
+            kaggle = _download_existing(store, kaggle_remote, kaggle_local)
+            kaggle_seed_rows = int(len(kaggle))
+            existing_parts = [frame for frame in (existing, kaggle) if frame is not None and not frame.empty]
+            if existing_parts:
+                existing = pd.concat(existing_parts).sort_index()
+                existing = existing.loc[~existing.index.duplicated(keep="last")]
             existing_by_symbol[symbol] = existing
             summary = usable_session_summary(existing, args.minimum_bars_per_session)
             latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
@@ -433,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
                     "source": "INDSTOCKS_HISTORICAL_5M",
                     "remote_path": remote,
                     "rows": int(len(existing)),
+                    "kaggle_seed_rows": kaggle_seed_rows,
                     "usable_sessions": int(summary["usable_sessions"]),
                     "last_timestamp_ist": summary["last_timestamp_ist"],
                     "fresh_latest_data": True,
@@ -522,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
                 "remote_path": remote,
                 "rows": int(len(merged)),
                 "fetched_rows": int(len(fetched)),
+                "kaggle_seed_rows": kaggle_seed_rows,
                 "usable_sessions": int(summary["usable_sessions"]),
                 "raw_sessions": int(summary["raw_sessions"]),
                 "fresh_latest_data": bool(fresh),

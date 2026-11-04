@@ -359,7 +359,16 @@ def load_symbol_5m(
     parts = []
     native_dir = root / NATIVE_5M_SEED_REL / f"symbol={sym}"
     if native_dir.exists():
-        for path in sorted(native_dir.rglob("*.parquet")):
+        seed_files = sorted(native_dir.rglob("*.parquet"))
+        # Kaggle is primary historical coverage. INDstocks fills absent slots;
+        # Kaggle is appended last so it wins only on overlapping timestamps.
+        kaggle_files = [
+            path for path in seed_files
+            if any("source=kaggle" in part.lower() for part in path.parts)
+            or "kaggle" in path.name.lower()
+        ]
+        fallback_files = [path for path in seed_files if path not in kaggle_files]
+        for path in fallback_files + kaggle_files:
             try:
                 bars = _close_labeled_5m(pd.read_parquet(path))
                 if not bars.empty:
