@@ -569,8 +569,8 @@ def calculate_portfolio(
         "starting_capital": float(initial_cash),
         "cash": cash,
         "positions": open_positions,
-        "realised_pnl": round(realised, 2),
-        "unrealised_pnl": round(unrealised, 2),
+        "realised_pnl": realised,
+        "unrealised_pnl": unrealised,
         "long_market_value": long_market_value,
         "short_liability": short_liability,
         "equity": equity,
@@ -1321,11 +1321,12 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
     k5.metric("Net liquidation value", f"₹{equity:,.2f}")
     k6.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{(total_pnl / float(account['initial_cash']) * 100):.2f}%")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
-    m2.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
-    m3.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
-    m4.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Starting capital", f"₹{state['starting_capital']:,.2f}")
+    m2.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
+    m3.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
+    m4.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
+    m5.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
     if state["margin_status"] == "CALL":
         st.error(
             "MARGIN CALL: net liquidation value is below the maintenance-margin "
