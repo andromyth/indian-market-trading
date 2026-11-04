@@ -432,6 +432,8 @@ def test_nse_cash_equity_charge_rates_are_side_and_segment_specific():
     assert intraday_buy["exchange_charges"] == pytest.approx(3.07)
     assert intraday_buy["sebi_charges"] == pytest.approx(0.10)
     assert intraday_buy["ipft_charges"] == 0
+    # 0.475 rupees is rounded half-up to ₹0.48, not banker's-rounded to ₹0.47.
+    assert paper.calculate_trade_charges("INTRADAY", "SELL", 1_900, 0)["stt"] == pytest.approx(0.48)
 
 
 def test_realised_pnl_deducts_entry_and_exit_statutory_charges(tmp_path, monkeypatch):
