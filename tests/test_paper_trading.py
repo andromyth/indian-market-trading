@@ -529,3 +529,50 @@ def test_paper_trading_does_not_substitute_wrong_horizon_when_30m_missing():
         {"horizon_min": 15, "signal": "HOLD_15M"},
     ]
     assert paper._select_prediction_for_horizon(predictions, 30) == {}
+
+
+
+def test_intraday_table_displays_all_six_matching_horizon_outputs():
+    predictions = [
+        {
+            "horizon_min": horizon,
+            "signal": f"SIGNAL_{horizon}",
+            "probability_up": horizon / 100,
+            "expected_return": horizon / 1000,
+            "predicted_price": 100 + horizon,
+            "feature_coverage": 0.95,
+        }
+        for horizon in (5, 10, 15, 20, 25, 30)
+    ]
+
+    rows = paper._intraday_horizon_table_rows(predictions)
+
+    assert [row["Horizon"] for row in rows] == [
+        "+5 min", "+10 min", "+15 min", "+20 min", "+25 min", "+30 min"
+    ]
+    assert [row["Signal"] for row in rows] == [
+        "SIGNAL_5", "SIGNAL_10", "SIGNAL_15",
+        "SIGNAL_20", "SIGNAL_25", "SIGNAL_30",
+    ]
+    assert rows[-1]["Forecast price"] == "₹130.00"
+
+
+def test_intraday_table_keeps_six_unavailable_rows_when_freshness_blocks_model():
+    reason = "Latest benchmark candle is 288.5 minutes old; maximum allowed is 5.0 minutes."
+    rows = paper._intraday_horizon_table_rows([], unavailable_reason=reason)
+
+    assert len(rows) == 6
+    assert all(row["Signal"] == "UNAVAILABLE" for row in rows)
+    assert all(row["Model status"] == "NOT RUN" for row in rows)
+    assert all(row["Reason"] == reason for row in rows)
+
+
+def test_intraday_table_does_not_substitute_missing_horizon():
+    rows = paper._intraday_horizon_table_rows([
+        {"horizon_min": 5, "signal": "BUY"},
+        {"horizon_min": 30, "signal": "SELL"},
+    ])
+
+    assert rows[0]["Signal"] == "BUY"
+    assert rows[-1]["Signal"] == "SELL"
+    assert all(row["Signal"] == "UNAVAILABLE" for row in rows[1:5])
