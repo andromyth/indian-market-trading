@@ -1306,42 +1306,53 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         float(account["initial_cash"]), fills, market_prices=market_prices,
         segment_capitals=segment_capitals,
     )
-    cash = float(state["cash"])
-    equity = float(state["equity"])
-    total_pnl = round(float(state["realised_pnl"]) + float(state["unrealised_pnl"]), 2)
-    unrealised = float(state["unrealised_pnl"])
+    selected_book_state = state["segments"][segment]
+    selected_book_capital = float(segment_capitals[segment])
+    selected_book_pnl = round(
+        float(selected_book_state["realised_pnl"])
+        + float(selected_book_state["unrealised_pnl"]),
+        2,
+    )
+    selected_book_return = (
+        selected_book_pnl / selected_book_capital * 100
+        if selected_book_capital > 0 else 0.0
+    )
+    selected_book_fills = [
+        fill for fill in fills
+        if str(fill.get("segment") or "LEGACY").upper() == segment
+    ]
 
     st.divider()
-    st.subheader("Combined paper account · all strategy books")
+    st.subheader(f"{segment.title()} paper account")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Cash balance", f"₹{cash:,.2f}")
-    k2.metric("Free cash after margin", f"₹{state['available_cash']:,.2f}")
-    k3.metric("Long market value", f"₹{state['long_market_value']:,.2f}")
-    k4.metric("Short liability", f"₹{state['short_liability']:,.2f}")
-    k5.metric("Net liquidation value", f"₹{equity:,.2f}")
-    k6.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{(total_pnl / float(account['initial_cash']) * 100):.2f}%")
+    k1.metric("Cash balance", f"₹{selected_book_state['cash']:,.2f}")
+    k2.metric("Free cash after margin", f"₹{selected_book_state['available_cash']:,.2f}")
+    k3.metric("Long market value", f"₹{selected_book_state['long_market_value']:,.2f}")
+    k4.metric("Short liability", f"₹{selected_book_state['short_liability']:,.2f}")
+    k5.metric("Net liquidation value", f"₹{selected_book_state['equity']:,.2f}")
+    k6.metric("Total P&L", f"₹{selected_book_pnl:,.2f}", f"{selected_book_return:.2f}%")
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Starting capital", f"₹{state['starting_capital']:,.2f}")
-    m2.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
-    m3.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
-    m4.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
-    m5.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
-    if state["margin_status"] == "CALL":
+    m1.metric("Starting allocation", f"₹{selected_book_capital:,.2f}")
+    m2.metric("Initial short margin", f"₹{selected_book_state['initial_margin_required']:,.2f}")
+    m3.metric("Maintenance margin", f"₹{selected_book_state['maintenance_margin_required']:,.2f}")
+    m4.metric("Margin excess", f"₹{selected_book_state['margin_excess']:,.2f}")
+    m5.metric("Realised P&L", f"₹{selected_book_state['realised_pnl']:,.2f}")
+    if selected_book_state["margin_status"] == "CALL":
         st.error(
-            "MARGIN CALL: net liquidation value is below the maintenance-margin "
-            "requirement. Reduce or cover short exposure; new risk-increasing orders are blocked."
+            f"{segment.title()} MARGIN CALL: net liquidation value is below the "
+            "maintenance-margin requirement. Reduce or cover short exposure."
         )
-    elif state["available_cash"] < -0.005:
-        if state["short_liability"] > 0:
-            st.warning("Initial short-margin reserve exceeds the cash balance. New risk-increasing orders are blocked.")
+    elif selected_book_state["available_cash"] < -0.005:
+        if selected_book_state["short_liability"] > 0:
+            st.warning("This book's initial short-margin reserve exceeds its cash balance.")
         else:
-            st.warning("The paper account has a cash funding deficit. New risk-increasing orders are blocked.")
+            st.warning("This book has a cash funding deficit. New risk-increasing orders are blocked.")
     st.caption(
-        f"Unrealised P&L: ₹{unrealised:,.2f} · "
+        f"Unrealised P&L: ₹{selected_book_state['unrealised_pnl']:,.2f} · "
         f"Brokerage estimate: {float(account['fee_bps']):g} bps · "
         f"Slippage: {float(account['slippage_bps']):g} bps · "
-        f"Recorded trade charges: ₹{sum(float(fill.get('charges') or 0.0) for fill in fills):,.2f} · "
+        f"Recorded charges in this book: ₹{sum(float(fill.get('charges') or 0.0) for fill in selected_book_fills):,.2f} · "
         f"Short margin assumptions: {INITIAL_SHORT_MARGIN_RATE:.0%} initial / "
         f"{MAINTENANCE_SHORT_MARGIN_RATE:.0%} maintenance."
     )
@@ -1349,6 +1360,25 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         f"Price source: {snapshot.get('source') or 'unavailable'} · "
         f"Quote status: {snapshot.get('price_freshness_status') or 'UNKNOWN'}"
     )
+
+    combined_pnl = round(float(state["realised_pnl"]) + float(state["unrealised_pnl"]), 2)
+    with st.expander("Combined account · all strategy books", expanded=False):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Combined cash", f"₹{state['cash']:,.2f}")
+        c2.metric("Combined free cash", f"₹{state['available_cash']:,.2f}")
+        c3.metric("Long market value", f"₹{state['long_market_value']:,.2f}")
+        c4.metric("Short liability", f"₹{state['short_liability']:,.2f}")
+        c5.metric("Net liquidation value", f"₹{state['equity']:,.2f}")
+        c6.metric(
+            "Total P&L", f"₹{combined_pnl:,.2f}",
+            f"{combined_pnl / float(account['initial_cash']) * 100:.2f}%",
+        )
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Starting capital", f"₹{state['starting_capital']:,.2f}")
+        d2.metric("Initial short margin", f"₹{state['initial_margin_required']:,.2f}")
+        d3.metric("Maintenance margin", f"₹{state['maintenance_margin_required']:,.2f}")
+        d4.metric("Margin excess", f"₹{state['margin_excess']:,.2f}")
+        d5.metric("Realised P&L", f"₹{state['realised_pnl']:,.2f}")
     with st.expander(f"{segment.title()} model information (optional)", expanded=False):
         probability = _finite_or_none(selected_prediction.get("probability_up"))
         expected_return = _finite_or_none(selected_prediction.get("expected_return"))
