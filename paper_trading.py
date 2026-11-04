@@ -20,6 +20,12 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
+DEFAULT_INTRADAY_ALLOCATION = 5_000.0
+# NSE cash-market rates currently in force (2026).
+NSE_TRANSACTION_CHARGE_RATE = 0.000030699
+NSE_IPFT_CHARGE_RATE = 0.000000001
+SEBI_TURNOVER_FEE_RATE = 0.000001
+GST_RATE = 0.18
 # Illustrative simulator assumptions; these are not exchange or broker margin rates.
 INITIAL_SHORT_MARGIN_RATE = 1.50
 MAINTENANCE_SHORT_MARGIN_RATE = 0.30
@@ -57,6 +63,63 @@ def _now_ist() -> str:
     return datetime.now(IST).isoformat(timespec="seconds")
 
 
+def calculate_trade_charges(
+    segment: str,
+    side: str,
+    turnover: float,
+    brokerage_bps: float,
+) -> dict[str, float | str]:
+    """Estimate Indian NSE cash-equity charges for a single executed side.
+
+    Per-fill paise rounding is a simulator estimate; broker/exchange contract
+    note aggregation may differ by a few paise. Brokerage is configurable.
+    """
+    selected_segment = str(segment).strip().upper()
+    direction = str(side).strip().upper()
+    amount = float(turnover)
+    brokerage_rate = float(brokerage_bps)
+    if selected_segment not in {"INTRADAY", "DELIVERY"}:
+        raise ValueError("Charges can only be estimated for INTRADAY or DELIVERY.")
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("Side must be BUY or SELL.")
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("Turnover must be a finite non-negative amount.")
+    if not math.isfinite(brokerage_rate) or not 0 <= brokerage_rate <= 500:
+        raise ValueError("Brokerage rate must be between 0 and 500 bps.")
+
+    brokerage = round(amount * brokerage_rate / 10_000.0, 2)
+    if selected_segment == "INTRADAY":
+        stt = round(amount * 0.00025, 2) if direction == "SELL" else 0.0
+        stamp_duty = round(amount * 0.00003, 2) if direction == "BUY" else 0.0
+    else:
+        stt = round(amount * 0.001, 2)
+        stamp_duty = round(amount * 0.00015, 2) if direction == "BUY" else 0.0
+
+    exchange_charges = round(amount * NSE_TRANSACTION_CHARGE_RATE, 2)
+    sebi_charges = round(amount * SEBI_TURNOVER_FEE_RATE, 2)
+    ipft_charges = round(amount * NSE_IPFT_CHARGE_RATE, 2)
+    gst = round(
+        (brokerage + exchange_charges + sebi_charges + ipft_charges) * GST_RATE,
+        2,
+    )
+    total = round(
+        brokerage + stt + stamp_duty + exchange_charges
+        + sebi_charges + ipft_charges + gst,
+        2,
+    )
+    return {
+        "brokerage": brokerage,
+        "stt": stt,
+        "stamp_duty": stamp_duty,
+        "exchange_charges": exchange_charges,
+        "sebi_charges": sebi_charges,
+        "ipft_charges": ipft_charges,
+        "gst": gst,
+        "total_charges": total,
+        "charge_model_version": "NSE_CASH_EQUITY_2026",
+    }
+
+
 def normalize_symbol(value: str) -> str:
     """Return a bare NSE symbol; the simulator intentionally excludes indices."""
     symbol = str(value or "").strip().upper()
@@ -79,7 +142,10 @@ def init_db() -> None:
                 initial_cash REAL NOT NULL,
                 fee_bps REAL NOT NULL,
                 slippage_bps REAL NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                intraday_initial_cash REAL NOT NULL DEFAULT 0,
+                delivery_initial_cash REAL NOT NULL DEFAULT 0,
+                legacy_initial_cash REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -96,6 +162,14 @@ def init_db() -> None:
                 fill_price REAL NOT NULL,
                 gross REAL NOT NULL,
                 charges REAL NOT NULL,
+                brokerage REAL,
+                stt REAL,
+                stamp_duty REAL,
+                exchange_charges REAL,
+                sebi_charges REAL,
+                ipft_charges REAL,
+                gst REAL,
+                charge_model_version TEXT,
                 source TEXT NOT NULL DEFAULT '',
                 quote_timestamp TEXT NOT NULL DEFAULT '',
                 prediction_signal TEXT NOT NULL DEFAULT '',
@@ -124,12 +198,136 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_paper_fills_segment_id ON paper_fills(segment, id)"
         )
 
+        account_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(paper_account)").fetchall()
+        }
+        added_allocations = False
+        for column in ("intraday_initial_cash", "delivery_initial_cash", "legacy_initial_cash"):
+            if column not in account_columns:
+                connection.execute(
+                    f"ALTER TABLE paper_account ADD COLUMN {column} REAL NOT NULL DEFAULT 0"
+                )
+                added_allocations = True
+        if added_allocations:
+            account = connection.execute(
+                "SELECT initial_cash FROM paper_account WHERE id = 1"
+            ).fetchone()
+            if account:
+                total_capital = float(account["initial_cash"])
+                has_legacy_fills = connection.execute(
+                    "SELECT 1 FROM paper_fills WHERE segment = 'LEGACY' LIMIT 1"
+                ).fetchone() is not None
+                if has_legacy_fills:
+                    intraday_capital = 0.0
+                    delivery_capital = 0.0
+                    legacy_capital = total_capital
+                else:
+                    intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, total_capital)
+                    delivery_capital = total_capital - intraday_capital
+                    legacy_capital = 0.0
+                connection.execute(
+                    """
+                    UPDATE paper_account
+                    SET intraday_initial_cash = ?,
+                        delivery_initial_cash = ?,
+                        legacy_initial_cash = ?
+                    WHERE id = 1
+                    """,
+                    (intraday_capital, delivery_capital, legacy_capital),
+                )
+
+        fill_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(paper_fills)").fetchall()
+        }
+        charge_columns = {
+            "brokerage": "REAL",
+            "stt": "REAL",
+            "stamp_duty": "REAL",
+            "exchange_charges": "REAL",
+            "sebi_charges": "REAL",
+            "ipft_charges": "REAL",
+            "gst": "REAL",
+            "charge_model_version": "TEXT",
+        }
+        for column, definition in charge_columns.items():
+            if column not in fill_columns:
+                connection.execute(
+                    f"ALTER TABLE paper_fills ADD COLUMN {column} {definition}"
+                )
+
+        old_charge_rows = connection.execute(
+            """
+            SELECT id, segment, side, gross, charges
+            FROM paper_fills
+            WHERE charge_model_version IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in old_charge_rows:
+            segment = str(row["segment"] or "LEGACY").upper()
+            if segment in {"INTRADAY", "DELIVERY"}:
+                # Preserve historic estimate as brokerage, then add statutory
+                # levies that the previous one-rate model omitted.
+                brokerage = round(max(0.0, float(row["charges"])), 2)
+                statutory = calculate_trade_charges(
+                    segment, str(row["side"]), float(row["gross"]), 0.0
+                )
+                exchange = float(statutory["exchange_charges"])
+                sebi = float(statutory["sebi_charges"])
+                ipft = float(statutory["ipft_charges"])
+                gst = round((brokerage + exchange + sebi + ipft) * GST_RATE, 2)
+                stt = float(statutory["stt"])
+                stamp_duty = float(statutory["stamp_duty"])
+                total = round(
+                    brokerage + stt + stamp_duty + exchange + sebi + ipft + gst,
+                    2,
+                )
+                connection.execute(
+                    """
+                    UPDATE paper_fills
+                    SET brokerage = ?, stt = ?, stamp_duty = ?,
+                        exchange_charges = ?, sebi_charges = ?,
+                        ipft_charges = ?, gst = ?, charges = ?,
+                        charge_model_version = 'NSE_CASH_EQUITY_2026_MIGRATED'
+                    WHERE id = ?
+                    """,
+                    (
+                        brokerage, stt, stamp_duty, exchange, sebi,
+                        ipft, gst, total, int(row["id"]),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE paper_fills
+                    SET charge_model_version = 'LEGACY_UNITEMIZED'
+                    WHERE id = ?
+                    """,
+                    (int(row["id"]),),
+                )
+
 
 def get_account() -> dict | None:
     init_db()
     with _connection() as connection:
         row = connection.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
     return dict(row) if row else None
+
+
+def _segment_capitals_from_account(account: dict) -> dict[str, float]:
+    total = float(account["initial_cash"])
+    values = {
+        "INTRADAY": float(account.get("intraday_initial_cash", min(DEFAULT_INTRADAY_ALLOCATION, total))),
+        "DELIVERY": float(account.get("delivery_initial_cash", max(0.0, total - DEFAULT_INTRADAY_ALLOCATION))),
+        "LEGACY": float(account.get("legacy_initial_cash", 0.0)),
+    }
+    if any(not math.isfinite(value) or value < 0 for value in values.values()):
+        raise ValueError("Paper account contains an invalid strategy cash allocation.")
+    if abs(sum(values.values()) - total) > 0.01:
+        raise ValueError("Strategy cash allocations must equal total starting capital.")
+    return values
 
 
 def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
@@ -139,14 +337,51 @@ def create_account(initial_cash: float, fee_bps: float = DEFAULT_FEE_BPS,
         raise ValueError("Account settings must be finite numbers.")
     if values[0] <= 0 or values[1] < 0 or values[2] < 0 or values[1] > 500 or values[2] > 500:
         raise ValueError("Capital must be positive; fee and slippage must be between 0 and 500 bps.")
+    intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, values[0])
+    delivery_capital = values[0] - intraday_capital
     init_db()
     with _connection() as connection:
         connection.execute(
             """
-            INSERT INTO paper_account(id, initial_cash, fee_bps, slippage_bps, created_at)
-            VALUES (1, ?, ?, ?, ?)
+            INSERT INTO paper_account(
+                id, initial_cash, fee_bps, slippage_bps, created_at,
+                intraday_initial_cash, delivery_initial_cash, legacy_initial_cash
+            )
+            VALUES (1, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (*values, _now_ist()),
+            (*values, _now_ist(), intraday_capital, delivery_capital),
+        )
+
+
+def update_segment_capital_allocations(
+    intraday_initial_cash: float,
+    delivery_initial_cash: float,
+    legacy_initial_cash: float = 0.0,
+) -> None:
+    values = tuple(float(value) for value in (
+        intraday_initial_cash, delivery_initial_cash, legacy_initial_cash
+    ))
+    if not all(math.isfinite(value) and value >= 0 for value in values):
+        raise ValueError("Strategy allocations must be finite, non-negative amounts.")
+    with _connection() as connection:
+        account = connection.execute(
+            "SELECT initial_cash FROM paper_account WHERE id = 1"
+        ).fetchone()
+        if not account:
+            raise RuntimeError("Paper account is not initialized.")
+        total = float(account["initial_cash"])
+        if abs(sum(values) - total) > 0.01:
+            raise ValueError(
+                f"Allocations must total ₹{total:,.2f}; supplied total is ₹{sum(values):,.2f}."
+            )
+        connection.execute(
+            """
+            UPDATE paper_account
+            SET intraday_initial_cash = ?, delivery_initial_cash = ?,
+                legacy_initial_cash = ?
+            WHERE id = 1
+            """,
+            values,
         )
 
 
@@ -172,9 +407,17 @@ def reset_account(initial_cash: float) -> None:
         if not account:
             raise RuntimeError("Paper account is not initialized.")
         connection.execute("DELETE FROM paper_fills")
+        intraday_capital = min(DEFAULT_INTRADAY_ALLOCATION, capital)
+        delivery_capital = capital - intraday_capital
         connection.execute(
-            "UPDATE paper_account SET initial_cash = ?, created_at = ? WHERE id = 1",
-            (capital, _now_ist()),
+            """
+            UPDATE paper_account
+            SET initial_cash = ?, created_at = ?,
+                intraday_initial_cash = ?, delivery_initial_cash = ?,
+                legacy_initial_cash = 0
+            WHERE id = 1
+            """,
+            (capital, _now_ist(), intraday_capital, delivery_capital),
         )
 
 
