@@ -203,7 +203,7 @@ def test_backfill_job_retries_after_transient_failure_and_resumes(monkeypatch):
     assert status["error"] is None or "Transient attempt" in status["error"]
 
 
-def test_backfill_yields_from_0900_until_1530_on_trading_days(monkeypatch):
+def test_backfill_yields_from_0900_until_1600_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
@@ -213,7 +213,9 @@ def test_backfill_yields_from_0900_until_1530_on_trading_days(monkeypatch):
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 8, 59, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 0, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
-    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
 
 
 def test_backfill_does_not_yield_on_non_trading_days(monkeypatch):
