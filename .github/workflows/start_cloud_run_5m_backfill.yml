@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t CHANGED_PATHS < <(git diff --name-only "$EXPECTED_DEPLOY_SHA" "$GITHUB_SHA")
+          mapfile -t CHANGED_PATHS < <(git diff --name-only "${EXPECTED_DEPLOY_SHA}^" "$GITHUB_SHA")
           if [[ "${#CHANGED_PATHS[@]}" -eq 1 && "${CHANGED_PATHS[0]}" == ".github/workflows/start_cloud_run_5m_backfill.yml" ]]; then
             echo "DEPLOY_GATE=SKIPPED_WORKFLOW_ONLY_CHANGE"
             exit 0
