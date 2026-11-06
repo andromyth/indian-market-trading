@@ -39,7 +39,7 @@ def test_recent_session_gap_is_flagged_but_complete_sessions_are_not() -> None:
 
     gaps = _recent_incomplete_session_dates(
         frame,
-        pd.Timestamp("2026-11-06 15:30", tz="Asia/Kolkata").to_pydatetime(),
+        pd.Timestamp("2026-11-05 15:30", tz="Asia/Kolkata").to_pydatetime(),
     )
 
     assert gaps == ["2026-11-04"]
