@@ -39,6 +39,9 @@ IST = ZoneInfo("Asia/Kolkata")
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 MAX_CODES_PER_REQUEST = 5
 MAX_DAYS_PER_REQUEST = 7
+RECENT_SESSION_LOOKBACK_DAYS = 10
+FULL_REGULAR_SESSION_BARS = 75
+LIVE_REMOTE_ROOT = "production_data/nse_official/intraday_5m_live"
 
 # Set by the private Cloud Run worker so this job reuses its process-local TOTP
 # token cache and yields API capacity during live-market hours.
@@ -125,6 +128,157 @@ def _instrument_codes() -> dict[str, str]:
     }
 
 
+def _align_to_monday(value: datetime) -> datetime:
+    """Align a range start to a stable Monday midnight for reusable 7-day checkpoints."""
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+    stamp = stamp.normalize() - pd.Timedelta(days=stamp.weekday())
+    return stamp.to_pydatetime()
+
+
+def _recent_incomplete_session_dates(
+    frame: pd.DataFrame,
+    end: datetime,
+    *,
+    lookback_days: int = RECENT_SESSION_LOOKBACK_DAYS,
+    expected_bars: int = FULL_REGULAR_SESSION_BARS,
+) -> list[str]:
+    """Return recent observed regular sessions that do not contain all 75 close-time bars."""
+    if frame is None or frame.empty:
+        return []
+    from market_session_guard import is_nse_trading_day
+
+    x = frame.copy()
+    idx = pd.DatetimeIndex(pd.to_datetime(x.index, errors="coerce"))
+    idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+    x.index = idx
+    required = ["Open", "High", "Low", "Close"]
+    if not set(required).issubset(x.columns):
+        return []
+    valid = x[required].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+    valid &= x[required].apply(pd.to_numeric, errors="coerce").gt(0).all(axis=1)
+    valid &= (x.index.time >= pd.Timestamp("09:20").time())
+    valid &= (x.index.time <= pd.Timestamp("15:30").time())
+    valid &= (x.index.minute % 5 == 0)
+    observed_dates = set(x.index[valid].date)
+    if not observed_dates:
+        return []
+    end_stamp = pd.Timestamp(end)
+    end_stamp = end_stamp.tz_localize(IST) if end_stamp.tzinfo is None else end_stamp.tz_convert(IST)
+    first_observed = min(observed_dates)
+    start_date = max(first_observed, end_stamp.date() - timedelta(days=int(lookback_days)))
+    session_dates = [
+        start_date + timedelta(days=offset)
+        for offset in range((end_stamp.date() - start_date).days + 1)
+        if is_nse_trading_day(start_date + timedelta(days=offset))
+    ]
+    counts = pd.Series(1, index=x.index[valid]).groupby(
+        pd.Index(x.index[valid].date)
+    ).sum().to_dict()
+    return [
+        day.isoformat()
+        for day in session_dates
+        if int(counts.get(day, 0)) < int(expected_bars)
+    ]
+
+
+def _load_recent_live_history(
+    store: Any,
+    symbols: set[str],
+    end: datetime,
+    work_root: Path,
+    *,
+    lookback_days: int = RECENT_SESSION_LOOKBACK_DAYS,
+) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+    """Load recent durable live OHLCV captures so backfill plans against all saved history."""
+    from googleapiclient.http import MediaIoBaseDownload
+    from market_session_guard import is_nse_trading_day
+
+    start_date = end.date() - timedelta(days=int(lookback_days))
+    buckets: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol in symbols}
+    files_read = 0
+    files_failed = 0
+    for offset in range((end.date() - start_date).days + 1):
+        day = start_date + timedelta(days=offset)
+        if not is_nse_trading_day(day):
+            continue
+        remote_dir = f"{LIVE_REMOTE_ROOT}/{day:%Y/%m/%d}"
+        folder = _resolve_remote_file(store, remote_dir)
+        if not folder:
+            continue
+        page_token = None
+        day_files: list[dict[str, Any]] = []
+        while True:
+            params = {
+                "q": f"'{folder['id']}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            response = store.service.files().list(**params).execute()
+            day_files.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        for item in day_files:
+            name = str(item.get("name") or "")
+            if item.get("mimeType") == "application/vnd.google-apps.folder":
+                continue
+            if not name.startswith("capture_") or not name.endswith(".parquet"):
+                continue
+            local = work_root / "live_history" / f"{day:%Y%m%d}" / Path(name).name
+            local.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                request = store.service.files().get_media(fileId=item["id"])
+                with local.open("wb") as output:
+                    downloader = MediaIoBaseDownload(
+                        output, request, chunksize=8 * 1024 * 1024
+                    )
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                capture = pd.read_parquet(local)
+                if capture.empty or not {"symbol", "Timestamp", *OHLCV}.issubset(capture.columns):
+                    files_failed += 1
+                    continue
+                capture["symbol"] = capture["symbol"].astype(str).str.strip().str.upper()
+                capture = capture.loc[capture["symbol"].isin(symbols)].copy()
+                if capture.empty:
+                    files_read += 1
+                    continue
+                idx = pd.DatetimeIndex(pd.to_datetime(capture.pop("Timestamp"), errors="coerce"))
+                idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+                capture.index = idx
+                for column in OHLCV:
+                    capture[column] = pd.to_numeric(capture[column], errors="coerce")
+                capture = capture.loc[~capture.index.isna()]
+                capture = capture.loc[capture.index <= pd.Timestamp(end)]
+                capture = capture.loc[capture[["Open", "High", "Low", "Close"]].notna().all(axis=1)]
+                capture = capture.loc[capture[["Open", "High", "Low", "Close"]].gt(0).all(axis=1)]
+                for symbol, part in capture.groupby("symbol", sort=False):
+                    buckets[str(symbol)].append(part[OHLCV])
+                files_read += 1
+            except Exception:
+                files_failed += 1
+    result: dict[str, pd.DataFrame] = {}
+    for symbol, parts in buckets.items():
+        if not parts:
+            result[symbol] = pd.DataFrame(
+                columns=OHLCV,
+                index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+            )
+            continue
+        merged = pd.concat(parts).sort_index()
+        merged = merged.loc[~merged.index.duplicated(keep="last")]
+        merged.index.name = "Datetime"
+        result[symbol] = merged[OHLCV]
+    return result, {"live_capture_files_read": files_read, "live_capture_files_failed": files_failed}
+
+
 def fetch_indstocks_5m_batch(
     symbols_and_codes: list[tuple[str, str]],
     start: datetime,
@@ -135,6 +289,7 @@ def fetch_indstocks_5m_batch(
     progress_context: dict[str, Any] | None = None,
     store: Any = None,
     checkpoint_root: Path | None = None,
+    force_refetch_after: datetime | None = None,
 ) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch a maximum of five stocks at once over consecutive seven-day windows."""
     if not symbols_and_codes:
@@ -162,35 +317,58 @@ def fetch_indstocks_5m_batch(
         checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if store is not None and checkpoint_root is not None else None
         checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if store is not None and checkpoint_root is not None else None
         expected_symbols = sorted(symbols_by_code.values())
-        if checkpoint_item and checkpoint_manifest_item:
-            from googleapiclient.http import MediaIoBaseDownload
-            checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-            for item, destination in (
-                (checkpoint_item, checkpoint_local),
-                (checkpoint_manifest_item, checkpoint_manifest_local),
-            ):
-                request = store.service.files().get_media(fileId=item["id"])
-                with destination.open("wb") as output:
-                    downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-            manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
-            if (
-                manifest.get("status") != "COMPLETE"
-                or manifest.get("window_key") != window_key
-                or manifest.get("symbols") != expected_symbols
-            ):
-                raise RuntimeError(f"Drive checkpoint manifest is invalid for window {window_key}; refusing to skip it.")
-            saved_window = pd.read_parquet(checkpoint_local)
-            if not saved_window.empty and (
-                "Symbol" not in saved_window.columns
-                or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
-            ):
-                raise RuntimeError(f"Drive checkpoint data contains unexpected symbols for window {window_key}.")
-            if not saved_window.empty:
+        reuse_checkpoint = bool(checkpoint_item and checkpoint_manifest_item)
+        if reuse_checkpoint:
+            if force_refetch_after is not None:
+                force_after = pd.Timestamp(force_refetch_after)
+                force_after = force_after.tz_localize(IST) if force_after.tzinfo is None else force_after.tz_convert(IST)
+                reuse_checkpoint = pd.Timestamp(window_end) <= force_after
+        if reuse_checkpoint:
+            try:
+                from googleapiclient.http import MediaIoBaseDownload
+                checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+                for item, destination in (
+                    (checkpoint_item, checkpoint_local),
+                    (checkpoint_manifest_item, checkpoint_manifest_local),
+                ):
+                    request = store.service.files().get_media(fileId=item["id"])
+                    with destination.open("wb") as output:
+                        downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
+                manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(manifest, dict)
+                    or manifest.get("status") != "COMPLETE"
+                    or manifest.get("window_key") != window_key
+                    or manifest.get("symbols") != expected_symbols
+                    or not isinstance(manifest.get("row_counts"), dict)
+                ):
+                    raise ValueError("checkpoint completion manifest is invalid")
+                saved_window = pd.read_parquet(checkpoint_local)
+                if not saved_window.empty and (
+                    not {"Symbol", *OHLCV}.issubset(saved_window.columns)
+                    or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
+                ):
+                    raise ValueError("checkpoint parquet has an invalid schema or unexpected symbols")
                 saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
-                saved_window.index = saved_window.index.tz_localize(IST) if saved_window.index.tz is None else saved_window.index.tz_convert(IST)
+                if saved_window.index.isna().any():
+                    raise ValueError("checkpoint parquet contains invalid timestamps")
+                saved_window.index = (
+                    saved_window.index.tz_localize(IST)
+                    if saved_window.index.tz is None
+                    else saved_window.index.tz_convert(IST)
+                )
+            except Exception as exc:
+                reuse_checkpoint = False
+                print(
+                    f"BACKFILL_CHECKPOINT_REFETCH_INVALID window={window_key} batch={batch_key} "
+                    f"reason={type(exc).__name__}",
+                    flush=True,
+                )
+        if reuse_checkpoint:
+            if not saved_window.empty:
                 for symbol in expected_symbols:
                     part = saved_window.loc[saved_window["Symbol"].eq(symbol), OHLCV]
                     if not part.empty:
@@ -346,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--initial-calendar-days", type=int, default=1000)
     parser.add_argument("--minimum-usable-sessions", type=int, default=200)
     parser.add_argument("--minimum-bars-per-session", type=int, default=50)
+    parser.add_argument("--recent-session-lookback-days", type=int, default=RECENT_SESSION_LOOKBACK_DAYS)
     parser.add_argument("--pause-seconds", type=float, default=1.0)
     parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--max-symbols", type=int, default=0)
@@ -360,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--minimum-usable-sessions must be 200 through --sessions")
     if args.minimum_bars_per_session < MIN_SESSION_BARS:
         raise ValueError(f"--minimum-bars-per-session must be at least {MIN_SESSION_BARS}")
+    if args.recent_session_lookback_days < 1 or args.recent_session_lookback_days > 30:
+        raise ValueError("--recent-session-lookback-days must be between 1 and 30")
     if not 0.5 <= args.minimum_symbol_coverage <= 1.0:
         raise ValueError("--minimum-symbol-coverage must be between 0.5 and 1.0")
     if args.pause_seconds < 0.20:
@@ -399,11 +580,27 @@ def main(argv: list[str] | None = None) -> int:
     if not resolvable:
         raise RuntimeError("INDstocks instrument master did not resolve any official NSE equity symbols.")
 
-    end = pd.Timestamp(args.end_date, tz=IST).to_pydatetime() if args.end_date else datetime.now(IST)
-    initial_start = end - timedelta(days=int(args.initial_calendar_days))
+    if args.end_date:
+        end = pd.Timestamp(args.end_date, tz=IST).to_pydatetime()
+    else:
+        now = datetime.now(IST)
+        # The Cloud Run request may arrive during market hours and wait until
+        # close. Pin the target to today's 15:30 bar boundary so today's final
+        # session is included when the shared worker resumes after the close.
+        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    initial_start = _align_to_monday(end - timedelta(days=int(args.initial_calendar_days)))
+    force_refetch_after = end - timedelta(days=int(args.recent_session_lookback_days))
     local_root = Path(args.work_root)
     local_root.mkdir(parents=True, exist_ok=True)
     store = GoogleDriveStore()
+    live_history, live_inventory = _load_recent_live_history(
+        store,
+        set(symbols),
+        end,
+        local_root,
+        lookback_days=args.recent_session_lookback_days,
+    )
+    print("BACKFILL_LIVE_HISTORY_INVENTORY " + json.dumps(live_inventory, sort_keys=True), flush=True)
     results: list[dict[str, Any]] = list(resolution_errors)
     total_api_calls = 0
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
@@ -427,17 +624,26 @@ def main(argv: list[str] | None = None) -> int:
             kaggle_local = local.with_name(f"{symbol}.kaggle.parquet")
             kaggle = _download_existing(store, kaggle_remote, kaggle_local)
             kaggle_seed_rows = int(len(kaggle))
-            existing_parts = [frame for frame in (existing, kaggle) if frame is not None and not frame.empty]
+            live = live_history.get(symbol, pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST)))
+            live_rows = int(len(live))
+            existing_parts = [frame for frame in (existing, kaggle, live) if frame is not None and not frame.empty]
             if existing_parts:
                 existing = pd.concat(existing_parts).sort_index()
                 existing = existing.loc[~existing.index.duplicated(keep="last")]
             existing_by_symbol[symbol] = existing
             summary = usable_session_summary(existing, args.minimum_bars_per_session)
             latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
+            recent_gaps = _recent_incomplete_session_dates(
+                existing,
+                end,
+                lookback_days=args.recent_session_lookback_days,
+                expected_bars=args.minimum_bars_per_session,
+            )
             is_complete = (
                 int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
                 and pd.notna(latest)
                 and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
+                and not recent_gaps
             )
             if is_complete:
                 results.append({
@@ -447,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
                     "remote_path": remote,
                     "rows": int(len(existing)),
                     "kaggle_seed_rows": kaggle_seed_rows,
+                    "live_history_rows": live_rows,
+                    "recent_incomplete_session_dates": recent_gaps,
                     "usable_sessions": int(summary["usable_sessions"]),
                     "last_timestamp_ist": summary["last_timestamp_ist"],
                     "fresh_latest_data": True,
@@ -454,13 +662,23 @@ def main(argv: list[str] | None = None) -> int:
                 })
                 continue
             active_batch.append((symbol, code))
-            starts[symbol] = choose_backfill_start(
-                summary,
-                end,
-                initial_start,
-                args.calendar_days,
-                args.sessions,
-            )
+            if (
+                recent_gaps
+                and int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
+                and pd.notna(latest)
+                and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
+            ):
+                starts[symbol] = _align_to_monday(
+                    end - timedelta(days=args.recent_session_lookback_days + MAX_DAYS_PER_REQUEST)
+                )
+            else:
+                starts[symbol] = _align_to_monday(choose_backfill_start(
+                    summary,
+                    end,
+                    initial_start,
+                    args.calendar_days,
+                    args.sessions,
+                ))
 
         # Do not spend provider calls on symbols already complete in Drive.
         if not active_batch:
@@ -492,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 store=store,
                 checkpoint_root=local_root / "window_checkpoints",
+                force_refetch_after=force_refetch_after,
             )
             total_api_calls += calls
         except Exception as exc:
@@ -509,7 +728,9 @@ def main(argv: list[str] | None = None) -> int:
             if not fetched.empty:
                 cutoff = pd.Timestamp.now(tz=IST).floor("5min")
                 fetched = fetched.loc[fetched.index <= cutoff].sort_index()
-            parts = [frame for frame in (existing, fetched) if frame is not None and not frame.empty]
+            # Existing coverage (Kaggle primary, then live capture) wins on duplicate timestamps;
+            # INDstocks supplies only timestamps not already present in the saved sources.
+            parts = [frame for frame in (fetched, existing) if frame is not None and not frame.empty]
             merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
             merged = merged.loc[~merged.index.duplicated(keep="last")]
             merged = retain_latest_sessions(merged, args.sessions, args.minimum_bars_per_session)
@@ -529,14 +750,31 @@ def main(argv: list[str] | None = None) -> int:
                 results.append({"symbol": symbol, "status": "ERROR", "error": f"Drive upload not confirmed: {uploaded}"})
                 continue
             ready = summary["usable_sessions"] >= args.minimum_usable_sessions
+            remaining_recent_gaps = _recent_incomplete_session_dates(
+                merged,
+                end,
+                lookback_days=args.recent_session_lookback_days,
+                expected_bars=FULL_REGULAR_SESSION_BARS,
+            )
+            recent_coverage_ready = not remaining_recent_gaps
+            final_status = (
+                "OK" if ready and fresh and recent_coverage_ready
+                else "RECENT_SESSION_GAPS" if ready and fresh and not recent_coverage_ready
+                else "STALE_LATEST_DATA" if ready
+                else "INSUFFICIENT_HISTORY"
+            )
             results.append({
                 "symbol": symbol,
-                "status": "OK" if ready and fresh else "STALE_LATEST_DATA" if ready else "INSUFFICIENT_HISTORY",
+                "status": final_status,
                 "source": "INDSTOCKS_HISTORICAL_5M",
                 "remote_path": remote,
                 "rows": int(len(merged)),
                 "fetched_rows": int(len(fetched)),
                 "kaggle_seed_rows": kaggle_seed_rows,
+                "live_history_rows": live_rows,
+                "recent_incomplete_session_dates": recent_gaps,
+                "remaining_recent_incomplete_session_dates": remaining_recent_gaps,
+                "recent_coverage_ready": bool(recent_coverage_ready),
                 "usable_sessions": int(summary["usable_sessions"]),
                 "raw_sessions": int(summary["raw_sessions"]),
                 "fresh_latest_data": bool(fresh),
@@ -579,6 +817,11 @@ def main(argv: list[str] | None = None) -> int:
         "target_sessions_per_symbol": args.sessions,
         "minimum_usable_sessions": args.minimum_usable_sessions,
         "minimum_bars_per_usable_session": args.minimum_bars_per_session,
+        "recent_session_full_bar_requirement": FULL_REGULAR_SESSION_BARS,
+        "recent_session_lookback_days": args.recent_session_lookback_days,
+        "recent_full_session_bar_requirement": FULL_REGULAR_SESSION_BARS,
+        "live_capture_files_read": live_inventory["live_capture_files_read"],
+        "live_capture_files_failed": live_inventory["live_capture_files_failed"],
         "calendar_days_requested": args.calendar_days,
         "initial_calendar_days": args.initial_calendar_days,
         "range_start_ist": initial_start.isoformat(),
@@ -599,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
             (row.get("last_timestamp_ist") or "" for row in results), default=None
         ),
         "symbols_with_errors": sum(row.get("status") == "ERROR" for row in results),
+        "symbols_with_recent_session_gaps": sum(bool(row.get("remaining_recent_incomplete_session_dates")) for row in results),
         "symbols_below_200_sessions": sum(row.get("status") == "INSUFFICIENT_HISTORY" for row in results),
         "symbols_with_data_but_no_200_sessions": sum(
             row.get("status") in {"INSUFFICIENT_HISTORY", "STALE_LATEST_DATA"} for row in results

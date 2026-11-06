@@ -11,6 +11,9 @@ on:
         options:
           - "no"
           - "yes"
+  schedule:
+    # 20:00 IST daily: after regular close and any scheduled Muhurat session.
+    - cron: "30 14 * * *"
   push:
     branches:
       - main
@@ -27,7 +30,7 @@ concurrency:
 
 jobs:
   start-backfill:
-    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]'))
+    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]')) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -60,6 +63,31 @@ jobs:
             sleep 10
           done
           echo "Backfill start blocked: timed out waiting for previous-commit deployment."
+          exit 1
+
+      - name: Require latest main-branch Cloud Run deployment to be successful
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | python -c 'import json,sys; runs=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_branch")=="main"]; print(json.dumps(max(runs,key=lambda r:r.get("created_at","")) if runs else {}))')"
+            RUN_ID="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              echo "LATEST_MAIN_DEPLOY_RUN_ID=$RUN_ID STATUS=$STATUS CONCLUSION=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                [[ "$CONCLUSION" == "success" ]] || { echo "Scheduled backfill blocked: latest main deployment did not succeed."; exit 1; }
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Scheduled backfill blocked: timed out waiting for latest main deployment."
           exit 1
 
       - name: Authenticate to Google Cloud
