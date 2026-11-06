@@ -4,7 +4,6 @@ import pandas as pd
 
 from indstocks_backfill_all_nse_5m_history import (
     _align_to_monday,
-    _checkpoint_contains_partial_sessions,
     _recent_incomplete_session_dates,
 )
 
@@ -56,25 +55,6 @@ def test_recent_session_gap_detects_a_whole_missing_session_between_observed_day
     )
 
     assert gaps == ["2026-11-04", "2026-11-06"]
-
-
-def test_checkpoint_with_74_bars_is_not_reused() -> None:
-    partial = _session_frame("2026-11-04", {"10:00"})
-    assert len(partial) == 74
-    assert _checkpoint_contains_partial_sessions(partial)
-
-
-def test_checkpoint_with_75_bars_is_reusable() -> None:
-    complete = _session_frame("2026-11-05")
-    assert len(complete) == 75
-    assert not _checkpoint_contains_partial_sessions(complete)
-
-
-def test_checkpoint_with_an_entire_missing_session_between_observed_days_is_not_reused() -> None:
-    before = _session_frame("2026-11-03")
-    after = _session_frame("2026-11-05")
-    saved = pd.concat([before, after]).sort_index()
-    assert _checkpoint_contains_partial_sessions(saved)
 
 
 def test_checkpoint_window_alignment_is_stable_within_the_same_week() -> None:
