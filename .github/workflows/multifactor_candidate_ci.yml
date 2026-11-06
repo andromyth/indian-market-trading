@@ -155,6 +155,7 @@ jobs:
           tests/test_dhan_backfill_5m.py
           tests/test_indstocks_5m_backfill.py
           tests/test_indstocks_backfill_gap_repair.py
+          tests/test_nse_trading_calendar.py
           tests/test_dhan_client_totp.py
           tests/test_native_5m_training_inputs.py
           tests/test_kaggle_nifty_5m_context.py

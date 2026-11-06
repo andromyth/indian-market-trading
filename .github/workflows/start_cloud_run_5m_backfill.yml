@@ -12,8 +12,10 @@ on:
           - "no"
           - "yes"
   schedule:
-    # 20:00 IST daily: after regular close and any scheduled Muhurat session.
-    - cron: "30 14 * * *"
+    # 00:00 IST daily: start early on weekends and NSE holidays.
+    - cron: "30 18 * * *"
+    # 16:00 IST on weekdays: start after the live 5-minute capture session.
+    - cron: "30 10 * * 1-5"
   push:
     branches:
       - main
@@ -39,6 +41,40 @@ jobs:
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
     steps:
+      - name: Check out repository for the NSE trading calendar
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+
+      - name: Gate scheduled start by NSE trading calendar and local time
+        id: schedule_gate
+        if: github.event_name == 'schedule'
+        env:
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from nse_trading_calendar import is_nse_trading_day
+
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          cron = os.environ.get("SCHEDULE_CRON", "")
+          trading_day = is_nse_trading_day(now.date())
+          if cron == "30 18 * * *":
+              allowed = not trading_day
+              reason = "non-trading day: full-day backfill window" if allowed else "trading day: wait until 16:00 IST"
+          elif cron == "30 10 * * 1-5":
+              allowed = trading_day and now.hour >= 16
+              reason = "trading day: post-market backfill window" if allowed else "not a trading day or before 16:00 IST"
+          else:
+              raise SystemExit("Unknown scheduled trigger; refusing to start backfill.")
+          print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("should_run=" + ("true" if allowed else "false") + "\n")
+          PY
+
       - name: Require successful deployment of the previous commit before starting backfill
         if: github.event_name == 'push'
         env:
@@ -66,7 +102,7 @@ jobs:
           exit 1
 
       - name: Require latest main-branch Cloud Run deployment to be successful
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && steps.schedule_gate.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -91,18 +127,21 @@ jobs:
           exit 1
 
       - name: Authenticate to Google Cloud
+        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           project_id: indian-market-trading
 
       - name: Set up gcloud
+        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
 
       # Immediate post-deploy kickoff: the marker commit is gated on the prior deploy.
       - name: Wait for the deployed private backfill endpoint
+        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
         id: endpoint
         shell: bash
         run: |
@@ -162,6 +201,7 @@ jobs:
           exit 1
 
       - name: Start resumable backfill using Cloud Run's existing TOTP cache
+        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
