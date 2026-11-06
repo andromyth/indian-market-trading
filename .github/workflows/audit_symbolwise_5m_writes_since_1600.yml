@@ -1,0 +1,154 @@
+name: Audit symbol-wise five-minute writes since 16:00 IST
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/audit_symbolwise_5m_writes_since_1600.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Audit Drive symbol archives and checkpoint writes
+        shell: bash
+        env:
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet google-api-python-client google-auth pandas pyarrow
+          python - <<'PY'
+          import io, json, os, sys
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+          import pandas as pd
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          CUTOFF = datetime(2026, 11, 6, 10, 30, tzinfo=timezone.utc)  # 16:00 IST
+          IST = ZoneInfo("Asia/Kolkata")
+          token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "")
+          root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
+          if not token_text or not root_id:
+              raise RuntimeError("Missing Google Drive OAuth token or root folder ID")
+          info = json.loads(token_text)
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid:
+              creds.refresh(Request())
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+          FOLDER = "application/vnd.google-apps.folder"
+
+          def children(parent):
+              out, page = [], None
+              while True:
+                  q = f"'{parent}' in parents and trashed = false"
+                  res = service.files().list(
+                      q=q, pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+                  ).execute()
+                  out.extend(res.get("files", []))
+                  page = res.get("nextPageToken")
+                  if not page:
+                      return out
+
+          def descend(parent, names):
+              cur = parent
+              for name in names:
+                  found = [x for x in children(cur) if x["name"] == name and x["mimeType"] == FOLDER]
+                  if not found:
+                      raise RuntimeError("Missing Drive folder: " + name)
+                  cur = found[0]["id"]
+              return cur
+
+          def modified(item):
+              value = item.get("modifiedTime")
+              return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+          archive = descend(root_id, ["production_data", "nse_official", "intraday_seed", "olo_5m_archive"])
+          symbols_root = descend(archive, ["symbols"])
+          root_items = children(symbols_root)
+          symbol_dirs = [x for x in root_items if x["mimeType"] == FOLDER and x["name"].startswith("symbol=")]
+          checkpoint_dirs = [x for x in root_items if x["mimeType"] == FOLDER and x["name"] == "window_checkpoints"]
+          symbol_files = []
+          for folder in symbol_dirs:
+              symbol = folder["name"].split("=", 1)[1].strip().upper()
+              for item in children(folder):
+                  if item["mimeType"] != FOLDER and item["name"] == f"{symbol}.parquet":
+                      symbol_files.append({**item, "symbol": symbol})
+          checkpoint_files = []
+          if checkpoint_dirs:
+              stack = [checkpoint_dirs[0]["id"]]
+              while stack:
+                  parent = stack.pop()
+                  for item in children(parent):
+                      if item["mimeType"] == FOLDER:
+                          stack.append(item["id"])
+                      else:
+                          checkpoint_files.append(item)
+
+          recent_symbols = [x for x in symbol_files if modified(x) and modified(x) >= CUTOFF]
+          recent_checkpoints = [x for x in checkpoint_files if modified(x) and modified(x) >= CUTOFF]
+          inspected = []
+          for item in sorted(recent_symbols, key=lambda x: x["symbol"]):
+              buf = io.BytesIO()
+              downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=item["id"]), chunksize=8*1024*1024)
+              done = False
+              while not done:
+                  _, done = downloader.next_chunk()
+              frame = pd.read_parquet(io.BytesIO(buf.getvalue()))
+              idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
+              if not isinstance(frame.index, pd.DatetimeIndex):
+                  idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
+              valid_idx = idx[~pd.isna(idx)]
+              usable = 0
+              if len(valid_idx):
+                  local_dates = pd.Series(valid_idx.tz_convert(IST).date)
+                  counts = local_dates.value_counts()
+                  usable = int((counts >= 50).sum())
+              inspected.append({
+                  "symbol": item["symbol"], "file": item["name"],
+                  "modifiedTime_utc": item.get("modifiedTime"),
+                  "bytes": int(item.get("size") or 0), "rows": int(len(frame)),
+                  "columns": list(map(str, frame.columns)),
+                  "first_timestamp_utc": str(valid_idx.min()) if len(valid_idx) else None,
+                  "last_timestamp_utc": str(valid_idx.max()) if len(valid_idx) else None,
+                  "usable_sessions_50plus_bars": usable,
+                  "readable": True
+              })
+
+          report = {
+              "audit_cutoff_utc": CUTOFF.isoformat(),
+              "audit_cutoff_ist": CUTOFF.astimezone(IST).isoformat(),
+              "audited_at_utc": datetime.now(timezone.utc).isoformat(),
+              "symbol_folder_count": len(symbol_dirs),
+              "symbolwise_parquet_file_count": len(symbol_files),
+              "symbolwise_parquet_modified_since_cutoff_count": len(recent_symbols),
+              "symbolwise_parquet_modified_since_cutoff": inspected,
+              "checkpoint_file_count_recursive": len(checkpoint_files),
+              "checkpoint_files_modified_since_cutoff_count": len(recent_checkpoints),
+              "recent_checkpoint_files": [{
+                  "name": x["name"], "modifiedTime_utc": x.get("modifiedTime"),
+                  "bytes": int(x.get("size") or 0),
+                  "type": "manifest" if x["name"].endswith(".json") else "parquet"
+              } for x in sorted(recent_checkpoints, key=lambda x: x.get("modifiedTime") or "", reverse=True)],
+              "conclusion": (
+                  "SYMBOLWISE_WRITES_CONFIRMED" if recent_symbols else
+                  "NO_SYMBOLWISE_WRITES_SINCE_1600_IST"
+              )
+          }
+          print("SYMBOLWISE_1600_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
+          PY
