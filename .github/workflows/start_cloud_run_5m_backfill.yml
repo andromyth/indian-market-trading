@@ -12,12 +12,9 @@ on:
           - "no"
           - "yes"
   schedule:
-    # 00:00 IST daily: start early on weekends and NSE holidays.
-    - cron: "30 18 * * *"
-    # Retry/resume every two hours on weekends and NSE holidays.
-    - cron: "0 */2 * * *"
-    # Retry/resume hourly from 16:00 through 23:00 IST on weekdays.
-    - cron: "30 10-17 * * 1-5"
+    # Hourly at :00 IST from 16:00 through 08:00, every calendar day.
+    # UTC equivalent: 10:30-17:30 and 18:30-02:30.
+    - cron: "30 0-2,10-23 * * *"
   push:
     branches:
       - main
@@ -66,14 +63,15 @@ jobs:
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           cron = os.environ.get("SCHEDULE_CRON", "")
           trading_day = is_nse_trading_day(now.date())
-          if cron in {"30 18 * * *", "0 */2 * * *"}:
-              allowed = not trading_day
-              reason = "non-trading day: checkpoint-safe backfill resume window" if allowed else "trading day: use the post-market schedule"
-          elif cron == "30 10-17 * * 1-5":
-              allowed = trading_day and now.hour >= 16
-              reason = "trading day: hourly post-market checkpoint-safe resume" if allowed else "not a trading day or before 16:00 IST"
-          else:
+          if cron != "30 0-2,10-23 * * *":
               raise SystemExit("Unknown scheduled trigger; refusing to start backfill.")
+          in_backfill_window = now.hour >= 16 or now.hour < 9
+          allowed = (not trading_day) or in_backfill_window
+          reason = (
+              "non-trading day: backfill window remains open"
+              if not trading_day
+              else "trading day: allowed only 16:00-09:00 IST"
+          )
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("should_run=" + ("true" if allowed else "false") + "\n")
@@ -83,7 +81,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_DEPLOY_SHA: ${{ github.event.before }}
+          EXPECTED_DEPLOY_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -107,7 +105,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "Backfill start blocked: timed out waiting for previous-commit deployment."
+          echo "Backfill start blocked: timed out waiting for this commit's worker deployment."
           exit 1
 
       - name: Require latest main-branch Cloud Run deployment to be successful
