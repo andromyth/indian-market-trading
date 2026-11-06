@@ -324,47 +324,63 @@ def fetch_indstocks_5m_batch(
                 force_after = force_after.tz_localize(IST) if force_after.tzinfo is None else force_after.tz_convert(IST)
                 reuse_checkpoint = pd.Timestamp(window_end) <= force_after
         if reuse_checkpoint:
-            from googleapiclient.http import MediaIoBaseDownload
-            checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-            for item, destination in (
-                (checkpoint_item, checkpoint_local),
-                (checkpoint_manifest_item, checkpoint_manifest_local),
-            ):
-                request = store.service.files().get_media(fileId=item["id"])
-                with destination.open("wb") as output:
-                    downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-            manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
-            if (
-                manifest.get("status") != "COMPLETE"
-                or manifest.get("window_key") != window_key
-                or manifest.get("symbols") != expected_symbols
-            ):
-                raise RuntimeError(f"Drive checkpoint manifest is invalid for window {window_key}; refusing to skip it.")
-            saved_window = pd.read_parquet(checkpoint_local)
-            if not saved_window.empty and (
-                "Symbol" not in saved_window.columns
-                or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
-            ):
-                raise RuntimeError(f"Drive checkpoint data contains unexpected symbols for window {window_key}.")
-            if reuse_checkpoint:
-                if not saved_window.empty:
-                    saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
-                    saved_window.index = saved_window.index.tz_localize(IST) if saved_window.index.tz is None else saved_window.index.tz_convert(IST)
-                    for symbol in expected_symbols:
-                        part = saved_window.loc[saved_window["Symbol"].eq(symbol), OHLCV]
-                        if not part.empty:
-                            accumulated[symbol].append(part)
-                cursor = window_end
-                if callable(BACKFILL_PROGRESS_CALLBACK):
-                    BACKFILL_PROGRESS_CALLBACK({
-                        "provider": "INDSTOCKS", **(progress_context or {}),
-                        "stage": "RESUMED_CHECKPOINT", "window_end": window_end.isoformat(),
-                        "api_calls_in_batch": calls,
-                    })
-                continue
+            try:
+                from googleapiclient.http import MediaIoBaseDownload
+                checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+                for item, destination in (
+                    (checkpoint_item, checkpoint_local),
+                    (checkpoint_manifest_item, checkpoint_manifest_local),
+                ):
+                    request = store.service.files().get_media(fileId=item["id"])
+                    with destination.open("wb") as output:
+                        downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
+                manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(manifest, dict)
+                    or manifest.get("status") != "COMPLETE"
+                    or manifest.get("window_key") != window_key
+                    or manifest.get("symbols") != expected_symbols
+                    or not isinstance(manifest.get("row_counts"), dict)
+                ):
+                    raise ValueError("checkpoint completion manifest is invalid")
+                saved_window = pd.read_parquet(checkpoint_local)
+                if not saved_window.empty and (
+                    not {"Symbol", *OHLCV}.issubset(saved_window.columns)
+                    or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
+                ):
+                    raise ValueError("checkpoint parquet has an invalid schema or unexpected symbols")
+                saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
+                if saved_window.index.isna().any():
+                    raise ValueError("checkpoint parquet contains invalid timestamps")
+                saved_window.index = (
+                    saved_window.index.tz_localize(IST)
+                    if saved_window.index.tz is None
+                    else saved_window.index.tz_convert(IST)
+                )
+            except Exception as exc:
+                reuse_checkpoint = False
+                print(
+                    f"BACKFILL_CHECKPOINT_REFETCH_INVALID window={window_key} batch={batch_key} "
+                    f"reason={type(exc).__name__}",
+                    flush=True,
+                )
+        if reuse_checkpoint:
+            if not saved_window.empty:
+                for symbol in expected_symbols:
+                    part = saved_window.loc[saved_window["Symbol"].eq(symbol), OHLCV]
+                    if not part.empty:
+                        accumulated[symbol].append(part)
+            cursor = window_end
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS", **(progress_context or {}),
+                    "stage": "RESUMED_CHECKPOINT", "window_end": window_end.isoformat(),
+                    "api_calls_in_batch": calls,
+                })
+            continue
         if request_guard is not None:
             request_guard()
         wait = pause_seconds - (time.monotonic() - last_request_started)
