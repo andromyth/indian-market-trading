@@ -46,7 +46,7 @@ def test_intraday_coverage_requires_populated_target_aligned_outcome(monkeypatch
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
-        "decision_timestamp": "2026-10-20T10:00:00+05:30",
+        "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat(),
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-1",
@@ -75,7 +75,7 @@ def test_intraday_coverage_accepts_a_matched_validated_actual(monkeypatch):
         "symbol": "SBIN",
         "mode": "Intraday",
         "prediction_horizon": "30m",
-        "decision_timestamp": "2026-10-20T10:00:00+05:30",
+        "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat(),
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-2",
