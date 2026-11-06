@@ -27,7 +27,8 @@ concurrency:
 jobs:
   learn:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Full-NSE learning reads and joins multi-week 5-minute Drive snapshots; the prior 45-minute cap cancelled this stage mid-run.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
