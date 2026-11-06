@@ -83,14 +83,19 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
     _log("indstocks_5m_backfill_progress", **progress)
 
 
+def _is_nse_live_priority_window(now: datetime) -> bool:
+    """Reserve 09:00-15:30 IST on NSE trading days for live capture."""
+    return is_nse_trading_day(now.date()) and (
+        now.hour >= 9 and (now.hour < 15 or (now.hour == 15 and now.minute < 30))
+    )
+
+
 def _wait_until_market_closed() -> None:
-    """Yield historical API requests during NSE live hours so snapshots stay first."""
+    """Yield historical API requests from 09:00-15:30 IST so snapshots stay first."""
     announced = False
     while True:
         now = datetime.now(IST)
-        market_open = is_nse_trading_day(now.date()) and (
-            now.hour > 9 or (now.hour == 9 and now.minute >= 15)
-        ) and (now.hour < 15 or (now.hour == 15 and now.minute < 30))
+        market_open = _is_nse_live_priority_window(now)
         if not market_open:
             if announced:
                 _log("indstocks_5m_backfill_resumed_after_market")
