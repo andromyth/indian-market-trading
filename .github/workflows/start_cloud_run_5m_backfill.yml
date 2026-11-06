@@ -101,6 +101,7 @@ jobs:
         with:
           project_id: indian-market-trading
 
+      # Immediate post-deploy kickoff: the marker commit is gated on the prior deploy.
       - name: Wait for the deployed private backfill endpoint
         id: endpoint
         shell: bash
