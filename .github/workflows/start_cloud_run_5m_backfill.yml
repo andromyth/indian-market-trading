@@ -36,16 +36,18 @@ jobs:
   start-backfill:
     if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]')) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
     steps:
-      - name: Check out repository for the NSE trading calendar
-        if: github.event_name == 'schedule'
+      - name: Check out repository
+        if: github.event_name == 'schedule' || github.event_name == 'push'
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Gate scheduled start by NSE trading calendar and local time
         id: schedule_gate
@@ -77,7 +79,7 @@ jobs:
               output.write("should_run=" + ("true" if allowed else "false") + "\n")
           PY
 
-      - name: Require successful deployment of the previous commit before starting backfill
+      - name: Require successful deployment when worker code changed
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,6 +87,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mapfile -t CHANGED_PATHS < <(git diff --name-only "$EXPECTED_DEPLOY_SHA" "$GITHUB_SHA")
+          if [[ "${#CHANGED_PATHS[@]}" -eq 1 && "${CHANGED_PATHS[0]}" == ".github/workflows/start_cloud_run_5m_backfill.yml" ]]; then
+            echo "DEPLOY_GATE=SKIPPED_WORKFLOW_ONLY_CHANGE"
+            exit 0
+          fi
           for attempt in $(seq 1 90); do
             RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&head_sha=${EXPECTED_DEPLOY_SHA}&per_page=20")"
             MATCH="$(printf '%s' "$RUNS" | python -c 'import json,os,sys; sha=os.environ["EXPECTED_DEPLOY_SHA"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha]; print(json.dumps(max(runs,key=lambda r:r.get("created_at","")) if runs else {}))')"
@@ -204,9 +211,12 @@ jobs:
 
       - name: Start resumable backfill using Cloud Run's existing TOTP cache
         if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        id: start
         shell: bash
         run: |
           set -euo pipefail
+          TRIGGER_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "trigger_started_at=$TRIGGER_STARTED_AT" >> "$GITHUB_OUTPUT"
           if [[ "$CALLER_IDENTITY" == "SELF" ]]; then
             TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
           else
@@ -241,3 +251,137 @@ jobs:
                   raise SystemExit(0)
           raise SystemExit("BACKFILL_START_FAILED http=" + code + " status=" + str(body.get("status")))
           PY
+
+      - name: Verify a durable symbol-wise Parquet write after kickoff
+        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        env:
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          TRIGGER_STARTED_AT: ${{ steps.start.outputs.trigger_started_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$GOOGLE_OAUTH_TOKEN_JSON" && -n "$GOOGLE_DRIVE_ROOT_ID" ]] || { echo "ERROR=drive_audit_secrets_missing"; exit 1; }
+          [[ -n "$TRIGGER_STARTED_AT" ]] || { echo "ERROR=trigger_timestamp_missing"; exit 1; }
+          python -m pip install --quiet google-api-python-client google-auth
+          for attempt in $(seq 1 30); do
+            gcloud logging read \
+              'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'"$TRIGGER_STARTED_AT"'"' \
+              --project="$PROJECT_ID" --limit=500 --order=desc --format=json > "$RUNNER_TEMP/backfill_verify_logs.json"
+            set +e
+            python - "$RUNNER_TEMP/backfill_verify_logs.json" <<'PY'
+          import json, os, sys
+          from datetime import datetime
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+
+          started = datetime.fromisoformat(os.environ["TRIGGER_STARTED_AT"].replace("Z", "+00:00"))
+          logs = json.load(open(sys.argv[1], encoding="utf-8"))
+          rendered = [json.dumps(row, sort_keys=True, default=str) for row in logs]
+          progress_events = [
+              row for row in rendered
+              if "indstocks_5m_backfill_progress" in row or "BACKFILL_PROGRESS" in row
+          ]
+          failure_events = [
+              row for row in rendered
+              if "indstocks_5m_backfill_failed" in row
+          ]
+          print("BACKFILL_PROGRESS_LOG_EVENTS=" + str(len(progress_events)))
+          if failure_events:
+              print("BACKFILL_FAILURE_LOG_EVENT=" + failure_events[0][:1500])
+              raise SystemExit(2)
+
+          info = json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          creds = Credentials.from_authorized_user_info(
+              info, scopes=["https://www.googleapis.com/auth/drive"]
+          )
+          if not creds.valid:
+              creds.refresh(Request())
+          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+          def children(parent_id, name=None):
+              query = f"'{parent_id}' in parents and trashed = false"
+              if name is not None:
+                  query += " and name = " + json.dumps(name)
+              rows, page = [], None
+              while True:
+                  result = drive.files().list(
+                      q=query, pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)"
+                  ).execute()
+                  rows.extend(result.get("files", []))
+                  page = result.get("nextPageToken")
+                  if not page:
+                      return rows
+
+          def descend(parent, names):
+              current = parent
+              for name in names:
+                  matches = [
+                      item for item in children(current, name)
+                      if item.get("mimeType") == "application/vnd.google-apps.folder"
+                  ]
+                  if not matches:
+                      raise RuntimeError("Drive archive path component missing: " + name)
+                  current = matches[0]["id"]
+              return current
+
+          archive_id = descend(os.environ["GOOGLE_DRIVE_ROOT_ID"], [
+              "production_data", "nse_official", "intraday_seed", "olo_5m_archive"
+          ])
+          symbols_id = descend(archive_id, ["symbols"])
+          symbol_dirs = [
+              item for item in children(symbols_id)
+              if item.get("mimeType") == "application/vnd.google-apps.folder"
+              and item.get("name", "").startswith("symbol=")
+          ]
+          symbol_parent_ids = {item["id"] for item in symbol_dirs}
+          parquet_files, page = [], None
+          query = "trashed = false and name contains '.parquet'"
+          while True:
+              result = drive.files().list(
+                  q=query, pageSize=1000, pageToken=page,
+                  fields="nextPageToken,files(id,name,size,modifiedTime,parents)"
+              ).execute()
+              parquet_files.extend(result.get("files", []))
+              page = result.get("nextPageToken")
+              if not page:
+                  break
+
+          updates = []
+          for item in parquet_files:
+              parents = set(item.get("parents") or [])
+              name = item.get("name") or ""
+              if not name.endswith(".parquet") or not parents.intersection(symbol_parent_ids):
+                  continue
+              modified = item.get("modifiedTime")
+              if not modified:
+                  continue
+              stamp = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+              if stamp > started:
+                  updates.append({
+                      "file": name,
+                      "modifiedTime": modified,
+                      "size": item.get("size"),
+                  })
+          updates.sort(key=lambda row: row["modifiedTime"], reverse=True)
+          print("DURABLE_SYMBOL_PARQUET_WRITE_COUNT=" + str(len(updates)))
+          print("DURABLE_SYMBOL_PARQUET_WRITE_EXAMPLES=" + json.dumps(updates[:10], sort_keys=True))
+          if updates:
+              print("BACKFILL_VERIFICATION=PASS_SYMBOL_PARQUET_WRITTEN_AFTER_TRIGGER")
+              raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            VERIFY_CODE=$?
+            set -e
+            if [[ "$VERIFY_CODE" -eq 0 ]]; then
+              exit 0
+            elif [[ "$VERIFY_CODE" -eq 2 ]]; then
+              exit 1
+            fi
+            echo "WAITING_FOR_SYMBOL_PARQUET_PERSISTENCE attempt=$attempt/30"
+            sleep 60
+          done
+          echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
+          exit 1
