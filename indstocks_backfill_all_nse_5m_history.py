@@ -187,7 +187,7 @@ def _checkpoint_contains_partial_sessions(
     *,
     expected_bars: int = FULL_REGULAR_SESSION_BARS,
 ) -> bool:
-    """A COMPLETE marker is not enough: every observed symbol/session must have 75 valid bars."""
+    """Refetch a checkpoint with any partial or missing session between observed dates."""
     if saved_window is None or saved_window.empty:
         return False
     if "Symbol" not in saved_window.columns:
@@ -195,6 +195,8 @@ def _checkpoint_contains_partial_sessions(
     required = ["Open", "High", "Low", "Close"]
     if not set(required).issubset(saved_window.columns):
         return True
+    from market_session_guard import is_nse_trading_day
+
     x = saved_window.copy()
     idx = pd.DatetimeIndex(pd.to_datetime(x.index, errors="coerce"))
     idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
@@ -206,14 +208,22 @@ def _checkpoint_contains_partial_sessions(
     valid &= (x.index.minute % 5 == 0)
     if not valid.any():
         return False
-    counts = (
-        x.loc[valid]
-        .assign(_session=x.index[valid].date, _symbol=x.loc[valid, "Symbol"].astype(str).to_numpy())
-        .groupby(["_symbol", "_session"], dropna=False)
-        .size()
-    )
-    return bool(((counts > 0) & (counts < int(expected_bars))).any())
-
+    valid_rows = x.loc[valid].copy()
+    valid_rows["_session"] = valid_rows.index.date
+    valid_rows["_symbol"] = valid_rows["Symbol"].astype(str)
+    counts = valid_rows.groupby(["_symbol", "_session"], dropna=False).size()
+    for symbol, symbol_counts in counts.groupby(level=0):
+        date_counts = {
+            session: int(count)
+            for (_, session), count in symbol_counts.items()
+        }
+        observed = sorted(date_counts)
+        first_day, last_day = observed[0], observed[-1]
+        for offset in range((last_day - first_day).days + 1):
+            session_day = first_day + timedelta(days=offset)
+            if is_nse_trading_day(session_day) and date_counts.get(session_day, 0) < int(expected_bars):
+                return True
+    return False
 
 def _load_recent_live_history(
     store: Any,
