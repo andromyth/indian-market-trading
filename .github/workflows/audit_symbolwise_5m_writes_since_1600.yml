@@ -86,7 +86,7 @@ jobs:
           symbol_files = []
           for folder in symbol_dirs:
               symbol = folder["name"].split("=", 1)[1].strip().upper()
-              for item in children(folder):
+              for item in children(folder["id"]):
                   if item["mimeType"] != FOLDER and item["name"] == f"{symbol}.parquet":
                       symbol_files.append({**item, "symbol": symbol})
           checkpoint_files = []
