@@ -750,9 +750,22 @@ def main(argv: list[str] | None = None) -> int:
                 results.append({"symbol": symbol, "status": "ERROR", "error": f"Drive upload not confirmed: {uploaded}"})
                 continue
             ready = summary["usable_sessions"] >= args.minimum_usable_sessions
+            remaining_recent_gaps = _recent_incomplete_session_dates(
+                merged,
+                end,
+                lookback_days=args.recent_session_lookback_days,
+                expected_bars=FULL_REGULAR_SESSION_BARS,
+            )
+            recent_coverage_ready = not remaining_recent_gaps
+            final_status = (
+                "OK" if ready and fresh and recent_coverage_ready
+                else "RECENT_SESSION_GAPS" if ready and fresh and not recent_coverage_ready
+                else "STALE_LATEST_DATA" if ready
+                else "INSUFFICIENT_HISTORY"
+            )
             results.append({
                 "symbol": symbol,
-                "status": "OK" if ready and fresh else "STALE_LATEST_DATA" if ready else "INSUFFICIENT_HISTORY",
+                "status": final_status,
                 "source": "INDSTOCKS_HISTORICAL_5M",
                 "remote_path": remote,
                 "rows": int(len(merged)),
@@ -760,6 +773,8 @@ def main(argv: list[str] | None = None) -> int:
                 "kaggle_seed_rows": kaggle_seed_rows,
                 "live_history_rows": live_rows,
                 "recent_incomplete_session_dates": recent_gaps,
+                "remaining_recent_incomplete_session_dates": remaining_recent_gaps,
+                "recent_coverage_ready": bool(recent_coverage_ready),
                 "usable_sessions": int(summary["usable_sessions"]),
                 "raw_sessions": int(summary["raw_sessions"]),
                 "fresh_latest_data": bool(fresh),
@@ -827,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
             (row.get("last_timestamp_ist") or "" for row in results), default=None
         ),
         "symbols_with_errors": sum(row.get("status") == "ERROR" for row in results),
+        "symbols_with_recent_session_gaps": sum(bool(row.get("remaining_recent_incomplete_session_dates")) for row in results),
         "symbols_below_200_sessions": sum(row.get("status") == "INSUFFICIENT_HISTORY" for row in results),
         "symbols_with_data_but_no_200_sessions": sum(
             row.get("status") in {"INSUFFICIENT_HISTORY", "STALE_LATEST_DATA"} for row in results
