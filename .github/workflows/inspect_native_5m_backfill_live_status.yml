@@ -89,3 +89,4 @@ jobs:
           if not found:
             print("BACKFILL_LOG_NOTE=No backfill progress/error events found in the last six hours.")
           PY
+# Fresh read-only diagnostic trigger: 2026-11-06 after the 16:00 IST storage audit.
