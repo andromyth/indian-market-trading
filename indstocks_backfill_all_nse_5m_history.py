@@ -182,49 +182,6 @@ def _recent_incomplete_session_dates(
     ]
 
 
-def _checkpoint_contains_partial_sessions(
-    saved_window: pd.DataFrame,
-    *,
-    expected_bars: int = FULL_REGULAR_SESSION_BARS,
-) -> bool:
-    """Refetch a checkpoint with any partial or missing session between observed dates."""
-    if saved_window is None or saved_window.empty:
-        return False
-    if "Symbol" not in saved_window.columns:
-        return True
-    required = ["Open", "High", "Low", "Close"]
-    if not set(required).issubset(saved_window.columns):
-        return True
-    from market_session_guard import is_nse_trading_day
-
-    x = saved_window.copy()
-    idx = pd.DatetimeIndex(pd.to_datetime(x.index, errors="coerce"))
-    idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
-    x.index = idx
-    valid = x[required].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
-    valid &= x[required].apply(pd.to_numeric, errors="coerce").gt(0).all(axis=1)
-    valid &= (x.index.time >= pd.Timestamp("09:20").time())
-    valid &= (x.index.time <= pd.Timestamp("15:30").time())
-    valid &= (x.index.minute % 5 == 0)
-    if not valid.any():
-        return False
-    valid_rows = x.loc[valid].copy()
-    valid_rows["_session"] = valid_rows.index.date
-    valid_rows["_symbol"] = valid_rows["Symbol"].astype(str)
-    counts = valid_rows.groupby(["_symbol", "_session"], dropna=False).size()
-    for symbol, symbol_counts in counts.groupby(level=0):
-        date_counts = {
-            session: int(count)
-            for (_, session), count in symbol_counts.items()
-        }
-        observed = sorted(date_counts)
-        first_day, last_day = observed[0], observed[-1]
-        for offset in range((last_day - first_day).days + 1):
-            session_day = first_day + timedelta(days=offset)
-            if is_nse_trading_day(session_day) and date_counts.get(session_day, 0) < int(expected_bars):
-                return True
-    return False
-
 def _load_recent_live_history(
     store: Any,
     symbols: set[str],
@@ -392,12 +349,6 @@ def fetch_indstocks_5m_batch(
                 or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
             ):
                 raise RuntimeError(f"Drive checkpoint data contains unexpected symbols for window {window_key}.")
-            if _checkpoint_contains_partial_sessions(saved_window):
-                reuse_checkpoint = False
-                print(
-                    f"BACKFILL_CHECKPOINT_REFETCH_PARTIAL window={window_key} batch={batch_key}",
-                    flush=True,
-                )
             if reuse_checkpoint:
                 if not saved_window.empty:
                     saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
@@ -556,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--calendar-days", type=int, default=1000)
     parser.add_argument("--initial-calendar-days", type=int, default=1000)
     parser.add_argument("--minimum-usable-sessions", type=int, default=200)
-    parser.add_argument("--minimum-bars-per-session", type=int, default=75)
+    parser.add_argument("--minimum-bars-per-session", type=int, default=50)
     parser.add_argument("--recent-session-lookback-days", type=int, default=RECENT_SESSION_LOOKBACK_DAYS)
     parser.add_argument("--pause-seconds", type=float, default=1.0)
     parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
@@ -570,8 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--sessions must be between 200 and 500")
     if not 200 <= args.minimum_usable_sessions <= args.sessions:
         raise ValueError("--minimum-usable-sessions must be 200 through --sessions")
-    if args.minimum_bars_per_session < FULL_REGULAR_SESSION_BARS:
-        raise ValueError(f"--minimum-bars-per-session must be at least {FULL_REGULAR_SESSION_BARS} for a complete regular NSE session")
+    if args.minimum_bars_per_session < MIN_SESSION_BARS:
+        raise ValueError(f"--minimum-bars-per-session must be at least {MIN_SESSION_BARS}")
     if args.recent_session_lookback_days < 1 or args.recent_session_lookback_days > 30:
         raise ValueError("--recent-session-lookback-days must be between 1 and 30")
     if not 0.5 <= args.minimum_symbol_coverage <= 1.0:
@@ -833,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         "target_sessions_per_symbol": args.sessions,
         "minimum_usable_sessions": args.minimum_usable_sessions,
         "minimum_bars_per_usable_session": args.minimum_bars_per_session,
+        "recent_session_full_bar_requirement": FULL_REGULAR_SESSION_BARS,
         "recent_session_lookback_days": args.recent_session_lookback_days,
         "recent_full_session_bar_requirement": FULL_REGULAR_SESSION_BARS,
         "live_capture_files_read": live_inventory["live_capture_files_read"],
