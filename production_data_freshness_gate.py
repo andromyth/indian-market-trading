@@ -20,16 +20,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 EOD_RE = re.compile(r"BhavCopy_NSE_CM_0_0_0_(\d{8})_F_0000\.parquet$", re.I)
 DELIVERY_RE = re.compile(r"delivery_(\d{8})\.parquet$", re.I)
 
-# 2026 NSE CM/equity holidays used by the existing ingestion layer.
-HOLIDAYS = {
-    date.fromisoformat(x)
-    for x in (
-        "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26",
-        "2026-03-31", "2026-04-03", "2026-04-14", "2026-05-01",
-        "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02",
-        "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25",
-    )
-}
+from nse_trading_calendar import HOLIDAYS
 
 
 def previous_trading_day(value: date) -> date:
