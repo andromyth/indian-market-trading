@@ -61,19 +61,26 @@ jobs:
             "progress": progress,
           }, sort_keys=True, default=str))
           PY
+          echo "CLOUD_RUN_SERVICE_CONFIG_BEGIN"
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(status.latestReadyRevisionName,status.latestCreatedRevisionName,status.traffic,spec.template.spec.containerConcurrency,spec.template.spec.timeoutSeconds,spec.template.metadata.annotations,spec.template.spec.containers[0].resources,spec.template.spec.containers[0].image)'
+          echo "CLOUD_RUN_RECENT_REVISIONS_BEGIN"
+          gcloud run revisions list --service="$SERVICE" --project="$PROJECT_ID" --region="$REGION" --limit=8 --format='table(metadata.name,status.conditions[0].status,status.conditions[0].reason,status.conditions[0].message,metadata.creationTimestamp,spec.containerConcurrency,spec.timeoutSeconds)'
           gcloud logging read \
-            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)'"' \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)'"' \
             --project="$PROJECT_ID" --limit=1500 --order=desc --format=json > "$LOGS"
           python - "$LOGS" <<'PY'
           import json, sys
           rows=json.load(open(sys.argv[1], encoding="utf-8"))
           keys=("indstocks_5m_backfill_progress","indstocks_5m_backfill_failed",
                 "indstocks_5m_backfill_completed","indstocks_5m_backfill_started",
-                "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED","BACKFILL_MANIFEST=")
+                "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED","BACKFILL_MANIFEST=",
+                "Traceback","Exception","SIGTERM","memory limit","terminated",
+                "Container called exit","Starting new instance","Shutting down",
+                "out of memory","OOM")
           found=[]
           for row in rows:
             rendered=json.dumps(row, sort_keys=True, default=str)
-            if any(k in rendered for k in keys):
+            if any(k in rendered for k in keys) or row.get("severity") in ("ERROR","CRITICAL","ALERT","EMERGENCY"):
               found.append({
                 "timestamp": row.get("timestamp"),
                 "revision": (row.get("resource") or {}).get("labels",{}).get("revision_name"),
@@ -81,12 +88,12 @@ jobs:
                 "text": row.get("textPayload"),
                 "jsonPayload": row.get("jsonPayload"),
               })
-          print("BACKFILL_RELATED_LOG_COUNT=" + str(len(found)))
+          print("DIAGNOSTIC_LOG_MATCH_COUNT=" + str(len(found)))
           if found:
             print("BACKFILL_LATEST_EVENT=" + json.dumps(found[0], sort_keys=True, default=str))
           for row in reversed(found[:250]):
             print("BACKFILL_LOG=" + json.dumps(row, sort_keys=True, default=str))
           if not found:
-            print("BACKFILL_LOG_NOTE=No backfill progress/error events found in the last six hours.")
+            print("DIAGNOSTIC_LOG_NOTE=No matching lifecycle/error/backfill events found in the last 24 hours.")
           PY
 # Fresh read-only diagnostic trigger: 2026-11-06 after the 16:00 IST storage audit.
