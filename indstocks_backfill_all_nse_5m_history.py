@@ -728,7 +728,9 @@ def main(argv: list[str] | None = None) -> int:
             if not fetched.empty:
                 cutoff = pd.Timestamp.now(tz=IST).floor("5min")
                 fetched = fetched.loc[fetched.index <= cutoff].sort_index()
-            parts = [frame for frame in (existing, fetched) if frame is not None and not frame.empty]
+            # Existing coverage (Kaggle primary, then live capture) wins on duplicate timestamps;
+            # INDstocks supplies only timestamps not already present in the saved sources.
+            parts = [frame for frame in (fetched, existing) if frame is not None and not frame.empty]
             merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
             merged = merged.loc[~merged.index.duplicated(keep="last")]
             merged = retain_latest_sessions(merged, args.sessions, args.minimum_bars_per_session)
