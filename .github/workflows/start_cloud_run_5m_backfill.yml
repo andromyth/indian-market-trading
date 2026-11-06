@@ -11,6 +11,9 @@ on:
         options:
           - "no"
           - "yes"
+  schedule:
+    # 20:00 IST daily: after regular close and any scheduled Muhurat session.
+    - cron: "30 14 * * *"
   push:
     branches:
       - main
@@ -27,7 +30,7 @@ concurrency:
 
 jobs:
   start-backfill:
-    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]'))
+    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]')) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
