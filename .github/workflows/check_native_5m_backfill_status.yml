@@ -13,7 +13,7 @@ permissions:
 jobs:
   status:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
@@ -175,6 +175,8 @@ jobs:
               except Exception as exc:
                   bad_parquet.append({"name": item["name"], "issues": [type(exc).__name__ + ": " + str(exc)[:250]]})
                   parquet_detail.append({"name": item["name"], "read_error": type(exc).__name__ + ": " + str(exc)[:250]})
+              if len(parquet_detail) % 25 == 0:
+                  print("CHECKPOINT_PARQUET_PROGRESS=" + str(len(parquet_detail)), flush=True)
           # Match parquet/manifests within the same Drive parent folder; filenames repeat across batches.
           def file_key(x):
               return ((x.get("parents") or [""])[0], x["name"])
