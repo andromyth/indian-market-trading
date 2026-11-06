@@ -72,7 +72,7 @@ jobs:
               raise SystemExit("Unknown scheduled trigger; refusing to start backfill.")
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("should_run=" + ("true" if allowed else "false") + "\\n")
+              output.write("should_run=" + ("true" if allowed else "false") + "\n")
           PY
 
       - name: Require successful deployment of the previous commit before starting backfill
