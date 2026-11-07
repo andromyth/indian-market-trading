@@ -423,8 +423,27 @@ def fetch_indstocks_5m_batch(
                     )
                 )
                 if not retryable or attempt == max_request_attempts - 1:
+                    print(json.dumps({
+                        "event": "indstocks_backfill_request_failed",
+                        "batch": (progress_context or {}).get("batch"),
+                        "attempt": attempt + 1,
+                        "max_attempts": max_request_attempts,
+                        "retryable": retryable,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:180],
+                    }, sort_keys=True), flush=True)
                     raise
-                time.sleep(min(2 ** (attempt + 1), 30))
+                delay = min(2 ** (attempt + 1), 30)
+                print(json.dumps({
+                    "event": "indstocks_backfill_request_retry",
+                    "batch": (progress_context or {}).get("batch"),
+                    "attempt": attempt + 1,
+                    "max_attempts": max_request_attempts,
+                    "delay_seconds": delay,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:180],
+                }, sort_keys=True), flush=True)
+                time.sleep(delay)
         body = response.json()
         if not isinstance(body, dict) or body.get("success") is not True:
             raise RuntimeError("INDstocks five-minute historical API did not report success.")
