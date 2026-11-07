@@ -318,3 +318,4 @@ jobs:
 # Read-only checkpoint audit: compare resumable window checkpoints with consolidated per-symbol training coverage.
 
 # Read-only Drive/checkpoint inventory recheck: 2026-11-07 after the backfill worker OOM.
+# Read-only live worker and Drive checkpoint recheck requested 2026-11-07; no restart.
