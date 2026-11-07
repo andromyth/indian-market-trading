@@ -259,3 +259,86 @@ def test_indstocks_batch_does_not_retry_nontransient_ssl_certificate_error(monke
         )
 
     assert len(attempts) == 1
+
+
+
+def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch, tmp_path):
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    end = pd.Timestamp("2026-11-06 15:30", tz=IST).to_pydatetime()
+    monkeypatch.setattr(
+        backfill,
+        "_resolve_remote_file",
+        lambda _store, _path: {"id": "live-folder"},
+    )
+    monkeypatch.setattr(
+        backfill,
+        "is_nse_trading_day",
+        lambda day: day == end.date(),
+        raising=False,
+    )
+
+    class Request:
+        pass
+
+    class Files:
+        def list(self, **_kwargs):
+            class Result:
+                @staticmethod
+                def execute():
+                    return {"files": [{"id": "capture-id", "name": "capture_test.parquet"}]}
+            return Result()
+
+        @staticmethod
+        def get_media(fileId):
+            return Request()
+
+    class Service:
+        @staticmethod
+        def files():
+            return Files()
+
+    class Store:
+        service = Service()
+
+    class Downloader:
+        def __init__(self, output, _request, chunksize):
+            self.output = output
+            assert chunksize == 8 * 1024 * 1024
+
+        def next_chunk(self):
+            self.output.write(b"parquet-placeholder")
+            return None, True
+
+    import googleapiclient.http
+    monkeypatch.setattr(googleapiclient.http, "MediaIoBaseDownload", Downloader)
+
+    read_calls = []
+
+    def fake_read_parquet(path, *, columns=None, filters=None):
+        read_calls.append({"columns": columns, "filters": filters})
+        return pd.DataFrame({
+            "symbol": ["RELIANCE"],
+            "Timestamp": [pd.Timestamp("2026-11-06 09:20", tz=IST)],
+            "Open": [100.0],
+            "High": [101.0],
+            "Low": [99.0],
+            "Close": [100.5],
+            "Volume": [1000.0],
+        })
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+
+    history, inventory = backfill._load_recent_live_history(
+        Store(),
+        {"RELIANCE"},
+        end,
+        tmp_path,
+        lookback_days=1,
+    )
+
+    assert len(read_calls) == 1
+    assert read_calls[0]["columns"] == ["symbol", "Timestamp", *backfill.OHLCV]
+    assert read_calls[0]["filters"] == [("symbol", "in", ["RELIANCE"])]
+    assert len(history["RELIANCE"]) == 1
+    assert inventory == {"live_capture_files_read": 1, "live_capture_files_failed": 0}
