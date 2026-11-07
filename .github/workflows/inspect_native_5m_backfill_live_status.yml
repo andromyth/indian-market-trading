@@ -108,3 +108,4 @@ jobs:
 # Read-only Drive-path verification requested 2026-11-07; do not restart backfill.
 
 # Read-only live progress and throughput measurement requested 2026-11-07; do not restart or interrupt worker.
+# Read-only status refresh requested 2026-11-07.
