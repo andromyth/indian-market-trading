@@ -316,3 +316,5 @@ jobs:
             print("BACKFILL_LOG_NOTE=No matching backfill progress/error events found in the last 90 minutes.")
           PY
 # Read-only checkpoint audit: compare resumable window checkpoints with consolidated per-symbol training coverage.
+
+# Read-only Drive/checkpoint inventory recheck: 2026-11-07 after the backfill worker OOM.
