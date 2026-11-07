@@ -105,3 +105,4 @@ jobs:
           PY
 
 # Read-only status probe trigger: 2026-11-07 after Drive showed no new checkpoint files.
+# Read-only live status refresh requested 2026-11-07 12:27 IST; do not restart worker.
