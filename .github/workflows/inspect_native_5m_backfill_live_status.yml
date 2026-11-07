@@ -104,3 +104,5 @@ jobs:
 # Read-only status check requested 2026-11-07 08:46 IST; diagnose progress gap, do not restart.
 
 # Read-only live backfill status refresh requested 2026-11-07; no restart.
+
+# Read-only Drive-path verification requested 2026-11-07; do not restart backfill.
