@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import threading
@@ -353,14 +354,38 @@ def _refresh_rejected_access_token(rejected_token: str) -> str:
         return _generate_and_cache_token_locked()
 
 
+def _transport_error_reason(exc: requests.RequestException) -> str:
+    """Return only allowlisted TLS/network failure details; never echo request data."""
+    rendered = str(exc).upper()
+    for marker in (
+        "UNEXPECTED_EOF_WHILE_READING",
+        "CERTIFICATE_VERIFY_FAILED",
+        "TLSV1_ALERT_INTERNAL_ERROR",
+        "WRONG_VERSION_NUMBER",
+        "CONNECTION_RESET",
+        "CONNECTION_ABORTED",
+        "TIMED OUT",
+    ):
+        if marker in rendered:
+            return marker
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "SSL_ERROR"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "TIMEOUT"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "CONNECTION_ERROR"
+    return "REQUEST_EXCEPTION"
+
+
 def _send_authenticated_request(
     method: str,
     path: str,
     params: dict[str, Any] | None,
     token: str,
 ) -> requests.Response:
+    started = time.monotonic()
     try:
-        return requests.request(
+        response = requests.request(
             method,
             f"{API_BASE}{path}",
             headers={
@@ -372,7 +397,31 @@ def _send_authenticated_request(
             timeout=_timeout(),
         )
     except requests.RequestException as exc:
-        raise RuntimeError(f"INDstocks request failed: {type(exc).__name__}") from None
+        duration_ms = round((time.monotonic() - started) * 1000, 1)
+        reason = _transport_error_reason(exc)
+        print(json.dumps({
+            "event": "indstocks_http_request",
+            "method": method,
+            "endpoint": path,
+            "duration_ms": duration_ms,
+            "outcome": "transport_error",
+            "exception_type": type(exc).__name__,
+            "error_reason": reason,
+        }, sort_keys=True), flush=True)
+        raise RuntimeError(
+            f"INDstocks request failed: {type(exc).__name__}: {reason}"
+        ) from None
+
+    print(json.dumps({
+        "event": "indstocks_http_request",
+        "method": method,
+        "endpoint": path,
+        "duration_ms": round((time.monotonic() - started) * 1000, 1),
+        "outcome": "http_response",
+        "http_status": response.status_code,
+        "retry_after": (getattr(response, "headers", {}) or {}).get("Retry-After"),
+    }, sort_keys=True), flush=True)
+    return response
 
 
 def _request(method: str, path: str, *, params: dict[str, Any] | None = None) -> requests.Response:

@@ -343,3 +343,24 @@ def test_rejected_token_refresh_failure_does_not_spam_rate_limited_endpoint(monk
 
     assert calls == ["attempt"]
     assert client._TOKEN_GENERATION_RETRY_AFTER > client.time.time()
+
+
+
+def test_ssl_unexpected_eof_is_classified_and_logged_without_secrets(monkeypatch, capsys):
+    monkeypatch.setattr(client, "access_token", lambda: "must-not-appear-in-logs")
+
+    def fail_request(*args, **kwargs):
+        raise client.requests.exceptions.SSLError(
+            "[SSL: UNEXPECTED_EOF_WHILE_READING] unexpected eof while reading"
+        )
+
+    monkeypatch.setattr(client.requests, "request", fail_request)
+
+    with pytest.raises(RuntimeError, match="UNEXPECTED_EOF_WHILE_READING"):
+        client._request("GET", "/market/historical/5minute", params={"scrip-codes": "NSE_2885"})
+
+    output = capsys.readouterr().out
+    assert '"event": "indstocks_http_request"' in output
+    assert '"outcome": "transport_error"' in output
+    assert '"error_reason": "UNEXPECTED_EOF_WHILE_READING"' in output
+    assert "must-not-appear-in-logs" not in output
