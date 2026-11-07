@@ -713,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             if callable(BACKFILL_PROGRESS_CALLBACK):
                 BACKFILL_PROGRESS_CALLBACK(progress)
+            del live_history
             continue
 
         # Batch ranges must be common per request, then deduplicate against Drive.
@@ -740,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in active_batch]} error={detail}", flush=True)
             except BrokenPipeError:
                 pass
+            del live_history, existing_by_symbol
             continue
 
         for symbol, _ in active_batch:
@@ -804,6 +806,8 @@ def main(argv: list[str] | None = None) -> int:
                 "drive_bytes": uploaded.get("size"),
             })
 
+        # Drop batch-scoped frames before loading the next live-history slice.
+        del fetched_by_symbol, live_history, existing_by_symbol
         progress = {
             "provider": "INDSTOCKS",
             "batch": batch_no,
