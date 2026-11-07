@@ -419,7 +419,7 @@ def _send_authenticated_request(
         "duration_ms": round((time.monotonic() - started) * 1000, 1),
         "outcome": "http_response",
         "http_status": response.status_code,
-        "retry_after": response.headers.get("Retry-After"),
+        "retry_after": (getattr(response, "headers", {}) or {}).get("Retry-After"),
     }, sort_keys=True), flush=True)
     return response
 
