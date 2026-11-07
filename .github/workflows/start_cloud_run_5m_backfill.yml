@@ -383,3 +383,4 @@ jobs:
           done
           echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
           exit 1
+# Authorized manual kickoff: resumable native 5-minute backfill; 2026-11-07.
