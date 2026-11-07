@@ -103,3 +103,5 @@ jobs:
           for item in reversed(found[-30:]):
               print("RECENT_BACKFILL_EVENT=" + json.dumps(item, sort_keys=True, default=str))
           PY
+
+# Read-only status probe trigger: 2026-11-07 after Drive showed no new checkpoint files.
