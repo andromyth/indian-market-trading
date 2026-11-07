@@ -271,11 +271,11 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
         "_resolve_remote_file",
         lambda _store, _path: {"id": "live-folder"},
     )
+    import market_session_guard
     monkeypatch.setattr(
-        backfill,
+        market_session_guard,
         "is_nse_trading_day",
         lambda day: day == end.date(),
-        raising=False,
     )
 
     class Request:
