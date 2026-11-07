@@ -99,3 +99,4 @@ jobs:
 # Fresh read-only diagnostic trigger: 2026-11-06 after the 16:00 IST storage audit.
 
 # Read-only Cloud Run instance/CPU lifecycle inspection: 2026-11-07 after worker returned IDLE.
+# Read-only verification run requested after authorized backfill kickoff: 2026-11-07.
