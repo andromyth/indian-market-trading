@@ -141,7 +141,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --source . \
   --service-account "$RUN_SA" \
   --port 8080 \
-  --cpu 1 \
+  --cpu 2 \
   --memory 8Gi \
   --min 1 \
   --max 1 \
