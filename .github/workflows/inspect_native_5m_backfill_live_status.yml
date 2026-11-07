@@ -97,3 +97,5 @@ jobs:
             print("DIAGNOSTIC_LOG_NOTE=No matching lifecycle/error/backfill events found in the last 24 hours.")
           PY
 # Fresh read-only diagnostic trigger: 2026-11-06 after the 16:00 IST storage audit.
+
+# Read-only Cloud Run instance/CPU lifecycle inspection: 2026-11-07 after worker returned IDLE.
