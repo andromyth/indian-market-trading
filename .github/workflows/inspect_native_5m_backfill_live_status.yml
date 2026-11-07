@@ -100,3 +100,5 @@ jobs:
 
 # Read-only Cloud Run instance/CPU lifecycle inspection: 2026-11-07 after worker returned IDLE.
 # Read-only verification run requested after authorized backfill kickoff: 2026-11-07.
+
+# Read-only status check requested 2026-11-07 08:46 IST; diagnose progress gap, do not restart.
