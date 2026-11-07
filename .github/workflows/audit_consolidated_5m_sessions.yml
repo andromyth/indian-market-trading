@@ -166,3 +166,5 @@ jobs:
           if status != "PASS":
               sys.exit(1)
           PY
+
+# Read-only per-symbol usable-session coverage audit refresh requested 2026-11-07; no backfill restart.
