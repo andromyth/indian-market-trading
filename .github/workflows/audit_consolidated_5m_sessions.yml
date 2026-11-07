@@ -163,7 +163,9 @@ jobs:
               print("SESSION_AUDIT_BLOCKING_UNREADABLE_SYMBOLS=" + json.dumps(unreadable, sort_keys=True))
           print("SESSION_AUDIT_COVERAGE_RULE=At least 90% of readable consolidated symbols must have 200+ usable sessions; symbols below 200 remain REVIEW until listing/trading history is independently verified.")
           print("SESSION_AUDIT_STATUS=" + status)
-          if status != "PASS":
+          # PASS_WITH_REVIEW is a successful audit with explicitly listed non-blocking review items.
+          # Fail the workflow only when the coverage/readability gate is not met.
+          if status == "NEEDS_ATTENTION":
               sys.exit(1)
           PY
 
