@@ -1,0 +1,134 @@
+name: Read-only native five-minute checkpoint audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/audit_native_5m_checkpoints_readonly.yml"
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+      - name: Read-only Drive checkpoint and worker audit
+        env:
+          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+          PROJECT_ID: indian-market-trading
+          REGION: asia-south1
+          SERVICE: indian-market-intraday-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$GOOGLE_OAUTH_TOKEN_JSON" && -n "$GOOGLE_DRIVE_ROOT_ID" ]] || { echo "ERROR=drive_audit_secrets_missing"; exit 1; }
+          python -m pip install --quiet google-api-python-client google-auth
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 25 -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfillz" > "$RUNNER_TEMP/backfill_state.json"
+          python - "$RUNNER_TEMP/backfill_state.json" <<'PY'
+          import json,sys
+          b=json.load(open(sys.argv[1],encoding="utf-8"))
+          s=b.get("five_minute_backfill") or {}
+          print("LIVE_BACKFILL_STATE="+json.dumps({
+            "status":s.get("status"),"started_at_utc":s.get("started_at_utc"),
+            "updated_at_utc":s.get("updated_at_utc"),"error":s.get("error"),
+            "exit_code":s.get("exit_code"),"progress":s.get("progress") or {}
+          },sort_keys=True,default=str))
+          PY
+          python - <<'PY'
+          import json, os, re
+          from collections import Counter
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+
+          info=json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          creds=Credentials.from_authorized_user_info(info,scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid: creds.refresh(Request())
+          drive=build("drive","v3",credentials=creds,cache_discovery=False)
+
+          def children(parent,name=None):
+              q=f"'{parent}' in parents and trashed=false"
+              if name is not None: q += " and name="+json.dumps(name)
+              out=[]; token=None
+              while True:
+                  r=drive.files().list(q=q,pageSize=1000,pageToken=token,
+                    fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)").execute()
+                  out.extend(r.get("files",[])); token=r.get("nextPageToken")
+                  if not token: return out
+          def folder(parent,name):
+              found=[x for x in children(parent,name) if x.get("mimeType")=="application/vnd.google-apps.folder"]
+              if len(found)!=1: raise RuntimeError(f"Expected one Drive folder {name}; found {len(found)}")
+              return found[0]["id"]
+          root=os.environ["GOOGLE_DRIVE_ROOT_ID"]
+          for part in ["production_data","nse_official","intraday_seed","olo_5m_archive"]:
+              root=folder(root,part)
+          archive=root
+          symbols=folder(archive,"symbols")
+          cp=folder(symbols,"window_checkpoints")
+          batch_dirs=[x for x in children(cp) if x.get("mimeType")=="application/vnd.google-apps.folder"]
+          print("CHECKPOINT_BATCH_DIRECTORIES="+str(len(batch_dirs)))
+          totals=Counter(); bad=[]; complete=[]
+          for batch in batch_dirs:
+              files=children(batch["id"])
+              byname={x["name"]:x for x in files}
+              parquet={n[:-8]:x for n,x in byname.items() if n.endswith(".parquet")}
+              manifests={n[:-13]:x for n,x in byname.items() if n.endswith(".parquet.json")}
+              totals["parquet"]+=len(parquet); totals["json"]+=len(manifests)
+              totals["parquet_without_manifest"]+=len(set(parquet)-set(manifests))
+              totals["manifest_without_parquet"]+=len(set(manifests)-set(parquet))
+              for key in sorted(set(parquet)|set(manifests)):
+                  if key not in parquet or key not in manifests:
+                      bad.append({"batch":batch["name"],"window":key,"problem":"unpaired_file"})
+                      continue
+                  try:
+                      raw=drive.files().get_media(fileId=manifests[key]["id"]).execute()
+                      m=json.loads(raw.decode("utf-8") if isinstance(raw,bytes) else raw)
+                      valid=(m.get("status")=="COMPLETE" and m.get("window_key")==key
+                             and isinstance(m.get("symbols"),list) and len(m["symbols"])==5
+                             and isinstance(m.get("row_counts"),dict)
+                             and set(m["row_counts"]).issubset(set(m["symbols"])))
+                      if valid:
+                          totals["valid_complete_manifests"]+=1
+                          complete.append({"batch":batch["name"],"window":key,
+                            "start":m.get("start"),"end":m.get("end"),
+                            "symbols":m.get("symbols"),"rows":sum(
+                              int(v) for v in m["row_counts"].values() if isinstance(v,(int,float))
+                            ),"modified":manifests[key].get("modifiedTime")})
+                      else:
+                          totals["invalid_manifests"]+=1
+                          bad.append({"batch":batch["name"],"window":key,"problem":"invalid_manifest",
+                            "status":m.get("status"),"symbols_count":len(m.get("symbols",[])) if isinstance(m.get("symbols"),list) else None})
+                  except Exception as e:
+                      totals["unreadable_manifests"]+=1
+                      bad.append({"batch":batch["name"],"window":key,"problem":type(e).__name__})
+          print("CHECKPOINT_COUNTS="+json.dumps(dict(totals),sort_keys=True))
+          print("CHECKPOINT_ISSUES="+json.dumps(bad[:100],sort_keys=True))
+          print("LATEST_COMPLETE_CHECKPOINTS="+json.dumps(sorted(complete,key=lambda x:x.get("modified") or "",reverse=True)[:12],sort_keys=True))
+          manifest_files=children(archive,"backfill_manifest.json")
+          if manifest_files:
+              try:
+                  raw=drive.files().get_media(fileId=manifest_files[0]["id"]).execute()
+                  gm=json.loads(raw.decode("utf-8") if isinstance(raw,bytes) else raw)
+                  print("GLOBAL_MANIFEST_SUMMARY="+json.dumps({
+                    "modified":manifest_files[0].get("modifiedTime"),
+                    "top_level_keys":sorted(gm.keys()) if isinstance(gm,dict) else None,
+                    "completed_symbols":gm.get("completed_symbols") if isinstance(gm,dict) else None,
+                    "total_symbols":gm.get("total_symbols") if isinstance(gm,dict) else None,
+                    "status_counts":dict(Counter(str(x.get("status")) for x in gm.get("results",[]) if isinstance(x,dict))) if isinstance(gm,dict) and isinstance(gm.get("results"),list) else None
+                  },sort_keys=True,default=str))
+              except Exception as e: print("GLOBAL_MANIFEST_READ_ERROR="+type(e).__name__)
+          else: print("GLOBAL_MANIFEST=NOT_FOUND")
+          print("AUDIT_MODE=READ_ONLY_NO_DRIVE_WRITES_NO_BACKFILL_RESTART")
+          PY
