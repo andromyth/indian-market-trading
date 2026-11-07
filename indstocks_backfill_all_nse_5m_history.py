@@ -241,8 +241,18 @@ def _load_recent_live_history(
                     done = False
                     while not done:
                         _, done = downloader.next_chunk()
-                capture = pd.read_parquet(local)
-                if capture.empty or not {"symbol", "Timestamp", *OHLCV}.issubset(capture.columns):
+                # Push symbol filtering and column projection into Parquet/Arrow.
+                # The archive files contain the full NSE universe; materializing every
+                # symbol for every day multiplied peak RAM by the entire universe.
+                capture = pd.read_parquet(
+                    local,
+                    columns=["symbol", "Timestamp", *OHLCV],
+                    filters=[("symbol", "in", sorted(symbols))],
+                )
+                if capture.empty:
+                    files_read += 1
+                    continue
+                if not {"symbol", "Timestamp", *OHLCV}.issubset(capture.columns):
                     files_failed += 1
                     continue
                 capture["symbol"] = capture["symbol"].astype(str).str.strip().str.upper()
@@ -593,21 +603,30 @@ def main(argv: list[str] | None = None) -> int:
     local_root = Path(args.work_root)
     local_root.mkdir(parents=True, exist_ok=True)
     store = GoogleDriveStore()
-    live_history, live_inventory = _load_recent_live_history(
-        store,
-        set(symbols),
-        end,
-        local_root,
-        lookback_days=args.recent_session_lookback_days,
-    )
-    print("BACKFILL_LIVE_HISTORY_INVENTORY " + json.dumps(live_inventory, sort_keys=True), flush=True)
     results: list[dict[str, Any]] = list(resolution_errors)
     total_api_calls = 0
+    live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
 
     for batch_no, batch in enumerate(batches, start=1):
         if callable(REQUEST_GUARD):
             REQUEST_GUARD()
+        # Load recent live captures only for the current <=5-symbol API batch.
+        # Do not retain the full 2,600+ symbol live-history universe in RAM.
+        live_history, live_inventory = _load_recent_live_history(
+            store,
+            {symbol for symbol, _ in batch},
+            end,
+            local_root,
+            lookback_days=args.recent_session_lookback_days,
+        )
+        for key in live_inventory_totals:
+            live_inventory_totals[key] += int(live_inventory.get(key, 0))
+        print(
+            "BACKFILL_LIVE_HISTORY_INVENTORY "
+            + json.dumps({"batch": batch_no, **live_inventory}, sort_keys=True),
+            flush=True,
+        )
         existing_by_symbol: dict[str, pd.DataFrame] = {}
         starts: dict[str, datetime] = {}
         active_batch: list[tuple[str, str]] = []
@@ -625,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             kaggle = _download_existing(store, kaggle_remote, kaggle_local)
             kaggle_seed_rows = int(len(kaggle))
             live = live_history.get(symbol, pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST)))
+            # The current batch is the only live-history slice retained in memory.
             live_rows = int(len(live))
             existing_parts = [frame for frame in (existing, kaggle, live) if frame is not None and not frame.empty]
             if existing_parts:
@@ -820,8 +840,8 @@ def main(argv: list[str] | None = None) -> int:
         "recent_session_full_bar_requirement": FULL_REGULAR_SESSION_BARS,
         "recent_session_lookback_days": args.recent_session_lookback_days,
         "recent_full_session_bar_requirement": FULL_REGULAR_SESSION_BARS,
-        "live_capture_files_read": live_inventory["live_capture_files_read"],
-        "live_capture_files_failed": live_inventory["live_capture_files_failed"],
+        "live_capture_files_read": live_inventory_totals["live_capture_files_read"],
+        "live_capture_files_failed": live_inventory_totals["live_capture_files_failed"],
         "calendar_days_requested": args.calendar_days,
         "initial_calendar_days": args.initial_calendar_days,
         "range_start_ist": initial_start.isoformat(),
