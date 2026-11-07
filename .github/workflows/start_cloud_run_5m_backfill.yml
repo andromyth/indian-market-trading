@@ -384,3 +384,4 @@ jobs:
           echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
           exit 1
 # Authorized manual kickoff: resumable native 5-minute backfill; 2026-11-07.
+# Verified production revision 00091-qef; resume from durable Drive checkpoints.
