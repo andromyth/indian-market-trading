@@ -98,6 +98,7 @@ jobs:
           # The existing APIs, runtime service account, scheduler identity, and
           # invoker bindings were provisioned previously. Do not re-enable APIs
           # or mutate project IAM from this narrowly scoped deployment identity.
+          # Cloud Run requires 2 vCPU for an 8 GiB service memory limit.
           gcloud run deploy indian-market-intraday-worker \
             --project="$PROJECT_ID" \
             --region="$REGION" \
@@ -105,7 +106,6 @@ jobs:
             --build-service-account "projects/$PROJECT_ID/serviceAccounts/cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com" \
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --port 8080 \
-            # Cloud Run requires 2 vCPU for an 8 GiB service memory limit. \
             --cpu 2 \
             --memory 8Gi \
             --min 1 \
