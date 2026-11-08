@@ -12,9 +12,9 @@ on:
           - "no"
           - "yes"
   schedule:
-    # Hourly at :00 IST from 16:00 through 08:00, every calendar day.
-    # UTC equivalent: 10:30-17:30 and 18:30-02:30.
-    - cron: "30 0-2,10-23 * * *"
+    # Hourly at :00 IST; the calendar gate skips trading days before 16:00.
+    # Non-trading days remain eligible throughout the day.
+    - cron: "30 * * * *"
   push:
     branches:
       - main
@@ -63,14 +63,13 @@ jobs:
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           cron = os.environ.get("SCHEDULE_CRON", "")
           trading_day = is_nse_trading_day(now.date())
-          if cron != "30 0-2,10-23 * * *":
+          if cron != "30 * * * *":
               raise SystemExit("Unknown scheduled trigger; refusing to start backfill.")
-          in_backfill_window = now.hour >= 16 or now.hour < 9
-          allowed = (not trading_day) or in_backfill_window
+          allowed = (not trading_day) or now.hour >= 16
           reason = (
-              "non-trading day: backfill window remains open"
+              "non-trading day: backfill is eligible throughout the day"
               if not trading_day
-              else "trading day: allowed only 16:00-09:00 IST"
+              else "trading day: eligible only from 16:00 IST"
           )
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -384,5 +383,5 @@ jobs:
           echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
           exit 1
 # Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment.
-# Scheduled starts remain limited to the non-market window; live-hour requests use low-priority pacing.
+# Scheduled checks run hourly; the NSE calendar gate permits trading days only from 16:00 IST.
 # Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
