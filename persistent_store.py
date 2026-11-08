@@ -835,25 +835,40 @@ class GoogleDriveStore:
         folder = "/".join(parts[:-1])
         write_service = self._get_write_service()
         parent_id = self.ensure_path(folder, service=write_service)
-        existing = self._find_child(parent_id, name, service=write_service)
-        media = self.MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
         try:
-            if existing:
-                result = write_service.files().update(
-                    fileId=existing["id"],
-                    media_body=media,
-                    fields="id,name,modifiedTime,size",
-                    supportsAllDrives=True,
-                ).execute()
-                action = "updated"
-            else:
-                result = write_service.files().create(
-                    body={"name": name, "parents": [parent_id]},
-                    media_body=media,
-                    fields="id,name,createdTime,size",
-                    supportsAllDrives=True,
-                ).execute()
-                action = "created"
+            result = None
+            action = "created"
+            for attempt in range(1, 5):
+                existing = self._find_child(parent_id, name, service=write_service)
+                if existing:
+                    action = "updated"
+                    result = _drive_execute_with_retry(
+                        "file_update",
+                        lambda: write_service.files().update(
+                            fileId=existing["id"],
+                            media_body=self.MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True),
+                            fields="id,name,modifiedTime,size",
+                            supportsAllDrives=True,
+                        ).execute(),
+                    )
+                    break
+                try:
+                    result = write_service.files().create(
+                        body={"name": name, "parents": [parent_id]},
+                        media_body=self.MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True),
+                        fields="id,name,createdTime,size",
+                        supportsAllDrives=True,
+                    ).execute()
+                    break
+                except Exception as exc:
+                    if not _is_retryable_drive_error(exc) or attempt == 4:
+                        raise
+                    delay = min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5)
+                    _DRIVE_LOGGER.warning(
+                        "google_drive_retry operation=file_create attempt=%s/4 delay_seconds=%.2f error=%s",
+                        attempt, delay, type(exc).__name__,
+                    )
+                    time.sleep(delay)
         except Exception as exc:
             detail = str(exc)
             if "storageQuotaExceeded" in detail or "Service Accounts do not have storage quota" in detail:
