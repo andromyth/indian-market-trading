@@ -192,7 +192,7 @@ def _load_recent_live_history(
     file_listing_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
     """Load recent durable live OHLCV captures so backfill plans against all saved history."""
-    from googleapiclient.http import MediaIoBaseDownload
+    from persistent_store import _drive_execute_with_retry, download_drive_file_with_retry
     from market_session_guard import is_nse_trading_day
 
     start_date = end.date() - timedelta(days=int(lookback_days))
@@ -229,7 +229,10 @@ def _load_recent_live_history(
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                response = store.service.files().list(**params).execute()
+                response = _drive_execute_with_retry(
+                    "live_capture_archive_list",
+                    lambda: store.service.files().list(**params).execute(),
+                )
                 day_files.extend(response.get("files", []))
                 page_token = response.get("nextPageToken")
                 if not page_token:
@@ -248,14 +251,10 @@ def _load_recent_live_history(
             local.parent.mkdir(parents=True, exist_ok=True)
             try:
                 if not local.exists() or local.stat().st_size == 0:
-                    request = store.service.files().get_media(fileId=item["id"])
-                    with local.open("wb") as output:
-                        downloader = MediaIoBaseDownload(
-                            output, request, chunksize=8 * 1024 * 1024
-                        )
-                        done = False
-                        while not done:
-                            _, done = downloader.next_chunk()
+                    download_drive_file_with_retry(
+                        store.service, item["id"], local,
+                        operation="live_capture_archive_download",
+                    )
                 # Push symbol filtering and column projection into Parquet/Arrow.
                 # The archive files contain the full NSE universe; materializing every
                 # symbol for every day multiplied peak RAM by the entire universe.
@@ -350,18 +349,15 @@ def fetch_indstocks_5m_batch(
                 reuse_checkpoint = pd.Timestamp(window_end) <= force_after
         if reuse_checkpoint:
             try:
-                from googleapiclient.http import MediaIoBaseDownload
+                from persistent_store import download_drive_file_with_retry
                 checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-                for item, destination in (
-                    (checkpoint_item, checkpoint_local),
-                    (checkpoint_manifest_item, checkpoint_manifest_local),
+                for item, destination, operation in (
+                    (checkpoint_item, checkpoint_local, "checkpoint_parquet_download"),
+                    (checkpoint_manifest_item, checkpoint_manifest_local, "checkpoint_manifest_download"),
                 ):
-                    request = store.service.files().get_media(fileId=item["id"])
-                    with destination.open("wb") as output:
-                        downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-                        done = False
-                        while not done:
-                            _, done = downloader.next_chunk()
+                    download_drive_file_with_retry(
+                        store.service, item["id"], destination, operation=operation
+                    )
                 manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
                 if (
                     not isinstance(manifest, dict)

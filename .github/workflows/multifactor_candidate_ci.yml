@@ -153,6 +153,7 @@ jobs:
           tests/test_live_training_feature_parity.py
           tests/test_five_minute_history_archive.py
           tests/test_dhan_backfill_5m.py
+          tests/test_drive_transport_retries.py
           tests/test_indstocks_5m_backfill.py
           tests/test_indstocks_backfill_gap_repair.py
           tests/test_nse_trading_calendar.py
