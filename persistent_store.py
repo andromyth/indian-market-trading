@@ -47,7 +47,7 @@ def _is_retryable_drive_error(exc: Exception) -> bool:
         return True
     detail = f"{type(exc).__name__}: {exc}".upper()
     return any(marker in detail for marker in (
-        "SSLError", "SSLEOFERROR", "UNEXPECTED_EOF_WHILE_READING",
+        "SSLERROR", "SSLEOFERROR", "UNEXPECTED_EOF_WHILE_READING",
         "REMOTEENDCLOSEDERROR", "CONNECTIONRESETERROR", "CONNECTION RESET",
         "CONNECTION ABORTED", "BROKEN PIPE", "TIMEOUT", "TIMED OUT",
         "INCOMPLETEREAD", "NETWORK IS UNREACHABLE",
@@ -674,15 +674,18 @@ def _discover_drive_root_folder(
         "and trashed = false"
     )
 
-    response = service.files().list(
-        q=q,
-        spaces="drive",
-        fields="files(id,name,mimeType,parents,driveId)",
-        pageSize=20,
-        orderBy="name",
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-    ).execute()
+    response = _drive_execute_with_retry(
+        "root_folder_list",
+        lambda: service.files().list(
+            q=q,
+            spaces="drive",
+            fields="files(id,name,mimeType,parents,driveId)",
+            pageSize=20,
+            orderBy="name",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute(),
+    )
 
     matches = response.get(
         "files",
