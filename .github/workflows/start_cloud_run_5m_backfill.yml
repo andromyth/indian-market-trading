@@ -385,3 +385,4 @@ jobs:
           exit 1
 # Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment.
 # Scheduled starts remain limited to the non-market window; live-hour requests use low-priority pacing.
+# Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
