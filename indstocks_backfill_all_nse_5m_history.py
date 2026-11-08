@@ -189,6 +189,7 @@ def _load_recent_live_history(
     work_root: Path,
     *,
     lookback_days: int = RECENT_SESSION_LOOKBACK_DAYS,
+    file_listing_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
     """Load recent durable live OHLCV captures so backfill plans against all saved history."""
     from googleapiclient.http import MediaIoBaseDownload
@@ -202,28 +203,41 @@ def _load_recent_live_history(
         day = start_date + timedelta(days=offset)
         if not is_nse_trading_day(day):
             continue
-        remote_dir = f"{LIVE_REMOTE_ROOT}/{day:%Y/%m/%d}"
-        folder = _resolve_remote_file(store, remote_dir)
-        if not folder:
-            continue
-        page_token = None
-        day_files: list[dict[str, Any]] = []
-        while True:
-            params = {
-                "q": f"'{folder['id']}' in parents and trashed = false",
-                "spaces": "drive",
-                "fields": "nextPageToken,files(id,name,mimeType)",
-                "pageSize": 1000,
-                "includeItemsFromAllDrives": True,
-                "supportsAllDrives": True,
-            }
-            if page_token:
-                params["pageToken"] = page_token
-            response = store.service.files().list(**params).execute()
-            day_files.extend(response.get("files", []))
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
+        day_key = day.isoformat()
+        reuse_listing = (
+            file_listing_cache is not None
+            and day != end.date()
+            and day_key in file_listing_cache
+        )
+        if reuse_listing:
+            day_files = file_listing_cache[day_key]
+        else:
+            remote_dir = f"{LIVE_REMOTE_ROOT}/{day:%Y/%m/%d}"
+            folder = _resolve_remote_file(store, remote_dir)
+            if not folder:
+                continue
+            page_token = None
+            day_files = []
+            while True:
+                params = {
+                    "q": f"'{folder['id']}' in parents and trashed = false",
+                    "spaces": "drive",
+                    "fields": "nextPageToken,files(id,name,mimeType)",
+                    "pageSize": 1000,
+                    "includeItemsFromAllDrives": True,
+                    "supportsAllDrives": True,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                response = store.service.files().list(**params).execute()
+                day_files.extend(response.get("files", []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+            # Past-session capture folders are immutable during this run. Refresh
+            # today's folder each batch so newly written live snapshots are visible.
+            if file_listing_cache is not None and day != end.date():
+                file_listing_cache[day_key] = day_files
         for item in day_files:
             name = str(item.get("name") or "")
             if item.get("mimeType") == "application/vnd.google-apps.folder":
@@ -233,14 +247,15 @@ def _load_recent_live_history(
             local = work_root / "live_history" / f"{day:%Y%m%d}" / Path(name).name
             local.parent.mkdir(parents=True, exist_ok=True)
             try:
-                request = store.service.files().get_media(fileId=item["id"])
-                with local.open("wb") as output:
-                    downloader = MediaIoBaseDownload(
-                        output, request, chunksize=8 * 1024 * 1024
-                    )
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
+                if not local.exists() or local.stat().st_size == 0:
+                    request = store.service.files().get_media(fileId=item["id"])
+                    with local.open("wb") as output:
+                        downloader = MediaIoBaseDownload(
+                            output, request, chunksize=8 * 1024 * 1024
+                        )
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
                 # Push symbol filtering and column projection into Parquet/Arrow.
                 # The archive files contain the full NSE universe; materializing every
                 # symbol for every day multiplied peak RAM by the entire universe.
@@ -626,19 +641,34 @@ def main(argv: list[str] | None = None) -> int:
     total_api_calls = 0
     live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
+    live_file_listing_cache: dict[str, list[dict[str, Any]]] = {}
 
     for batch_no, batch in enumerate(batches, start=1):
         if callable(REQUEST_GUARD):
             REQUEST_GUARD()
         # Load recent live captures only for the current <=5-symbol API batch.
         # Do not retain the full 2,600+ symbol live-history universe in RAM.
+        live_history_started = time.monotonic()
+        if callable(BACKFILL_PROGRESS_CALLBACK):
+            BACKFILL_PROGRESS_CALLBACK({
+                "provider": "INDSTOCKS", "batch": batch_no,
+                "total_batches": len(batches), "stage": "LOADING_LIVE_HISTORY",
+            })
         live_history, live_inventory = _load_recent_live_history(
             store,
             {symbol for symbol, _ in batch},
             end,
             local_root,
             lookback_days=args.recent_session_lookback_days,
+            file_listing_cache=live_file_listing_cache,
         )
+        if callable(BACKFILL_PROGRESS_CALLBACK):
+            BACKFILL_PROGRESS_CALLBACK({
+                "provider": "INDSTOCKS", "batch": batch_no,
+                "total_batches": len(batches), "stage": "LIVE_HISTORY_READY",
+                "elapsed_seconds": round(time.monotonic() - live_history_started, 1),
+                **live_inventory,
+            })
         for key in live_inventory_totals:
             live_inventory_totals[key] += int(live_inventory.get(key, 0))
         print(
