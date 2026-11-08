@@ -152,3 +152,5 @@ jobs:
           }
           print("SYMBOLWISE_1600_AUDIT=" + json.dumps(report, sort_keys=True, default=str))
           PY
+
+# Read-only Drive archive verification requested 2026-11-08; no data mutation.
