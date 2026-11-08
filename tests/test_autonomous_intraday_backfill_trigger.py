@@ -15,7 +15,7 @@ def reset_backfill_state(monkeypatch):
     monkeypatch.setattr(service, "BACKFILL_START_LOCK", threading.Lock())
     monkeypatch.setattr(service, "BACKFILL_THREAD", None)
     monkeypatch.setattr(service, "BACKFILL_MARKET_PAUSED", False)
-    monkeypatch.setattr(service, "_backfill_start_allowed", lambda _now: True)
+    monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: False)
     with service.STATE_LOCK:
         service.STATE["five_minute_backfill"] = {"status": "IDLE"}
     yield
