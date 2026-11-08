@@ -74,14 +74,39 @@ def _update_backfill_status(**fields: Any) -> None:
     with STATE_LOCK:
         current = dict(STATE.get("five_minute_backfill") or {})
         current.update(fields)
-        heartbeat = datetime.now(timezone.utc).isoformat()
-        current["updated_at_utc"] = heartbeat
-        current["last_heartbeat_at_utc"] = heartbeat
+        current["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        current["last_status_update_at_utc"] = current["updated_at_utc"]
         STATE["five_minute_backfill"] = current
 
 
+def _backfill_worker_heartbeat(**fields: Any) -> None:
+    heartbeat = datetime.now(timezone.utc).isoformat()
+    _update_backfill_status(
+        last_heartbeat_at_utc=heartbeat,
+        last_worker_heartbeat_at_utc=heartbeat,
+        **fields,
+    )
+
+
 def _backfill_progress(progress: dict[str, Any]) -> None:
-    _update_backfill_status(progress=progress, status="RUNNING", phase="DOWNLOADING")
+    fields: dict[str, Any] = {
+        "progress": progress,
+        "status": "RUNNING",
+        "phase": "DOWNLOADING",
+        "last_progress_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    stage = str(progress.get("stage") or "").upper()
+    if stage == "PROVIDER_REQUEST_STARTED":
+        fields["last_provider_request_started_at_utc"] = datetime.now(timezone.utc).isoformat()
+    elif stage == "PROVIDER_RESPONSE":
+        fields["last_provider_response_at_utc"] = datetime.now(timezone.utc).isoformat()
+        fields["last_provider_window_end"] = progress.get("window_end")
+    elif stage == "CHECKPOINT_PERSISTED":
+        fields["last_checkpoint_write_at_utc"] = datetime.now(timezone.utc).isoformat()
+        fields["last_checkpoint_path"] = progress.get("checkpoint_path")
+    elif stage == "RESUMED_CHECKPOINT":
+        fields["last_checkpoint_reused_at_utc"] = datetime.now(timezone.utc).isoformat()
+    _backfill_worker_heartbeat(**fields)
     _log("indstocks_5m_backfill_progress", **progress)
 
 
@@ -111,7 +136,7 @@ def _wait_for_backfill_request_slot() -> None:
             BACKFILL_MARKET_PAUSED = True
             _log("indstocks_5m_backfill_paused_for_live_market")
         # This heartbeat is local state only: no provider request or recovery check.
-        _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET", phase="MARKET_HOURS_PAUSE")
+        _backfill_worker_heartbeat(status="PAUSED_FOR_LIVE_MARKET", phase="MARKET_HOURS_PAUSE")
         time.sleep(30)
 
     if BACKFILL_MARKET_PAUSED:
@@ -128,6 +153,11 @@ def _run_five_minute_backfill() -> None:
         started_at_utc=datetime.now(timezone.utc).isoformat(),
         finished_at_utc=None,
         progress={},
+        last_heartbeat_at_utc=datetime.now(timezone.utc).isoformat(),
+        last_worker_heartbeat_at_utc=datetime.now(timezone.utc).isoformat(),
+        last_progress_at_utc=None,
+        last_provider_response_at_utc=None,
+        last_checkpoint_write_at_utc=None,
         error=None,
         exit_code=None,
     )
@@ -674,6 +704,20 @@ class WorkerHandler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/backfillz":
             with STATE_LOCK:
                 backfill = dict(STATE.get("five_minute_backfill") or {})
+            now = datetime.now(timezone.utc)
+            backfill["worker_thread_alive"] = bool(
+                BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
+            )
+            for field, timestamp_key in (
+                ("worker_heartbeat_age_seconds", "last_worker_heartbeat_at_utc"),
+                ("provider_response_age_seconds", "last_provider_response_at_utc"),
+                ("checkpoint_write_age_seconds", "last_checkpoint_write_at_utc"),
+            ):
+                stamp = pd.to_datetime(backfill.get(timestamp_key), errors="coerce", utc=True)
+                backfill[field] = (
+                    None if pd.isna(stamp)
+                    else round((pd.Timestamp(now) - stamp).total_seconds(), 1)
+                )
             self._send_json(200, {"status": backfill.get("status", "IDLE"), "five_minute_backfill": backfill})
             return
         if self.path == "/modelz":
