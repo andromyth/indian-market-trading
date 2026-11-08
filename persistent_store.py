@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import random
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -34,6 +37,73 @@ PERSIST_ROOT = BASE_DIR / "data" / "persistent_market_data"
 INTRADAY_ROOT = PERSIST_ROOT / "intraday_1m"
 MANIFEST_PATH = PERSIST_ROOT / "manifest.json"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+_DRIVE_LOGGER = logging.getLogger(__name__)
+
+def _is_retryable_drive_error(exc: Exception) -> bool:
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None)
+    if status in (429, 500, 502, 503, 504):
+        return True
+    detail = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in detail for marker in (
+        "SSLError", "SSLEOFERROR", "UNEXPECTED_EOF_WHILE_READING",
+        "REMOTEENDCLOSEDERROR", "CONNECTIONRESETERROR", "CONNECTION RESET",
+        "CONNECTION ABORTED", "BROKEN PIPE", "TIMEOUT", "TIMED OUT",
+        "INCOMPLETEREAD", "NETWORK IS UNREACHABLE",
+    ))
+
+def _drive_execute_with_retry(operation: str, request_factory: Any, max_attempts: int = 4) -> Any:
+    """Execute an idempotent Drive request with bounded transport retries."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return request_factory()
+        except Exception as exc:
+            if not _is_retryable_drive_error(exc) or attempt >= max_attempts:
+                _DRIVE_LOGGER.error(
+                    "google_drive_operation_failed operation=%s attempt=%s/%s error=%s",
+                    operation, attempt, max_attempts, type(exc).__name__,
+                )
+                raise
+            delay = min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5)
+            _DRIVE_LOGGER.warning(
+                "google_drive_retry operation=%s attempt=%s/%s delay_seconds=%.2f error=%s",
+                operation, attempt, max_attempts, delay, type(exc).__name__,
+            )
+            time.sleep(delay)
+
+def download_drive_file_with_retry(service: Any, file_id: str, destination: Path, operation: str, max_attempts: int = 4) -> Path:
+    """Download to a temporary file and publish only after a complete transfer."""
+    from googleapiclient.http import MediaIoBaseDownload
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, max_attempts + 1):
+        fd, temp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".download", dir=str(destination.parent))
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            request = service.files().get_media(fileId=file_id)
+            with temp_path.open("wb") as output:
+                downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            os.replace(temp_path, destination)
+            return destination
+        except Exception as exc:
+            temp_path.unlink(missing_ok=True)
+            if not _is_retryable_drive_error(exc) or attempt >= max_attempts:
+                _DRIVE_LOGGER.error(
+                    "google_drive_operation_failed operation=%s attempt=%s/%s error=%s",
+                    operation, attempt, max_attempts, type(exc).__name__,
+                )
+                raise
+            delay = min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5)
+            _DRIVE_LOGGER.warning(
+                "google_drive_retry operation=%s attempt=%s/%s delay_seconds=%.2f error=%s",
+                operation, attempt, max_attempts, delay, type(exc).__name__,
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"Google Drive download exhausted retries: {operation}")
 
 
 def _now_utc() -> str:
@@ -721,14 +791,17 @@ class GoogleDriveStore:
         q = f"name = '{self._q(name)}' and '{parent_id}' in parents and trashed = false"
         if mime_type:
             q += f" and mimeType = '{mime_type}'"
-        resp = svc.files().list(
-            q=q,
-            spaces="drive",
-            fields="files(id,name,mimeType)",
-            pageSize=10,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        resp = _drive_execute_with_retry(
+            "metadata_list",
+            lambda: svc.files().list(
+                q=q,
+                spaces="drive",
+                fields="files(id,name,mimeType)",
+                pageSize=10,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute(),
+        )
         files = resp.get("files", [])
         return files[0] if files else None
 
@@ -738,11 +811,14 @@ class GoogleDriveStore:
         if hit:
             return hit["id"]
         meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-        return svc.files().create(
-            body=meta,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()["id"]
+        return _drive_execute_with_retry(
+            "folder_create",
+            lambda: svc.files().create(
+                body=meta,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute(),
+        )["id"]
 
     def ensure_path(self, relative_folder: str, service=None) -> str:
         svc = service or self.service
