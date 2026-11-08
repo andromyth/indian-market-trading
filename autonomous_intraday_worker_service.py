@@ -111,17 +111,17 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
 
 
 def _is_nse_live_priority_window(now: datetime) -> bool:
-    """Block historical backfill from the 09:15 session open until 16:00 IST."""
+    """Block historical backfill only during NSE cash-market hours, 09:15–15:30 IST."""
     return (
         is_nse_trading_day(now.date())
         and (now.hour, now.minute) >= (9, 15)
-        and (now.hour, now.minute) < (16, 0)
+        and (now.hour, now.minute) < (15, 30)
     )
 
 
 def _backfill_start_allowed(now: datetime) -> bool:
-    """Trading-day backfill may start only from 16:00 IST; holidays remain eligible."""
-    return not is_nse_trading_day(now.date()) or (now.hour, now.minute) >= (16, 0)
+    """Allow backfill whenever the NSE cash market is closed."""
+    return not _is_nse_live_priority_window(now)
 
 
 BACKFILL_MARKET_PAUSED = False
