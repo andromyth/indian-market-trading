@@ -74,57 +74,57 @@ def _update_backfill_status(**fields: Any) -> None:
     with STATE_LOCK:
         current = dict(STATE.get("five_minute_backfill") or {})
         current.update(fields)
-        current["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        heartbeat = datetime.now(timezone.utc).isoformat()
+        current["updated_at_utc"] = heartbeat
+        current["last_heartbeat_at_utc"] = heartbeat
         STATE["five_minute_backfill"] = current
 
 
 def _backfill_progress(progress: dict[str, Any]) -> None:
-    _update_backfill_status(progress=progress, status="RUNNING")
+    _update_backfill_status(progress=progress, status="RUNNING", phase="DOWNLOADING")
     _log("indstocks_5m_backfill_progress", **progress)
 
 
 def _is_nse_live_priority_window(now: datetime) -> bool:
-    """Reserve 09:00-16:00 IST on NSE trading days for live capture."""
-    return is_nse_trading_day(now.date()) and 9 <= now.hour < 16
+    """Block historical backfill from the 09:15 session open until 16:00 IST."""
+    return (
+        is_nse_trading_day(now.date())
+        and (now.hour, now.minute) >= (9, 15)
+        and (now.hour, now.minute) < (16, 0)
+    )
 
 
-BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS = 5.0
-BACKFILL_MARKET_PACING_LOCK = threading.Lock()
-BACKFILL_LAST_MARKET_REQUEST_AT = 0.0
-BACKFILL_MARKET_PACING_ACTIVE = False
+def _backfill_start_allowed(now: datetime) -> bool:
+    """Trading-day backfill may start only from 16:00 IST; holidays remain eligible."""
+    return not is_nse_trading_day(now.date()) or (now.hour, now.minute) >= (16, 0)
+
+
+BACKFILL_MARKET_PAUSED = False
 
 
 def _wait_for_backfill_request_slot() -> None:
-    """Keep backfill low-priority during NSE hours instead of pausing it for seven hours."""
-    global BACKFILL_LAST_MARKET_REQUEST_AT, BACKFILL_MARKET_PACING_ACTIVE
+    """Wait without historical API activity until the NSE live-priority window ends."""
+    global BACKFILL_MARKET_PAUSED
 
-    market_open = _is_nse_live_priority_window(datetime.now(IST))
-    with BACKFILL_MARKET_PACING_LOCK:
-        if not market_open:
-            if BACKFILL_MARKET_PACING_ACTIVE:
-                _log("indstocks_5m_backfill_resumed_after_market")
-                BACKFILL_MARKET_PACING_ACTIVE = False
-            return
+    while _is_nse_live_priority_window(datetime.now(IST)):
+        if not BACKFILL_MARKET_PAUSED:
+            BACKFILL_MARKET_PAUSED = True
+            _log("indstocks_5m_backfill_paused_for_live_market")
+        # This heartbeat is local state only: no provider request or recovery check.
+        _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET", phase="MARKET_HOURS_PAUSE")
+        time.sleep(30)
 
-        if not BACKFILL_MARKET_PACING_ACTIVE:
-            _log(
-                "indstocks_5m_backfill_running_during_market",
-                minimum_request_interval_seconds=BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS,
-                priority="live_capture",
-            )
-            BACKFILL_MARKET_PACING_ACTIVE = True
-
-        elapsed = time.monotonic() - BACKFILL_LAST_MARKET_REQUEST_AT
-        wait_seconds = max(0.0, BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS - elapsed)
-        if wait_seconds:
-            time.sleep(wait_seconds)
-        BACKFILL_LAST_MARKET_REQUEST_AT = time.monotonic()
+    if BACKFILL_MARKET_PAUSED:
+        BACKFILL_MARKET_PAUSED = False
+        _update_backfill_status(status="RUNNING", phase="DOWNLOADING")
+        _log("indstocks_5m_backfill_resumed_after_market")
 
 
 def _run_five_minute_backfill() -> None:
     """Run in this process to share INDstocks TOTP token cache with live capture."""
     _update_backfill_status(
         status="RUNNING",
+        phase="DOWNLOADING",
         started_at_utc=datetime.now(timezone.utc).isoformat(),
         finished_at_utc=None,
         progress={},
@@ -164,6 +164,7 @@ def _run_five_minute_backfill() -> None:
                 delay_seconds = 10 * job_attempt
                 _update_backfill_status(
                     status="RUNNING",
+                    phase="RETRY_WAIT",
                     error=f"Transient attempt {job_attempt}/{max_job_attempts} failed; resuming from Drive checkpoints in {delay_seconds}s: {detail}",
                 )
                 _log(
@@ -747,13 +748,33 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._send_json(409, {"status": "BACKFILL_START_IN_PROGRESS"})
                 return
             try:
-                with STATE_LOCK:
-                    backfill_status = str((STATE.get("five_minute_backfill") or {}).get("status") or "IDLE")
-                if backfill_status in {"RUNNING", "PAUSED_FOR_LIVE_MARKET"} or (
-                    BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
-                ):
-                    self._send_json(409, {"status": "BACKFILL_ALREADY_RUNNING", "five_minute_backfill": STATE.get("five_minute_backfill")})
+                now_ist = datetime.now(IST)
+                if not _backfill_start_allowed(now_ist):
+                    self._send_json(423, {
+                        "status": "BACKFILL_OUTSIDE_ALLOWED_WINDOW",
+                        "nse_time_ist": now_ist.isoformat(),
+                        "next_allowed_time_ist": "16:00 IST today",
+                    })
                     return
+
+                thread_alive = BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
+                with STATE_LOCK:
+                    backfill_state = dict(STATE.get("five_minute_backfill") or {})
+                    backfill_status = str(backfill_state.get("status") or "IDLE")
+                if thread_alive:
+                    self._send_json(409, {"status": "BACKFILL_ALREADY_RUNNING", "five_minute_backfill": backfill_state})
+                    return
+                if backfill_status in {"RUNNING", "PAUSED_FOR_LIVE_MARKET"}:
+                    _log(
+                        "indstocks_5m_backfill_stale_worker_recovery",
+                        stale_status=backfill_status,
+                        last_heartbeat_at_utc=backfill_state.get("last_heartbeat_at_utc"),
+                    )
+                    _update_backfill_status(
+                        status="RECOVERING_STALE_WORKER",
+                        phase="CHECKPOINT_RECOVERY",
+                        previous_status=backfill_status,
+                    )
                 preflight = _preflight()
                 if not all(
                     preflight.get(key) is True
@@ -781,7 +802,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._send_json(202, {
                     "status": "BACKFILL_STARTED",
                     "status_endpoint": "/backfillz",
-                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; uses one historical request per five seconds during live NSE hours and four requests per second outside market hours.",
+                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; historical requests pause from 09:15 through 15:59 IST on NSE trading days and resume after 16:00, or run throughout non-trading days.",
                 })
                 return
             finally:
