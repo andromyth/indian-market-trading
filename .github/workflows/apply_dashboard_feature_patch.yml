@@ -1,38 +1,48 @@
-name: Apply dashboard feature patch
+name: Prepare dashboard feature patch PR
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "tools/patch_dashboard_features.py"
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  patch:
+  prepare-patch:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Apply patch
+      - name: Apply dashboard patch to working tree
         run: python tools/patch_dashboard_features.py
 
-      - name: Commit app changes
-        run: |
-          if git diff --quiet -- app.py; then
-            echo "app.py already contains the dashboard feature patch"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app.py
-          git commit -m "Add prediction history and delivery price forecast"
-          git push
+      - name: Create or update reviewed pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: automation/dashboard-feature-patch
+          delete-branch: false
+          add-paths: app.py
+          commit-message: "Add prediction history and delivery price forecast"
+          title: "Dashboard: apply prediction history and delivery forecast patch"
+          body: |
+            This pull request contains the generated dashboard feature patch.
+
+            Review the app.py diff and CI checks before merging. This workflow does not push generated application changes directly to main.
+          labels: |
+            automated
+            dashboard
