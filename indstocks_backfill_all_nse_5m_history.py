@@ -402,8 +402,6 @@ def fetch_indstocks_5m_batch(
                     "api_calls_in_batch": calls,
                 })
             continue
-        if request_guard is not None:
-            request_guard()
         wait = pause_seconds - (time.monotonic() - last_request_started)
         if calls and wait > 0:
             time.sleep(wait)
@@ -418,6 +416,10 @@ def fetch_indstocks_5m_batch(
         # but allow enough time for the provider connection to recover.
         max_request_attempts = 5
         for attempt in range(max_request_attempts):
+            # Recheck immediately before every provider call; retry sleep can
+            # cross the NSE live-market boundary.
+            if request_guard is not None:
+                request_guard()
             try:
                 response = _request("GET", "/market/historical/5minute", params=params)
                 break
@@ -461,6 +463,12 @@ def fetch_indstocks_5m_batch(
         data = body.get("data")
         if not isinstance(data, dict):
             raise RuntimeError(f"INDstocks response data is not an object for window {window_key}.")
+        if callable(BACKFILL_PROGRESS_CALLBACK):
+            BACKFILL_PROGRESS_CALLBACK({
+                "provider": "INDSTOCKS", **(progress_context or {}),
+                "stage": "PROVIDER_RESPONSE", "window_end": window_end.isoformat(),
+                "api_calls_in_batch": calls + 1,
+            })
         # INDstocks may omit a requested code, or its candles field, when no
         # candles exist for that instrument/window (for example before a listing).
         # The live capture path uses the same empty-history interpretation. Keep
@@ -527,6 +535,15 @@ def fetch_indstocks_5m_batch(
             )
             if str(uploaded_manifest.get("status") or "").upper() != "OK":
                 raise RuntimeError(f"Drive checkpoint manifest write failed for window {window_key}: {uploaded_manifest}")
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS",
+                    **(progress_context or {}),
+                    "stage": "CHECKPOINT_PERSISTED",
+                    "window_end": window_end.isoformat(),
+                    "checkpoint_path": checkpoint_remote,
+                    "api_calls_in_batch": calls + 1,
+                })
         calls += 1
         cursor = window_end
         if callable(BACKFILL_PROGRESS_CALLBACK):
@@ -763,31 +780,21 @@ def main(argv: list[str] | None = None) -> int:
 
         # Batch ranges must be common per request, then deduplicate against Drive.
         batch_start = min(starts.values())
-        try:
-            fetched_by_symbol, calls = fetch_indstocks_5m_batch(
-                active_batch, batch_start, end, pause_seconds=args.pause_seconds,
-                request_guard=REQUEST_GUARD,
-                progress_context={
-                    "batch": batch_no,
-                    "total_batches": len(batches),
-                    "completed_symbols": (batch_no - 1) * MAX_CODES_PER_REQUEST,
-                    "resolved_symbols": len(resolvable),
-                    "api_calls": total_api_calls,
-                },
-                store=store,
-                checkpoint_root=local_root / "window_checkpoints",
-                force_refetch_after=force_refetch_after,
-            )
-            total_api_calls += calls
-        except Exception as exc:
-            detail = f"{type(exc).__name__}: {str(exc)[:300]}"
-            results.extend({"symbol": symbol, "status": "ERROR", "error": detail} for symbol, _ in active_batch)
-            try:
-                print(f"BACKFILL_BATCH_FAILED batch={batch_no}/{len(batches)} symbols={[s for s, _ in active_batch]} error={detail}", flush=True)
-            except BrokenPipeError:
-                pass
-            del live_history, existing_by_symbol
-            continue
+        fetched_by_symbol, calls = fetch_indstocks_5m_batch(
+            active_batch, batch_start, end, pause_seconds=args.pause_seconds,
+            request_guard=REQUEST_GUARD,
+            progress_context={
+                "batch": batch_no,
+                "total_batches": len(batches),
+                "completed_symbols": (batch_no - 1) * MAX_CODES_PER_REQUEST,
+                "resolved_symbols": len(resolvable),
+                "api_calls": total_api_calls,
+            },
+            store=store,
+            checkpoint_root=local_root / "window_checkpoints",
+            force_refetch_after=force_refetch_after,
+        )
+        total_api_calls += calls
 
         for symbol, _ in active_batch:
             existing = existing_by_symbol[symbol]
@@ -816,6 +823,14 @@ def main(argv: list[str] | None = None) -> int:
             if str(uploaded.get("status") or "").upper() != "OK":
                 results.append({"symbol": symbol, "status": "ERROR", "error": f"Drive upload not confirmed: {uploaded}"})
                 continue
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS",
+                    "stage": "CHECKPOINT_PERSISTED",
+                    "symbol": symbol,
+                    "checkpoint_path": remote,
+                    "drive_bytes": uploaded.get("size"),
+                })
             ready = summary["usable_sessions"] >= args.minimum_usable_sessions
             remaining_recent_gaps = _recent_incomplete_session_dates(
                 merged,
