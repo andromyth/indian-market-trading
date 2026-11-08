@@ -12,3 +12,8 @@ oauth_client_secret*.json
 
 # Local paper-trading account and SQLite WAL files
 data/paper_trading.sqlite3*
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -80,9 +80,14 @@ jobs:
       - name: Resolve audit period (IST)
         id: period
         shell: bash
+        env:
+          START_DATE_INPUT: ${{ inputs.start_date }}
+          END_DATE_INPUT: ${{ inputs.end_date }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          START_DATE='${{ inputs.start_date }}'
-          END_DATE='${{ inputs.end_date }}'
+          set -euo pipefail
+          START_DATE="$START_DATE_INPUT"
+          END_DATE="$END_DATE_INPUT"
           if [ -z "$START_DATE" ]; then
             START_DATE="$(TZ=Asia/Kolkata date +%Y-%m-01)"
           fi
@@ -90,7 +95,7 @@ jobs:
             END_DATE="$(TZ=Asia/Kolkata date +%Y-%m-%d)"
           fi
           # A specifically named commit can run a one-day historical audit without changing normal defaults.
-          if [ "${{ github.event.head_commit.message }}" = "Run historical accuracy for 2026-10-30" ]; then
+          if [ "$HEAD_COMMIT_MESSAGE" = "Run historical accuracy for 2026-10-30" ]; then
             START_DATE="2026-10-30"
             END_DATE="2026-10-30"
           fi

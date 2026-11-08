@@ -58,8 +58,10 @@ jobs:
               raise SystemExit("Drive read/write preflight failed.")
           PY
       - name: Run one cycle during the NSE session
+        env:
+          MAX_STOCKS_INPUT: ${{ inputs.max_stocks || '1' }}
         run: |
           python -u autonomous_intraday_worker.py \
             --segment once \
             --max-cycles 1 \
-            --max-stocks "${{ inputs.max_stocks || '1' }}"
+            --max-stocks "$MAX_STOCKS_INPUT"
