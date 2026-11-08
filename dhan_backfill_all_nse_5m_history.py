@@ -153,14 +153,8 @@ def _download_existing(store: Any, remote: str, destination: Path) -> pd.DataFra
     item = _resolve_remote_file(store, remote)
     if not item:
         return pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
-    from googleapiclient.http import MediaIoBaseDownload
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = store.service.files().get_media(fileId=item["id"])
-    with destination.open("wb") as output:
-        downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    from persistent_store import download_drive_file_with_retry
+    download_drive_file_with_retry(store.service, item["id"], destination, operation="symbol_archive_download")
     old = pd.read_parquet(destination)
     if "Timestamp" in old.columns:
         old = old.set_index("Timestamp")
