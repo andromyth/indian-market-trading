@@ -38,7 +38,8 @@ jobs:
           TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
           RESPONSE="$(mktemp)"
           LOGS="$(mktemp)"
-          trap 'rm -f "$RESPONSE" "$LOGS"; unset TOKEN' EXIT
+          HTTP_LOGS="$(mktemp)"
+          trap 'rm -f "$RESPONSE" "$LOGS" "$HTTP_LOGS"; unset TOKEN' EXIT
 
           CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
@@ -63,15 +64,23 @@ jobs:
           print("BACKFILL_LIVE_STATE=" + json.dumps(summary, sort_keys=True, default=str))
           PY
 
+          SINCE_UTC="$(date -u -d '90 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
           gcloud logging read \
-            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'$(date -u -d '90 minutes ago' +%Y-%m-%dT%H:%M:%SZ)'"' \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"indian-market-intraday-worker\" AND timestamp >= \"$SINCE_UTC\"" \
             --project="$PROJECT_ID" --limit=500 --order=desc --format=json > "$LOGS"
+
+          # Query HTTP telemetry separately so high-volume progress messages cannot
+          # crowd request/429 evidence out of the general 500-entry service-log query.
+          gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"indian-market-intraday-worker\" AND timestamp >= \"$SINCE_UTC\" AND textPayload:\"indstocks_http_request\"" \
+            --project="$PROJECT_ID" --limit=1000 --order=desc --format=json > "$HTTP_LOGS"
 
           python - "$LOGS" <<'PY'
           import json, sys
           rows=json.load(open(sys.argv[1], encoding="utf-8"))
           keys=("indstocks_5m_backfill_progress","indstocks_5m_backfill_failed",
                 "indstocks_5m_backfill_completed","indstocks_5m_backfill_started",
+                "indstocks_backfill_request_retry","indstocks_backfill_request_failed",
                 "BACKFILL_PROGRESS","BACKFILL_BATCH_FAILED","checkpoint write failed",
                 "SSLError","UNEXPECTED_EOF_WHILE_READING")
           found=[]
@@ -91,4 +100,110 @@ jobs:
             print("BACKFILL_LOG=" + json.dumps(row, sort_keys=True, default=str))
           if not found:
             print("BACKFILL_LOG_NOTE=No matching backfill progress/error events found in the last 90 minutes.")
+          PY
+
+          python - "$HTTP_LOGS" <<'PY'
+          import collections, datetime as dt, json, math, sys
+
+          rows=json.load(open(sys.argv[1], encoding="utf-8"))
+
+          def event_payload(row):
+            payload=row.get("jsonPayload")
+            if isinstance(payload, dict) and payload.get("event") == "indstocks_http_request":
+              return payload
+            rendered=row.get("textPayload") or ""
+            if not isinstance(rendered, str):
+              return None
+            start=rendered.find("{")
+            if start < 0:
+              return None
+            try:
+              payload=json.loads(rendered[start:])
+            except (TypeError, ValueError):
+              return None
+            return payload if isinstance(payload, dict) and payload.get("event") == "indstocks_http_request" else None
+
+          events=[]
+          for row in rows:
+            payload=event_payload(row)
+            if not payload:
+              continue
+            timestamp=row.get("timestamp")
+            try:
+              epoch=dt.datetime.fromisoformat(str(timestamp).replace("Z","+00:00")).timestamp()
+            except (TypeError, ValueError):
+              epoch=None
+            events.append({
+              "timestamp": timestamp,
+              "epoch": epoch,
+              "method": payload.get("method"),
+              "endpoint": payload.get("endpoint"),
+              "outcome": payload.get("outcome"),
+              "http_status": payload.get("http_status"),
+              "retry_after": payload.get("retry_after"),
+              "duration_ms": payload.get("duration_ms"),
+              "error_reason": payload.get("error_reason"),
+              "exception_type": payload.get("exception_type"),
+            })
+
+          def percentile(values, fraction):
+            if not values:
+              return None
+            ordered=sorted(values)
+            return round(ordered[min(len(ordered)-1, max(0, math.ceil(fraction*len(ordered))-1))], 1)
+
+          def max_in_window(values, seconds):
+            ordered=sorted(values)
+            left=0
+            maximum=0
+            for right, value in enumerate(ordered):
+              while value-ordered[left] > seconds:
+                left += 1
+              maximum=max(maximum, right-left+1)
+            return maximum
+
+          responses=[e for e in events if e.get("outcome") == "http_response"]
+          transports=[e for e in events if e.get("outcome") == "transport_error"]
+          statuses=collections.Counter(str(e.get("http_status","unknown")) for e in responses)
+          outcomes=collections.Counter(str(e.get("outcome","unknown")) for e in events)
+          durations=[]
+          for event in events:
+            try:
+              durations.append(float(event["duration_ms"]))
+            except (TypeError, ValueError, KeyError):
+              pass
+          epochs=[e["epoch"] for e in events if e["epoch"] is not None]
+          retry_headers=[
+            {"timestamp":e["timestamp"],"status":e["http_status"],"retry_after":str(e["retry_after"])}
+            for e in responses if e.get("retry_after") not in (None,"")
+          ]
+          by_endpoint_status=collections.Counter(
+            f'{e.get("endpoint") or "unknown"}:{e.get("http_status","unknown")}'
+            for e in responses
+          )
+          last_events=sorted(events,key=lambda e:e["epoch"] if e["epoch"] is not None else -1)[-20:]
+          for event in last_events:
+            event.pop("epoch",None)
+
+          audit={
+            "query_window_minutes":90,
+            "cloud_logging_rows_returned":len(rows),
+            "query_limit_reached":len(rows)>=1000,
+            "parsed_http_events":len(events),
+            "outcomes":dict(outcomes),
+            "http_status_counts":dict(statuses),
+            "http_429_count":statuses.get("429",0),
+            "http_5xx_count":sum(count for code,count in statuses.items() if code.isdigit() and 500<=int(code)<=599),
+            "transport_error_reasons":dict(collections.Counter(str(e.get("error_reason") or e.get("exception_type") or "unknown") for e in transports)),
+            "retry_after_header_count":len(retry_headers),
+            "retry_after_examples":retry_headers[-10:],
+            "request_duration_ms":{"p50":percentile(durations,0.50),"p95":percentile(durations,0.95),"max":round(max(durations),1) if durations else None},
+            "max_requests_in_1_second_window":max_in_window(epochs,1) if epochs else 0,
+            "max_requests_in_60_second_window":max_in_window(epochs,60) if epochs else 0,
+            "endpoint_status_counts":dict(by_endpoint_status),
+            "latest_20_requests":last_events,
+          }
+          print("INDSTOCKS_HTTP_AUDIT=" + json.dumps(audit,sort_keys=True,default=str))
+          if not events:
+            print("INDSTOCKS_HTTP_AUDIT_NOTE=No indstocks_http_request telemetry found in the last 90 minutes.")
           PY
