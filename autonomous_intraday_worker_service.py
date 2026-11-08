@@ -96,7 +96,9 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
         "last_progress_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     stage = str(progress.get("stage") or "").upper()
-    if stage == "PROVIDER_RESPONSE":
+    if stage == "PROVIDER_REQUEST_STARTED":
+        fields["last_provider_request_started_at_utc"] = datetime.now(timezone.utc).isoformat()
+    elif stage == "PROVIDER_RESPONSE":
         fields["last_provider_response_at_utc"] = datetime.now(timezone.utc).isoformat()
         fields["last_provider_window_end"] = progress.get("window_end")
     elif stage == "CHECKPOINT_PERSISTED":
@@ -702,6 +704,20 @@ class WorkerHandler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/backfillz":
             with STATE_LOCK:
                 backfill = dict(STATE.get("five_minute_backfill") or {})
+            now = datetime.now(timezone.utc)
+            backfill["worker_thread_alive"] = bool(
+                BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
+            )
+            for field, timestamp_key in (
+                ("worker_heartbeat_age_seconds", "last_worker_heartbeat_at_utc"),
+                ("provider_response_age_seconds", "last_provider_response_at_utc"),
+                ("checkpoint_write_age_seconds", "last_checkpoint_write_at_utc"),
+            ):
+                stamp = pd.to_datetime(backfill.get(timestamp_key), errors="coerce", utc=True)
+                backfill[field] = (
+                    None if pd.isna(stamp)
+                    else round((pd.Timestamp(now) - stamp).total_seconds(), 1)
+                )
             self._send_json(200, {"status": backfill.get("status", "IDLE"), "five_minute_backfill": backfill})
             return
         if self.path == "/modelz":
