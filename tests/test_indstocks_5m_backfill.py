@@ -275,7 +275,7 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
     monkeypatch.setattr(
         market_session_guard,
         "is_nse_trading_day",
-        lambda day: day.isoformat() == "2026-11-05",
+        lambda day: day.isoformat() in {"2026-11-05", "2026-11-06"},
     )
 
     class Request:
@@ -353,12 +353,12 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
         file_listing_cache=listing_cache,
     )
 
-    assert len(read_calls) == 2
-    assert len(list_calls) == 1
-    assert len(download_calls) == 2
+    assert len(read_calls) == 4
+    assert len(list_calls) == 3  # Prior day once; today's folder refreshed per batch.
+    assert len(download_calls) == 4  # Each immutable file downloaded once.
     assert read_calls[0]["columns"] == ["symbol", "Timestamp", *backfill.OHLCV]
     assert read_calls[0]["filters"] == [("symbol", "in", ["RELIANCE"])]
     assert len(history["RELIANCE"]) == 1
     assert len(history_again["RELIANCE"]) == 1
-    assert inventory == {"live_capture_files_read": 1, "live_capture_files_failed": 0}
+    assert inventory == {"live_capture_files_read": 2, "live_capture_files_failed": 0}
     assert inventory_again == inventory
