@@ -14,6 +14,8 @@ import indstocks_client
 def reset_backfill_state(monkeypatch):
     monkeypatch.setattr(service, "BACKFILL_START_LOCK", threading.Lock())
     monkeypatch.setattr(service, "BACKFILL_THREAD", None)
+    monkeypatch.setattr(service, "BACKFILL_MARKET_PAUSED", False)
+    monkeypatch.setattr(service, "_backfill_start_allowed", lambda _now: True)
     with service.STATE_LOCK:
         service.STATE["five_minute_backfill"] = {"status": "IDLE"}
     yield
@@ -203,64 +205,44 @@ def test_backfill_job_retries_after_transient_failure_and_resumes(monkeypatch):
     assert status["error"] is None or "Transient attempt" in status["error"]
 
 
-def test_backfill_yields_from_0900_until_1600_on_trading_days(monkeypatch):
+def test_backfill_pauses_from_0915_until_1600_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     ist = ZoneInfo("Asia/Kolkata")
-    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 8, 59, tzinfo=ist))
-    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 0, tzinfo=ist))
-    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
+    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
 
 
-def test_backfill_does_not_yield_on_non_trading_days(monkeypatch):
+def test_backfill_start_allowed_only_after_1600_on_trading_days(monkeypatch):
+    monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
+
+
+def test_backfill_start_allowed_all_day_on_non_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: False)
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     ist = ZoneInfo("Asia/Kolkata")
-    assert not service._is_nse_live_priority_window(datetime(2026, 11, 7, 10, 0, tzinfo=ist))
-
-def test_backfill_uses_low_priority_market_pacing_instead_of_pausing(monkeypatch):
-    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_LOCK", threading.Lock())
-    monkeypatch.setattr(service, "BACKFILL_LAST_MARKET_REQUEST_AT", 100.0)
-    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_ACTIVE", False)
-    monkeypatch.setattr(service, "_is_nse_live_priority_window", lambda _now: True)
-
-    clock = {"now": 100.0}
-    sleeps = []
-    events = []
-
-    def fake_sleep(seconds):
-        sleeps.append(seconds)
-        clock["now"] += seconds
-
-    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(service.time, "sleep", fake_sleep)
-    monkeypatch.setattr(service, "_log", lambda event, **fields: events.append((event, fields)))
-
-    service._wait_for_backfill_request_slot()
-
-    assert sleeps == [5.0]
-    assert service.BACKFILL_LAST_MARKET_REQUEST_AT == 105.0
-    assert service.BACKFILL_MARKET_PACING_ACTIVE is True
-    assert events == [(
-        "indstocks_5m_backfill_running_during_market",
-        {"minimum_request_interval_seconds": 5.0, "priority": "live_capture"},
-    )]
+    assert service._backfill_start_allowed(datetime(2026, 11, 7, 10, 0, tzinfo=ist))
 
 
-def test_backfill_market_pacing_returns_to_full_rate_after_market(monkeypatch):
-    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_LOCK", threading.Lock())
-    monkeypatch.setattr(service, "BACKFILL_LAST_MARKET_REQUEST_AT", 105.0)
-    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_ACTIVE", True)
-    monkeypatch.setattr(service, "_is_nse_live_priority_window", lambda _now: False)
+def test_backfill_waits_without_provider_requests_during_market_hours(monkeypatch):
+    windows = iter([True, False])
+    monkeypatch.setattr(service, "_is_nse_live_priority_window", lambda _now: next(windows))
     sleeps = []
     events = []
     monkeypatch.setattr(service.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -268,7 +250,76 @@ def test_backfill_market_pacing_returns_to_full_rate_after_market(monkeypatch):
 
     service._wait_for_backfill_request_slot()
 
-    assert sleeps == []
-    assert service.BACKFILL_MARKET_PACING_ACTIVE is False
-    assert events == ["indstocks_5m_backfill_resumed_after_market"]
+    with service.STATE_LOCK:
+        state = dict(service.STATE["five_minute_backfill"])
+    assert sleeps == [30]
+    assert state["status"] == "RUNNING"
+    assert state["phase"] == "DOWNLOADING"
+    assert state["last_heartbeat_at_utc"]
+    assert events == [
+        "indstocks_5m_backfill_paused_for_live_market",
+        "indstocks_5m_backfill_resumed_after_market",
+    ]
 
+
+def test_manual_backfill_start_is_rejected_before_1600_on_trading_day(monkeypatch):
+    monkeypatch.setattr(service, "_backfill_start_allowed", lambda _now: False)
+    monkeypatch.setattr(
+        service,
+        "_preflight",
+        lambda: pytest.fail("preflight must not run during the blocked window"),
+    )
+
+    response = _post_backfill(_confirmed_body())
+
+    assert response["http_status"] == 423
+    assert response["body"]["status"] == "BACKFILL_OUTSIDE_ALLOWED_WINDOW"
+    assert service.BACKFILL_THREAD is None
+
+
+def test_dead_worker_with_stale_running_status_can_be_resumed(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "_preflight",
+        lambda: {
+            "ready": True,
+            "configured": True,
+            "reachable": True,
+            "write_ready": True,
+        },
+    )
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+
+    class DeadThread:
+        @staticmethod
+        def is_alive():
+            return False
+
+    class StubThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+    with service.STATE_LOCK:
+        service.STATE["five_minute_backfill"] = {
+            "status": "RUNNING",
+            "last_heartbeat_at_utc": "2026-11-08T10:00:00+00:00",
+        }
+    service.BACKFILL_THREAD = DeadThread()
+    monkeypatch.setattr(service.threading, "Thread", StubThread)
+
+    response = _post_backfill(_confirmed_body())
+
+    assert response["http_status"] == 202
+    assert response["body"]["status"] == "BACKFILL_STARTED"
+    assert service.BACKFILL_THREAD.started is True
+    with service.STATE_LOCK:
+        assert service.STATE["five_minute_backfill"]["status"] == "RECOVERING_STALE_WORKER"
