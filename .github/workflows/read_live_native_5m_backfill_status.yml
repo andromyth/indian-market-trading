@@ -207,3 +207,5 @@ jobs:
           if not events:
             print("INDSTOCKS_HTTP_AUDIT_NOTE=No indstocks_http_request telemetry found in the last 90 minutes.")
           PY
+
+# Read-only live status check requested 2026-11-08; no restart or data mutation.
