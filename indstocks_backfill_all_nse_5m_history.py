@@ -163,18 +163,13 @@ def fetch_indstocks_5m_batch(
         checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if store is not None and checkpoint_root is not None else None
         expected_symbols = sorted(symbols_by_code.values())
         if checkpoint_item and checkpoint_manifest_item:
-            from googleapiclient.http import MediaIoBaseDownload
+            from persistent_store import download_drive_file_with_retry
             checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
-            for item, destination in (
-                (checkpoint_item, checkpoint_local),
-                (checkpoint_manifest_item, checkpoint_manifest_local),
+            for item, destination, operation in (
+                (checkpoint_item, checkpoint_local, "checkpoint_parquet_download"),
+                (checkpoint_manifest_item, checkpoint_manifest_local, "checkpoint_manifest_download"),
             ):
-                request = store.service.files().get_media(fileId=item["id"])
-                with destination.open("wb") as output:
-                    downloader = MediaIoBaseDownload(output, request, chunksize=8 * 1024 * 1024)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
+                download_drive_file_with_retry(store.service, item["id"], destination, operation=operation)
             manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
             if (
                 manifest.get("status") != "COMPLETE"
