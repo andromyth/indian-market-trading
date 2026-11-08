@@ -102,11 +102,14 @@ jobs:
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+          START_DATE_INPUT: ${{ inputs.start }}
+          END_DATE_INPUT: ${{ inputs.end }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.start }}" ] && [ -n "${{ inputs.end }}" ]; then
-            START='${{ inputs.start }}'
-            END='${{ inputs.end }}'
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -n "$START_DATE_INPUT" ] && [ -n "$END_DATE_INPUT" ]; then
+            START="$START_DATE_INPUT"
+            END="$END_DATE_INPUT"
           else
             END=$(date -u +%Y-%m-%d)
             START=$(date -u -d '7 days ago' +%Y-%m-%d)

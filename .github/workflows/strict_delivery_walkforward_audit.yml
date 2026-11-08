@@ -34,6 +34,7 @@ jobs:
       - name: Install audit dependencies
         run: pip install numpy pandas pyarrow scikit-learn==1.6.1 joblib duckdb google-api-python-client google-auth google-auth-oauthlib
       - name: Verify Google Drive read access
+        if: github.event_name != 'pull_request'
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -50,6 +51,7 @@ jobs:
       - name: Compile audit script
         run: python -m py_compile strict_delivery_walkforward_audit.py
       - name: Run strict walk-forward audit (read-only)
+        if: github.event_name != 'pull_request'
         env:
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}

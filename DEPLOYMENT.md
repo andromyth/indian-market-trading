@@ -4,7 +4,7 @@ This is the clean application package for Streamlit Community Cloud.
 
 ## Upload to GitHub
 
-Upload the contents of this directory to a **private GitHub repository**.
+Use a **private GitHub repository** for production deployment where possible. If a repository is public, assume all tracked files and commit metadata are publicly visible.
 Do not upload `.env`, credentials, `data/dhan/auth.json`, `.venv`, `__pycache__`, research datasets, model checkpoints, or generated reports.
 
 ## Streamlit Secrets
@@ -23,7 +23,7 @@ If Dhan is not configured, the dashboard uses its existing free fallback sources
 
 ## Deploy
 
-In Streamlit Community Cloud: Create app -> select the private GitHub repository -> select `main` -> choose `app.py` -> Deploy.
+In Streamlit Community Cloud: Create app -> select the connected GitHub repository -> select `main` -> choose `app.py` -> Deploy.
 
 ## Important
 
