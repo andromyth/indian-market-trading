@@ -226,3 +226,49 @@ def test_backfill_does_not_yield_on_non_trading_days(monkeypatch):
 
     ist = ZoneInfo("Asia/Kolkata")
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 7, 10, 0, tzinfo=ist))
+
+def test_backfill_uses_low_priority_market_pacing_instead_of_pausing(monkeypatch):
+    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_LOCK", threading.Lock())
+    monkeypatch.setattr(service, "BACKFILL_LAST_MARKET_REQUEST_AT", 100.0)
+    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_ACTIVE", False)
+    monkeypatch.setattr(service, "_is_nse_live_priority_window", lambda _now: True)
+
+    clock = {"now": 100.0}
+    sleeps = []
+    events = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(service.time, "sleep", fake_sleep)
+    monkeypatch.setattr(service, "_log", lambda event, **fields: events.append((event, fields)))
+
+    service._wait_for_backfill_request_slot()
+
+    assert sleeps == [5.0]
+    assert service.BACKFILL_LAST_MARKET_REQUEST_AT == 105.0
+    assert service.BACKFILL_MARKET_PACING_ACTIVE is True
+    assert events == [(
+        "indstocks_5m_backfill_running_during_market",
+        {"minimum_request_interval_seconds": 5.0, "priority": "live_capture"},
+    )]
+
+
+def test_backfill_market_pacing_returns_to_full_rate_after_market(monkeypatch):
+    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_LOCK", threading.Lock())
+    monkeypatch.setattr(service, "BACKFILL_LAST_MARKET_REQUEST_AT", 105.0)
+    monkeypatch.setattr(service, "BACKFILL_MARKET_PACING_ACTIVE", True)
+    monkeypatch.setattr(service, "_is_nse_live_priority_window", lambda _now: False)
+    sleeps = []
+    events = []
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(service, "_log", lambda event, **fields: events.append(event))
+
+    service._wait_for_backfill_request_slot()
+
+    assert sleeps == []
+    assert service.BACKFILL_MARKET_PACING_ACTIVE is False
+    assert events == ["indstocks_5m_backfill_resumed_after_market"]
+

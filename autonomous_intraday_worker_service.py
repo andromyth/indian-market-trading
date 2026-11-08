@@ -88,21 +88,37 @@ def _is_nse_live_priority_window(now: datetime) -> bool:
     return is_nse_trading_day(now.date()) and 9 <= now.hour < 16
 
 
-def _wait_until_market_closed() -> None:
-    """Yield historical API requests from 09:00-16:00 IST so snapshots stay first."""
-    announced = False
-    while True:
-        now = datetime.now(IST)
-        market_open = _is_nse_live_priority_window(now)
+BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS = 5.0
+BACKFILL_MARKET_PACING_LOCK = threading.Lock()
+BACKFILL_LAST_MARKET_REQUEST_AT = 0.0
+BACKFILL_MARKET_PACING_ACTIVE = False
+
+
+def _wait_for_backfill_request_slot() -> None:
+    """Keep backfill low-priority during NSE hours instead of pausing it for seven hours."""
+    global BACKFILL_LAST_MARKET_REQUEST_AT, BACKFILL_MARKET_PACING_ACTIVE
+
+    market_open = _is_nse_live_priority_window(datetime.now(IST))
+    with BACKFILL_MARKET_PACING_LOCK:
         if not market_open:
-            if announced:
+            if BACKFILL_MARKET_PACING_ACTIVE:
                 _log("indstocks_5m_backfill_resumed_after_market")
+                BACKFILL_MARKET_PACING_ACTIVE = False
             return
-        if not announced:
-            _log("indstocks_5m_backfill_paused_for_live_market")
-            _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET")
-            announced = True
-        time.sleep(30)
+
+        if not BACKFILL_MARKET_PACING_ACTIVE:
+            _log(
+                "indstocks_5m_backfill_running_during_market",
+                minimum_request_interval_seconds=BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS,
+                priority="live_capture",
+            )
+            BACKFILL_MARKET_PACING_ACTIVE = True
+
+        elapsed = time.monotonic() - BACKFILL_LAST_MARKET_REQUEST_AT
+        wait_seconds = max(0.0, BACKFILL_MARKET_REQUEST_INTERVAL_SECONDS - elapsed)
+        if wait_seconds:
+            time.sleep(wait_seconds)
+        BACKFILL_LAST_MARKET_REQUEST_AT = time.monotonic()
 
 
 def _run_five_minute_backfill() -> None:
@@ -120,7 +136,7 @@ def _run_five_minute_backfill() -> None:
         from indstocks_client import configured
         if not configured():
             raise RuntimeError("INDstocks read-only credentials are not configured in Cloud Run.")
-        backfill.REQUEST_GUARD = _wait_until_market_closed
+        backfill.REQUEST_GUARD = _wait_for_backfill_request_slot
         backfill.BACKFILL_PROGRESS_CALLBACK = _backfill_progress
         # If a transient provider/network failure outlasts the per-request retry
         # budget, rerun the job from Drive checkpoints instead of requiring a
@@ -765,7 +781,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._send_json(202, {
                     "status": "BACKFILL_STARTED",
                     "status_endpoint": "/backfillz",
-                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; yields API requests during live NSE hours.",
+                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; uses one historical request per five seconds during live NSE hours and four requests per second outside market hours.",
                 })
                 return
             finally:

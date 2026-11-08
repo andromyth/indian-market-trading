@@ -554,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minimum-usable-sessions", type=int, default=200)
     parser.add_argument("--minimum-bars-per-session", type=int, default=50)
     parser.add_argument("--recent-session-lookback-days", type=int, default=RECENT_SESSION_LOOKBACK_DAYS)
-    parser.add_argument("--pause-seconds", type=float, default=1.0)
+    parser.add_argument("--pause-seconds", type=float, default=0.25)
     parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--symbols", default="")
