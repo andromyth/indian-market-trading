@@ -43,6 +43,3 @@ jobs:
             This pull request contains the generated dashboard feature patch.
 
             Review the app.py diff and CI checks before merging. This workflow does not push generated application changes directly to main.
-          labels: |
-            automated
-            dashboard
