@@ -753,7 +753,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     self._send_json(423, {
                         "status": "BACKFILL_OUTSIDE_ALLOWED_WINDOW",
                         "nse_time_ist": now_ist.isoformat(),
-                        "next_allowed_time_ist": "16:00 on the next NSE trading day",
+                        "next_allowed_time_ist": "16:00 IST today",
                     })
                     return
 
