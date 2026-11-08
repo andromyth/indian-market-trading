@@ -109,9 +109,9 @@ def _wait_for_backfill_request_slot() -> None:
     while _is_nse_live_priority_window(datetime.now(IST)):
         if not BACKFILL_MARKET_PAUSED:
             BACKFILL_MARKET_PAUSED = True
-            _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET", phase="MARKET_HOURS_PAUSE")
             _log("indstocks_5m_backfill_paused_for_live_market")
-        # This is a heartbeat, not a provider request or recovery check.
+        # This heartbeat is local state only: no provider request or recovery check.
+        _update_backfill_status(status="PAUSED_FOR_LIVE_MARKET", phase="MARKET_HOURS_PAUSE")
         time.sleep(30)
 
     if BACKFILL_MARKET_PAUSED:
