@@ -814,14 +814,30 @@ class GoogleDriveStore:
         if hit:
             return hit["id"]
         meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-        return _drive_execute_with_retry(
-            "folder_create",
-            lambda: svc.files().create(
-                body=meta,
-                fields="id",
-                supportsAllDrives=True,
-            ).execute(),
-        )["id"]
+        for attempt in range(1, 5):
+            hit = self._find_child(parent_id, name, "application/vnd.google-apps.folder", service=svc)
+            if hit:
+                return hit["id"]
+            try:
+                return svc.files().create(
+                    body=meta,
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()["id"]
+            except Exception as exc:
+                if not _is_retryable_drive_error(exc) or attempt == 4:
+                    _DRIVE_LOGGER.error(
+                        "google_drive_operation_failed operation=folder_create attempt=%s/4 error=%s",
+                        attempt, type(exc).__name__,
+                    )
+                    raise
+                delay = min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5)
+                _DRIVE_LOGGER.warning(
+                    "google_drive_retry operation=folder_create attempt=%s/4 delay_seconds=%.2f error=%s",
+                    attempt, delay, type(exc).__name__,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"Google Drive folder creation exhausted retries: {name}")
 
     def ensure_path(self, relative_folder: str, service=None) -> str:
         svc = service or self.service
