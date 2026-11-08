@@ -14,6 +14,7 @@ on:
   schedule:
     # Hourly at :00 IST; the calendar gate skips trading days before 16:00.
     # Non-trading days remain eligible throughout the day.
+    # A one-off checkpoint resume can be triggered with the [start-native-5m-backfill] push marker.
     - cron: "30 * * * *"
   push:
     branches:
