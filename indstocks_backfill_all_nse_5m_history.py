@@ -420,6 +420,12 @@ def fetch_indstocks_5m_batch(
             # cross the NSE live-market boundary.
             if request_guard is not None:
                 request_guard()
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS", **(progress_context or {}),
+                    "stage": "PROVIDER_REQUEST_STARTED", "window_end": window_end.isoformat(),
+                    "attempt": attempt + 1,
+                })
             try:
                 response = _request("GET", "/market/historical/5minute", params=params)
                 break
