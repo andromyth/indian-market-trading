@@ -275,14 +275,18 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
     monkeypatch.setattr(
         market_session_guard,
         "is_nse_trading_day",
-        lambda day: day == end.date(),
+        lambda day: day.isoformat() in {"2026-11-05", "2026-11-06"},
     )
 
     class Request:
         pass
 
+    list_calls = []
+    download_calls = []
+
     class Files:
         def list(self, **_kwargs):
+            list_calls.append(1)
             class Result:
                 @staticmethod
                 def execute():
@@ -291,6 +295,7 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
 
         @staticmethod
         def get_media(fileId):
+            download_calls.append(fileId)
             return Request()
 
     class Service:
@@ -304,6 +309,7 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
     class Downloader:
         def __init__(self, output, _request, chunksize):
             self.output = output
+            download_calls.append("download")
             assert chunksize == 8 * 1024 * 1024
 
         def next_chunk(self):
@@ -329,16 +335,30 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
 
     monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
 
+    listing_cache = {}
     history, inventory = backfill._load_recent_live_history(
         Store(),
         {"RELIANCE"},
         end,
         tmp_path,
-        lookback_days=1,
+        lookback_days=2,
+        file_listing_cache=listing_cache,
+    )
+    history_again, inventory_again = backfill._load_recent_live_history(
+        Store(),
+        {"RELIANCE"},
+        end,
+        tmp_path,
+        lookback_days=2,
+        file_listing_cache=listing_cache,
     )
 
-    assert len(read_calls) == 1
+    assert len(read_calls) == 4
+    assert len(list_calls) == 3  # Prior day once; today's folder refreshed per batch.
+    assert len(download_calls) == 4  # Each immutable file downloaded once.
     assert read_calls[0]["columns"] == ["symbol", "Timestamp", *backfill.OHLCV]
     assert read_calls[0]["filters"] == [("symbol", "in", ["RELIANCE"])]
     assert len(history["RELIANCE"]) == 1
-    assert inventory == {"live_capture_files_read": 1, "live_capture_files_failed": 0}
+    assert len(history_again["RELIANCE"]) == 1
+    assert inventory == {"live_capture_files_read": 2, "live_capture_files_failed": 0}
+    assert inventory_again == inventory
