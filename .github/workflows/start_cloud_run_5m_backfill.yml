@@ -380,5 +380,5 @@ jobs:
           exit 1
 # Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment,
 # but only after 16:00 IST on trading days or at any time on non-trading days.
-# The scheduled kickoff runs once daily at 16:30 IST; Cloud Run owns ongoing backfill execution.
+# The scheduled kickoff runs once daily at 16:00 IST; Cloud Run owns ongoing backfill execution.
 # Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
