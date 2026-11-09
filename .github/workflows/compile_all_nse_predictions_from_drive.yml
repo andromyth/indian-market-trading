@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile drive_all_nse_prediction_compiler.py all_nse_minute_prediction_capture.py
-          pytest -q tests/test_indstocks_client.py tests/test_all_nse_minute_prediction_capture.py tests/test_drive_all_nse_prediction_compiler.py
+          pytest -q tests/test_indstocks_client.py tests/test_all_nse_minute_prediction_capture.py tests/test_drive_all_nse_prediction_compiler.py tests/test_autonomous_intraday_worker.py tests/test_market_news_pit_collector.py
 
       - name: Verify Drive credentials without printing secret values
         if: github.event_name != 'pull_request'
