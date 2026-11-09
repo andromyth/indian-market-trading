@@ -12,10 +12,10 @@ on:
           - "no"
           - "yes"
   schedule:
-    # One daily kickoff at 16:30 IST (11:00 UTC); Cloud Run owns the resumable backfill.
+    # One daily kickoff at 16:00 IST (10:30 UTC); Cloud Run owns the resumable backfill.
     # The NSE calendar/time gate below remains a second safety barrier.
     # Manual dispatch remains available but is subject to the same gate.
-    - cron: "0 11 * * *"
+    - cron: "30 10 * * *"
   push:
     branches:
       - main
