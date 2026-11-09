@@ -63,8 +63,7 @@ for secret_name in "${required_secrets[@]}"; do
   fi
 done
 
-# Full-universe minute capture requires INDstocks read-only market-data access.
-# Prefer the unattended TOTP credential set; a manual access token expires after 24 hours.
+# Full-universe capture and historical backfill require Cloud Run-owned TOTP credentials.
 auto_broker_auth=true
 for secret_name in "indstocks-client-id" "indstocks-mpin" "indstocks-totp-secret"; do
   if ! gcloud secrets describe "$secret_name" --project "$PROJECT_ID" >/dev/null 2>&1 \
