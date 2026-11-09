@@ -7,6 +7,7 @@ indstocks_client; INDstocks access remains inside the singleton Cloud Run worker
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 HISTORY_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
+MAX_CAPTURE_AGE_SECONDS = 600
+MAX_MINUTE_MANIFEST_CANDIDATES = 6
 
 
 def _find_remote(store, remote: str):
@@ -91,32 +94,101 @@ def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
     return frame
 
 
-def _latest_capture(store) -> tuple[dict, pd.DataFrame, pd.Timestamp]:
-    item = _find_remote(store, f"{QUOTE_ROOT}/latest_manifest.json")
-    if not item:
-        raise RuntimeError("Latest all-universe quote manifest is missing from Drive")
-    local = Path("/tmp/drive_all_nse/latest_manifest.json")
-    _download(store, item["id"], local)
-    manifest = json.loads(local.read_text(encoding="utf-8"))
-    minute = pd.Timestamp(manifest.get("cycle_minute_ist"))
-    minute = minute.tz_localize(IST) if minute.tzinfo is None else minute.tz_convert(IST)
-    status = str(manifest.get("status") or "").upper()
-    if manifest.get("snapshot_persisted") is not True or status != "STORED":
-        raise RuntimeError(
-            f"Latest quote snapshot is not durably stored: status={status or 'MISSING'}"
+def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.DataFrame, pd.Timestamp]:
+    """Select the newest fresh STORED snapshot, even when latest_manifest is a failure pointer.
+
+    A failed capture updates latest_manifest.json. That status pointer must not
+    hide a valid same-session snapshot whose own per-minute manifest was stored.
+    """
+    current = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    current = current.tz_localize(IST) if current.tzinfo is None else current.tz_convert(IST)
+    day_folder = _find_remote(store, f"{QUOTE_ROOT}/{current:%Y/%m/%d}")
+    latest_item = _find_remote(store, f"{QUOTE_ROOT}/latest_manifest.json")
+
+    items: list[dict] = []
+    if day_folder:
+        minute_items = [
+            item for item in _list_children(store, day_folder["id"])
+            if re.fullmatch(r"manifest_\d{8}_\d{4}\.json", str(item.get("name") or ""))
+        ]
+        minute_items.sort(key=lambda item: str(item.get("name") or ""), reverse=True)
+        items.extend(minute_items[:MAX_MINUTE_MANIFEST_CANDIDATES])
+    if latest_item and all(item.get("id") != latest_item.get("id") for item in items):
+        items.append(latest_item)
+    if not items:
+        raise RuntimeError("No current-session quote manifests are available in Drive")
+
+    candidates: list[tuple[pd.Timestamp, dict, dict]] = []
+    skipped: list[str] = []
+    for index, item in enumerate(items):
+        local = Path("/tmp/drive_all_nse") / f"capture_manifest_candidate_{index}.json"
+        _download(store, item["id"], local)
+        try:
+            manifest = json.loads(local.read_text(encoding="utf-8"))
+            minute = pd.Timestamp(manifest.get("cycle_minute_ist"))
+            minute = minute.tz_localize(IST) if minute.tzinfo is None else minute.tz_convert(IST)
+            candidates.append((minute, manifest, item))
+        except Exception as exc:
+            skipped.append(f"{item.get('name')}: invalid manifest ({type(exc).__name__})")
+
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    seen_minutes: set[pd.Timestamp] = set()
+    for minute, manifest, item in candidates:
+        if minute in seen_minutes:
+            continue
+        seen_minutes.add(minute)
+        status = str(manifest.get("status") or "").upper()
+        age_seconds = (current - minute).total_seconds()
+        if manifest.get("snapshot_persisted") is not True or status != "STORED":
+            skipped.append(f"{item.get('name')}: status={status or 'MISSING'}")
+            continue
+        if minute.date() != current.date() or age_seconds < 0 or age_seconds > MAX_CAPTURE_AGE_SECONDS:
+            skipped.append(f"{item.get('name')}: stale_or_future age_seconds={round(age_seconds, 1)}")
+            continue
+
+        snapshot_remote = str(
+            manifest.get("snapshot_drive_path") or manifest.get("remote_snapshot_path") or ""
         )
-    snapshot_remote = str(manifest.get("snapshot_drive_path") or "")
-    if not snapshot_remote:
-        raise RuntimeError("Latest quote manifest has no snapshot_drive_path")
-    snapshot_item = _find_remote(store, snapshot_remote)
-    if not snapshot_item:
-        raise RuntimeError("Manifest points to a missing quote snapshot in Drive")
-    snapshot_path = Path("/tmp/drive_all_nse") / Path(snapshot_remote).name
-    _download(store, snapshot_item["id"], snapshot_path)
-    quotes = pd.read_parquet(snapshot_path)
-    if quotes.empty or "symbol" not in quotes.columns:
-        raise RuntimeError("Latest quote snapshot is empty or has no symbol column")
-    return manifest, quotes, minute
+        if not snapshot_remote:
+            skipped.append(f"{item.get('name')}: missing snapshot path")
+            continue
+        snapshot_item = _find_remote(store, snapshot_remote)
+        if not snapshot_item:
+            skipped.append(f"{item.get('name')}: snapshot file missing")
+            continue
+        snapshot_path = Path("/tmp/drive_all_nse") / Path(snapshot_remote).name
+        _download(store, snapshot_item["id"], snapshot_path)
+        try:
+            quotes = pd.read_parquet(snapshot_path)
+        except Exception as exc:
+            skipped.append(f"{item.get('name')}: unreadable snapshot ({type(exc).__name__})")
+            continue
+        if quotes.empty or "symbol" not in quotes.columns:
+            skipped.append(f"{item.get('name')}: empty snapshot or missing symbol column")
+            continue
+        declared_rows = manifest.get("row_count")
+        if declared_rows is not None and int(declared_rows) != len(quotes):
+            skipped.append(f"{item.get('name')}: row_count_mismatch")
+            continue
+        print(
+            "DRIVE_CAPTURE_SELECTED="
+            + json.dumps({
+                "manifest": item.get("name"),
+                "cycle_minute_ist": minute.isoformat(),
+                "age_seconds": round(age_seconds, 1),
+                "status": status,
+                "snapshot_drive_path": snapshot_remote,
+                "quote_rows": len(quotes),
+                "skipped_newer_candidates": skipped,
+            }, sort_keys=True),
+            flush=True,
+        )
+        return manifest, quotes, minute
+
+    raise RuntimeError(
+        "No fresh, durably stored current-session quote snapshot was found; "
+        + "; ".join(skipped[-8:])
+    )
 
 
 def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, work: Path, lookback: int) -> dict[str, pd.DataFrame]:
