@@ -10,19 +10,21 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: diagnose-indstocks-provider-auth
   cancel-in-progress: false
 
 jobs:
-  diagnose:
+  diagnose-capture-compile:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
@@ -38,46 +40,85 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Call Cloud Run provider diagnostic using the existing private invoker
+      - name: Verify INDstocks, run one Cloud Run capture tick, and dispatch Drive-only compiler
         shell: bash
         run: |
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           [[ -n "$SERVICE_URL" ]] || { echo "Cloud Run service URL is unavailable."; exit 1; }
-          RESPONSE="$(mktemp)"
-          trap 'rm -f "$RESPONSE"' EXIT
-          SUCCESS=0
-          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
-            if [[ "$SA" == "SELF" ]]; then
-              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-            else
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          if [[ -z "$TOKEN" ]]; then
+            for SA in "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
               TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
-            fi
-            [[ -n "$TOKEN" ]] || continue
-            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 150 \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/json" \
-              --output "$RESPONSE" --write-out "%{http_code}" \
-              "$SERVICE_URL/providerz")" || HTTP_CODE=000
-            echo "PROVIDER_DIAGNOSTIC_HTTP_STATUS=$HTTP_CODE"
-            if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "503" ]]; then
-              SUCCESS=1
+              [[ -n "$TOKEN" ]] && break
+            done
+          fi
+          [[ -n "$TOKEN" ]] || { echo "Could not mint an identity token for the existing private Cloud Run service."; exit 1; }
+
+          PROVIDER="$(mktemp)"
+          TICK="$(mktemp)"
+          CAPTURE="$(mktemp)"
+          trap 'rm -f "$PROVIDER" "$TICK" "$CAPTURE"' EXIT
+
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 150 \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            --output "$PROVIDER" --write-out "%{http_code}" "$SERVICE_URL/providerz")"
+          echo "PROVIDER_DIAGNOSTIC_HTTP_STATUS=$CODE"
+          python - "$PROVIDER" "$CODE" <<'PY'
+          import json, sys
+          data=json.load(open(sys.argv[1],encoding="utf-8"))
+          print("INDSTOCKS_PROVIDER_DIAGNOSTIC="+json.dumps(data,sort_keys=True))
+          if sys.argv[2]!="200" or data.get("status")!="ok":
+              raise SystemExit("INDstocks diagnostic failed; refusing to trigger capture.")
+          PY
+
+          TICK_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 300 \
+            --request POST -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" -H "Accept: application/json" \
+            --data '{}' --output "$TICK" --write-out "%{http_code}" "$SERVICE_URL/tick")" || TICK_CODE=000
+          echo "CLOUD_RUN_TICK_HTTP_STATUS=$TICK_CODE"
+          cat "$TICK"
+          if [[ "$TICK_CODE" != "200" && "$TICK_CODE" != "409" ]]; then
+            echo "Cloud Run capture tick did not complete or was not already running."
+            exit 1
+          fi
+
+          CAPTURE_OK=0
+          for attempt in $(seq 1 18); do
+            sleep 10
+            CAPTURE_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$CAPTURE" --write-out "%{http_code}" "$SERVICE_URL/capturez")" || CAPTURE_CODE=000
+            if [[ "$CAPTURE_CODE" == "200" ]] && python - "$CAPTURE" <<'PY'
+          import json,sys
+          from datetime import datetime,timezone
+          from dateutil.parser import isoparse
+          data=json.load(open(sys.argv[1],encoding="utf-8"))
+          age=data.get("age_seconds")
+          ok=(
+              data.get("status")=="ok"
+              and int(data.get("row_count") or 0)>0
+              and bool(data.get("drive_path"))
+              and age is not None and float(age)<=600
+          )
+          print("PERSISTED_CAPTURE_CHECK="+json.dumps({
+              "status":data.get("status"),
+              "cycle_minute_ist":data.get("cycle_minute_ist"),
+              "age_seconds":age,
+              "expected_symbol_count":data.get("expected_symbol_count"),
+              "quoted_symbol_count":data.get("quoted_symbol_count"),
+              "row_count":data.get("row_count"),
+              "drive_path":data.get("drive_path"),
+              "reasons":data.get("reasons"),
+          },sort_keys=True))
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              CAPTURE_OK=1
               break
             fi
           done
-          if [[ "$SUCCESS" != "1" ]]; then
-            echo "Could not reach the private Cloud Run provider diagnostic using the GitHub deployer or existing scheduler identities."
-            exit 1
-          fi
-          python - "$RESPONSE" "$HTTP_CODE" <<'PY'
-          import json, sys
-          path, code = sys.argv[1:]
-          try:
-              data = json.load(open(path, encoding="utf-8"))
-          except Exception:
-              raise SystemExit("Cloud Run provider diagnostic returned non-JSON output.")
-          print("INDSTOCKS_PROVIDER_DIAGNOSTIC=" + json.dumps(data, sort_keys=True))
-          if code != "200" or data.get("status") != "ok":
-              raise SystemExit("INDstocks provider diagnostic failed; no credentials or service settings were changed.")
-          print("INDSTOCKS_PROVIDER_DIAGNOSTIC=PASS")
-          PY
+          [[ "$CAPTURE_OK" == "1" ]] || { echo "No fresh, durably stored quote snapshot was confirmed; compiler not dispatched."; exit 1; }
+
+          gh workflow run compile_all_nse_predictions_from_drive.yml --ref main
+          echo "DRIVE_ONLY_PREDICTION_COMPILER_DISPATCHED=true"
