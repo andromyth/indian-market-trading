@@ -6,6 +6,19 @@ import pytest
 import indstocks_client as client
 
 
+@pytest.fixture(autouse=True)
+def _run_indstocks_unit_tests_as_cloud_run(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "unit-test-cloud-run")
+
+
+def test_indstocks_access_is_disabled_outside_cloud_run(monkeypatch):
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    monkeypatch.setenv("INDSTOCKS_ACCESS_TOKEN", "must-not-be-used")
+    assert client.configured() is False
+    with pytest.raises(RuntimeError, match="restricted to the Cloud Run worker"):
+        client.access_token()
+
+
 def test_totp_matches_rfc6238_sha1_six_digit_vector():
     # RFC 6238 test secret, Unix time 59 seconds, SHA-1, six digits.
     assert client._totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", at_time=59) == "287082"
