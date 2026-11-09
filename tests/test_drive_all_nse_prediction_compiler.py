@@ -47,3 +47,112 @@ def test_read_history_filters_to_requested_symbol(tmp_path):
 
     assert len(result) == 1
     assert result.iloc[0]["Close"] == 200.5
+
+
+
+def test_latest_capture_skips_blocked_pointer_and_uses_fresh_stored_minute_manifest(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    snapshot_remote = "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1440.parquet"
+    blocked = {
+        "cycle_minute_ist": "2026-11-09T14:45:00+05:30",
+        "status": "BLOCKED_PROVIDER_CREDENTIALS",
+        "snapshot_persisted": False,
+    }
+    stored = {
+        "cycle_minute_ist": "2026-11-09T14:40:00+05:30",
+        "status": "STORED",
+        "snapshot_persisted": True,
+        "snapshot_drive_path": snapshot_remote,
+        "row_count": 1,
+    }
+    items = [
+        {"id": "blocked", "name": "manifest_20261109_1445.json"},
+        {"id": "stored", "name": "manifest_20261109_1440.json"},
+    ]
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        if remote == snapshot_remote:
+            return {"id": "snapshot"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "blocked": blocked,
+            "stored": stored,
+            "latest": blocked,
+        }.get(file_id)
+        if payload is not None:
+            destination.write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            destination.write_bytes(b"parquet-placeholder")
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", lambda store, parent_id: items)
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(
+        compiler.pd,
+        "read_parquet",
+        lambda path: pd.DataFrame({"symbol": ["RELIANCE"]}),
+    )
+
+    manifest, quotes, minute = compiler._latest_capture(SimpleNamespace(), now=now)
+
+    assert manifest["status"] == "STORED"
+    assert minute == pd.Timestamp("2026-11-09 14:40:00", tz=IST)
+    assert quotes["symbol"].tolist() == ["RELIANCE"]
+
+
+def test_latest_capture_rejects_stale_stored_manifest(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    stale = {
+        "cycle_minute_ist": "2026-11-09T14:30:00+05:30",
+        "status": "STORED",
+        "snapshot_persisted": True,
+        "snapshot_drive_path": "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1430.parquet",
+        "row_count": 1,
+    }
+    blocked = {
+        "cycle_minute_ist": "2026-11-09T14:45:00+05:30",
+        "status": "BLOCKED_PROVIDER_CREDENTIALS",
+        "snapshot_persisted": False,
+    }
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = stale if file_id == "stale" else blocked
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, parent_id: [{"id": "stale", "name": "manifest_20261109_1430.json"}],
+    )
+    monkeypatch.setattr(compiler, "_download", download)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="No fresh, durably stored"):
+        compiler._latest_capture(SimpleNamespace(), now=now)
