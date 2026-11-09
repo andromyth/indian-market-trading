@@ -317,11 +317,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "history_seed_failed_batches", "history_refresh_batch_count",
                 "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
                 "eligible_symbol_count", "skipped_missing_quote_count",
-                "source_snapshot_drive_path", "prediction_policy", "status", "error",
+                "source_snapshot_drive_path", "prediction_policy", "status", "error", "reason",
             )
             if key in all_nse
         })
-        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}:
+        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}:
             STATE["all_nse_minute_prediction_error"] = str(
                 all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
             )
@@ -444,6 +444,17 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
         eligible = int(item.get("eligible_symbol_count") or 0)
         item_status = str(item.get("status") or state.get("all_nse_minute_prediction_status") or "NOT_RUN").upper()
         age = _diagnostic_age_seconds(minute)
+
+        if item_status == "DELEGATED_TO_GITHUB_ACTIONS":
+            payload = {
+                "status": "delegated",
+                "probe": "all_nse_minute_prediction_actual",
+                "checked_at_utc": now_utc.isoformat(),
+                "cycle_minute_ist": minute,
+                "source_snapshot_drive_path": item.get("source_snapshot_drive_path"),
+                "reason": "GitHub Actions owns ALL-NSE inference and prediction persistence.",
+            }
+            return 202, payload
 
         # No valid quote is an expected no-op for that slot, not a global
         # coverage failure. The stored source snapshot remains the audit record.
@@ -748,7 +759,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 or capture_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
-                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
