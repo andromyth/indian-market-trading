@@ -1,6 +1,7 @@
 name: Compile ALL-NSE predictions from Google Drive
 
 on:
+  pull_request:
   workflow_dispatch:
   # GitHub cron is UTC; the Python guard restricts execution to 09:15–15:25 IST
   # on NSE trading days. Cloud Run alone collects INDstocks quotes/history.
@@ -41,6 +42,7 @@ jobs:
           pytest -q tests/test_indstocks_client.py tests/test_all_nse_minute_prediction_capture.py tests/test_drive_all_nse_prediction_compiler.py
 
       - name: Verify Drive credentials without printing secret values
+        if: github.event_name != 'pull_request'
         run: |
           python - <<'PY'
           import os
@@ -60,4 +62,5 @@ jobs:
           PY
 
       - name: Compile latest persisted Drive snapshot and upload predictions
+        if: github.event_name != 'pull_request'
         run: python -u drive_all_nse_prediction_compiler.py
