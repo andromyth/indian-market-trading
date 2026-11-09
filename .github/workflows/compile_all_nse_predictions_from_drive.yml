@@ -87,7 +87,7 @@ jobs:
         run: python -u drive_all_nse_prediction_compiler.py
 
       - name: Save updated Drive history cache
-        if: always() && github.event_name != 'pull_request'
+        if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:
