@@ -72,7 +72,7 @@ def _auth_mode() -> str:
     """Return the explicitly selected token owner mode; never infer TOTP from secrets."""
     if not _is_cloud_run_owner():
         return "disabled"
-    mode = str(_setting("INDSTOCKS_AUTH_MODE", "totp") or "totp").strip().lower()
+    mode = str(_setting("INDSTOCKS_AUTH_MODE", "manual") or "manual").strip().lower()
     if mode not in {"disabled", "manual", "totp"}:
         raise RuntimeError("INDSTOCKS_AUTH_MODE must be disabled, manual or totp")
     return mode
