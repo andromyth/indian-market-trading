@@ -1,0 +1,76 @@
+name: Diagnose Cloud Run INDstocks provider authentication
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/diagnose_indstocks_provider_auth.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-indstocks-provider-auth
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Call Cloud Run provider diagnostic using the existing private invoker
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          [[ -n "$SERVICE_URL" ]] || { echo "Cloud Run service URL is unavailable."; exit 1; }
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"' EXIT
+          SUCCESS=0
+          for SA in "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            [[ -n "$TOKEN" ]] || continue
+            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 150 \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/json" \
+              --output "$RESPONSE" --write-out "%{http_code}" \
+              "$SERVICE_URL/providerz")" || HTTP_CODE=000
+            echo "PROVIDER_DIAGNOSTIC_HTTP_STATUS=$HTTP_CODE"
+            if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "503" ]]; then
+              SUCCESS=1
+              break
+            fi
+          done
+          if [[ "$SUCCESS" != "1" ]]; then
+            echo "Could not reach the private Cloud Run provider diagnostic using either existing scheduler identity."
+            exit 1
+          fi
+          python - "$RESPONSE" "$HTTP_CODE" <<'PY'
+          import json, sys
+          path, code = sys.argv[1:]
+          try:
+              data = json.load(open(path, encoding="utf-8"))
+          except Exception:
+              raise SystemExit("Cloud Run provider diagnostic returned non-JSON output.")
+          print("INDSTOCKS_PROVIDER_DIAGNOSTIC=" + json.dumps(data, sort_keys=True))
+          if code != "200" or data.get("status") != "ok":
+              raise SystemExit("INDstocks provider diagnostic failed; no credentials or service settings were changed.")
+          print("INDSTOCKS_PROVIDER_DIAGNOSTIC=PASS")
+          PY
