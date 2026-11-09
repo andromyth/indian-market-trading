@@ -120,8 +120,10 @@ def _is_nse_live_priority_window(now: datetime) -> bool:
 
 
 def _backfill_start_allowed(now: datetime) -> bool:
-    """Allow backfill whenever the NSE cash market is closed."""
-    return not _is_nse_live_priority_window(now)
+    """Allow all day on NSE non-trading days; on trading days only from 16:00 IST."""
+    if not is_nse_trading_day(now.date()):
+        return True
+    return (now.hour, now.minute) >= (16, 0)
 
 
 BACKFILL_MARKET_PAUSED = False
