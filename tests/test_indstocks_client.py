@@ -8,7 +8,7 @@ import indstocks_client as client
 
 @pytest.fixture(autouse=True)
 def _run_indstocks_unit_tests_as_cloud_run(monkeypatch):
-    monkeypatch.setenv("K_SERVICE", "unit-test-cloud-run")
+    monkeypatch.setenv("K_SERVICE", "indian-market-intraday-worker")
 
 
 def test_indstocks_access_is_disabled_outside_cloud_run(monkeypatch):
