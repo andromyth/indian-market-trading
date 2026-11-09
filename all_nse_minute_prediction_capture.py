@@ -2279,6 +2279,8 @@ class AllNSEMinutePredictor:
         self,
         capture_manifest: dict[str, Any] | None,
         worker_root: str | Path | None = None,
+        *,
+        drive_only: bool = False,
     ) -> dict[str, Any]:
         """Predict for the captured NSE universe and write one row per symbol to Drive."""
         capture_manifest = capture_manifest or {}
@@ -2403,18 +2405,22 @@ class AllNSEMinutePredictor:
                 "prediction_policy": "PER_SYMBOL_STORED_QUOTE",
             }
 
-        self.start()
+        if not drive_only:
+            self.start()
         if self._last_minute == minute_key:
             return {"status": "DUPLICATE_MINUTE_SKIPPED", "cycle_minute_ist": minute_key}
 
-        # Validate the quote dependency before scheduling additional source refresh work.
+        # GitHub's compiler consumes only durable Drive inputs; it must never call INDstocks.
         refresh_target = minute
-        history_refresh = self._schedule_current_session_history_refresh(refresh_target)
-        if str(history_refresh.get("status") or "").upper() in {"IN_PROGRESS", "SCHEDULED_ASYNC"}:
-            history_refresh = self._wait_for_current_session_history_refresh(
-                refresh_target,
-                timeout_seconds=45.0,
-            )
+        if drive_only:
+            history_refresh = {"status": "DRIVE_ONLY", "updated_symbols": 0}
+        else:
+            history_refresh = self._schedule_current_session_history_refresh(refresh_target)
+            if str(history_refresh.get("status") or "").upper() in {"IN_PROGRESS", "SCHEDULED_ASYNC"}:
+                history_refresh = self._wait_for_current_session_history_refresh(
+                    refresh_target,
+                    timeout_seconds=45.0,
+                )
         failed_refresh_symbols = set(history_refresh.get("failed_symbols") or [])
         with self._lock:
             symbols = sorted(quote_by_symbol)
@@ -2431,7 +2437,10 @@ class AllNSEMinutePredictor:
             market_history,
             minute,
         )
-        nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
+        if drive_only:
+            nifty_price, nifty_observed_at, nifty_error = None, None, "LIVE_INDEX_QUOTE_NOT_REQUESTED_IN_DRIVE_ONLY_MODE"
+        else:
+            nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
         try:
             # Model initialization is independent of universe-wide history
             # coverage; each stored stock quote is evaluated with its own data.
