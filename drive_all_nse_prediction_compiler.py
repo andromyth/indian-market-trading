@@ -153,9 +153,6 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
                 continue
             local = work / "live" / name
             _download(store, item["id"], local)
-            frame = _read_history(local)
-            if frame.empty:
-                continue
             raw = pd.read_parquet(local)
             if "symbol" not in raw.columns:
                 continue
@@ -174,7 +171,7 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
 
 
 def _market_history(minute: pd.Timestamp) -> pd.DataFrame:
-    """Yahoo is a market-context fallback only; no INDstocks request is made."""
+    """Fetch only Yahoo NIFTY context; never use the broker adapter from GitHub."""
     import yfinance as yf
     import all_nse_intraday_model as model
 
@@ -182,6 +179,17 @@ def _market_history(minute: pd.Timestamp) -> pd.DataFrame:
         "^NSEI", period="10d", interval="5m", auto_adjust=False,
         progress=False, threads=False, timeout=15, group_by="column",
     )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        picked = {}
+        tokens = [[str(part).strip().lower() for part in column] for column in raw.columns]
+        for field in OHLCV:
+            matches = [index for index, values in enumerate(tokens) if field.lower() in values]
+            if matches:
+                picked[field] = matches[0]
+        raw = raw.iloc[:, [picked[field] for field in OHLCV if field in picked]].copy()
+        raw.columns = [field for field in OHLCV if field in picked]
     frame = model._norm(raw)
     if frame.empty:
         return frame
