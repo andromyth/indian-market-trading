@@ -42,6 +42,11 @@ _INSTRUMENTS: dict[str, tuple[float, pd.DataFrame]] = {}
 _INSTRUMENTS_LOCK = threading.Lock()
 
 
+def _is_cloud_run_owner() -> bool:
+    """Only the singleton Cloud Run worker may access the INDstocks account."""
+    return bool(os.getenv("K_SERVICE", "").strip())
+
+
 def _setting(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
     if value and value.strip():
@@ -65,15 +70,20 @@ def _timeout() -> int:
 
 def _auth_mode() -> str:
     """Return the explicitly selected token owner mode; never infer TOTP from secrets."""
-    mode = str(_setting("INDSTOCKS_AUTH_MODE", "manual") or "manual").strip().lower()
-    if mode not in {"manual", "totp"}:
-        raise RuntimeError("INDSTOCKS_AUTH_MODE must be either 'manual' or 'totp'")
+    if not _is_cloud_run_owner():
+        return "disabled"
+    mode = str(_setting("INDSTOCKS_AUTH_MODE", "totp") or "totp").strip().lower()
+    if mode not in {"disabled", "manual", "totp"}:
+        raise RuntimeError("INDSTOCKS_AUTH_MODE must be disabled, manual or totp")
     return mode
 
 
 def configured() -> bool:
-    """Check credentials for the selected mode without triggering authentication."""
-    if _auth_mode() == "manual":
+    """Check credentials without allowing non-Cloud-Run processes to access INDstocks."""
+    mode = _auth_mode()
+    if mode == "disabled":
+        return False
+    if mode == "manual":
         return bool(_setting("INDSTOCKS_ACCESS_TOKEN"))
     return all(
         _setting(k)
@@ -251,9 +261,13 @@ def _generate_and_cache_token_locked() -> str:
 
 
 def access_token() -> str:
-    """Use the explicitly selected credential mode; only TOTP mode can mint tokens."""
+    """Use credentials only inside the singleton Cloud Run market-data worker."""
     global _CACHED_TOKEN, _CACHED_TOKEN_EXPIRES_AT
+    if not _is_cloud_run_owner():
+        raise RuntimeError("INDstocks access is restricted to the Cloud Run worker.")
     mode = _auth_mode()
+    if mode == "disabled":
+        raise RuntimeError("INDstocks access is disabled for this Cloud Run revision.")
     if mode == "manual":
         manual = _setting("INDSTOCKS_ACCESS_TOKEN")
         if not manual:
