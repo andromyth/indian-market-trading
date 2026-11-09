@@ -142,7 +142,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
 
     minute = pd.Timestamp.now(tz=IST).floor("5min")
     predictor = AllNSEMinutePredictor(tmp_path)
-    predictor.start = lambda: None
+    predictor.start = lambda: pytest.fail("Drive-only inference must not start the INDstocks history seed")
     predictor._seed_ready = False
     predictor._seed_complete = False
     predictor._seed_status = "READY_PARTIAL"
@@ -156,12 +156,9 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
         "trained_until": "2026-10-20T09:15:00+00:00",
         "manifest_sha256_match": True,
     }
-    predictor._schedule_current_session_history_refresh = lambda _minute: {
-        "status": "PARTIAL", "minute": _minute.isoformat(),
-        "batch_count": 1, "failed_batches": 1,
-        "failed_symbols": ["BBB"], "updated_symbols": 0, "elapsed_seconds": 0.1,
-        "pending_symbol_count": 2,
-    }
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "Drive-only inference must not call INDstocks history endpoints"
+    )
     predictor._load_completed_fno_context = lambda _minute: ({}, "UNAVAILABLE", None)
     predictor._history = {}
     predictor._market_history = pd.DataFrame(
@@ -181,7 +178,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     predictor._regressor = SimpleNamespace(
         predict=lambda frame: np.array([0.01] * len(frame))
     )
-    predictor._fetch_current_nifty_quote = lambda: (None, None, "optional context missing")
+    predictor._fetch_current_nifty_quote = lambda: pytest.fail("Drive-only inference must not call a live broker quote endpoint")
 
     snapshot_dir = tmp_path / "all_universe_minute_snapshots"
     snapshot_dir.mkdir(parents=True)
@@ -220,6 +217,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
             ),
         },
         worker_root=tmp_path,
+        drive_only=True,
     )
 
     assert result["status"] == "STORED"
