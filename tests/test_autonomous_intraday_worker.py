@@ -589,3 +589,77 @@ def test_prediction_audit_starts_after_opening_warmup_and_caps_live_minutes():
     live_through_0931 = [key for key in full_session_keys if key <= "20261021_0931"]
     required_live, _ = _required_prediction_snapshot_keys(live_through_0931, day)
     assert required_live == []
+
+
+def test_watchlist_uses_fresh_drive_pit_news_when_live_rss_has_no_symbol_matches(tmp_path, monkeypatch):
+    import autonomous_intraday_worker as worker_module
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    worker.news_context_status = "FRESH"
+    worker.news_manifest = {"checked_at_utc": "2026-11-09T04:30:00+00:00"}
+    worker.news_context_by_symbol = {
+        "SBIN": {
+            "article_count_24h": 3,
+            "news_event_impact_24h": 0.8,
+            "source_count_24h": 2,
+            "latest_news_available_at_utc": "2026-11-09T04:25:00+00:00",
+        },
+        "RELIANCE": {
+            "article_count_24h": 1,
+            "news_event_impact_24h": 0.9,
+            "source_count_24h": 1,
+            "latest_news_available_at_utc": "2026-11-09T04:20:00+00:00",
+        },
+        "TCS": {
+            "article_count_24h": 0,
+            "news_event_impact_24h": 1.0,
+            "source_count_24h": 3,
+            "latest_news_available_at_utc": "2026-11-09T04:15:00+00:00",
+        },
+    }
+    monkeypatch.setattr(
+        worker_module,
+        "_watchlist",
+        lambda _limit: ([], {"status": "NO_SOURCE_MATCHES", "article_count": 0}),
+    )
+
+    worker._refresh_watchlist_if_due()
+
+    assert worker.symbols == ["SBIN", "RELIANCE"]
+    assert worker.watchlist_meta["status"] == "PIT_NEWS_FALLBACK"
+    assert worker.watchlist_meta["fallback_source"] == "GOOGLE_DRIVE_PIT_ARCHIVE"
+
+
+def test_watchlist_does_not_use_stale_drive_pit_news_as_fallback(tmp_path, monkeypatch):
+    import autonomous_intraday_worker as worker_module
+    from autonomous_intraday_worker import AutonomousIntradayWorker
+
+    worker = AutonomousIntradayWorker(
+        segment="service",
+        root=tmp_path,
+        flush_every=5,
+    )
+    worker.news_context_status = "STALE_OR_PARTIAL"
+    worker.news_context_by_symbol = {
+        "SBIN": {
+            "article_count_24h": 3,
+            "news_event_impact_24h": 0.8,
+            "source_count_24h": 2,
+            "latest_news_available_at_utc": "2026-10-27T09:00:00+00:00",
+        },
+    }
+    monkeypatch.setattr(
+        worker_module,
+        "_watchlist",
+        lambda _limit: ([], {"status": "NO_SOURCE_MATCHES", "article_count": 0}),
+    )
+
+    worker._refresh_watchlist_if_due()
+
+    assert worker.symbols == []
+    assert worker.watchlist_meta["status"] == "NO_SOURCE_MATCHES"
