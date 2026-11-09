@@ -88,6 +88,35 @@ def _backfill_worker_heartbeat(**fields: Any) -> None:
     )
 
 
+# Per-run counters of distinct backfill artifacts. These are not log-event
+# counts: each counter increments only on the one stage that proves that artifact.
+_BACKFILL_COUNTER_STAGES = {
+    "PROVIDER_REQUEST_STARTED": "api_requests_attempted",
+    "PROVIDER_RESPONSE": "api_requests_successful",
+    "PROVIDER_REQUEST_FAILED": "api_requests_failed",
+    "CHECKPOINT_DOWNLOADED": "checkpoints_downloaded",
+    "CHECKPOINT_PERSISTED": "checkpoints_written",
+    "RESUMED_CHECKPOINT": "checkpoints_reused",
+    "CHECKPOINT_REFETCH_INVALID": "checkpoints_invalid",
+    "SYMBOL_PARQUET_PERSISTED": "symbol_files_written",
+}
+_BACKFILL_COUNTERS: dict[str, int] = {}
+_BACKFILL_COUNTER_LOCK = threading.Lock()
+
+
+def _reset_backfill_counters() -> None:
+    with _BACKFILL_COUNTER_LOCK:
+        _BACKFILL_COUNTERS.clear()
+
+
+def _count_backfill_stage(stage: str) -> dict[str, int]:
+    name = _BACKFILL_COUNTER_STAGES.get(stage)
+    with _BACKFILL_COUNTER_LOCK:
+        if name:
+            _BACKFILL_COUNTERS[name] = _BACKFILL_COUNTERS.get(name, 0) + 1
+        return dict(_BACKFILL_COUNTERS)
+
+
 def _backfill_progress(progress: dict[str, Any]) -> None:
     fields: dict[str, Any] = {
         "progress": progress,
@@ -96,6 +125,7 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
         "last_progress_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     stage = str(progress.get("stage") or "").upper()
+    fields["counters"] = _count_backfill_stage(stage)
     if stage == "PROVIDER_REQUEST_STARTED":
         fields["last_provider_request_started_at_utc"] = datetime.now(timezone.utc).isoformat()
     elif stage == "PROVIDER_RESPONSE":
@@ -104,6 +134,9 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
     elif stage == "CHECKPOINT_PERSISTED":
         fields["last_checkpoint_write_at_utc"] = datetime.now(timezone.utc).isoformat()
         fields["last_checkpoint_path"] = progress.get("checkpoint_path")
+    elif stage == "SYMBOL_PARQUET_PERSISTED":
+        fields["last_symbol_parquet_write_at_utc"] = datetime.now(timezone.utc).isoformat()
+        fields["last_symbol_parquet_path"] = progress.get("symbol_parquet_path")
     elif stage == "RESUMED_CHECKPOINT":
         fields["last_checkpoint_reused_at_utc"] = datetime.now(timezone.utc).isoformat()
     _backfill_worker_heartbeat(**fields)
@@ -149,7 +182,9 @@ def _wait_for_backfill_request_slot() -> None:
 
 def _run_five_minute_backfill() -> None:
     """Run in this process to share INDstocks TOTP token cache with live capture."""
+    _reset_backfill_counters()
     _update_backfill_status(
+        counters={},
         status="RUNNING",
         phase="DOWNLOADING",
         started_at_utc=datetime.now(timezone.utc).isoformat(),
