@@ -920,6 +920,34 @@ class AutonomousIntradayWorker:
             return
         try:
             symbols, meta = _watchlist(self.max_stocks)
+            if not symbols and self.news_context_status == "FRESH":
+                # Reuse the same point-in-time Drive news archive consumed by the
+                # news overlay. This avoids a second, narrower RSS scrape becoming
+                # a hard dependency for watchlist inference.
+                pit_candidates = [
+                    (symbol, context)
+                    for symbol, context in self.news_context_by_symbol.items()
+                    if int(context.get("article_count_24h") or 0) > 0
+                    and context.get("latest_news_available_at_utc")
+                ]
+                pit_candidates.sort(
+                    key=lambda item: (
+                        int(item[1].get("article_count_24h") or 0),
+                        float(item[1].get("news_event_impact_24h") or 0.0),
+                        int(item[1].get("source_count_24h") or 0),
+                    ),
+                    reverse=True,
+                )
+                symbols = [symbol for symbol, _ in pit_candidates[:self.max_stocks]]
+                if symbols:
+                    meta = {
+                        **meta,
+                        "status": "PIT_NEWS_FALLBACK",
+                        "dynamic_symbols": symbols,
+                        "fallback_source": "GOOGLE_DRIVE_PIT_ARCHIVE",
+                        "news_context_checked_at_utc": self.news_manifest.get("checked_at_utc"),
+                        "message": "Live RSS symbol matching was empty; using only fresh, symbol-matched PIT news rows.",
+                    }
             self.last_watchlist_refresh = monotonic_now
             self.watchlist_meta = meta
             if symbols:
@@ -945,10 +973,9 @@ class AutonomousIntradayWorker:
     def _cycle(self) -> dict:
         now = pd.Timestamp.now(tz=IST)
         self.last_minute_snapshot_rows = []
-        self._refresh_watchlist_if_due()
-        # Probe the Drive manifest each minute; if the 15-minute collector has
-        # published a newer snapshot, reload it before this cycle's inference.
+        # Refresh the shared Drive PIT archive before building the watchlist.
         self._refresh_news_context_if_due()
+        self._refresh_watchlist_if_due()
         summary = {
             "cycle": self.cycle_count,
             "observed_at_utc": now.tz_convert("UTC").isoformat(),
