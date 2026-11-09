@@ -41,9 +41,12 @@ def _list_children(store, parent_id: str) -> list[dict]:
     while True:
         result = store.service.files().list(
             q=f"'{parent_id}' in parents and trashed = false",
+            spaces="drive",
             pageSize=1000,
             pageToken=page,
             fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
         ).execute()
         rows.extend(result.get("files", []))
         page = result.get("nextPageToken")
@@ -52,15 +55,14 @@ def _list_children(store, parent_id: str) -> list[dict]:
 
 
 def _download(store, file_id: str, destination: Path) -> None:
-    from googleapiclient.http import MediaIoBaseDownload
+    from persistent_store import download_drive_file_with_retry
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = store.service.files().get_media(fileId=file_id)
-    with destination.open("wb") as handle:
-        downloader = MediaIoBaseDownload(handle, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    download_drive_file_with_retry(
+        store.service,
+        file_id,
+        destination,
+        operation="github_drive_prediction_input",
+    )
 
 
 def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
