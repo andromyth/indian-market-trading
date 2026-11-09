@@ -205,7 +205,7 @@ def test_backfill_job_retries_after_transient_failure_and_resumes(monkeypatch):
     assert status["error"] is None or "Transient attempt" in status["error"]
 
 
-def test_backfill_pauses_only_during_0915_to_1530_on_trading_days(monkeypatch):
+def test_backfill_pauses_until_1600_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
@@ -216,22 +216,26 @@ def test_backfill_pauses_only_during_0915_to_1530_on_trading_days(monkeypatch):
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
-    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 23, 59, tzinfo=ist))
 
 
-def test_backfill_start_allowed_throughout_non_market_hours_on_trading_days(monkeypatch):
+def test_backfill_start_allowed_only_from_1600_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     ist = ZoneInfo("Asia/Kolkata")
-    assert service._backfill_start_allowed(datetime(2026, 11, 6, 0, 0, tzinfo=ist))
-    assert service._backfill_start_allowed(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 0, 0, tzinfo=ist))
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
-    assert service._backfill_start_allowed(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
     assert service._backfill_start_allowed(datetime(2026, 11, 6, 23, 59, tzinfo=ist))
 
 
@@ -242,7 +246,9 @@ def test_backfill_start_allowed_all_day_on_non_trading_days(monkeypatch):
     from zoneinfo import ZoneInfo
 
     ist = ZoneInfo("Asia/Kolkata")
+    assert service._backfill_start_allowed(datetime(2026, 11, 7, 0, 0, tzinfo=ist))
     assert service._backfill_start_allowed(datetime(2026, 11, 7, 10, 0, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 7, 23, 59, tzinfo=ist))
 
 
 def test_backfill_waits_without_provider_requests_during_market_hours(monkeypatch):

@@ -12,7 +12,7 @@ on:
           - "no"
           - "yes"
   schedule:
-    # Hourly at :00 IST; the calendar gate skips trading days before 16:00.
+    # Hourly at :00 IST; trading days are eligible from 16:00 IST onward.
     # Non-trading days remain eligible throughout the day.
     # A one-off checkpoint resume can be triggered with the [start-native-5m-backfill] push marker.
     - cron: "30 * * * *"
@@ -42,16 +42,12 @@ jobs:
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
     steps:
       - name: Check out repository
-        if: github.event_name == 'schedule' || github.event_name == 'push'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Gate scheduled start by NSE trading calendar and local time
+      - name: Gate backfill by NSE trading calendar and 16:00 IST start
         id: schedule_gate
-        if: github.event_name == 'schedule'
-        env:
-          SCHEDULE_CRON: ${{ github.event.schedule }}
         shell: bash
         run: |
           set -euo pipefail
@@ -62,20 +58,14 @@ jobs:
           from nse_trading_calendar import is_nse_trading_day
 
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
-          cron = os.environ.get("SCHEDULE_CRON", "")
           trading_day = is_nse_trading_day(now.date())
-          if cron != "30 * * * *":
-              raise SystemExit("Unknown scheduled trigger; refusing to start backfill.")
-          live_market_hours = (
-              trading_day
-              and (now.hour, now.minute) >= (9, 15)
-              and (now.hour, now.minute) < (15, 30)
-          )
-          allowed = not live_market_hours
+          allowed = (not trading_day) or (now.hour, now.minute) >= (16, 0)
           reason = (
-              "NSE live market hours: backfill is paused"
-              if live_market_hours
-              else "NSE non-market hours: backfill is eligible"
+              "NSE trading day before 16:00 IST: backfill is not eligible"
+              if trading_day and not allowed
+              else "NSE non-trading day: backfill is eligible all day"
+              if not trading_day
+              else "NSE trading day at or after 16:00 IST: backfill is eligible"
           )
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -83,7 +73,7 @@ jobs:
           PY
 
       - name: Require successful deployment when worker code changed
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && steps.schedule_gate.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_DEPLOY_SHA: ${{ github.sha }}
@@ -139,21 +129,21 @@ jobs:
           exit 1
 
       - name: Authenticate to Google Cloud
-        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           project_id: indian-market-trading
 
       - name: Set up gcloud
-        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true'
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
 
       # Immediate post-deploy kickoff: the marker commit is gated on the prior deploy.
       - name: Wait for the deployed private backfill endpoint
-        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true'
         id: endpoint
         shell: bash
         run: |
@@ -213,7 +203,7 @@ jobs:
           exit 1
 
       - name: Start resumable backfill using Cloud Run's existing TOTP cache
-        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true'
         id: start
         shell: bash
         run: |
@@ -256,7 +246,7 @@ jobs:
           PY
 
       - name: Verify a durable symbol-wise Parquet write after kickoff
-        if: github.event_name != 'schedule' || steps.schedule_gate.outputs.should_run == 'true'
+        if: steps.schedule_gate.outputs.should_run == 'true'
         env:
           GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
@@ -388,6 +378,7 @@ jobs:
           done
           echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
           exit 1
-# Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment.
-# Scheduled checks run hourly; backfill is eligible whenever the NSE cash market is closed.
+# Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment,
+# but only after 16:00 IST on trading days or at any time on non-trading days.
+# Scheduled checks run hourly and share the same calendar/time gate.
 # Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
