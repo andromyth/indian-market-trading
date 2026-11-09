@@ -72,23 +72,10 @@ for secret_name in "indstocks-client-id" "indstocks-mpin" "indstocks-totp-secret
     auto_broker_auth=false
   fi
 done
-manual_broker_auth=false
-if gcloud secrets describe "indstocks-access-token" --project "$PROJECT_ID" >/dev/null 2>&1 \
-    && gcloud secrets versions access latest --secret "indstocks-access-token" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  manual_broker_auth=true
-fi
-if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" != "true" ]]; then
-  # Keep watchlist prediction + contemporaneous actual-price persistence live
-  # even if the separate full-universe quote provider has not been provisioned.
-  # The worker records an explicit degraded full-universe capture status; it
-  # must not let missing optional broker credentials prevent a deploy that
-  # restores the core minute prediction/actual snapshot path.
-  echo "WARNING: INDstocks credentials are not configured in Secret Manager." >&2
-  echo "The full-universe minute capture will remain blocked until credentials are added." >&2
-  echo "Continuing deployment so the independent watchlist prediction/actual snapshots can persist." >&2
-fi
-if [[ "$auto_broker_auth" != "true" && "$manual_broker_auth" == "true" ]]; then
-  echo "WARNING: Using a manual INDstocks token; it normally expires after 24 hours." >&2
+if [[ "$auto_broker_auth" != "true" ]]; then
+  echo "ERROR: Cloud Run requires the INDstocks TOTP credential set in Secret Manager."
+  echo "Manual INDstocks tokens are not accepted; no other process may own this account token."
+  exit 2
 fi
 
 # OAuth user credentials are sufficient for My Drive read/write. An optional
@@ -114,7 +101,6 @@ optional_secrets=(
   "INDSTOCKS_CLIENT_ID=indstocks-client-id"
   "INDSTOCKS_MPIN=indstocks-mpin"
   "INDSTOCKS_TOTP_SECRET=indstocks-totp-secret"
-  "INDSTOCKS_ACCESS_TOKEN=indstocks-access-token"
 )
 for mapping in "${optional_secrets[@]}"; do
   env_name="${mapping%%=*}"
@@ -126,11 +112,8 @@ for mapping in "${optional_secrets[@]}"; do
 done
 secrets_arg="$(IFS=,; echo "${secret_mappings[*]}")"
 
-# Cloud Run is the only TOTP-token owner. Manual-token deployments stay manual.
-INDSTOCKS_AUTH_MODE="manual"
-if [[ "$auto_broker_auth" == "true" ]]; then
-  INDSTOCKS_AUTH_MODE="totp"
-fi
+# Cloud Run is the only INDstocks token owner and always uses TOTP.
+INDSTOCKS_AUTH_MODE="totp"
 
 # Cloud Scheduler calls /tick during the NSE session. Request-based billing and
 # min-instances=0 let Cloud Run scale down overnight/weekends instead of charging
