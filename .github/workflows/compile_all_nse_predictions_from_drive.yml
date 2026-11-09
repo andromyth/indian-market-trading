@@ -60,7 +60,7 @@ jobs:
           from zoneinfo import ZoneInfo
           value = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("value=" + value + "\\n")
+              output.write("value=" + value + "\n")
           PY
 
       - name: Restore Drive history cache
