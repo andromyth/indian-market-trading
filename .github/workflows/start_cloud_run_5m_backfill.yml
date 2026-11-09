@@ -12,10 +12,10 @@ on:
           - "no"
           - "yes"
   schedule:
-    # Hourly at :00 IST; trading days are eligible from 16:00 IST onward.
-    # Non-trading days remain eligible throughout the day.
-    # A one-off checkpoint resume can be triggered with the [start-native-5m-backfill] push marker.
-    - cron: "30 * * * *"
+    # One daily kickoff at 16:30 IST (11:00 UTC); Cloud Run owns the resumable backfill.
+    # The NSE calendar/time gate below remains a second safety barrier.
+    # Manual dispatch remains available but is subject to the same gate.
+    - cron: "0 11 * * *"
   push:
     branches:
       - main
@@ -380,5 +380,5 @@ jobs:
           exit 1
 # Push marker [start-native-5m-backfill] resumes the durable backfill after a worker deployment,
 # but only after 16:00 IST on trading days or at any time on non-trading days.
-# Scheduled checks run hourly and share the same calendar/time gate.
+# The scheduled kickoff runs once daily at 16:30 IST; Cloud Run owns ongoing backfill execution.
 # Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
