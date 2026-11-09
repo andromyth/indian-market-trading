@@ -150,18 +150,8 @@ jobs:
           else
             echo "SAFE_RUNTIME_ENV_REFERENCE_STATUS=UNAVAILABLE"
           fi
-          echo "=== Safe INDstocks Secret Manager presence check (names/status only; values never read to output) ==="
-          for secret_name in indstocks-client-id indstocks-mpin indstocks-totp-secret indstocks-access-token; do
-            if gcloud secrets describe "$secret_name" --project="$PROJECT_ID" >/dev/null 2>&1; then
-              if gcloud secrets versions access latest --secret="$secret_name" --project="$PROJECT_ID" >/dev/null 2>&1; then
-                echo "INDSTOCKS_SECRET=$secret_name STATUS=LATEST_VERSION_READABLE"
-              else
-                echo "INDSTOCKS_SECRET=$secret_name STATUS=NO_READABLE_LATEST_VERSION"
-              fi
-            else
-              echo "INDSTOCKS_SECRET=$secret_name STATUS=MISSING_OR_UNREADABLE"
-            fi
-          done
+          echo "INDSTOCKS_SECRET_ACCESS=NOT_CHECKED"
+          echo "INDSTOCKS_CREDENTIAL_OWNER=Cloud Run only"
           echo "=== Recent Cloud Builds ==="
           gcloud builds list --project="$PROJECT_ID" --limit=8 --sort-by='~createTime' --format='table(id,status,createTime,finishTime,logUrl)' || true
           echo "=== Cloud Run HTTP request metrics for last 20 minutes ==="
