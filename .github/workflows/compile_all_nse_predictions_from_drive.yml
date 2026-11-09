@@ -1,6 +1,17 @@
 name: Compile ALL-NSE predictions from Google Drive
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/compile_all_nse_predictions_from_drive.yml"
+      - "drive_all_nse_prediction_compiler.py"
+      - "all_nse_minute_prediction_capture.py"
+      - "persistent_store.py"
+      - "all_nse_intraday_model.py"
+      - "market_session_guard.py"
+      - "requirements.txt"
   pull_request:
   workflow_dispatch:
   # GitHub cron is UTC; the Python guard restricts execution to 09:15–15:25 IST
@@ -14,7 +25,8 @@ permissions:
 
 concurrency:
   group: all-nse-drive-prediction-compiler
-  cancel-in-progress: true
+  # Do not cancel a running 15-minute compiler when the next 5-minute tick arrives.
+  cancel-in-progress: false
 
 jobs:
   compile-predictions:
@@ -48,7 +60,7 @@ jobs:
           from zoneinfo import ZoneInfo
           value = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("value=" + value + "\n")
+              output.write("value=" + value + "\\n")
           PY
 
       - name: Restore Drive history cache
