@@ -35,6 +35,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Resolve India market date for history cache
+        id: market_date
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          value = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("value=" + value + "\\n")
+          PY
+
+      - name: Restore Drive history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/drive_all_nse/history_cache
+          key: nse-history-${{ steps.market_date.outputs.value }}
+          restore-keys: |
+            nse-history-
+
       - name: Compile and test Drive-only prediction path
         run: |
           set -euo pipefail
@@ -64,3 +84,11 @@ jobs:
       - name: Compile latest persisted Drive snapshot and upload predictions
         if: github.event_name != 'pull_request'
         run: python -u drive_all_nse_prediction_compiler.py
+
+      - name: Save updated Drive history cache
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /tmp/drive_all_nse/history_cache
+          key: nse-history-${{ steps.market_date.outputs.value }}
