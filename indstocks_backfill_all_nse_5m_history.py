@@ -314,6 +314,7 @@ def fetch_indstocks_5m_batch(
     store: Any = None,
     checkpoint_root: Path | None = None,
     force_refetch_after: datetime | None = None,
+    active_symbols: set[str] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch a maximum of five stocks at once over consecutive seven-day windows."""
     if not symbols_and_codes:
@@ -327,6 +328,16 @@ def fetch_indstocks_5m_batch(
 
     symbols_by_code = {code: symbol for symbol, code in symbols_and_codes}
     batch_key = hashlib.sha1("|".join(sorted(symbols_by_code.values())).encode()).hexdigest()[:16]
+    # Checkpoints written before FULL_BATCH_V2 were keyed by the *active* subset
+    # (symbols not yet complete), so the folder changed whenever a peer finished.
+    # New checkpoints are keyed by the full five-symbol group. Old folders stay
+    # readable (never written) so completed windows are not downloaded again.
+    full_symbols = sorted(symbols_by_code.values())
+    legacy_symbols = sorted(set(active_symbols or ()) & set(full_symbols))
+    legacy_key = (
+        hashlib.sha1("|".join(legacy_symbols).encode()).hexdigest()[:16]
+        if legacy_symbols and legacy_symbols != full_symbols else None
+    )
     accumulated: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol, _ in symbols_and_codes}
     cursor = start
     calls = 0
@@ -338,9 +349,24 @@ def fetch_indstocks_5m_batch(
         checkpoint_local = (checkpoint_root or Path("/tmp/nse_5m_checkpoints")) / batch_key / f"{window_key}.parquet"
         checkpoint_manifest_remote = checkpoint_remote + ".json"
         checkpoint_manifest_local = checkpoint_local.with_suffix(".parquet.json")
-        checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if store is not None and checkpoint_root is not None else None
-        checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if store is not None and checkpoint_root is not None else None
-        expected_symbols = sorted(symbols_by_code.values())
+        lookup_enabled = store is not None and checkpoint_root is not None
+        checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if lookup_enabled else None
+        checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if lookup_enabled else None
+        expected_symbols = full_symbols
+        reuse_expected = full_symbols
+        read_local = checkpoint_local
+        read_manifest_local = checkpoint_manifest_local
+        checkpoint_source = "FULL_BATCH_V2"
+        if lookup_enabled and legacy_key and not (checkpoint_item and checkpoint_manifest_item):
+            legacy_remote = f"{REMOTE_ROOT}/window_checkpoints/{legacy_key}/{window_key}.parquet"
+            legacy_item = _resolve_remote_file(store, legacy_remote)
+            legacy_manifest_item = _resolve_remote_file(store, legacy_remote + ".json")
+            if legacy_item and legacy_manifest_item:
+                checkpoint_item, checkpoint_manifest_item = legacy_item, legacy_manifest_item
+                reuse_expected = legacy_symbols
+                read_local = (checkpoint_root or Path("/tmp/nse_5m_checkpoints")) / legacy_key / f"{window_key}.parquet"
+                read_manifest_local = read_local.with_suffix(".parquet.json")
+                checkpoint_source = "LEGACY_ACTIVE_SUBSET_KEY"
         reuse_checkpoint = bool(checkpoint_item and checkpoint_manifest_item)
         if reuse_checkpoint:
             if force_refetch_after is not None:
@@ -350,27 +376,37 @@ def fetch_indstocks_5m_batch(
         if reuse_checkpoint:
             try:
                 from persistent_store import download_drive_file_with_retry
-                checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
+                read_local.parent.mkdir(parents=True, exist_ok=True)
+                download_started = time.monotonic()
                 for item, destination, operation in (
-                    (checkpoint_item, checkpoint_local, "checkpoint_parquet_download"),
-                    (checkpoint_manifest_item, checkpoint_manifest_local, "checkpoint_manifest_download"),
+                    (checkpoint_item, read_local, "checkpoint_parquet_download"),
+                    (checkpoint_manifest_item, read_manifest_local, "checkpoint_manifest_download"),
                 ):
                     download_drive_file_with_retry(
                         store.service, item["id"], destination, operation=operation
                     )
-                manifest = json.loads(checkpoint_manifest_local.read_text(encoding="utf-8"))
+                if callable(BACKFILL_PROGRESS_CALLBACK):
+                    BACKFILL_PROGRESS_CALLBACK({
+                        "provider": "INDSTOCKS", **(progress_context or {}),
+                        "stage": "CHECKPOINT_DOWNLOADED", "window_key": window_key,
+                        "batch_key": batch_key, "checkpoint_source": checkpoint_source,
+                        "drive_file_id": checkpoint_item["id"],
+                        "bytes": read_local.stat().st_size,
+                        "duration_seconds": round(time.monotonic() - download_started, 2),
+                    })
+                manifest = json.loads(read_manifest_local.read_text(encoding="utf-8"))
                 if (
                     not isinstance(manifest, dict)
                     or manifest.get("status") != "COMPLETE"
                     or manifest.get("window_key") != window_key
-                    or manifest.get("symbols") != expected_symbols
+                    or manifest.get("symbols") != reuse_expected
                     or not isinstance(manifest.get("row_counts"), dict)
                 ):
                     raise ValueError("checkpoint completion manifest is invalid")
-                saved_window = pd.read_parquet(checkpoint_local)
+                saved_window = pd.read_parquet(read_local)
                 if not saved_window.empty and (
                     not {"Symbol", *OHLCV}.issubset(saved_window.columns)
-                    or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(expected_symbols))
+                    or not set(saved_window["Symbol"].dropna().astype(str)).issubset(set(reuse_expected))
                 ):
                     raise ValueError("checkpoint parquet has an invalid schema or unexpected symbols")
                 saved_window.index = pd.DatetimeIndex(pd.to_datetime(saved_window.index, errors="coerce"))
@@ -388,6 +424,12 @@ def fetch_indstocks_5m_batch(
                     f"reason={type(exc).__name__}",
                     flush=True,
                 )
+                if callable(BACKFILL_PROGRESS_CALLBACK):
+                    BACKFILL_PROGRESS_CALLBACK({
+                        "provider": "INDSTOCKS", **(progress_context or {}),
+                        "stage": "CHECKPOINT_REFETCH_INVALID", "window_key": window_key,
+                        "batch_key": batch_key, "reason": type(exc).__name__,
+                    })
         if reuse_checkpoint:
             if not saved_window.empty:
                 for symbol in expected_symbols:
@@ -399,6 +441,7 @@ def fetch_indstocks_5m_batch(
                 BACKFILL_PROGRESS_CALLBACK({
                     "provider": "INDSTOCKS", **(progress_context or {}),
                     "stage": "RESUMED_CHECKPOINT", "window_end": window_end.isoformat(),
+                    "window_key": window_key, "checkpoint_source": checkpoint_source,
                     "api_calls_in_batch": calls,
                 })
             continue
@@ -441,6 +484,13 @@ def fetch_indstocks_5m_batch(
                         "CONNECTION ABORTED", "BROKEN PIPE",
                     )
                 )
+                if callable(BACKFILL_PROGRESS_CALLBACK):
+                    BACKFILL_PROGRESS_CALLBACK({
+                        "provider": "INDSTOCKS", **(progress_context or {}),
+                        "stage": "PROVIDER_REQUEST_FAILED", "window_end": window_end.isoformat(),
+                        "attempt": attempt + 1, "retryable": retryable,
+                        "error_type": type(exc).__name__,
+                    })
                 if not retryable or attempt == max_request_attempts - 1:
                     print(json.dumps({
                         "event": "indstocks_backfill_request_failed",
@@ -535,6 +585,8 @@ def fetch_indstocks_5m_batch(
                 "row_counts": row_counts,
                 "provider_omitted_codes": missing_codes,
                 "checkpoint_remote": checkpoint_remote,
+                "batch_key": batch_key,
+                "key_scheme": "FULL_BATCH_V2",
             }, sort_keys=True), encoding="utf-8")
             uploaded_manifest = store.upload_or_update(
                 checkpoint_manifest_local, checkpoint_manifest_remote, mime_type="application/json"
@@ -786,8 +838,11 @@ def main(argv: list[str] | None = None) -> int:
 
         # Batch ranges must be common per request, then deduplicate against Drive.
         batch_start = min(starts.values())
+        # Fetch the whole five-symbol group (one request costs the same) so the
+        # checkpoint folder key stays stable; only active symbols are consolidated.
         fetched_by_symbol, calls = fetch_indstocks_5m_batch(
-            active_batch, batch_start, end, pause_seconds=args.pause_seconds,
+            batch, batch_start, end, pause_seconds=args.pause_seconds,
+            active_symbols={symbol for symbol, _ in active_batch},
             request_guard=REQUEST_GUARD,
             progress_context={
                 "batch": batch_no,
@@ -832,9 +887,9 @@ def main(argv: list[str] | None = None) -> int:
             if callable(BACKFILL_PROGRESS_CALLBACK):
                 BACKFILL_PROGRESS_CALLBACK({
                     "provider": "INDSTOCKS",
-                    "stage": "CHECKPOINT_PERSISTED",
+                    "stage": "SYMBOL_PARQUET_PERSISTED",
                     "symbol": symbol,
-                    "checkpoint_path": remote,
+                    "symbol_parquet_path": remote,
                     "drive_bytes": uploaded.get("size"),
                 })
             ready = summary["usable_sessions"] >= args.minimum_usable_sessions

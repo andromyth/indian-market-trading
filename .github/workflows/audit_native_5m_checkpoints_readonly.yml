@@ -96,7 +96,7 @@ jobs:
                       raw=drive.files().get_media(fileId=manifests[key]["id"]).execute()
                       m=json.loads(raw.decode("utf-8") if isinstance(raw,bytes) else raw)
                       valid=(m.get("status")=="COMPLETE" and m.get("window_key")==key
-                             and isinstance(m.get("symbols"),list) and len(m["symbols"])==5
+                             and isinstance(m.get("symbols"),list) and 1<=len(m["symbols"])<=5
                              and isinstance(m.get("row_counts"),dict)
                              and set(m["row_counts"]).issubset(set(m["symbols"])))
                       if valid:
