@@ -119,6 +119,14 @@ def _latest_capture(store) -> tuple[dict, pd.DataFrame, pd.Timestamp]:
 
 def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, work: Path, lookback: int) -> dict[str, pd.DataFrame]:
     history: dict[str, pd.DataFrame] = {}
+    cache_dir = work / "history_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    index_path = cache_dir / "index.json"
+    try:
+        cache_index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache_index = {}
+
     archive_folder = _find_remote(store, HISTORY_ROOT)
     if archive_folder:
         for folder in _list_children(store, archive_folder["id"]):
@@ -135,12 +143,27 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
             )
             if not item:
                 continue
-            local = work / "backfill" / f"{symbol}.parquet"
-            _download(store, item["id"], local)
-            frame = _read_history(local)
+            local = cache_dir / f"{symbol}.parquet"
+            cached = cache_index.get(symbol) or {}
+            if (
+                not local.is_file()
+                or cached.get("modifiedTime") != item.get("modifiedTime")
+                or str(cached.get("size") or "") != str(item.get("size") or "")
+            ):
+                _download(store, item["id"], local)
+            try:
+                frame = _read_history(local)
+            except Exception:
+                _download(store, item["id"], local)
+                frame = _read_history(local)
+            cache_index[symbol] = {
+                "modifiedTime": item.get("modifiedTime"),
+                "size": item.get("size"),
+            }
             frame = frame.loc[frame.index <= minute].tail(lookback)
             if not frame.empty:
                 history[symbol] = frame
+    index_path.write_text(json.dumps(cache_index, sort_keys=True), encoding="utf-8")
 
     live_folder = _find_remote(
         store,
@@ -168,7 +191,6 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
                 combined = combined.loc[~combined.index.duplicated(keep="last")].sort_index()
                 history[symbol] = combined.loc[combined.index <= minute].tail(lookback)
     return history
-
 
 def _market_history(minute: pd.Timestamp) -> pd.DataFrame:
     """Fetch only Yahoo NIFTY context; never use the broker adapter from GitHub."""
@@ -208,7 +230,7 @@ def main() -> int:
     if not is_nse_trading_day(now.date()):
         print(json.dumps({"status": "SKIPPED", "reason": "NSE_NON_TRADING_DAY", "now_ist": now.isoformat()}))
         return 0
-    if not (now.hour, now.minute) >= (9, 15) or (now.hour, now.minute) >= (15, 30):
+    if (now.hour, now.minute) < (9, 15) or (now.hour, now.minute) >= (15, 30):
         print(json.dumps({"status": "SKIPPED", "reason": "OUTSIDE_NSE_CASH_SESSION", "now_ist": now.isoformat()}))
         return 0
 
