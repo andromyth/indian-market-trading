@@ -1,0 +1,145 @@
+name: Deploy checkpoint fix without scheduler mutation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy_checkpoint_fix_safe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: intraday-worker-checkpoint-safe-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-and-verify:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Checkout merged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Run checkpoint regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements.txt
+          pytest -q tests/test_backfill_checkpoint_key_stability.py tests/test_indstocks_5m_backfill.py
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Refuse deployment while a backfill is active
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          BODY="$(mktemp)"
+          trap 'rm -f "$BODY"' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$BODY" --write-out "%{http_code}" "$SERVICE_URL/backfillz")"
+          echo "BACKFILL_STATUS_HTTP=$CODE"
+          [[ "$CODE" == "200" ]] || { cat "$BODY"; echo "Cannot establish backfill state; deployment blocked."; exit 1; }
+          python - "$BODY" <<'PY'
+          import json, sys
+          data=json.load(open(sys.argv[1], encoding="utf-8"))
+          def walk(value):
+              if isinstance(value, dict):
+                  for k,v in value.items():
+                      if k.lower() in {"status","backfill_status","state"} and isinstance(v,str):
+                          yield v.upper()
+                      yield from walk(v)
+              elif isinstance(value,list):
+                  for v in value:
+                      yield from walk(v)
+          states=list(walk(data))
+          print("BACKFILL_STATES="+json.dumps(states))
+          if not states:
+              raise SystemExit("No explicit backfill state found; fail closed.")
+          if any(s in {"RUNNING","STARTING","ACTIVE","IN_PROGRESS"} for s in states):
+              raise SystemExit("Backfill is active; deployment blocked to avoid interrupting it.")
+          print("BACKFILL_IDLE_CONFIRMED=true")
+          PY
+
+      - name: Stage candidate revision without production traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --source . \
+            --build-service-account "projects/$PROJECT_ID/serviceAccounts/cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com" \
+            --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+            --port 8080 --cpu 2 --memory 8Gi --min 1 --max 1 \
+            --no-cpu-throttling --concurrency 1 --timeout 300 \
+            --no-allow-unauthenticated --no-traffic --tag=checkpointfix \
+            --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+            --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
+
+      - name: Validate staged model and Drive readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          REVISION_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.traffic[?tag=checkpointfix].url)')"
+          [[ -n "$REVISION_URL" ]] || { echo "Tagged candidate URL missing."; exit 1; }
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          BODY="$(mktemp)"
+          trap 'rm -f "$BODY"' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 60 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$BODY" --write-out "%{http_code}" "$REVISION_URL/modelz")"
+          echo "STAGED_MODEL_HTTP=$CODE"
+          python - "$BODY" "$CODE" <<'PY'
+          import json,sys
+          data=json.load(open(sys.argv[1],encoding="utf-8"))
+          checks=data.get("checks") or {}
+          print("STAGED_PREFLIGHT="+json.dumps({"status":data.get("status"),"checks":checks},sort_keys=True))
+          ok=(sys.argv[2]=="200" and data.get("status")=="ok"
+              and checks.get("bar_interval_minutes")==5
+              and checks.get("target")=="target_30m"
+              and checks.get("feature_count_manifest")==checks.get("feature_count_runtime")
+              and checks.get("feature_list_matches_runtime") is True
+              and checks.get("artifact_hashes_match") is True
+              and checks.get("drive_configured") is True
+              and checks.get("drive_reachable") is True
+              and checks.get("drive_write_ready") is True)
+          if not ok: raise SystemExit("Staged worker preflight failed; production traffic unchanged.")
+          PY
+
+      - name: Promote candidate revision to production
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.traffic[?tag=checkpointfix].revisionName)')"
+          [[ -n "$REVISION" ]] || { echo "Candidate revision name missing."; exit 1; }
+          gcloud run services update-traffic "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --to-revisions="$REVISION=100" --quiet
+          echo "PRODUCTION_TRAFFIC_PROMOTED_REVISION=$REVISION"
+
+      - name: Verify promoted revision and confirm scheduler untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='yaml(status.latestReadyRevisionName,status.traffic)'
+          for job in intraday-worker-0915-0959 intraday-worker-1000-1459 intraday-worker-1500-1530; do
+            gcloud scheduler jobs describe "$job" --project="$PROJECT_ID" --location="$REGION" --format='yaml(name,schedule,state)'
+          done
+          echo "SCHEDULER_MUTATION=NONE"
