@@ -24,6 +24,9 @@ jobs:
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
     steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -44,8 +47,12 @@ jobs:
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
           SUCCESS=0
-          for SA in "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
-            TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+          for SA in "SELF" "indian-market-scheduler@$PROJECT_ID.iam.gserviceaccount.com" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
+            if [[ "$SA" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            fi
             [[ -n "$TOKEN" ]] || continue
             HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 150 \
               -H "Authorization: Bearer $TOKEN" \
@@ -59,7 +66,7 @@ jobs:
             fi
           done
           if [[ "$SUCCESS" != "1" ]]; then
-            echo "Could not reach the private Cloud Run provider diagnostic using either existing scheduler identity."
+            echo "Could not reach the private Cloud Run provider diagnostic using the GitHub deployer or existing scheduler identities."
             exit 1
           fi
           python - "$RESPONSE" "$HTTP_CODE" <<'PY'
