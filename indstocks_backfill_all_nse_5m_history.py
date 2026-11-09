@@ -614,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     from persistent_store import GoogleDriveStore, drive_status
 
     if not configured():
-        raise RuntimeError("INDstocks manual access token is not configured in GitHub Actions secrets.")
+        raise RuntimeError("INDstocks TOTP credentials are not configured in the Cloud Run worker.")
     preflight = drive_status(require_write=True)
     if not preflight.get("configured") or preflight.get("reachable") is not True or preflight.get("write_ready") is not True:
         raise RuntimeError("Google Drive read/write preflight failed: " + str(preflight.get("reason")))
