@@ -111,6 +111,7 @@ jobs:
           calibration_overlay.py
           all_universe_minute_capture.py
           all_nse_minute_prediction_capture.py
+          drive_all_nse_prediction_compiler.py
           all_nse_prediction_learning.py
           audit_all_universe_minute_snapshots.py
           nse_intraday_all_universe_sync.py
@@ -148,6 +149,7 @@ jobs:
           tests/test_59_feature_source_coverage.py
           tests/test_candidate_pipeline_stages.py
           tests/test_all_nse_minute_prediction_capture.py
+          tests/test_drive_all_nse_prediction_compiler.py
           tests/test_all_universe_minute_capture.py
           tests/test_all_nse_5m_bar_training.py
           tests/test_live_training_feature_parity.py
