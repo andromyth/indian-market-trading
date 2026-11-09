@@ -1,91 +1,46 @@
-# INDstocks API setup (read-only market data)
+# INDstocks API access — Cloud Run only
 
-The application uses INDstocks for authenticated quotes and one-minute OHLCV candles when configured. Existing official NSE, local/Google Drive archive, Dhan (if configured), and Yahoo fallback paths remain in place. The application has no order-placement implementation.
+INDstocks is a read-only market-data source. **The singleton Cloud Run service is the only process permitted to authenticate to or call INDstocks.** Streamlit, local scripts, notebooks and GitHub Actions must not access the provider or generate/refresh its token.
 
-## Option A — first connection check with the generated access token
+## Cloud Run credentials
 
-In Streamlit Community Cloud, open your app → Settings → Secrets and add:
-
-    INDSTOCKS_ACCESS_TOKEN = "PASTE_YOUR_GENERATED_ACCESS_TOKEN"
-    INDSTOCKS_TIMEOUT_SECONDS = "12"
-
-Save secrets and restart/reboot the app. Never paste the token into chat, source code, GitHub files, screenshots, or logs. The token is treated as a password and expires after 24 hours, so this option is only suitable for an initial connection test or manual renewal.
-
-## Option B — unattended access-token renewal (recommended for autonomy)
-
-First, open the official INDstocks API access page:
-
-https://www.indstocks.com/app/api-trading/access-tokens
-
-Complete the site's Setup TOTP flow. Securely save the TOTP secret when it is shown; it is not retrievable later. Record the Client ID shown after setup and use your INDstocks account MPIN.
-
-**Configure TOTP credentials in Google Cloud Secret Manager for Cloud Run only:**
+Create these Google Cloud Secret Manager secrets:
 
 | Secret Manager name | Value |
 |---|---|
 | `indstocks-client-id` | INDstocks Client ID |
-| `indstocks-mpin` | INDstocks account MPIN |
+| `indstocks-mpin` | Account MPIN |
 | `indstocks-totp-secret` | Base32 TOTP secret |
 
-Do not add these three credentials to Streamlit Secrets or run TOTP authentication from a local script or GitHub Actions job. The Streamlit app is intentionally pinned to manual-token mode. The Cloud Run deployment maps these Secret Manager values to the corresponding environment variables and explicitly selects `INDSTOCKS_AUTH_MODE=totp`.
+The deployment maps these secrets only into `indian-market-intraday-worker` and sets `INDSTOCKS_AUTH_MODE=totp`. Manual access-token secrets are not supported by the deployment.
 
-The Cloud Run process computes the six-digit TOTP locally and calls the documented token-generation endpoint. The client caches the resulting token in process memory and refreshes it before the 24-hour expiry; it does not write credentials or tokens to disk.
+Cloud Run is configured with **one maximum instance and concurrency one**. The INDstocks client also serializes token generation in-process and applies a cooldown after token-generation failures. The `K_SERVICE` runtime guard rejects INDstocks access outside Cloud Run, even if a process happens to contain copied credentials.
 
-**Token ownership:** the Streamlit dashboard is forced into manual-token mode and must not mint TOTP tokens. Its existing `INDSTOCKS_ACCESS_TOKEN` setting is left untouched. Cloud Run explicitly uses `INDSTOCKS_AUTH_MODE=totp` and is the only deployed process allowed to generate tokens. In every other process, the default mode is `manual`; merely having TOTP secrets present cannot trigger token generation.
+Do not put INDstocks credentials or tokens in GitHub repository secrets, Streamlit Secrets, local environment files, notebooks, or source code. Do not run `indstocks_smoke_test.py` locally. A second login can invalidate the active account token.
 
-Important token constraint: INDstocks documents that only one TOTP-generated token can be live per account. A successful token-generation call invalidates the previous TOTP token. Do not configure multiple independent applications to generate tokens for the same account; use one application/process to own token generation.
+## Data flow
 
-## Verify the connection
+1. **Cloud Run** owns the INDstocks token and collects five-minute full-universe quote snapshots. It runs the resumable 5-minute historical backfill only through the authenticated private Cloud Run endpoint, sharing the same process-local token cache.
+2. Cloud Run persists quote snapshots and symbol-wise five-minute history Parquet files to Google Drive.
+3. **GitHub Actions** reads those Drive artifacts, compiles the existing 30-minute ALL-NSE model features, loads the existing model/F&O context from Drive, and writes prediction Parquet files and manifests back to Drive. It does not import or call INDstocks.
+4. The news collector is a separate GitHub Actions workflow. It reads publisher RSS and writes the point-in-time news archive to Drive. News is optional context; absence of a matching news headline must not block the independent ALL-NSE prediction pipeline.
+5. Streamlit is a read-only dashboard and uses other configured market-data fallbacks. INDstocks access is disabled in the dashboard.
 
-To test a **manual token** from a local terminal, set `INDSTOCKS_AUTH_MODE=manual` and `INDSTOCKS_ACCESS_TOKEN`, then run:
+Prediction output:
+`production_data/all_nse_minute_predictions/YYYY/MM/DD/predictions_YYYYMMDD_HHMM.parquet`
 
-    python indstocks_smoke_test.py
+Source quote snapshots:
+`production_data/all_universe_minute_snapshots/YYYY/MM/DD/snapshot_YYYYMMDD_HHMM.parquet`
 
-The test checks API authentication without printing profile details, requests one live quote for RELIANCE, and retrieves recent one-minute candles. It reports success/failure and the row count, not your credentials. Do not run a local TOTP-mode smoke test while Cloud Run owns the account token: generating another token can invalidate Cloud Run's token.
+## Recovery rules
 
-The Streamlit dashboard continues using its existing manual token and does not mint TOTP tokens. If the token expires or is invalidated, Streamlit requests may fail; it still will not generate a replacement. Cloud Run is the sole TOTP-token owner.
+- If Cloud Run reports an INDstocks token-generation timeout or rejection, inspect Cloud Run logs and the Secret Manager TOTP configuration. Do not generate another token from a second process.
+- If the provider remains unavailable, Cloud Run must record the capture as blocked/degraded; GitHub must not invent quotes or candles and must not generate predictions from a stale snapshot.
+- The GitHub compiler skips a slot when its Drive snapshot is missing, not persisted, or older than its freshness limit.
+- A stored prediction file is not proof of a complete feature row. Inspect `PREDICTED` versus `PREDICTED_DATA_LIMITED` counts and feature coverage.
 
-## Static IP
+## Provider limits and scope
 
-INDstocks' current documentation says a whitelisted static IP is required for order placement, modification, and cancellation. Read-only quotes, historical data, profile, and funds endpoints do not require whitelisting. This application uses only read-only market-data endpoints; no orders are sent.
-
-## Scope and limitations
-
-- The one-minute historical endpoint supports a maximum seven-day window per API call; this adapter requests up to seven days for the live intraday model.
-- The broker's daily, weekly and monthly history endpoint supports up to one year per call. Long-term bulk research should continue to use the project's existing persistent historical archive and official NSE ingestion.
-- A broker quote or candle is not by itself a validated prediction. Prediction quality still depends on feature readiness, the existing locked model/feature contract, correct timestamps, and out-of-sample validation.
-- This integration is a data-source change only. It does not create a new model version, alter trained model weights, or enable automated orders.
-
-## ALL-NSE five-minute history backfill fallback
-
-The repository backfill workflow prefers DhanHQ when Dhan credentials are configured. When Dhan is unavailable, it can use the INDstocks historical-data API instead.
-
-For a one-off backfill, create a dashboard-generated INDstocks access token and add it directly as the GitHub Actions repository secret:
-
-    INDSTOCKS_ACCESS_TOKEN
-
-Do not paste the token into chat, source files, workflow YAML, or logs. It expires after 24 hours; a normal backfill run is designed to complete within that lifetime. The workflow deliberately uses manual-token mode and does not generate an INDstocks TOTP token, because a new TOTP token invalidates the previous token and could disrupt the running Cloud Run worker.
-
-The backfill requests native `5minute` candles only. It batches up to five NSE instruments per request, walks the range in seven-day windows, and pauses between requests to stay below the documented five data requests per second. It writes the same per-symbol native five-minute Parquet archive as DhanHQ and applies the same 200–500 usable-session / 90% fresh-coverage gate.
-
-To run it, open **Actions → Backfill ALL-NSE native five-minute history → Run workflow**, choose `provider=indstocks` (or `auto` when Dhan credentials are unavailable), `sessions=500`, `calendar_days=1000`, and `max_symbols=0`. Completion is determined only by the Drive `backfill_manifest.json` reporting `overall_status=PASS`; starting the workflow is not proof that the backfill completed.
-
-
-## Native five-minute historical backfill using the existing Cloud Run token
-
-The private Cloud Run worker exposes an authenticated backfill trigger so historical ingestion can share the same process-local INDstocks TOTP token cache as live capture. It does not mint a separate token in Streamlit or GitHub Actions.
-
-- `POST $SERVICE_URL/backfill` requires the JSON body `{"confirm":"START_NATIVE_5M_BACKFILL"}` and starts the default resumable run (500 target sessions, 1,000 calendar-day search range, 90% coverage gate). Requests without the exact confirmation are rejected with HTTP 400.
-- `GET $SERVICE_URL/backfillz` reports status and per-batch progress. Invoke both endpoints only with Google Cloud IAM authentication; do not make the service public.
-- The GitHub Actions trigger is manual-only. Its confirmation input defaults to `no`; select `yes` deliberately to authorize a start request.
-- The backfill waits during NSE trading hours and uses a conservative one-request-per-second cadence to leave API capacity for live five-minute snapshots. It resumes from existing per-symbol Drive archives after process restarts.
-- Drive write readiness and INDstocks credentials are checked before starting. The endpoint returns `409` if a run is already active. A completed run with gaps is not a pass; inspect the Drive manifest and require at least 90% symbol coverage.
-- A Cloud Run instance restart stops the in-memory worker thread, but completed symbol archives are checkpointed to Drive. Check `/backfillz` and re-trigger if needed.
-
-Example from an authenticated shell (does not print credentials):
-~~~bash
-SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project indian-market-trading --region asia-south1 --format='value(status.url)')"
-TOKEN="$(gcloud auth print-identity-token)"
-curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data '{"confirm":"START_NATIVE_5M_BACKFILL"}' "$SERVICE_URL/backfill"
-curl -fsS -H "Authorization: Bearer $TOKEN" "$SERVICE_URL/backfillz"
-~~~
+- Historical INDstocks requests are issued only by Cloud Run.
+- The native five-minute backfill is resumable from the per-symbol Drive checkpoints and retains the 200–500 usable-session target.
+- This integration is read-only. It does not place, modify, or cancel orders.

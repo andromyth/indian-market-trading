@@ -16,9 +16,8 @@ import streamlit as st
 import subprocess
 import sys
 
-# Streamlit is a manual-token consumer only. Keep its existing token intact,
-# but never let this app mint/revoke the shared account's TOTP token.
-os.environ["INDSTOCKS_AUTH_MODE"] = "manual"
+# INDstocks credentials and API access are reserved for the singleton Cloud Run worker.
+os.environ["INDSTOCKS_AUTH_MODE"] = "disabled"
 
 from data_fetcher import (
     INDEX_TICKER_MAP,

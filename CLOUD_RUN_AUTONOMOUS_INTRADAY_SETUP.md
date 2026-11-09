@@ -2,9 +2,14 @@
 
 This private Cloud Run worker is scheduled once per minute during regular NSE cash-market hours. It retains the existing prediction engine, checks freshness, and writes prediction snapshots and daily ledgers to Google Drive.
 
-**Full-universe market observations are separate from forecasts.** Each tick also calls the read-only INDstocks full-quote endpoint in batches of up to 900 instruments and writes one Parquet row for every symbol in the official NSE equity universe, including explicit missing/unmapped quote rows. Minute snapshots are stored under `production_data/all_universe_minute_snapshots/YYYY/MM/DD/snapshot_YYYYMMDD_HHMM.parquet`; `latest_manifest.json` tracks expected/quoted/missing symbols, matched outcomes, and Drive persistence status. An actual forecast is attached only for symbols and horizons emitted by the existing model. The current forecast engine still focuses on its dynamic news-selected watchlist (five symbols by default); this change does not claim the locked classifier predicts all NSE stocks.
+**Full-universe market observations are separate from forecasts.** Cloud Run calls the read-only INDstocks full-quote endpoint in batches and writes one Parquet row for every symbol in the official NSE equity universe, including explicit missing/unmapped quote rows. Snapshots are stored under `production_data/all_universe_minute_snapshots/YYYY/MM/DD/snapshot_YYYYMMDD_HHMM.parquet`; `latest_manifest.json` records coverage and Drive persistence. A separate GitHub Actions workflow reads the same-slot Drive snapshot and historical Parquet archive, builds the existing 30-minute ALL-NSE model features, and writes prediction Parquet files and manifests under `production_data/all_nse_minute_predictions/`. GitHub does not access INDstocks. The older five-symbol news-selected worker remains a separate optional intraday/news overlay; an empty news watchlist must not gate the independent ALL-NSE prediction pipeline.
 
 INDstocks full quotes provide a **collector-time live price snapshot**, not an exchange-timestamped one-minute OHLCV candle. Outcome matches are therefore explicitly labelled as observed target-minute quote matches. For true exchange-stamped minute-bar evaluation, use a validated one-minute candle feed and retain its source timestamp. No orders are placed.
+
+
+## GitHub Drive-only ALL-NSE prediction compiler
+
+The workflow `Compile ALL-NSE predictions from Google Drive` runs every five minutes during the NSE cash session. It reads the latest persisted quote snapshot, cached per-symbol 5-minute history partitions, current-session history captures, the existing model artifacts and prior-date F&O context from Drive. It writes the same timestamped ALL-NSE prediction Parquet/manifest contract. The compiler has a `drive_only=True` execution path and does not call the INDstocks adapter. Cloud Run remains responsible for INDstocks quotes, historical refresh and the non-market-hours resumable backfill. A missing or stale source snapshot blocks compilation rather than fabricating predictions.
 
 ## Live website-news collection
 
@@ -46,7 +51,7 @@ Open Google Cloud Console → **Security → Secret Manager**. Create the requir
 
 The worker can use the OAuth user token for both Google Drive reads and writes. A valid service-account JSON is optional; when present and valid, it can be used for Drive read/list operations while OAuth handles writes to the owner's My Drive. The deployment script validates this optional secret silently and falls back to OAuth-only access if it is missing or malformed.
 
-The deployment explicitly sets `INDSTOCKS_AUTH_MODE=totp` only on Cloud Run when all three TOTP secrets are present. Streamlit is forced to `manual` mode in `app.py`, so an existing dashboard token can remain configured without triggering token generation or replacing Cloud Run's token.
+The deployment requires all three INDstocks TOTP secrets and maps them only into the private Cloud Run worker. Streamlit sets `INDSTOCKS_AUTH_MODE=disabled`; the client also checks Cloud Run's `K_SERVICE` runtime marker and rejects access from every other process. The deployment enforces `--max 1` and `--concurrency 1`, so only one Cloud Run instance can own the account token. Do not create a manual access token in Streamlit or GitHub Actions, and do not run local INDstocks smoke tests.
 
 The deployment preflight checks actual Google Drive read/write access and refuses to run if it fails. JSON formatting alone is not proof that the account can access the configured Drive folder.
 

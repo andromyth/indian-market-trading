@@ -317,11 +317,11 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "history_seed_failed_batches", "history_refresh_batch_count",
                 "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
                 "eligible_symbol_count", "skipped_missing_quote_count",
-                "source_snapshot_drive_path", "prediction_policy", "status", "error",
+                "source_snapshot_drive_path", "prediction_policy", "status", "error", "reason",
             )
             if key in all_nse
         })
-        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}:
+        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}:
             STATE["all_nse_minute_prediction_error"] = str(
                 all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
             )
@@ -444,6 +444,17 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
         eligible = int(item.get("eligible_symbol_count") or 0)
         item_status = str(item.get("status") or state.get("all_nse_minute_prediction_status") or "NOT_RUN").upper()
         age = _diagnostic_age_seconds(minute)
+
+        if item_status == "DELEGATED_TO_GITHUB_ACTIONS":
+            payload = {
+                "status": "delegated",
+                "probe": "all_nse_minute_prediction_actual",
+                "checked_at_utc": now_utc.isoformat(),
+                "cycle_minute_ist": minute,
+                "source_snapshot_drive_path": item.get("source_snapshot_drive_path"),
+                "reason": "GitHub Actions owns ALL-NSE inference and prediction persistence.",
+            }
+            return 202, payload
 
         # No valid quote is an expected no-op for that slot, not a global
         # coverage failure. The stored source snapshot remains the audit record.
@@ -748,7 +759,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 or capture_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
-                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS"}
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
@@ -903,61 +914,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
             history_prefetch = _prepare_all_nse_history_before_capture()
             result = WORKER.tick_once()
             result["all_nse_pre_capture_history_refresh"] = history_prefetch
-            # Run pooled all-NSE inference only when the full-universe quote
-            # capture actually ran on a scheduled five-minute slot.
+            # Cloud Run owns INDstocks collection and durable snapshot/history writes.
+            # GitHub Actions consumes those Drive artifacts and owns ALL-NSE inference.
             capture_result = result.get("all_universe_capture") or {}
             if capture_result.get("status") == "NOT_SCHEDULED":
                 result["all_nse_minute_predictions"] = {
                     "status": "NOT_SCHEDULED",
-                    "reason": "Full-NSE prediction snapshots are written on five-minute capture slots only.",
+                    "reason": "No scheduled five-minute quote snapshot was captured.",
                 }
             else:
-                # Each symbol in the confirmed same-slot Drive snapshot is an
-                # independent prediction candidate. run_for_capture validates
-                # its own quote and history; no universe-wide coverage threshold
-                # may prevent other complete symbols from being evaluated.
-                prediction_capture = {"status": "ERROR", "error": "Prediction capture did not run."}
-                prediction_error = None
-                for prediction_attempt in range(1, 4):
-                    try:
-                        prediction_capture = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
-                            capture_result,
-                            WORKER.root,
-                        )
-                        prediction_status = str(prediction_capture.get("status") or "").upper()
-                        if prediction_status not in {
-                            "ERROR", "PERSISTENCE_ERROR",
-                            "BLOCKED_SNAPSHOT_CAPTURE", "BLOCKED_SNAPSHOT_VALIDATION",
-                        }:
-                            prediction_error = None
-                            break
-                        prediction_error = str(
-                            prediction_capture.get("error")
-                            or f"prediction capture returned {prediction_status}"
-                        )
-                    except Exception as prediction_exc:
-                        prediction_error = (
-                            f"{type(prediction_exc).__name__}: {str(prediction_exc)[:240]}"
-                        )
-                        prediction_capture = {
-                            "status": "ERROR",
-                            "error": prediction_error,
-                        }
-                    if prediction_attempt < 3:
-                        _log(
-                            "all_nse_minute_prediction_capture_retry",
-                            attempt=prediction_attempt,
-                            next_attempt=prediction_attempt + 1,
-                            error=prediction_error,
-                        )
-                        time.sleep(0.5 * prediction_attempt)
-                result["all_nse_minute_predictions"] = prediction_capture
-                if prediction_error:
-                    _log(
-                        "all_nse_minute_prediction_capture_failed",
-                        attempts=3,
-                        error=prediction_error,
-                    )
+                result["all_nse_minute_predictions"] = {
+                    "status": "DELEGATED_TO_GITHUB_ACTIONS",
+                    "cycle_minute_ist": capture_result.get("cycle_minute_ist"),
+                    "source_snapshot_drive_path": capture_result.get("snapshot_drive_path"),
+                    "reason": "GitHub Actions compiles the persisted Drive snapshot and history archive.",
+                }
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result)
             # A tick completed even if one symbol/source failed; errors are
@@ -1035,29 +1006,14 @@ def main() -> None:
     )
     monitor.start()
     def prediction_runtime_prewarm() -> None:
+        # This instance is a market-data collector only; GitHub loads the model
+        # and compiles predictions from the persisted Drive inputs.
         ALL_NSE_MINUTE_PREDICTOR.start()
-        attempts = 0
-        while True:
-            attempts += 1
-            try:
-                ALL_NSE_MINUTE_PREDICTOR._ensure_model()
-                _log(
-                    "all_nse_prediction_model_prewarm",
-                    status="OK",
-                    predictor_status=ALL_NSE_MINUTE_PREDICTOR.status(),
-                    attempts=attempts,
-                )
-                return
-            except Exception as exc:
-                if attempts == 1 or attempts % 5 == 0:
-                    _log(
-                        "all_nse_prediction_model_prewarm_retry",
-                        status="RETRYING",
-                        attempt=attempts,
-                        error=f"{type(exc).__name__}: {str(exc)[:180]}",
-                        predictor_status=ALL_NSE_MINUTE_PREDICTOR.status(),
-                    )
-                time.sleep(30)
+        _log(
+            "all_nse_history_collector_started",
+            status=ALL_NSE_MINUTE_PREDICTOR.status().get("status"),
+            predictor_status=ALL_NSE_MINUTE_PREDICTOR.status(),
+        )
     threading.Thread(
         target=prediction_runtime_prewarm,
         name="all-nse-prediction-prewarm",

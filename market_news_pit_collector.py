@@ -1054,10 +1054,12 @@ def main() -> int:
     ):
         upload = store.upload_or_update(local, remote, mime_type=mime_type)
         print(json.dumps({"upload_path": remote, "result": str(upload)}, default=str), flush=True)
+        if str(upload.get("status") or "").upper() != "OK":
+            raise RuntimeError(f"Google Drive news artifact write was not confirmed: {remote}")
 
     print(json.dumps(manifest, indent=2, default=str), flush=True)
-    # Partial source availability is useful data but must not be described as full coverage.
-    return 0 if manifest["collection_status"] == "PASS" else 0
+    # A partial collection is persisted for diagnosis, but must fail the scheduled health check.
+    return 0 if manifest["collection_status"] == "PASS" else 1
 
 
 if __name__ == "__main__":
