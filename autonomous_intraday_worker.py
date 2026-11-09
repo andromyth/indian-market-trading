@@ -738,8 +738,9 @@ class AutonomousIntradayWorker:
                 if pd.notna(checked_at) else None
             )
             feed_successes = int(self.news_manifest.get("successful_feed_count", 0) or 0)
-            if self.news_manifest.get("collection_status") == "PASS" and age_minutes is not None and 0 <= age_minutes <= 45 and feed_successes >= 3:
-                self.news_context_status = "FRESH"
+            collection_status = str(self.news_manifest.get("collection_status") or "").upper()
+            if collection_status in {"PASS", "PARTIAL"} and age_minutes is not None and 0 <= age_minutes <= 45 and feed_successes >= 3:
+                self.news_context_status = "FRESH" if collection_status == "PASS" else "FRESH_PARTIAL"
             elif age_minutes is None:
                 self.news_context_status = "UNKNOWN"
             else:
@@ -920,7 +921,7 @@ class AutonomousIntradayWorker:
             return
         try:
             symbols, meta = _watchlist(self.max_stocks)
-            if not symbols and self.news_context_status == "FRESH":
+            if not symbols and self.news_context_status in {"FRESH", "FRESH_PARTIAL"}:
                 # Reuse the same point-in-time Drive news archive consumed by the
                 # news overlay. This avoids a second, narrower RSS scrape becoming
                 # a hard dependency for watchlist inference.
