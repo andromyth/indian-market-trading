@@ -577,9 +577,8 @@ def capture_all_universe_minute_snapshot(
         manifest.update({
             "status": "BLOCKED_PROVIDER_CREDENTIALS",
             "error": (
-                "INDstocks credentials are not configured. Set INDSTOCKS_ACCESS_TOKEN "
-                "or INDSTOCKS_CLIENT_ID, INDSTOCKS_MPIN and INDSTOCKS_TOTP_SECRET "
-                "in the Cloud Run service's secret-backed environment."
+                "INDstocks TOTP credentials are not configured in the Cloud Run service's "
+                "secret-backed environment. Only Cloud Run may access INDstocks."
             ),
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
         })
