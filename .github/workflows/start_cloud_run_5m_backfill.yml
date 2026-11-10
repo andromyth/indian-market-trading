@@ -382,3 +382,4 @@ jobs:
 # but only after 16:00 IST on trading days or at any time on non-trading days.
 # The scheduled kickoff runs once daily at 16:00 IST; Cloud Run owns ongoing backfill execution.
 # Recovery trigger: deployment 42475367565 verified revision 00095-von; resume from existing Drive checkpoints.
+# Manual recovery request: resume native 5m backfill from durable checkpoints; no reset.
