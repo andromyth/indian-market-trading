@@ -21,9 +21,104 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
+
+      - name: Inspect Cloud Run durability configuration and instance startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services describe indian-market-intraday-worker \
+            --project=indian-market-trading --region=asia-south1 --format=json \
+            > "$RUNNER_TEMP/cloud_run_service.json"
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
+            --project=indian-market-trading --limit=200 --order=asc --format=json \
+            > "$RUNNER_TEMP/cloud_run_startup_logs.json" || echo "STARTUP_LOG_QUERY=FAILED"
+          python - "$RUNNER_TEMP/cloud_run_service.json" "$RUNNER_TEMP/cloud_run_startup_logs.json" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          doc=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          meta=doc.get("metadata") or {}
+          spec=doc.get("spec") or {}
+          template=spec.get("template") or doc.get("template") or {}
+          tmeta=template.get("metadata") or {}
+          tspec=template.get("spec") or {}
+          annotations={**(meta.get("annotations") or {}), **(tmeta.get("annotations") or {}), **(template.get("annotations") or {})}
+          scaling=template.get("scaling") or tspec.get("scaling") or {}
+          containers=template.get("containers") or tspec.get("containers") or []
+          mounts=[]
+          env_names=[]
+          path_env={}
+          for container in containers:
+              for item in (container.get("env") or []):
+                  name=str(item.get("name") or "")
+                  env_names.append(name)
+                  if re.search(r"(ROOT|PATH|WORK|CHECKPOINT|BACKFILL|CACHE|TMP)",name,re.I):
+                      value=item.get("value")
+                      if value is not None and not item.get("valueFrom"):
+                          path_env[name]=value
+              for mount in (container.get("volumeMounts") or []):
+                  mounts.append({"name":mount.get("name"),"mountPath":mount.get("mountPath"),"readOnly":mount.get("readOnly",False)})
+          volumes=[]
+          for volume in (tspec.get("volumes") or template.get("volumes") or []):
+              volumes.append({"name":volume.get("name"),"source_types":sorted(k for k in volume if k not in {"name"})})
+          result={
+            "revision":(doc.get("status") or {}).get("latestReadyRevisionName") or (doc.get("status") or {}).get("latestCreatedRevisionName"),
+            "service_account":tspec.get("serviceAccountName") or template.get("serviceAccount"),
+            "cpu_throttling_annotation":annotations.get("run.googleapis.com/cpu-throttling"),
+            "min_instances":scaling.get("minInstanceCount") or annotations.get("autoscaling.knative.dev/minScale") or annotations.get("run.googleapis.com/minScale"),
+            "max_instances":scaling.get("maxInstanceCount") or annotations.get("autoscaling.knative.dev/maxScale") or annotations.get("run.googleapis.com/maxScale"),
+            "container_concurrency":tspec.get("containerConcurrency") or template.get("maxInstanceRequestConcurrency"),
+            "path_environment":path_env,
+            "environment_variable_names":sorted(set(env_names)),
+            "volume_mounts":mounts,
+            "volumes":volumes
+          }
+          print("CLOUD_RUN_DURABILITY_CONFIG="+json.dumps(result,sort_keys=True,default=str))
+          try:
+              logs=json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          except Exception:
+              logs=[]
+          found=[]
+          for entry in logs if isinstance(logs,list) else []:
+              payload=entry.get("textPayload") or (entry.get("jsonPayload") or {}).get("message") or ""
+              if not payload and entry.get("protoPayload"):
+                  payload=json.dumps(entry["protoPayload"],sort_keys=True)
+              if re.search(r"start(ing|ed)? (new )?instance|instance (start|started)|container (start|started)|startup|starting container",str(payload),re.I):
+                  found.append({"timestamp":entry.get("timestamp"),"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":str(payload)[:600]})
+          print("INSTANCE_STARTUP_EVENTS_2026_11_10_1411_IST="+json.dumps(found[:40],sort_keys=True))
+          print("INSTANCE_STARTUP_LOG_ROWS="+str(len(logs) if isinstance(logs,list) else 0))
+          PY
+
+      - name: Grant workflow identity access to Cloud Run OAuth secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKFLOW_SA="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          [[ "$WORKFLOW_SA" == *@*.iam.gserviceaccount.com ]] || {
+            echo "ERROR=workflow_auth_identity_is_not_a_service_account"
+            exit 1
+          }
+          echo "WORKFLOW_SERVICE_ACCOUNT=$WORKFLOW_SA"
+          gcloud secrets add-iam-policy-binding google-oauth-token-json \
+            --project=indian-market-trading \
+            --member="serviceAccount:$WORKFLOW_SA" \
+            --role="roles/secretmanager.secretAccessor" \
+            --quiet
+
+      - name: Load Drive credential from Secret Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          gcloud secrets versions access latest \
+            --project=indian-market-trading \
+            --secret=google-oauth-token-json \
+            > "$RUNNER_TEMP/drive_token.json"
+          test -s "$RUNNER_TEMP/drive_token.json"
+          echo "GOOGLE_OAUTH_TOKEN_FILE=$RUNNER_TEMP/drive_token.json" >> "$GITHUB_ENV"
       - name: Read-only Drive checkpoint and worker audit
         env:
-          GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
           GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
           PROJECT_ID: indian-market-trading
           REGION: asia-south1
@@ -31,7 +126,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ -n "$GOOGLE_OAUTH_TOKEN_JSON" && -n "$GOOGLE_DRIVE_ROOT_ID" ]] || { echo "ERROR=drive_audit_secrets_missing"; exit 1; }
+          [[ -n "${GOOGLE_OAUTH_TOKEN_FILE:-}" && -s "$GOOGLE_OAUTH_TOKEN_FILE" && -n "$GOOGLE_DRIVE_ROOT_ID" ]] || { echo "ERROR=drive_audit_credential_file_or_root_missing"; exit 1; }
           python -m pip install --quiet google-api-python-client google-auth
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
@@ -48,13 +143,15 @@ jobs:
           PY
           python - <<'PY'
           import json, os, re
+          from pathlib import Path
           from collections import Counter
           from google.oauth2.credentials import Credentials
           from google.auth.transport.requests import Request
           from googleapiclient.discovery import build
 
-          info=json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
-          creds=Credentials.from_authorized_user_info(info,scopes=["https://www.googleapis.com/auth/drive"])
+          token_path=Path(os.environ["GOOGLE_OAUTH_TOKEN_FILE"])
+          info=json.loads(token_path.read_text(encoding="utf-8"))
+          creds=Credentials.from_authorized_user_info(info,scopes=["https://www.googleapis.com/auth/drive.readonly"])
           if not creds.valid: creds.refresh(Request())
           drive=build("drive","v3",credentials=creds,cache_discovery=False)
 
@@ -132,4 +229,9 @@ jobs:
           else: print("GLOBAL_MANIFEST=NOT_FOUND")
           print("AUDIT_MODE=READ_ONLY_NO_DRIVE_WRITES_NO_BACKFILL_RESTART")
           PY
+
+      - name: Remove Drive credential
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/drive_token.json"
 # Manual read-only reconciliation refresh: inspect checkpoint inventory and live worker state; no writes or restart.
