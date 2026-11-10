@@ -1,0 +1,62 @@
+name: Hugging Face one-shard staging pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-one-shard-staging-pilot
+  cancel-in-progress: false
+
+jobs:
+  staging-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install importer dependencies
+        run: python -m pip install --upgrade pip pandas pyarrow requests
+
+      - name: Run exactly one source shard into isolated staging
+        run: |
+          python hf_historical_seed.py \
+            --max-shards 1 \
+            --min-sessions 200 \
+            --max-sessions 500 \
+            --output ./hf_one_shard_staging
+
+      - name: Validate pilot output and print compact audit
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("hf_one_shard_staging/hf_seed_audit.json")
+          if not p.exists():
+              raise SystemExit("Pilot audit file was not produced")
+          data = json.loads(p.read_text())
+          print(json.dumps({k: v for k, v in data.items() if k != "symbols"}, indent=2))
+          for row in data.get("symbols", []):
+              print(f"{row['symbol']} rows_5m={row['rows_5m']} sessions={row['usable_sessions']} meets_200={row['meets_minimum']}")
+          files = list(Path("hf_one_shard_staging").glob("symbol=*/**/*.parquet"))
+          print(f"staged_symbol_parquet_files={len(files)}")
+          print(f"staged_parquet_bytes={sum(x.stat().st_size for x in files)}")
+          PY
+
+      - name: Upload isolated staging output and audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-one-shard-staging-pilot
+          path: hf_one_shard_staging/
+          if-no-files-found: warn
+          retention-days: 7
