@@ -288,3 +288,5 @@ jobs:
           done
           echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
           exit 1
+
+# Resume request after verifier correction: use Cloud Run persistence events; preserve all existing checkpoints.
