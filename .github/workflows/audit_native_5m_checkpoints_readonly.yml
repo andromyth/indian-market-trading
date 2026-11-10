@@ -30,7 +30,7 @@ jobs:
             --project=indian-market-trading --region=asia-south1 --format=json \
             > "$RUNNER_TEMP/cloud_run_service.json"
           gcloud logging read \
-            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
+            'logName="projects/indian-market-trading/logs/run.googleapis.com%2Fvarlog%2Fsystem" AND resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
             --project=indian-market-trading --limit=200 --order=asc --format=json \
             > "$RUNNER_TEMP/cloud_run_startup_logs.json" || echo "STARTUP_LOG_QUERY=FAILED"
           python - "$RUNNER_TEMP/cloud_run_service.json" "$RUNNER_TEMP/cloud_run_startup_logs.json" <<'PY'
@@ -53,9 +53,13 @@ jobs:
               for item in (container.get("env") or []):
                   name=str(item.get("name") or "")
                   env_names.append(name)
-                  if re.search(r"(ROOT|PATH|WORK|CHECKPOINT|BACKFILL|CACHE|TMP)",name,re.I):
+                  value_from=item.get("valueFrom") or {}
+                  secret_ref=value_from.get("secretKeyRef") or item.get("valueSource",{}).get("secretKeyRef")
+                  if secret_ref:
+                      path_env[name]={"secret":secret_ref.get("secret"),"version":secret_ref.get("version")}
+                  elif re.search(r"(ROOT|PATH|WORK|CHECKPOINT|BACKFILL|CACHE|TMP)",name,re.I):
                       value=item.get("value")
-                      if value is not None and not item.get("valueFrom"):
+                      if value is not None:
                           path_env[name]=value
               for mount in (container.get("volumeMounts") or []):
                   mounts.append({"name":mount.get("name"),"mountPath":mount.get("mountPath"),"readOnly":mount.get("readOnly",False)})
@@ -81,40 +85,30 @@ jobs:
               logs=[]
           found=[]
           for entry in logs if isinstance(logs,list) else []:
-              payload=entry.get("textPayload") or (entry.get("jsonPayload") or {}).get("message") or ""
-              if not payload and entry.get("protoPayload"):
-                  payload=json.dumps(entry["protoPayload"],sort_keys=True)
-              if re.search(r"start(ing|ed)? (new )?instance|instance (start|started)|container (start|started)|startup|starting container",str(payload),re.I):
-                  found.append({"timestamp":entry.get("timestamp"),"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":str(payload)[:600]})
+              payload=entry.get("textPayload") or entry.get("jsonPayload") or entry.get("protoPayload") or ""
+              payload_text=json.dumps(payload,sort_keys=True,default=str) if not isinstance(payload,str) else payload
+              if re.search(r"instance|container|startup|revision|restart|autoscal",payload_text,re.I):
+                  found.append({"timestamp":entry.get("timestamp"),"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:600]})
           print("INSTANCE_STARTUP_EVENTS_2026_11_10_1411_IST="+json.dumps(found[:40],sort_keys=True))
           print("INSTANCE_STARTUP_LOG_ROWS="+str(len(logs) if isinstance(logs,list) else 0))
           PY
-
-      - name: Grant workflow identity access to Cloud Run OAuth secret
-        shell: bash
-        run: |
-          set -euo pipefail
-          WORKFLOW_SA="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
-          [[ "$WORKFLOW_SA" == *@*.iam.gserviceaccount.com ]] || {
-            echo "ERROR=workflow_auth_identity_is_not_a_service_account"
-            exit 1
-          }
-          echo "WORKFLOW_SERVICE_ACCOUNT=$WORKFLOW_SA"
-          gcloud secrets add-iam-policy-binding google-oauth-token-json \
-            --project=indian-market-trading \
-            --member="serviceAccount:$WORKFLOW_SA" \
-            --role="roles/secretmanager.secretAccessor" \
-            --quiet
 
       - name: Load Drive credential from Secret Manager
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          gcloud secrets versions access latest \
+          WORKFLOW_SA="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          echo "WORKFLOW_SERVICE_ACCOUNT=$WORKFLOW_SA"
+          if ! gcloud secrets versions access latest \
             --project=indian-market-trading \
             --secret=google-oauth-token-json \
-            > "$RUNNER_TEMP/drive_token.json"
+            > "$RUNNER_TEMP/drive_token.json"; then
+            rm -f "$RUNNER_TEMP/drive_token.json"
+            echo "ERROR=secret_accessor_role_required"
+            echo "Grant roles/secretmanager.secretAccessor on google-oauth-token-json to serviceAccount:$WORKFLOW_SA"
+            exit 1
+          fi
           test -s "$RUNNER_TEMP/drive_token.json"
           echo "GOOGLE_OAUTH_TOKEN_FILE=$RUNNER_TEMP/drive_token.json" >> "$GITHUB_ENV"
       - name: Read-only Drive checkpoint and worker audit
