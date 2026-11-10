@@ -104,5 +104,32 @@ jobs:
               print("RECENT_BACKFILL_EVENT=" + json.dumps(item, sort_keys=True, default=str))
           PY
 
+
+      - name: Read Google Drive OAuth and write-readiness diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/healthz")"
+          echo "DRIVE_HEALTH_HTTP=$CODE"
+          python - "$RESPONSE" "$CODE" <<'PY'
+          import json, sys
+          path, code = sys.argv[1:]
+          if code != "200":
+              raise SystemExit("Cloud Run health endpoint returned HTTP " + code)
+          body=json.load(open(path, encoding="utf-8"))
+          print("DRIVE_PREFLIGHT_DIAGNOSTIC=" + json.dumps({
+              "status": body.get("status"),
+              "drive_preflight_status": body.get("drive_preflight_status"),
+              "drive_preflight": body.get("drive_preflight"),
+              "last_error": body.get("last_error"),
+          }, sort_keys=True, default=str))
+          PY
+
 # Read-only status probe trigger: 2026-11-07 after Drive showed no new checkpoint files.
 # Read-only live status refresh requested 2026-11-10; do not restart worker.
