@@ -18,6 +18,9 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
     total_oi_rows = 0
     total_duplicates = 0
     total_invalid_ohlc = 0
+    total_invalid_oi = 0
+    total_non_monotonic = 0
+    total_out_of_session = 0
     missing_oi_symbols = []
     for path in files:
         symbol = path.parent.name.removeprefix("symbol=")
@@ -40,7 +43,12 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
         quality_frame = frame.loc[timestamps.notna(), ["timestamp"]].copy()
         quality = session_quality(quality_frame)
         has_oi = "oi" in frame.columns
-        oi_rows = int(pd.to_numeric(frame["oi"], errors="coerce").notna().sum()) if has_oi else 0
+        oi_numeric = pd.to_numeric(frame["oi"], errors="coerce") if has_oi else pd.Series(dtype="float64")
+        oi_rows = int(oi_numeric.notna().sum()) if has_oi else 0
+        invalid_oi = int((oi_numeric.notna() & oi_numeric.lt(0)).sum()) if has_oi else 0
+        non_monotonic = int((timestamps.diff().dropna() < pd.Timedelta(0)).sum())
+        local_clock = timestamps.dt.tz_convert("Asia/Kolkata").dt.strftime("%H:%M")
+        out_of_session = int((~local_clock.between("09:20", "15:30")).sum())
         if not has_oi:
             missing_oi_symbols.append(symbol)
         row_count = len(frame)
@@ -48,6 +56,9 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
         total_oi_rows += oi_rows
         total_duplicates += duplicates
         total_invalid_ohlc += invalid
+        total_invalid_oi += invalid_oi
+        total_non_monotonic += non_monotonic
+        total_out_of_session += out_of_session
         symbols.append({
             "symbol": symbol,
             "rows_5m": row_count,
@@ -57,6 +68,9 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
             "oi_non_null_pct": round(100 * oi_rows / row_count, 2) if row_count else 0.0,
             "duplicate_timestamp_rows": duplicates,
             "invalid_rows": invalid,
+            "negative_oi_rows": invalid_oi,
+            "non_monotonic_timestamp_rows": non_monotonic,
+            "out_of_session_rows": out_of_session,
         })
 
     canonical_symbols = set()
@@ -83,17 +97,27 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
         "oi_non_null_pct": round(100 * total_oi_rows / total_rows, 2) if total_rows else 0.0,
         "duplicate_timestamp_rows": total_duplicates,
         "invalid_rows": total_invalid_ohlc,
+        "negative_oi_rows": total_invalid_oi,
+        "non_monotonic_timestamp_rows": total_non_monotonic,
+        "out_of_session_rows": total_out_of_session,
         "canonical_symbol_overlap_count": len(overlap) if overlap is not None else None,
         "canonical_symbol_overlap": overlap,
-        "canonical_comparison": "performed" if canonical_root else "not_run_no_archive_mount",
+        "canonical_comparison": "performed" if canonical_root else "BLOCKED_NO_READ_ONLY_ARCHIVE_MOUNT",
         "symbols": symbols,
+        "merge_readiness": {
+            "ready": bool(canonical_root) and bool(files) and not missing_oi_symbols and total_duplicates == 0 and total_invalid_ohlc == 0 and total_invalid_oi == 0 and total_non_monotonic == 0 and total_out_of_session == 0,
+            "blocked_reasons": ([] if canonical_root else ["canonical_archive_read_only_comparison_not_run"]),
+        },
         "quality_gate": {
-            "passed": bool(files) and not missing_oi_symbols and total_duplicates == 0 and total_invalid_ohlc == 0,
+            "passed": bool(files) and not missing_oi_symbols and total_duplicates == 0 and total_invalid_ohlc == 0 and total_invalid_oi == 0 and total_non_monotonic == 0 and total_out_of_session == 0,
             "checks": {
                 "parquet_files_present": bool(files),
                 "oi_column_present_for_every_symbol": not missing_oi_symbols,
                 "no_duplicate_timestamps": total_duplicates == 0,
                 "no_invalid_ohlcv_rows": total_invalid_ohlc == 0,
+                "no_negative_oi": total_invalid_oi == 0,
+                "timestamps_monotonic_per_symbol": total_non_monotonic == 0,
+                "all_bars_within_regular_session": total_out_of_session == 0,
             },
         },
     }
