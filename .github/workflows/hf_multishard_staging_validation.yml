@@ -1,0 +1,63 @@
+name: Hugging Face multi-shard staging validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_shards:
+        description: "Number of source shards to process (bounded staging run)"
+        required: true
+        type: choice
+        options:
+          - "2"
+          - "3"
+          - "5"
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-multishard-staging-validation
+  cancel-in-progress: false
+
+jobs:
+  staging-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install importer dependencies
+        run: python -m pip install --upgrade pip pandas pyarrow requests
+
+      - name: Process bounded source-shard sample into isolated staging
+        run: |
+          python hf_historical_seed.py \
+            --max-shards "${{ inputs.max_shards }}" \
+            --min-sessions 200 \
+            --max-sessions 500 \
+            --output ./hf_multishard_staging
+
+      - name: Audit staged Parquet quality, OI and duplicate timestamps
+        if: always()
+        run: |
+          python hf_staging_quality_audit.py \
+            --staging-root ./hf_multishard_staging \
+            --output ./hf_multishard_quality_audit.json
+
+      - name: Upload isolated staging data and audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-multishard-staging-validation
+          path: |
+            hf_multishard_staging/
+            hf_multishard_quality_audit.json
+          if-no-files-found: warn
+          retention-days: 7
