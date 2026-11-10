@@ -35,9 +35,9 @@ jobs:
             -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/backfillz" \
             > "$RUNNER_TEMP/backfill_state.json"
           gcloud logging read \
-            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
-            --project=indian-market-trading --limit=500 --order=asc --format=json \
-            > "$RUNNER_TEMP/cloud_run_startup_logs.json" || echo "STARTUP_LOG_QUERY=FAILED"
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND resource.labels.revision_name="indian-market-intraday-worker-00106-lor" AND timestamp >= "2026-11-10T07:00:00Z" AND timestamp <= "2026-11-10T09:30:00Z"' \
+            --project=indian-market-trading --limit=5000 --order=asc --format=json \
+            > "$RUNNER_TEMP/cloud_run_startup_logs.json" || echo "LIFECYCLE_LOG_QUERY=FAILED"
           python - "$RUNNER_TEMP/cloud_run_service.json" "$RUNNER_TEMP/cloud_run_startup_logs.json" <<'PY'
           import json, re, sys
           from pathlib import Path
@@ -98,12 +98,20 @@ jobs:
           except Exception:
               logs=[]
           found=[]
+          by_instance={}
           for entry in logs if isinstance(logs,list) else []:
               payload=entry.get("textPayload") or entry.get("jsonPayload") or entry.get("protoPayload") or ""
               payload_text=json.dumps(payload,sort_keys=True,default=str) if not isinstance(payload,str) else payload
-              if re.search(r"cloud_run_worker_api_(started|stopped)|indstocks_5m_backfill_(started|finished|failed|retry_scheduled)|instance|restart|autoscal",payload_text,re.I):
-                  found.append({"timestamp":entry.get("timestamp"),"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:600]})
-          print("WORKER_LIFECYCLE_AND_BACKFILL_EVENTS_2026_11_10_1405_TO_1420_IST="+json.dumps(found[:80],sort_keys=True))
+              labels=entry.get("labels") or {}
+              instance=labels.get("instanceId") or labels.get("instance_id") or "INSTANCE_ID_NOT_EXPOSED"
+              event_match=bool(re.search(r"SYMBOL_PARQUET_PERSISTED|CHECKPOINT.*PERSIST|BACKFILL.*(START|FINISH|COMPLETE|FAIL|ERROR)|indstocks_5m_backfill_(started|finished|failed|retry_scheduled)|cloud_run_worker_api_(started|stopped)|Traceback|Exception|ERROR",payload_text,re.I))
+              if event_match:
+                  item={"timestamp":entry.get("timestamp"),"instance_id":instance,"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:1200]}
+                  found.append(item)
+                  by_instance.setdefault(instance,[]).append(item)
+          summary={k:{"matching_events":len(v),"first":v[0].get("timestamp"),"last":v[-1].get("timestamp"),"persisted_symbol_events":sum(bool(re.search(r"SYMBOL_PARQUET_PERSISTED",x["message"],re.I)) for x in v),"start_finish_error_events":sum(bool(re.search(r"BACKFILL.*(START|FINISH|COMPLETE|FAIL|ERROR)|started|finished|failed|Traceback|Exception",x["message"],re.I)) for x in v)} for k,v in by_instance.items()}
+          print("WORKER_LIFECYCLE_AND_PERSISTENCE_EVENTS_2026_11_10_1230_TO_1500_IST="+json.dumps(found[:300],sort_keys=True))
+          print("EVENT_COUNTS_BY_INSTANCE_ID="+json.dumps(summary,sort_keys=True))
           print("CLOUD_RUN_LOG_ROWS_IN_WINDOW="+str(len(logs) if isinstance(logs,list) else 0))
           PY
 
