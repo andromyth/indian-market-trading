@@ -104,15 +104,15 @@ jobs:
               payload_text=json.dumps(payload,sort_keys=True,default=str) if not isinstance(payload,str) else payload
               labels=entry.get("labels") or {}
               instance=labels.get("instanceId") or labels.get("instance_id") or "INSTANCE_ID_NOT_EXPOSED"
-              event_match=bool(re.search(r"SYMBOL_PARQUET_PERSISTED|CHECKPOINT.*PERSIST|BACKFILL.*(START|FINISH|COMPLETE|FAIL|ERROR)|indstocks_5m_backfill_(started|finished|failed|retry_scheduled)|cloud_run_worker_api_(started|stopped)|Traceback|Exception|ERROR",payload_text,re.I))
+              event_match=bool(re.search(r"SYMBOL_PARQUET_PERSISTED|CHECKPOINT.*PERSIST|BACKFILL.*(START|FINISH|COMPLETE|FAIL|ERROR)|indstocks_5m_backfill_(started|finished|failed|retry_scheduled)|cloud_run_worker_api_(started|stopped)|Traceback|Exception|ERROR|invalid_grant|RefreshError|upload.{0,30}(fail|error)|(?:fail|error).{0,30}upload|httpRequest|requestMethod|/backfill|OOM|out.of.memory|memory limit|container.*(terminate|exit|stop)|Killing|terminated",payload_text,re.I))
               if event_match:
-                  item={"timestamp":entry.get("timestamp"),"instance_id":instance,"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:1200]}
+                  item={"timestamp":entry.get("timestamp"),"instance_id":instance,"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:3000]}
                   found.append(item)
                   by_instance.setdefault(instance,[]).append(item)
           summary={k:{"matching_events":len(v),"first":v[0].get("timestamp"),"last":v[-1].get("timestamp"),"persisted_symbol_events":sum(bool(re.search(r"SYMBOL_PARQUET_PERSISTED",x["message"],re.I)) for x in v),"start_finish_error_events":sum(bool(re.search(r"BACKFILL.*(START|FINISH|COMPLETE|FAIL|ERROR)|started|finished|failed|Traceback|Exception",x["message"],re.I)) for x in v)} for k,v in by_instance.items()}
-          print("WORKER_LIFECYCLE_AND_PERSISTENCE_EVENTS_2026_11_10_1230_TO_1500_IST="+json.dumps(found[:300],sort_keys=True))
+          print("WORKER_LIFECYCLE_REQUEST_AUTH_AND_FAILURE_EVENTS_2026_11_10_1100_IST_TO_NOW="+json.dumps(found[:300],sort_keys=True))
           print("EVENT_COUNTS_BY_INSTANCE_ID="+json.dumps(summary,sort_keys=True))
-          print("CLOUD_RUN_LOG_ROWS_IN_WINDOW="+str(len(logs) if isinstance(logs,list) else 0))
+          print("CLOUD_RUN_LOG_ROWS_SINCE_1100_IST="+str(len(logs) if isinstance(logs,list) else 0))
           PY
 
       - name: Load Drive credential from Secret Manager
