@@ -146,3 +146,4 @@ jobs:
 # Read-only live status refresh requested 2026-11-10; do not restart worker.
 
 # Read-only preflight refresh requested 2026-11-10 after OAuth credential update.
+# Read-only preflight refresh after user confirmed Google Drive secret update.
