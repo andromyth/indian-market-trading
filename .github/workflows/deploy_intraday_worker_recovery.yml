@@ -418,3 +418,4 @@ jobs:
             exit 1
           fi
           fi
+# Refresh secret-backed Cloud Run revision after Google Drive OAuth secret update.
