@@ -39,3 +39,24 @@ def test_audit_fails_when_oi_is_missing(tmp_path):
     report = audit_staging(tmp_path)
     assert report["oi_column_missing_symbols"] == ["SBIN"]
     assert not report["quality_gate"]["passed"]
+
+
+
+def test_audit_fails_negative_oi_and_non_monotonic_timestamps(tmp_path):
+    frame = pd.DataFrame({
+        "timestamp": [
+            pd.Timestamp("2026-11-09 03:55:00+00:00"),
+            pd.Timestamp("2026-11-09 03:50:00+00:00"),
+        ],
+        "open": [100.0, 100.0], "high": [101.0, 101.0],
+        "low": [99.0, 99.0], "close": [100.5, 100.5],
+        "volume": [10, 10], "oi": [500, -1],
+    })
+    path = tmp_path / "symbol=SBIN" / "SBIN.parquet"
+    path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pandas(frame, preserve_index=False), path)
+
+    report = audit_staging(tmp_path)
+    assert report["negative_oi_rows"] == 1
+    assert report["non_monotonic_timestamp_rows"] == 1
+    assert not report["quality_gate"]["passed"]
