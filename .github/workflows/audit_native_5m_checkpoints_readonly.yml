@@ -167,8 +167,20 @@ jobs:
 
           token_path=Path(os.environ["GOOGLE_OAUTH_TOKEN_FILE"])
           info=json.loads(token_path.read_text(encoding="utf-8"))
-          creds=Credentials.from_authorized_user_info(info,scopes=["https://www.googleapis.com/auth/drive.readonly"])
+          # Do not request a new scope during refresh: Google refresh tokens are
+          # restricted to the scopes originally granted during user consent.
+          # Refresh with the token's existing grant, then verify Drive access.
+          creds=Credentials.from_authorized_user_info(info)
           if not creds.valid: creds.refresh(Request())
+          granted=set(creds.granted_scopes or [])
+          drive_scopes={
+              "https://www.googleapis.com/auth/drive",
+              "https://www.googleapis.com/auth/drive.readonly",
+              "https://www.googleapis.com/auth/drive.metadata.readonly",
+          }
+          print("DRIVE_OAUTH_GRANTED_SCOPES="+json.dumps(sorted(s for s in granted if "drive" in s)))
+          if granted and not (granted & drive_scopes):
+              raise RuntimeError("OAuth token has no usable Google Drive scope; reauthorize Drive access")
           drive=build("drive","v3",credentials=creds,cache_discovery=False)
 
           def children(parent,name=None):
