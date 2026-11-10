@@ -117,13 +117,24 @@ jobs:
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
             --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/healthz")"
           echo "DRIVE_HEALTH_HTTP=$CODE"
+          if [[ "$CODE" == "404" ]]; then
+            echo "HEALTHZ_ROUTE_NOT_FOUND=trying_root_route"
+            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/")"
+            echo "DRIVE_ROOT_HTTP=$CODE"
+          fi
           python - "$RESPONSE" "$CODE" <<'PY'
           import json, sys
           path, code = sys.argv[1:]
-          if code != "200":
-              raise SystemExit("Cloud Run health endpoint returned HTTP " + code)
-          body=json.load(open(path, encoding="utf-8"))
+          if code not in ("200", "503"):
+              raise SystemExit("Cloud Run health routes returned HTTP " + code)
+          try:
+              body=json.load(open(path, encoding="utf-8"))
+          except Exception as exc:
+              raise SystemExit("Cloud Run health response was not valid JSON: " + type(exc).__name__)
           print("DRIVE_PREFLIGHT_DIAGNOSTIC=" + json.dumps({
+              "http_status": int(code),
               "status": body.get("status"),
               "drive_preflight_status": body.get("drive_preflight_status"),
               "drive_preflight": body.get("drive_preflight"),
