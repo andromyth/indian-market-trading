@@ -132,3 +132,4 @@ jobs:
           else: print("GLOBAL_MANIFEST=NOT_FOUND")
           print("AUDIT_MODE=READ_ONLY_NO_DRIVE_WRITES_NO_BACKFILL_RESTART")
           PY
+# Manual read-only reconciliation refresh: inspect checkpoint inventory and live worker state; no writes or restart.
