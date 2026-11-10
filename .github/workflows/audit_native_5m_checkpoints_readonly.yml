@@ -29,9 +29,14 @@ jobs:
           gcloud run services describe indian-market-intraday-worker \
             --project=indian-market-trading --region=asia-south1 --format=json \
             > "$RUNNER_TEMP/cloud_run_service.json"
+          SERVICE_URL="$(gcloud run services describe indian-market-intraday-worker --project=indian-market-trading --region=asia-south1 --format='value(status.url)')"
+          ID_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 25 \
+            -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/backfillz" \
+            > "$RUNNER_TEMP/backfill_state.json"
           gcloud logging read \
-            'logName="projects/indian-market-trading/logs/run.googleapis.com%2Fvarlog%2Fsystem" AND resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
-            --project=indian-market-trading --limit=200 --order=asc --format=json \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "2026-11-10T08:35:00Z" AND timestamp <= "2026-11-10T08:50:00Z"' \
+            --project=indian-market-trading --limit=500 --order=asc --format=json \
             > "$RUNNER_TEMP/cloud_run_startup_logs.json" || echo "STARTUP_LOG_QUERY=FAILED"
           python - "$RUNNER_TEMP/cloud_run_service.json" "$RUNNER_TEMP/cloud_run_startup_logs.json" <<'PY'
           import json, re, sys
@@ -56,7 +61,7 @@ jobs:
                   value_from=item.get("valueFrom") or {}
                   secret_ref=value_from.get("secretKeyRef") or item.get("valueSource",{}).get("secretKeyRef")
                   if secret_ref:
-                      path_env[name]={"secret":secret_ref.get("secret"),"version":secret_ref.get("version")}
+                      path_env[name]={"secret_reference":secret_ref}
                   elif re.search(r"(ROOT|PATH|WORK|CHECKPOINT|BACKFILL|CACHE|TMP)",name,re.I):
                       value=item.get("value")
                       if value is not None:
@@ -79,6 +84,15 @@ jobs:
             "volumes":volumes
           }
           print("CLOUD_RUN_DURABILITY_CONFIG="+json.dumps(result,sort_keys=True,default=str))
+          status=json.loads(Path(sys.argv[2].replace("cloud_run_startup_logs.json","backfill_state.json")).read_text(encoding="utf-8"))
+          backfill=status.get("five_minute_backfill") or {}
+          progress=backfill.get("progress") or {}
+          print("CURRENT_BACKFILL_STATE="+json.dumps({
+            "status":backfill.get("status"),"started_at_utc":backfill.get("started_at_utc"),
+            "updated_at_utc":backfill.get("updated_at_utc"),"worker_thread_alive":backfill.get("worker_thread_alive"),
+            "progress":{k:progress.get(k) for k in ("stage","batch","total_batches","completed_symbols","resolved_symbols","api_calls","api_calls_in_batch","window_key","window_end","checkpoint_source")},
+            "counters":backfill.get("counters"),"error":backfill.get("error")
+          },sort_keys=True,default=str))
           try:
               logs=json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
           except Exception:
@@ -87,10 +101,10 @@ jobs:
           for entry in logs if isinstance(logs,list) else []:
               payload=entry.get("textPayload") or entry.get("jsonPayload") or entry.get("protoPayload") or ""
               payload_text=json.dumps(payload,sort_keys=True,default=str) if not isinstance(payload,str) else payload
-              if re.search(r"instance|container|startup|revision|restart|autoscal",payload_text,re.I):
+              if re.search(r"cloud_run_worker_api_(started|stopped)|indstocks_5m_backfill_(started|finished|failed|retry_scheduled)|instance|restart|autoscal",payload_text,re.I):
                   found.append({"timestamp":entry.get("timestamp"),"revision":(entry.get("resource") or {}).get("labels",{}).get("revision_name"),"logName":entry.get("logName"),"message":payload_text[:600]})
-          print("INSTANCE_STARTUP_EVENTS_2026_11_10_1411_IST="+json.dumps(found[:40],sort_keys=True))
-          print("INSTANCE_STARTUP_LOG_ROWS="+str(len(logs) if isinstance(logs,list) else 0))
+          print("WORKER_LIFECYCLE_AND_BACKFILL_EVENTS_2026_11_10_1405_TO_1420_IST="+json.dumps(found[:80],sort_keys=True))
+          print("CLOUD_RUN_LOG_ROWS_IN_WINDOW="+str(len(logs) if isinstance(logs,list) else 0))
           PY
 
       - name: Load Drive credential from Secret Manager
