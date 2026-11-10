@@ -47,6 +47,8 @@ def download_shard(repo: str, item: dict, path: Path, session: requests.Session)
 def five_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
     """Aggregate complete 5-minute buckets; discard buckets missing any source minute."""
     empty_cols = ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+    if "oi" in frame.columns:
+        empty_cols.append("oi")
     if frame.empty:
         return pd.DataFrame(columns=empty_cols)
     x = frame.copy()
@@ -56,8 +58,9 @@ def five_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing source columns: {sorted(missing)}")
     x["symbol"] = x["symbol"].astype(str).str.strip().str.upper()
     x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST)
-    for c in ("open", "high", "low", "close", "volume"):
-        x[c] = pd.to_numeric(x[c], errors="coerce")
+    for c in ("open", "high", "low", "close", "volume", "oi"):
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
     x = x.dropna(subset=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
     x = x.loc[x["symbol"].ne("") & x["symbol"].ne("NAN")]
     clock = x["timestamp"].dt.strftime("%H:%M")
@@ -65,9 +68,15 @@ def five_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
     x = x.drop_duplicates(["symbol", "timestamp"], keep="last")
     x["_session"] = x["timestamp"].dt.date
     x["_bucket"] = x["timestamp"].dt.floor("5min")
+    aggregations = {
+        "open": ("open", "first"), "high": ("high", "max"),
+        "low": ("low", "min"), "close": ("close", "last"),
+        "volume": ("volume", "sum"), "minutes": ("timestamp", "nunique"),
+    }
+    if "oi" in x.columns:
+        aggregations["oi"] = ("oi", "last")
     bars = x.groupby(["symbol", "_session", "_bucket"], sort=True, observed=True).agg(
-        open=("open", "first"), high=("high", "max"), low=("low", "min"),
-        close=("close", "last"), volume=("volume", "sum"), minutes=("timestamp", "nunique")
+        **aggregations
     ).reset_index()
     bars = bars.loc[bars["minutes"].eq(5)].copy()
     bars["timestamp"] = bars.pop("_bucket") + pd.Timedelta(minutes=5)
@@ -80,10 +89,30 @@ def five_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
     bars["timestamp"] = bars["timestamp"].dt.tz_convert("UTC")
     return bars.reset_index(drop=True)
 
-def usable_sessions(frame: pd.DataFrame) -> int:
+def session_quality(frame: pd.DataFrame) -> dict:
+    """Count regular sessions only when all 75 right-labelled bars are present."""
     if frame.empty:
-        return 0
-    return int(pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert(IST).dt.date.nunique())
+        return {"complete_sessions": 0, "partial_sessions": 0,
+                "first_session": None, "last_session": None}
+    local = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce").dt.tz_convert(IST).dropna()
+    if local.empty:
+        return {"complete_sessions": 0, "partial_sessions": 0,
+                "first_session": None, "last_session": None}
+    expected = set(pd.date_range("09:20", "15:30", freq="5min").strftime("%H:%M"))
+    complete = 0
+    for _, values in local.groupby(local.dt.date):
+        labels = set(values.dt.strftime("%H:%M"))
+        if labels == expected and len(values) == 75:
+            complete += 1
+    total = local.dt.date.nunique()
+    return {"complete_sessions": complete, "partial_sessions": int(total - complete),
+            "first_session": local.dt.date.min().isoformat(),
+            "last_session": local.dt.date.max().isoformat()}
+
+
+def usable_sessions(frame: pd.DataFrame) -> int:
+    """Backward-compatible name; counts complete regular sessions only."""
+    return session_quality(frame)["complete_sessions"]
 
 def process_shard(path: Path, out: Path, min_sessions: int, max_sessions: int) -> list[dict]:
     parquet = pq.ParquetFile(path)
@@ -138,8 +167,10 @@ def process_shard(path: Path, out: Path, min_sessions: int, max_sessions: int) -
         target = out / ".shard_outputs" / path.stem / f"symbol={symbol}" / f"{symbol}.parquet"
         target.parent.mkdir(parents=True, exist_ok=True)
         combined.to_parquet(target, index=False, compression="snappy")
-        sessions = usable_sessions(combined)
-        summaries.append({"symbol": symbol, "rows_5m": len(combined), "usable_sessions": sessions,
+        quality = session_quality(combined)
+        sessions = quality["complete_sessions"]
+        summaries.append({"symbol": symbol, "rows_5m": len(combined),
+                          "usable_sessions": sessions, **quality,
                           "meets_minimum": sessions >= min_sessions, "path": str(target)})
         for p in files:
             p.unlink(missing_ok=True)
@@ -188,8 +219,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     merged = pd.read_parquet(source_path)
                 merged.to_parquet(target_path, index=False, compression="snappy")
-                sessions = usable_sessions(merged)
-                row.update(path=str(target_path), rows_5m=len(merged), usable_sessions=sessions,
+                quality = session_quality(merged)
+                sessions = quality["complete_sessions"]
+                row.update(path=str(target_path), rows_5m=len(merged),
+                           usable_sessions=sessions, **quality,
                            meets_minimum=sessions >= args.min_sessions)
                 symbols[row["symbol"]] = row
             print(f"[{i}/{len(shards)}] {item['path']} symbols_written={len(symbols)}", flush=True)
