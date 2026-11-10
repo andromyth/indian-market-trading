@@ -104,6 +104,10 @@ def audit_staging(root: Path, canonical_root: Path | None = None) -> dict:
         "canonical_symbol_overlap": overlap,
         "canonical_comparison": "performed" if canonical_root else "BLOCKED_NO_READ_ONLY_ARCHIVE_MOUNT",
         "symbols": symbols,
+        "merge_readiness": {
+            "ready": bool(canonical_root) and bool(files) and not missing_oi_symbols and total_duplicates == 0 and total_invalid_ohlc == 0 and total_invalid_oi == 0 and total_non_monotonic == 0 and total_out_of_session == 0,
+            "blocked_reasons": ([] if canonical_root else ["canonical_archive_read_only_comparison_not_run"]),
+        },
         "quality_gate": {
             "passed": bool(files) and not missing_oi_symbols and total_duplicates == 0 and total_invalid_ohlc == 0 and total_invalid_oi == 0 and total_non_monotonic == 0 and total_out_of_session == 0,
             "checks": {
