@@ -208,6 +208,7 @@ jobs:
           tests/test_delivery_production_refresh.py
           tests/test_append_delivery_pit_snapshots_to_research_panel.py
           tests/test_delivery_factor_weightage.py
+          tests/test_hf_historical_seed.py
 
       - name: Run deployment smoke test
         run: python deployment_smoke_test.py
