@@ -135,7 +135,7 @@ def process_shard(path: Path, out: Path, min_sessions: int, max_sessions: int) -
         dates = combined["timestamp"].dt.tz_convert(IST).dt.date
         keep = sorted(dates.unique())[-max_sessions:]
         combined = combined.loc[dates.isin(keep)].copy()
-        target = out / f"symbol={symbol}" / f"{symbol}.parquet"
+        target = out / ".shard_outputs" / path.stem / f"symbol={symbol}" / f"{symbol}.parquet"
         target.parent.mkdir(parents=True, exist_ok=True)
         combined.to_parquet(target, index=False, compression="snappy")
         sessions = usable_sessions(combined)
@@ -174,18 +174,23 @@ def main(argv: list[str] | None = None) -> int:
             if not local.exists() or local.stat().st_size == 0:
                 download_shard(args.repo, item, local, session)
             for row in process_shard(local, args.output, args.min_sessions, args.max_sessions):
+                source_path = Path(row["path"])
+                target_path = args.output / f"symbol={row['symbol']}" / f"{row['symbol']}.parquet"
+                target_path.parent.mkdir(parents=True, exist_ok=True)
                 old = symbols.get(row["symbol"])
                 if old:
                     old_path = Path(old["path"])
-                    new_path = Path(row["path"])
-                    merged = pd.concat([pd.read_parquet(old_path), pd.read_parquet(new_path)], ignore_index=True)
+                    merged = pd.concat([pd.read_parquet(old_path), pd.read_parquet(source_path)], ignore_index=True)
                     merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
                     merged = merged.dropna(subset=["timestamp"]).drop_duplicates("timestamp", keep="last").sort_values("timestamp")
                     dates = merged["timestamp"].dt.tz_convert(IST).dt.date
                     merged = merged.loc[dates.isin(sorted(dates.unique())[-args.max_sessions:])]
-                    merged.to_parquet(old_path, index=False, compression="snappy")
-                    sessions = usable_sessions(merged)
-                    row.update(rows_5m=len(merged), usable_sessions=sessions, meets_minimum=sessions >= args.min_sessions)
+                else:
+                    merged = pd.read_parquet(source_path)
+                merged.to_parquet(target_path, index=False, compression="snappy")
+                sessions = usable_sessions(merged)
+                row.update(path=str(target_path), rows_5m=len(merged), usable_sessions=sessions,
+                           meets_minimum=sessions >= args.min_sessions)
                 symbols[row["symbol"]] = row
             print(f"[{i}/{len(shards)}] {item['path']} symbols_written={len(symbols)}", flush=True)
             if not args.keep_downloads:
