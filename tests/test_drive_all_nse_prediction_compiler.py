@@ -289,3 +289,32 @@ def test_load_drive_history_retains_persisted_nifty_market_context(tmp_path, mon
     assert result["RELIANCE"].iloc[-1]["Close"] == 101.0
     assert result["__NIFTY50__"].iloc[-1]["Close"] == 24010.0
     assert str(result["__NIFTY50__"].index.tz) == "Asia/Kolkata"
+
+
+
+def test_prediction_already_stored_checks_per_slot_manifest(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    import drive_all_nse_prediction_compiler as compiler
+
+    minute = pd.Timestamp("2026-11-11 14:00:00", tz=IST)
+    requested = (
+        "production_data/all_nse_minute_predictions/"
+        "2026/11/11/manifest_20261111_1400.json"
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_find_remote",
+        lambda store, remote: {"id": "prediction"} if remote == requested else None,
+    )
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps({"status": "STORED"}), encoding="utf-8")
+
+    monkeypatch.setattr(compiler, "_download", download)
+
+    assert compiler._prediction_already_stored(SimpleNamespace(), minute) is True
+
+    monkeypatch.setattr(compiler, "_find_remote", lambda store, remote: None)
+    assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False
