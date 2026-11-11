@@ -22,8 +22,8 @@ QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 HISTORY_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
-MAX_CAPTURE_AGE_SECONDS = 600
-MAX_MINUTE_MANIFEST_CANDIDATES = 6
+MAX_CAPTURE_AGE_SECONDS = 6 * 60 * 60
+MAX_MINUTE_MANIFEST_CANDIDATES = 100
 
 
 def _find_remote(store, remote: str):
@@ -67,6 +67,23 @@ def _download(store, file_id: str, destination: Path) -> None:
         destination,
         operation="github_drive_prediction_input",
     )
+
+
+def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
+    remote = (
+        "production_data/all_nse_minute_predictions/"
+        f"{minute:%Y/%m/%d}/manifest_{minute:%Y%m%d_%H%M}.json"
+    )
+    item = _find_remote(store, remote)
+    if not item:
+        return False
+    local = Path("/tmp/drive_all_nse") / f"existing_prediction_{minute:%Y%m%d_%H%M}.json"
+    _download(store, item["id"], local)
+    try:
+        manifest = json.loads(local.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return str(manifest.get("status") or "").upper() == "STORED"
 
 
 def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
@@ -132,7 +149,9 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         except Exception as exc:
             skipped.append(f"{item.get('name')}: invalid manifest ({type(exc).__name__})")
 
-    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    # Recover the oldest unprocessed slot first. This makes each scheduled run
+    # drain missed intervals instead of repeatedly selecting the newest snapshot.
+    candidates.sort(key=lambda candidate: candidate[0])
     seen_minutes: set[pd.Timestamp] = set()
     for minute, manifest, item in candidates:
         if minute in seen_minutes:
@@ -145,6 +164,9 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
             continue
         if minute.date() != current.date() or age_seconds < 0 or age_seconds > MAX_CAPTURE_AGE_SECONDS:
             skipped.append(f"{item.get('name')}: stale_or_future age_seconds={round(age_seconds, 1)}")
+            continue
+        if _prediction_already_stored(store, minute):
+            skipped.append(f"{item.get('name')}: prediction already STORED")
             continue
 
         snapshot_remote = str(
@@ -209,7 +231,7 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         return manifest, quotes, minute
 
     raise RuntimeError(
-        "No fresh, durably stored current-session quote snapshot was found; "
+        "No unprocessed, durably stored current-session quote snapshot was found; "
         + "; ".join(skipped[-8:])
     )
 
@@ -309,8 +331,8 @@ def main() -> int:
     store = GoogleDriveStore()
     manifest, quotes, minute = _latest_capture(store)
     age_minutes = (now - minute).total_seconds() / 60.0
-    if age_minutes < -1 or age_minutes > 15:
-        raise RuntimeError(f"Latest quote snapshot is stale: age_minutes={age_minutes:.1f}")
+    if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
+        raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
     symbols = set(quotes["symbol"].astype(str).str.strip().str.upper())
     prediction_manifest_remote = (
         "production_data/all_nse_minute_predictions/"
