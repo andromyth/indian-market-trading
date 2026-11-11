@@ -702,6 +702,13 @@ def capture_all_universe_minute_snapshot(
         # the real collector result rather than dropping coverage statistics.
         manifest["quoted_symbol_count"] = int(frame["quote_status"].eq("PASS").sum())
         manifest["missing_quote_count"] = int(frame["quote_status"].ne("PASS").sum())
+        manifest["capture_data_status"] = (
+            "BLOCKED_PROVIDER_AUTH"
+            if provider_auth_circuit_open and manifest["quoted_symbol_count"] == 0
+            else "COMPLETE"
+            if manifest["quoted_symbol_count"] == manifest["expected_symbol_count"]
+            else "PARTIAL"
+        )
         manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
         manifest["row_count"] = int(len(frame))
         complete_coverage_pct = _snapshot_coverage_pct(

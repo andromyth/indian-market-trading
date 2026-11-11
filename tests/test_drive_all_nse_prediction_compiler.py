@@ -247,3 +247,45 @@ def test_latest_capture_skips_persisted_but_ineligible_snapshot_and_uses_prior_v
     assert minute == pd.Timestamp("2026-11-09 14:40:00", tz=IST)
     assert manifest["status"] == "STORED"
     assert quotes.iloc[0]["quote_status"] == "PASS"
+
+
+def test_load_drive_history_retains_persisted_nifty_market_context(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    import drive_all_nse_prediction_compiler as compiler
+
+    live_root = "production_data/nse_official/intraday_5m_live/2026/11/11"
+    source = tmp_path / "source_capture.parquet"
+    stamp = pd.Timestamp("2026-11-11 12:40:00", tz=IST)
+    pd.DataFrame({
+        "symbol": ["RELIANCE", "__NIFTY50__"],
+        "Timestamp": [stamp, stamp],
+        "Open": [100.0, 24000.0],
+        "High": [102.0, 24020.0],
+        "Low": [99.0, 23990.0],
+        "Close": [101.0, 24010.0],
+        "Volume": [1000.0, 50000.0],
+    }).to_parquet(source, index=False)
+
+    monkeypatch.setattr(
+        compiler, "_find_remote",
+        lambda store, remote: {"id": "live"} if remote == live_root else None,
+    )
+    monkeypatch.setattr(
+        compiler, "_list_children",
+        lambda store, parent: [{"id": "capture", "name": "capture_20261111_1240.parquet"}]
+        if parent == "live" else [],
+    )
+    def copy_capture(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    monkeypatch.setattr(compiler, "_download", copy_capture)
+
+    result = compiler._load_drive_history(
+        SimpleNamespace(), {"RELIANCE"}, stamp, tmp_path / "work", 120
+    )
+
+    assert set(result) == {"RELIANCE", "__NIFTY50__"}
+    assert result["RELIANCE"].iloc[-1]["Close"] == 101.0
+    assert result["__NIFTY50__"].iloc[-1]["Close"] == 24010.0
+    assert str(result["__NIFTY50__"].index.tz) == "Asia/Kolkata"

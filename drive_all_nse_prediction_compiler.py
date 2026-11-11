@@ -20,6 +20,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 HISTORY_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
+MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 MAX_CAPTURE_AGE_SECONDS = 600
 MAX_MINUTE_MANIFEST_CANDIDATES = 6
@@ -230,7 +231,7 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
             if folder.get("mimeType") != FOLDER_MIME or not name.startswith("symbol="):
                 continue
             symbol = name.split("=", 1)[1].strip().upper()
-            if symbol not in quote_symbols:
+            if symbol not in quote_symbols and symbol != MARKET_CONTEXT_SYMBOL:
                 continue
             files = _list_children(store, folder["id"])
             item = next(
@@ -276,7 +277,7 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
             if "symbol" not in raw.columns:
                 continue
             raw["symbol"] = raw["symbol"].astype(str).str.strip().str.upper()
-            raw = raw.loc[raw["symbol"].isin(quote_symbols)]
+            raw = raw.loc[raw["symbol"].isin(quote_symbols | {MARKET_CONTEXT_SYMBOL})]
             for symbol, group in raw.groupby("symbol"):
                 part_path = work / "live_parts" / f"{symbol}_{name}"
                 part_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,12 +336,19 @@ def main() -> int:
     history = _load_drive_history(
         store, symbols, minute, work, HISTORY_LOOKBACK_BARS
     )
-    # GitHub prediction is a strict Drive consumer. Missing persisted NIFTY
-    # context remains missing; the predictor must not refresh it from Yahoo.
-    market = pd.DataFrame(
-        columns=OHLCV,
-        index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+    # Cloud Run persists NIFTY benchmark history under the reserved symbol.
+    # Pass it separately; GitHub must never fetch a replacement from an API.
+    market = history.pop(
+        MARKET_CONTEXT_SYMBOL,
+        pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime")),
     )
+    market = market.loc[market.index <= minute].tail(HISTORY_LOOKBACK_BARS)
+    print(json.dumps({
+        "event": "DRIVE_MARKET_CONTEXT_LOADED",
+        "rows": int(len(market)),
+        "latest_candle_ist": market.index.max().isoformat() if not market.empty else None,
+        "source": "GOOGLE_DRIVE_PERSISTED_HISTORY" if not market.empty else "MISSING",
+    }, sort_keys=True), flush=True)
 
     predictor = AllNSEMinutePredictor(work)
     predictor._symbols = sorted(symbols)
