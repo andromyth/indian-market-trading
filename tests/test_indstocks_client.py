@@ -402,3 +402,56 @@ def test_shared_api_request_gate_waits_between_requests(monkeypatch):
     assert first_started == 10.0
     assert sleeps == [client.API_REQUEST_MIN_INTERVAL_SECONDS]
     assert client._API_REQUEST_LAST_STARTED >= first_started + client.API_REQUEST_MIN_INTERVAL_SECONDS
+
+
+def test_request_telemetry_reports_throttle_category_and_status_without_request_data(monkeypatch, capsys):
+    monkeypatch.setattr(client, "_wait_for_api_request_slot", lambda: (175.0, 220.0))
+    clock = iter([10.0, 10.034])
+    monkeypatch.setattr(client.time, "monotonic", lambda: next(clock))
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "2"}
+
+    monkeypatch.setattr(client.requests, "request", lambda *args, **kwargs: FakeResponse())
+    response = client._send_authenticated_request(
+        "GET",
+        "/market/quotes/full",
+        {"scrip-codes": "PRIVATE-SYMBOL-LIST"},
+        "must-not-appear-in-logs",
+    )
+
+    assert response.status_code == 429
+    output = capsys.readouterr().out
+    event = __import__("json").loads(output)
+    assert event["event"] == "indstocks_http_request"
+    assert event["endpoint_category"] == "market_quotes"
+    assert event["attempt"] == 1
+    assert event["throttle_wait_ms"] == 175.0
+    assert event["request_start_interval_ms"] == 220.0
+    assert event["duration_ms"] == 34.0
+    assert event["http_status"] == 429
+    assert event["retry_after"] == "2"
+    assert "PRIVATE-SYMBOL-LIST" not in output
+    assert "must-not-appear-in-logs" not in output
+
+
+def test_request_retry_telemetry_marks_second_attempt(monkeypatch, capsys):
+    monkeypatch.setattr(client, "_wait_for_api_request_slot", lambda: (0.0, 220.0))
+    monkeypatch.setattr(client.time, "monotonic", lambda: 20.0)
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+    monkeypatch.setattr(client.requests, "request", lambda *args, **kwargs: FakeResponse())
+    client._send_authenticated_request(
+        "GET", "/market/historical/5minute", None, "secret", attempt=2
+    )
+
+    import json
+    event = json.loads(capsys.readouterr().out)
+    assert event["endpoint_category"] == "market_historical"
+    assert event["attempt"] == 2
+    assert event["http_status"] == 200
+    assert "secret" not in json.dumps(event)
