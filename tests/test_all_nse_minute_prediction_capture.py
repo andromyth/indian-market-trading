@@ -168,30 +168,43 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     predictor._model_api = SimpleNamespace(
         FEATURES=["f1", "f2"],
         _latest_features=lambda price_df, market_df=None, fno=None, decision_timestamp=None: {
-            "f1": 1.0,
+            "f1": float(price_df["Close"].iloc[-1]),
             "f2": 0.5,
         },
     )
-    predictor._classifier = SimpleNamespace(
-        predict_proba=lambda frame: np.array([[0.2, 0.8]] * len(frame))
-    )
+    def predict_one(frame):
+        if float(frame.iloc[0]["f1"]) > 200:
+            raise ValueError("symbol-specific model failure")
+        return np.array([[0.2, 0.8]])
+    predictor._classifier = SimpleNamespace(predict_proba=predict_one)
     predictor._regressor = SimpleNamespace(
-        predict=lambda frame: np.array([0.01] * len(frame))
+        predict=lambda frame: np.array([0.01])
     )
     predictor._fetch_current_nifty_quote = lambda: pytest.fail("Drive-only inference must not call a live broker quote endpoint")
 
     snapshot_dir = tmp_path / "all_universe_minute_snapshots"
     snapshot_dir.mkdir(parents=True)
     quote_path = snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet"
-    pd.DataFrame([{
-        "symbol": "AAA",
-        "instrument_code": "NSE_1",
-        "cycle_minute_ist": minute.isoformat(),
-        "quote_status": "PASS",
-        "actual_observed_price": 101.25,
-        "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
-        "day_volume": 10000,
-    }]).to_parquet(quote_path, index=False)
+    pd.DataFrame([
+        {
+            "symbol": "AAA",
+            "instrument_code": "NSE_1",
+            "cycle_minute_ist": minute.isoformat(),
+            "quote_status": "PASS",
+            "actual_observed_price": 101.25,
+            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=2)).isoformat(),
+            "day_volume": 10000,
+        },
+        {
+            "symbol": "BBB",
+            "instrument_code": "NSE_2",
+            "cycle_minute_ist": minute.isoformat(),
+            "quote_status": "PASS",
+            "actual_observed_price": 202.25,
+            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=3)).isoformat(),
+            "day_volume": 20000,
+        },
+    ]).to_parquet(quote_path, index=False)
 
     class FakeDriveStore:
         def upload_or_update(self, local_path, remote_relative_path, mime_type="application/octet-stream"):
@@ -221,11 +234,22 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     )
 
     assert result["status"] == "STORED"
-    assert result["row_count"] == 1
+    assert result["row_count"] == 2
     assert result["expected_symbol_count"] == 3
-    assert result["eligible_symbol_count"] == 1
+    assert result["eligible_symbol_count"] == 2
     assert result["prediction_count"] == 1
-    assert result["prediction_status_counts"] == {"PREDICTED": 1}
+    assert result["prediction_status_counts"] == {
+        "PREDICTED": 1,
+        "MODEL_INFERENCE_ERROR": 1,
+    }
+    stored = pd.read_parquet(
+        tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" /
+        f"{minute:%m}" / f"{minute:%d}" /
+        f"predictions_{minute:%Y%m%d_%H%M}.parquet"
+    )
+    assert set(stored["symbol"]) == {"AAA", "BBB"}
+    assert stored.set_index("symbol").loc["AAA", "prediction_status"] == "PREDICTED"
+    assert stored.set_index("symbol").loc["BBB", "prediction_status"] == "MODEL_INFERENCE_ERROR"
     assert "quality_gate_pass" not in result
 
     written = pd.read_parquet(
