@@ -2051,8 +2051,7 @@ if interface_mode == "Live Test":
             st.stop()
         if not market_open:
             st.info("Market is closed. The latest persisted GitHub prediction remains available below when present.")
-        if auto_refresh and market_open:
-            @st.fragment(run_every="60s", key="selected_intraday_prediction_panel")
+        @st.fragment(run_every="60s" if auto_refresh and market_open else None, key="selected_intraday_prediction_panel")
             def _render_selected_intraday_panel():
                 snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
                 if snapshot.get("status") != "OK":
@@ -2125,12 +2124,7 @@ if interface_mode == "Live Test":
                 }
                 st.dataframe(pd.DataFrame([details]), width="stretch", hide_index=True)
                 st.caption("Prediction source: GitHub Actions → Google Drive. The displayed timestamp is the persisted five-minute prediction cycle.")
-            _render_selected_intraday_panel()
-        else:
-            snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
-            st.info("Auto-refresh is off. Enable it to refresh the persisted GitHub prediction record.")
-            if snapshot.get("status") == "OK":
-                st.caption(f"Latest stored cycle: {snapshot.get('cycle_minute_ist') or 'timestamp unavailable'}")
+        _render_selected_intraday_panel()
 
     st.caption(
         "Decision-support only · no orders are placed · the model may abstain when data or validation is inadequate."
