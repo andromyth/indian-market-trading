@@ -2052,79 +2052,79 @@ if interface_mode == "Live Test":
         if not market_open:
             st.info("Market is closed. The latest persisted GitHub prediction remains available below when present.")
         @st.fragment(run_every="60s" if auto_refresh and market_open else None, key="selected_intraday_prediction_panel")
-            def _render_selected_intraday_panel():
-                snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
-                if snapshot.get("status") != "OK":
-                    st.warning(
-                        "No persisted five-minute snapshot is available from GitHub/Drive: "
-                        + str(snapshot.get("reason") or snapshot.get("status"))
-                    )
-                    return
-                rows = snapshot.get("rows")
-                if not isinstance(rows, pd.DataFrame) or rows.empty:
-                    st.warning("The latest persisted snapshot contains no symbol rows.")
-                    return
-                symbol_rows = rows.loc[
-                    rows["symbol"].astype(str).str.upper().eq(selected_root.upper())
-                ]
-                if symbol_rows.empty:
-                    st.warning(f"{selected_root} is not present in the latest persisted five-minute snapshot.")
-                    return
-                row = symbol_rows.iloc[0]
-                cycle_value = snapshot.get("cycle_minute_ist")
-                cycle_ts = pd.to_datetime(cycle_value, errors="coerce")
-                if pd.isna(cycle_ts):
-                    st.warning("The GitHub prediction cycle timestamp is missing or invalid.")
-                    return
-                cycle_ts = cycle_ts.tz_localize("Asia/Kolkata") if cycle_ts.tzinfo is None else cycle_ts.tz_convert("Asia/Kolkata")
-                age_seconds = max(0.0, (pd.Timestamp.now(tz="Asia/Kolkata") - cycle_ts).total_seconds())
-                prediction_manifest = snapshot.get("prediction_manifest") or {}
-                prediction_ready = (
-                    snapshot.get("prediction_file_stored") is True
-                    and str(prediction_manifest.get("status") or "").upper() == "STORED"
-                    and bool(row.get("prediction_stored"))
-                    and str(row.get("prediction_snapshot_link_status") or "") == "MATCHED_TO_SNAPSHOT_QUOTE"
+        def _render_selected_intraday_panel():
+            snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
+            if snapshot.get("status") != "OK":
+                st.warning(
+                    "No persisted five-minute snapshot is available from GitHub/Drive: "
+                    + str(snapshot.get("reason") or snapshot.get("status"))
                 )
-                st.caption(
-                    f"GitHub prediction cycle: {cycle_ts.strftime('%d %b %Y %H:%M:%S')} IST · "
-                    f"age: {age_seconds / 60:.1f} min · source: Google Drive"
+                return
+            rows = snapshot.get("rows")
+            if not isinstance(rows, pd.DataFrame) or rows.empty:
+                st.warning("The latest persisted snapshot contains no symbol rows.")
+                return
+            symbol_rows = rows.loc[
+                rows["symbol"].astype(str).str.upper().eq(selected_root.upper())
+            ]
+            if symbol_rows.empty:
+                st.warning(f"{selected_root} is not present in the latest persisted five-minute snapshot.")
+                return
+            row = symbol_rows.iloc[0]
+            cycle_value = snapshot.get("cycle_minute_ist")
+            cycle_ts = pd.to_datetime(cycle_value, errors="coerce")
+            if pd.isna(cycle_ts):
+                st.warning("The GitHub prediction cycle timestamp is missing or invalid.")
+                return
+            cycle_ts = cycle_ts.tz_localize("Asia/Kolkata") if cycle_ts.tzinfo is None else cycle_ts.tz_convert("Asia/Kolkata")
+            age_seconds = max(0.0, (pd.Timestamp.now(tz="Asia/Kolkata") - cycle_ts).total_seconds())
+            prediction_manifest = snapshot.get("prediction_manifest") or {}
+            prediction_ready = (
+                snapshot.get("prediction_file_stored") is True
+                and str(prediction_manifest.get("status") or "").upper() == "STORED"
+                and bool(row.get("prediction_stored"))
+                and str(row.get("prediction_snapshot_link_status") or "") == "MATCHED_TO_SNAPSHOT_QUOTE"
+            )
+            st.caption(
+                f"GitHub prediction cycle: {cycle_ts.strftime('%d %b %Y %H:%M:%S')} IST · "
+                f"age: {age_seconds / 60:.1f} min · source: Google Drive"
+            )
+            if age_seconds > 10 * 60:
+                st.warning("This GitHub prediction cycle is stale (older than 10 minutes). No local inference fallback is used.")
+                return
+            if not prediction_ready:
+                st.warning(
+                    "A matching, successfully persisted GitHub prediction is not available for this symbol and snapshot. "
+                    "No local inference fallback is used."
                 )
-                if age_seconds > 10 * 60:
-                    st.warning("This GitHub prediction cycle is stale (older than 10 minutes). No local inference fallback is used.")
-                    return
-                if not prediction_ready:
-                    st.warning(
-                        "A matching, successfully persisted GitHub prediction is not available for this symbol and snapshot. "
-                        "No local inference fallback is used."
-                    )
-                    return
-                signal = str(row.get("signal") or "HOLD").upper()
-                probability = pd.to_numeric(row.get("probability_up_30m"), errors="coerce")
-                expected_return = pd.to_numeric(row.get("expected_return_30m"), errors="coerce")
-                reference_price = pd.to_numeric(row.get("actual_market_value"), errors="coerce")
-                predicted_price = (
-                    float(reference_price) * (1.0 + float(expected_return))
-                    if pd.notna(reference_price) and pd.notna(expected_return) else np.nan
-                )
-                p1, p2, p3, p4 = st.columns(4)
-                p1.metric("Snapshot price", f"₹{float(reference_price):,.2f}" if pd.notna(reference_price) else "—")
-                p2.metric("GitHub signal · 30m", signal)
-                p3.metric("P(up) · 30m", f"{float(probability):.1%}" if pd.notna(probability) else "—")
-                p4.metric("Forecast price · 30m", f"₹{predicted_price:,.2f}" if pd.notna(predicted_price) else "Unavailable")
-                target_ts = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
-                details = {
-                    "Prediction cycle (IST)": cycle_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                    "Forecast target (IST)": target_ts.tz_convert("Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S") if pd.notna(target_ts) else "—",
-                    "Signal": signal,
-                    "Prediction status": str(row.get("prediction_status") or "—"),
-                    "Expected return": f"{float(expected_return):+.2%}" if pd.notna(expected_return) else "—",
-                    "Model version": str(row.get("model_version") or "—"),
-                    "Data readiness": row.get("data_readiness_score"),
-                    "Snapshot link": str(row.get("prediction_snapshot_link_status") or "—"),
-                }
-                st.dataframe(pd.DataFrame([details]), width="stretch", hide_index=True)
-                st.caption("Prediction source: GitHub Actions → Google Drive. The displayed timestamp is the persisted five-minute prediction cycle.")
-        _render_selected_intraday_panel()
+                return
+            signal = str(row.get("signal") or "HOLD").upper()
+            probability = pd.to_numeric(row.get("probability_up_30m"), errors="coerce")
+            expected_return = pd.to_numeric(row.get("expected_return_30m"), errors="coerce")
+            reference_price = pd.to_numeric(row.get("actual_market_value"), errors="coerce")
+            predicted_price = (
+                float(reference_price) * (1.0 + float(expected_return))
+                if pd.notna(reference_price) and pd.notna(expected_return) else np.nan
+            )
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Snapshot price", f"₹{float(reference_price):,.2f}" if pd.notna(reference_price) else "—")
+            p2.metric("GitHub signal · 30m", signal)
+            p3.metric("P(up) · 30m", f"{float(probability):.1%}" if pd.notna(probability) else "—")
+            p4.metric("Forecast price · 30m", f"₹{predicted_price:,.2f}" if pd.notna(predicted_price) else "Unavailable")
+            target_ts = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
+            details = {
+                "Prediction cycle (IST)": cycle_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "Forecast target (IST)": target_ts.tz_convert("Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S") if pd.notna(target_ts) else "—",
+                "Signal": signal,
+                "Prediction status": str(row.get("prediction_status") or "—"),
+                "Expected return": f"{float(expected_return):+.2%}" if pd.notna(expected_return) else "—",
+                "Model version": str(row.get("model_version") or "—"),
+                "Data readiness": row.get("data_readiness_score"),
+                "Snapshot link": str(row.get("prediction_snapshot_link_status") or "—"),
+            }
+            st.dataframe(pd.DataFrame([details]), width="stretch", hide_index=True)
+            st.caption("Prediction source: GitHub Actions → Google Drive. The displayed timestamp is the persisted five-minute prediction cycle.")
+    _render_selected_intraday_panel()
 
     st.caption(
         "Decision-support only · no orders are placed · the model may abstain when data or validation is inadequate."
