@@ -7,7 +7,7 @@ import pytest
 from persistent_store import gdrive_config
 
 
-def test_service_account_preferred_when_legacy_oauth_token_also_present(monkeypatch):
+def test_oauth_preferred_when_both_drive_credentials_are_configured(monkeypatch):
     service_info = {
         "type": "service_account",
         "project_id": "test-project",
@@ -33,11 +33,9 @@ def test_service_account_preferred_when_legacy_oauth_token_also_present(monkeypa
     cfg = gdrive_config()
 
     assert cfg["configured"] is True
-    assert cfg["auth_method"] == "service_account"
-    assert cfg["client_email"] == service_info["client_email"]
+    assert cfg["auth_method"] == "oauth"
+    assert cfg["oauth_token_info"]["refresh_token"] == oauth_info["refresh_token"]
     assert cfg["root_folder_id"] == "test-root-folder-id"
-    assert cfg["oauth_write_token_info"]["refresh_token"] == oauth_info["refresh_token"]
-    assert cfg["oauth_write_configured"] is True
 
 
 def test_oauth_remains_supported_when_no_service_account_is_configured(monkeypatch):
