@@ -22,7 +22,7 @@ QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 HISTORY_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
-MAX_CAPTURE_AGE_SECONDS = 6 * 60 * 60
+MAX_CAPTURE_AGE_SECONDS = 7 * 60 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
 
 
