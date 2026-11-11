@@ -386,6 +386,36 @@ def _snapshot_quote_error_counts(
     return dict(sorted(counts.items()))
 
 
+def _snapshot_quote_diagnostics(
+    quotes: list[dict[str, Any]],
+    expected_minute: pd.Timestamp,
+) -> dict[str, Any]:
+    """Summarize persisted quote values rejected by the eligibility gate."""
+    status_counts: dict[str, int] = {}
+    rejected_samples: list[dict[str, Any]] = []
+    for row in quotes:
+        raw_status = row.get("quote_status")
+        status = "<NULL>" if raw_status is None or pd.isna(raw_status) else str(raw_status)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        reason = _snapshot_quote_error(row, expected_minute)
+        if reason and len(rejected_samples) < 5:
+            rejected_samples.append({
+                "symbol": str(row.get("symbol") or ""),
+                "quote_status": status,
+                "quote_error": str(row.get("quote_error") or "")[:200],
+                "actual_observed_price": _safe_float(row.get("actual_observed_price")),
+                "instrument_code_present": bool(str(row.get("instrument_code") or "").strip()),
+                "cycle_minute_ist": str(row.get("cycle_minute_ist") or ""),
+                "quote_observed_at_ist": str(row.get("quote_observed_at_ist") or ""),
+                "rejection_reason": reason,
+            })
+    return {
+        "snapshot_columns": sorted({str(key) for row in quotes for key in row}),
+        "quote_status_counts": dict(sorted(status_counts.items())),
+        "rejected_row_samples": rejected_samples,
+    }
+
+
 def _capture_snapshot_validation_error(
     capture_manifest: dict[str, Any],
     quote_frame: pd.DataFrame,
@@ -2386,6 +2416,7 @@ class AllNSEMinutePredictor:
 
         if not quote_by_symbol:
             quote_validation_errors = _snapshot_quote_error_counts(snapshot_rows, minute)
+            quote_diagnostics = _snapshot_quote_diagnostics(snapshot_rows, minute)
             with self._lock:
                 self._last_minute = minute_key
                 self._last_health = {
@@ -2403,6 +2434,7 @@ class AllNSEMinutePredictor:
                 snapshot_symbol_count=len(snapshot_symbols),
                 skipped_missing_quote_count=len(skipped_quote_symbols),
                 quote_validation_error_counts=quote_validation_errors,
+                **quote_diagnostics,
                 quote_validation_error_samples={
                     reason: next(
                         (
@@ -2426,6 +2458,7 @@ class AllNSEMinutePredictor:
                 "eligible_symbol_count": 0,
                 "skipped_missing_quote_count": len(skipped_quote_symbols),
                 "quote_validation_error_counts": quote_validation_errors,
+                **quote_diagnostics,
                 "prediction_count": 0,
                 "prediction_status_counts": {},
                 "source_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
