@@ -231,7 +231,7 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         return manifest, quotes, minute
 
     raise RuntimeError(
-        "No unprocessed, durably stored current-session quote snapshot was found; "
+        "No fresh, durably stored unprocessed current-session quote snapshot was found; "
         + "; ".join(skipped[-8:])
     )
 
