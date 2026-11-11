@@ -72,7 +72,7 @@ jobs:
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --port 8080 --cpu 2 --memory 8Gi --min 1 --max 1 \
             --no-cpu-throttling --concurrency 1 --timeout 300 \
-            --no-allow-unauthenticated --no-traffic --tag=telemetry-candidate \
+            --no-allow-unauthenticated --no-traffic --tag=telemetry \
             --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
             --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 
@@ -82,7 +82,7 @@ jobs:
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           CANDIDATE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.traffic)' | true)"
-          CANDIDATE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json | python -c 'import json,sys; d=json.load(sys.stdin); xs=[x for x in d.get("status",{}).get("traffic",[]) if x.get("tag")=="telemetry-candidate"]; assert xs and xs[0].get("url"); print(xs[0]["url"])')"
+          CANDIDATE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json | python -c 'import json,sys; d=json.load(sys.stdin); xs=[x for x in d.get("status",{}).get("traffic",[]) if x.get("tag")=="telemetry"]; assert xs and xs[0].get("url"); print(xs[0]["url"])')"
           TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"' EXIT
@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json | python -c 'import json,sys; d=json.load(sys.stdin); xs=[x for x in d.get("status",{}).get("traffic",[]) if x.get("tag")=="telemetry-candidate"]; assert xs and xs[0].get("revisionName"); print(xs[0]["revisionName"])')"
+          REVISION="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json | python -c 'import json,sys; d=json.load(sys.stdin); xs=[x for x in d.get("status",{}).get("traffic",[]) if x.get("tag")=="telemetry"]; assert xs and xs[0].get("revisionName"); print(xs[0]["revisionName"])')"
           gcloud run services update-traffic "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --to-revisions="$REVISION=100" --quiet
           READY="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
           [[ "$READY" == "$REVISION" ]] || { echo "Ready revision mismatch: $READY"; exit 1; }
