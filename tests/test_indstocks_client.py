@@ -377,3 +377,28 @@ def test_ssl_unexpected_eof_is_classified_and_logged_without_secrets(monkeypatch
     assert '"outcome": "transport_error"' in output
     assert '"error_reason": "UNEXPECTED_EOF_WHILE_READING"' in output
     assert "must-not-appear-in-logs" not in output
+
+
+
+def test_shared_api_request_gate_waits_between_requests(monkeypatch):
+    client._API_REQUEST_LAST_STARTED = 0.0
+    clock = {"now": 10.0}
+    sleeps = []
+
+    def monotonic():
+        return clock["now"]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(client.time, "monotonic", monotonic)
+    monkeypatch.setattr(client.time, "sleep", sleep)
+
+    client._wait_for_api_request_slot()
+    first_started = client._API_REQUEST_LAST_STARTED
+    client._wait_for_api_request_slot()
+
+    assert first_started == 10.0
+    assert sleeps == [client.API_REQUEST_MIN_INTERVAL_SECONDS]
+    assert client._API_REQUEST_LAST_STARTED >= first_started + client.API_REQUEST_MIN_INTERVAL_SECONDS

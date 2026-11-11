@@ -30,6 +30,11 @@ API_BASE = "https://api.indstocks.com"
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_TIMEOUT = 12
 TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS = 60
+# INDstocks documents 5 requests/second for quote and data APIs. A single
+# process-wide gate serializes requests from live capture and backfill threads.
+API_REQUEST_MIN_INTERVAL_SECONDS = 0.22
+_API_REQUEST_LOCK = threading.Lock()
+_API_REQUEST_LAST_STARTED = 0.0
 
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
@@ -391,12 +396,24 @@ def _transport_error_reason(exc: requests.RequestException) -> str:
     return "REQUEST_EXCEPTION"
 
 
+def _wait_for_api_request_slot() -> None:
+    """Keep all in-process INDstocks data requests below the documented 5 req/s."""
+    global _API_REQUEST_LAST_STARTED
+    with _API_REQUEST_LOCK:
+        now = time.monotonic()
+        wait = API_REQUEST_MIN_INTERVAL_SECONDS - (now - _API_REQUEST_LAST_STARTED)
+        if wait > 0:
+            time.sleep(wait)
+        _API_REQUEST_LAST_STARTED = time.monotonic()
+
+
 def _send_authenticated_request(
     method: str,
     path: str,
     params: dict[str, Any] | None,
     token: str,
 ) -> requests.Response:
+    _wait_for_api_request_slot()
     started = time.monotonic()
     try:
         response = requests.request(
