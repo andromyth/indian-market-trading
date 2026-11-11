@@ -102,7 +102,15 @@ def test_latest_capture_skips_blocked_pointer_and_uses_fresh_stored_minute_manif
     monkeypatch.setattr(
         compiler.pd,
         "read_parquet",
-        lambda path: pd.DataFrame({"symbol": ["RELIANCE"]}),
+        lambda path: pd.DataFrame({
+            "symbol": ["RELIANCE"],
+            "instrument_code": ["NSE_EQ|123"],
+            "cycle_minute_ist": ["2026-11-09T14:40:00+05:30"],
+            "quote_status": ["PASS"],
+            "actual_observed_price": [1500.0],
+            "quote_observed_at_ist": ["2026-11-09T14:40:05+05:30"],
+            "quote_error": [None],
+        }),
     )
 
     manifest, quotes, minute = compiler._latest_capture(SimpleNamespace(), now=now)
@@ -156,3 +164,86 @@ def test_latest_capture_rejects_stale_stored_manifest(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No fresh, durably stored"):
         compiler._latest_capture(SimpleNamespace(), now=now)
+
+
+def test_latest_capture_skips_persisted_but_ineligible_snapshot_and_uses_prior_valid_one(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    newer_remote = "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1445.parquet"
+    older_remote = "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1440.parquet"
+    manifests = {
+        "newer": {
+            "cycle_minute_ist": "2026-11-09T14:45:00+05:30",
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "snapshot_drive_path": newer_remote,
+            "row_count": 1,
+        },
+        "older": {
+            "cycle_minute_ist": "2026-11-09T14:40:00+05:30",
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "snapshot_drive_path": older_remote,
+            "row_count": 1,
+        },
+    }
+    items = [
+        {"id": "newer", "name": "manifest_20261109_1445.json"},
+        {"id": "older", "name": "manifest_20261109_1440.json"},
+    ]
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        if remote == newer_remote:
+            return {"id": "snapshot_newer"}
+        if remote == older_remote:
+            return {"id": "snapshot_older"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if file_id in manifests:
+            destination.write_text(json.dumps(manifests[file_id]), encoding="utf-8")
+        elif file_id == "latest":
+            destination.write_text(json.dumps(manifests["newer"]), encoding="utf-8")
+        else:
+            destination.write_bytes(b"parquet-placeholder")
+
+    def read_parquet(path):
+        if "1445" in str(path):
+            return pd.DataFrame({
+                "symbol": ["RELIANCE"],
+                "instrument_code": ["NSE_EQ|123"],
+                "cycle_minute_ist": ["2026-11-09T14:45:00+05:30"],
+                "quote_status": ["TOKEN_REJECTED"],
+                "actual_observed_price": [None],
+                "quote_observed_at_ist": [None],
+                "quote_error": ["provider token rejected"],
+            })
+        return pd.DataFrame({
+            "symbol": ["RELIANCE"],
+            "instrument_code": ["NSE_EQ|123"],
+            "cycle_minute_ist": ["2026-11-09T14:40:00+05:30"],
+            "quote_status": ["PASS"],
+            "actual_observed_price": [1500.0],
+            "quote_observed_at_ist": ["2026-11-09T14:40:05+05:30"],
+            "quote_error": [None],
+        })
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", lambda store, parent_id: items)
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(compiler.pd, "read_parquet", read_parquet)
+
+    manifest, quotes, minute = compiler._latest_capture(SimpleNamespace(), now=now)
+
+    assert minute == pd.Timestamp("2026-11-09 14:40:00", tz=IST)
+    assert manifest["status"] == "STORED"
+    assert quotes.iloc[0]["quote_status"] == "PASS"

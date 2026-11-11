@@ -392,17 +392,26 @@ def _snapshot_quote_diagnostics(
 ) -> dict[str, Any]:
     """Summarize persisted quote values rejected by the eligibility gate."""
     status_counts: dict[str, int] = {}
+    rejection_reason_counts: dict[str, int] = {}
+    provider_error_counts: dict[str, int] = {}
     rejected_samples: list[dict[str, Any]] = []
     for row in quotes:
         raw_status = row.get("quote_status")
         status = "<NULL>" if raw_status is None or pd.isna(raw_status) else str(raw_status)
         status_counts[status] = status_counts.get(status, 0) + 1
-        reason = _snapshot_quote_error(row, expected_minute)
-        if reason and len(rejected_samples) < 5:
+
+        reason = _snapshot_quote_error(row, expected_minute) or "ELIGIBLE"
+        rejection_reason_counts[reason] = rejection_reason_counts.get(reason, 0) + 1
+        provider_error = str(row.get("quote_error") or "").strip()
+        if provider_error:
+            provider_error = provider_error[:200]
+            provider_error_counts[provider_error] = provider_error_counts.get(provider_error, 0) + 1
+
+        if reason != "ELIGIBLE" and len(rejected_samples) < 5:
             rejected_samples.append({
                 "symbol": str(row.get("symbol") or ""),
                 "quote_status": status,
-                "quote_error": str(row.get("quote_error") or "")[:200],
+                "quote_error": provider_error,
                 "actual_observed_price": _safe_float(row.get("actual_observed_price")),
                 "instrument_code_present": bool(str(row.get("instrument_code") or "").strip()),
                 "cycle_minute_ist": str(row.get("cycle_minute_ist") or ""),
@@ -412,6 +421,8 @@ def _snapshot_quote_diagnostics(
     return {
         "snapshot_columns": sorted({str(key) for row in quotes for key in row}),
         "quote_status_counts": dict(sorted(status_counts.items())),
+        "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
+        "provider_error_counts": dict(sorted(provider_error_counts.items())),
         "rejected_row_samples": rejected_samples,
     }
 
@@ -966,6 +977,8 @@ class AllNSEMinutePredictor:
         self,
         market_history: pd.DataFrame | None,
         minute: pd.Timestamp,
+        *,
+        allow_refresh: bool = True,
     ) -> pd.DataFrame:
         """Return fresh pre-decision NIFTY candles, refreshing stale cache independently.
 
@@ -976,7 +989,14 @@ class AllNSEMinutePredictor:
         the decision time; it never fabricates index OHLC or uses future bars.
         """
         before = self._market_history_before(market_history, minute)
-        if not before.empty:
+        if not before.empty or not allow_refresh:
+            if before.empty and not allow_refresh:
+                self._log(
+                    "all_nse_nifty_context_fast_refresh",
+                    status="SKIPPED_DRIVE_ONLY",
+                    cutoff_ist=_as_ist_timestamp(minute).isoformat(),
+                    reason="GitHub prediction may consume persisted context only",
+                )
             return before
 
         try:
@@ -2496,6 +2516,7 @@ class AllNSEMinutePredictor:
         market_history_before_minute = self._fresh_market_history_before(
             market_history,
             minute,
+            allow_refresh=not drive_only,
         )
         if drive_only:
             nifty_price, nifty_observed_at, nifty_error = None, None, "LIVE_INDEX_QUOTE_NOT_REQUESTED_IN_DRIVE_ONLY_MODE"
