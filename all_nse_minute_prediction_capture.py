@@ -2675,26 +2675,40 @@ class AllNSEMinutePredictor:
                 # Infer one symbol at a time. A malformed feature row or model
                 # exception for one stock must not suppress the rest of the
                 # independently eligible snapshot universe.
+                from concurrent.futures import ThreadPoolExecutor
+
                 record_by_symbol = {str(row["symbol"]): row for row in current_rows}
-                for idx, symbol in enumerate(feature_symbols):
-                    row = record_by_symbol[symbol]
+
+                def infer_symbol(item):
+                    idx, symbol = item
                     try:
                         one_row = x.iloc[[idx]]
                         probability = float(np.clip(
                             self._classifier.predict_proba(one_row)[0, 1], 0, 1
                         ))
                         predicted_return = float(self._regressor.predict(one_row)[0])
-                        expected_return = (
-                            predicted_return if np.isfinite(predicted_return) else None
-                        )
+                        return idx, symbol, probability, predicted_return, None
                     except Exception as exc:
+                        return idx, symbol, None, None, f"{type(exc).__name__}: {str(exc)[:240]}"
+
+                # Eight read-only workers share the loaded model. Drive persistence
+                # remains single-writer after every symbol has completed.
+                with ThreadPoolExecutor(max_workers=8, thread_name_prefix="nse-symbol-inference") as pool:
+                    inference_results = list(pool.map(infer_symbol, enumerate(feature_symbols)))
+
+                for idx, symbol, probability, predicted_return, inference_error in inference_results:
+                    row = record_by_symbol[symbol]
+                    if inference_error:
                         row.update({
                             "prediction_status": "MODEL_INFERENCE_ERROR",
                             "signal": "HOLD",
-                            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                            "error": inference_error,
                         })
                         model_failures += 1
                         continue
+                    expected_return = (
+                        predicted_return if np.isfinite(predicted_return) else None
+                    )
                     readiness = float(x.iloc[idx].notna().mean())
                     decision_ts = _as_ist_timestamp(
                         row.get("actual_observed_at_ist"),
