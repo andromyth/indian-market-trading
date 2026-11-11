@@ -249,6 +249,106 @@ def test_latest_capture_skips_persisted_but_ineligible_snapshot_and_uses_prior_v
     assert quotes.iloc[0]["quote_status"] == "PASS"
 
 
+
+def test_latest_capture_prefers_newest_fresh_eligible_slot(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    minutes = ["1440", "1445"]
+    manifests = {
+        minute: {
+            "cycle_minute_ist": f"2026-11-09T{minute[:2]}:{minute[2:]}:00+05:30",
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "snapshot_drive_path": f"production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_{minute}.parquet",
+            "row_count": 1,
+        }
+        for minute in minutes
+    }
+    items = [
+        {"id": minute, "name": f"manifest_20261109_{minute}.json"}
+        for minute in reversed(minutes)
+    ]
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        if "/snapshot_20261109_1445.parquet" in remote:
+            return {"id": "snapshot_1445"}
+        if "/snapshot_20261109_1440.parquet" in remote:
+            return {"id": "snapshot_1440"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if file_id in manifests:
+            destination.write_text(json.dumps(manifests[file_id]), encoding="utf-8")
+        elif file_id == "latest":
+            destination.write_text(json.dumps(manifests["1445"]), encoding="utf-8")
+        else:
+            destination.write_bytes(b"parquet-placeholder")
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", lambda store, parent_id: items)
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(
+        compiler.pd,
+        "read_parquet",
+        lambda path: pd.DataFrame({
+            "symbol": ["RELIANCE"],
+            "instrument_code": ["NSE_EQ|123"],
+            "cycle_minute_ist": ["2026-11-09T14:45:00+05:30" if "1445" in str(path) else "2026-11-09T14:40:00+05:30"],
+            "quote_status": ["PASS"],
+            "actual_observed_price": [1500.0],
+            "quote_observed_at_ist": ["2026-11-09T14:45:05+05:30" if "1445" in str(path) else "2026-11-09T14:40:05+05:30"],
+            "quote_error": [None],
+        }),
+    )
+
+    _, _, minute = compiler._latest_capture(SimpleNamespace(), now=now)
+
+    assert minute == pd.Timestamp("2026-11-09 14:45:00", tz=IST)
+
+
+def test_latest_capture_rejects_snapshot_older_than_live_freshness_window(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import pytest
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    stale = {
+        "cycle_minute_ist": "2026-11-09T14:30:00+05:30",
+        "status": "STORED",
+        "snapshot_persisted": True,
+        "snapshot_drive_path": "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1430.parquet",
+        "row_count": 1,
+    }
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(stale), encoding="utf-8")
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", lambda store, parent_id: [
+        {"id": "stale", "name": "manifest_20261109_1430.json"}
+    ])
+    monkeypatch.setattr(compiler, "_download", download)
+
+    with pytest.raises(RuntimeError, match="No fresh, durably stored"):
+        compiler._latest_capture(SimpleNamespace(), now=now)
+
 def test_load_drive_history_retains_persisted_nifty_market_context(tmp_path, monkeypatch):
     import shutil
     from types import SimpleNamespace

@@ -22,7 +22,7 @@ QUOTE_ROOT = "production_data/all_universe_minute_snapshots"
 HISTORY_ROOT = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
-MAX_CAPTURE_AGE_SECONDS = 7 * 60 * 60
+MAX_CAPTURE_AGE_SECONDS = 12 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
 
 
@@ -149,9 +149,9 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         except Exception as exc:
             skipped.append(f"{item.get('name')}: invalid manifest ({type(exc).__name__})")
 
-    # Recover the oldest unprocessed slot first. This makes each scheduled run
-    # drain missed intervals instead of repeatedly selecting the newest snapshot.
-    candidates.sort(key=lambda candidate: candidate[0])
+    # Live predictions take priority: always compile the newest fresh eligible
+    # current-session slot. Historical gaps must never make the dashboard stale.
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     seen_minutes: set[pd.Timestamp] = set()
     for minute, manifest, item in candidates:
         if minute in seen_minutes:
