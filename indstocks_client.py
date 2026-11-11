@@ -396,15 +396,33 @@ def _transport_error_reason(exc: requests.RequestException) -> str:
     return "REQUEST_EXCEPTION"
 
 
-def _wait_for_api_request_slot() -> None:
-    """Keep all in-process INDstocks data requests below the documented 5 req/s."""
+def _wait_for_api_request_slot() -> tuple[float, float]:
+    """Return throttle wait and actual request-start spacing in milliseconds."""
     global _API_REQUEST_LAST_STARTED
     with _API_REQUEST_LOCK:
         now = time.monotonic()
-        wait = API_REQUEST_MIN_INTERVAL_SECONDS - (now - _API_REQUEST_LAST_STARTED)
+        wait = max(0.0, API_REQUEST_MIN_INTERVAL_SECONDS - (now - _API_REQUEST_LAST_STARTED))
         if wait > 0:
             time.sleep(wait)
-        _API_REQUEST_LAST_STARTED = time.monotonic()
+        started = time.monotonic()
+        interval_ms = (
+            round((started - _API_REQUEST_LAST_STARTED) * 1000, 1)
+            if _API_REQUEST_LAST_STARTED
+            else None
+        )
+        _API_REQUEST_LAST_STARTED = started
+    return round(wait * 1000, 1), interval_ms
+
+
+def _indstocks_endpoint_category(path: str) -> str:
+    """Map known API paths to safe low-cardinality telemetry labels."""
+    if path.startswith("/market/quotes/"):
+        return "market_quotes"
+    if path.startswith("/market/historical/"):
+        return "market_historical"
+    if path.startswith("/user/"):
+        return "user"
+    return "other"
 
 
 def _send_authenticated_request(
@@ -412,9 +430,19 @@ def _send_authenticated_request(
     path: str,
     params: dict[str, Any] | None,
     token: str,
+    *,
+    attempt: int = 1,
 ) -> requests.Response:
-    _wait_for_api_request_slot()
+    throttle_wait_ms, request_start_interval_ms = _wait_for_api_request_slot()
     started = time.monotonic()
+    common = {
+        "event": "indstocks_http_request",
+        "method": method.upper(),
+        "endpoint_category": _indstocks_endpoint_category(path),
+        "attempt": attempt,
+        "throttle_wait_ms": throttle_wait_ms,
+        "request_start_interval_ms": request_start_interval_ms,
+    }
     try:
         response = requests.request(
             method,
@@ -428,25 +456,19 @@ def _send_authenticated_request(
             timeout=_timeout(),
         )
     except requests.RequestException as exc:
-        duration_ms = round((time.monotonic() - started) * 1000, 1)
-        reason = _transport_error_reason(exc)
         print(json.dumps({
-            "event": "indstocks_http_request",
-            "method": method,
-            "endpoint": path,
-            "duration_ms": duration_ms,
+            **common,
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
             "outcome": "transport_error",
             "exception_type": type(exc).__name__,
-            "error_reason": reason,
+            "error_reason": _transport_error_reason(exc),
         }, sort_keys=True), flush=True)
         raise RuntimeError(
-            f"INDstocks request failed: {type(exc).__name__}: {reason}"
+            f"INDstocks request failed: {type(exc).__name__}: {_transport_error_reason(exc)}"
         ) from None
 
     print(json.dumps({
-        "event": "indstocks_http_request",
-        "method": method,
-        "endpoint": path,
+        **common,
         "duration_ms": round((time.monotonic() - started) * 1000, 1),
         "outcome": "http_response",
         "http_status": response.status_code,
@@ -471,7 +493,7 @@ def _request(method: str, path: str, *, params: dict[str, Any] | None = None) ->
                 f"re-authentication failed: {type(exc).__name__}: {str(exc)[:240]}"
             ) from None
         if refreshed_token:
-            response = _send_authenticated_request(method, path, params, refreshed_token)
+            response = _send_authenticated_request(method, path, params, refreshed_token, attempt=2)
 
     if response.status_code >= 400:
         if response.status_code == 401:
