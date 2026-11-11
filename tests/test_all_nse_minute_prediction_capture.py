@@ -1215,6 +1215,8 @@ def test_snapshot_quote_diagnostics_exposes_persisted_status_and_rejected_row():
     }], minute)
 
     assert diagnostics["quote_status_counts"] == {"MISSING_QUOTE": 1}
+    assert diagnostics["rejection_reason_counts"] == {"Quote status is not PASS.": 1}
+    assert diagnostics["provider_error_counts"] == {"provider returned no price": 1}
     assert diagnostics["rejected_row_samples"][0]["symbol"] == "TATASTEEL"
     assert diagnostics["rejected_row_samples"][0]["quote_error"] == "provider returned no price"
     assert diagnostics["rejected_row_samples"][0]["rejection_reason"] == "Quote status is not PASS."
