@@ -170,6 +170,26 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         if declared_rows is not None and int(declared_rows) != len(quotes):
             skipped.append(f"{item.get('name')}: row_count_mismatch")
             continue
+
+        # STORED means the parquet was persisted, not that its quotes are usable.
+        # Prefer the newest same-session snapshot with at least one quote that
+        # passes the exact per-symbol eligibility contract. Never turn a failed
+        # provider quote into a prediction.
+        from all_nse_minute_prediction_capture import _snapshot_quote_diagnostics
+
+        quote_diagnostics = _snapshot_quote_diagnostics(
+            quotes.to_dict(orient="records"), minute
+        )
+        eligible_count = int(
+            quote_diagnostics.get("rejection_reason_counts", {}).get("ELIGIBLE", 0)
+        )
+        if eligible_count < 1:
+            skipped.append(
+                f"{item.get('name')}: no eligible quotes "
+                + json.dumps(quote_diagnostics, sort_keys=True)
+            )
+            continue
+
         print(
             "DRIVE_CAPTURE_SELECTED="
             + json.dumps({
@@ -179,6 +199,8 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
                 "status": status,
                 "snapshot_drive_path": snapshot_remote,
                 "quote_rows": len(quotes),
+                "eligible_quote_rows": eligible_count,
+                "quote_diagnostics": quote_diagnostics,
                 "skipped_newer_candidates": skipped,
             }, sort_keys=True),
             flush=True,
@@ -266,31 +288,6 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
                 history[symbol] = combined.loc[combined.index <= minute].tail(lookback)
     return history
 
-def _market_history(minute: pd.Timestamp) -> pd.DataFrame:
-    """Fetch only Yahoo NIFTY context; never use the broker adapter from GitHub."""
-    import yfinance as yf
-    import all_nse_intraday_model as model
-
-    raw = yf.download(
-        "^NSEI", period="10d", interval="5m", auto_adjust=False,
-        progress=False, threads=False, timeout=15, group_by="column",
-    )
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    if isinstance(raw.columns, pd.MultiIndex):
-        picked = {}
-        tokens = [[str(part).strip().lower() for part in column] for column in raw.columns]
-        for field in OHLCV:
-            matches = [index for index, values in enumerate(tokens) if field.lower() in values]
-            if matches:
-                picked[field] = matches[0]
-        raw = raw.iloc[:, [picked[field] for field in OHLCV if field in picked]].copy()
-        raw.columns = [field for field in OHLCV if field in picked]
-    frame = model._norm(raw)
-    if frame.empty:
-        return frame
-    return frame.loc[frame.index <= minute].tail(500)
-
 
 def main() -> int:
     from market_session_guard import is_nse_trading_day
@@ -338,7 +335,12 @@ def main() -> int:
     history = _load_drive_history(
         store, symbols, minute, work, HISTORY_LOOKBACK_BARS
     )
-    market = _market_history(minute)
+    # GitHub prediction is a strict Drive consumer. Missing persisted NIFTY
+    # context remains missing; the predictor must not refresh it from Yahoo.
+    market = pd.DataFrame(
+        columns=OHLCV,
+        index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+    )
 
     predictor = AllNSEMinutePredictor(work)
     predictor._symbols = sorted(symbols)
