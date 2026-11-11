@@ -390,10 +390,10 @@ def gdrive_config() -> dict:
         except Exception as exc:
             oauth_write_error = f"invalid OAuth token JSON: {type(exc).__name__}"
 
-    # Prefer the service account for Drive read/list access when both credential
-    # types exist. For My Drive writes, Google requires OAuth user credentials
-    # because service accounts have no personal storage quota.
-    if oauth_json and not service_json:
+    # Prefer the verified OAuth user identity whenever it is configured. It can
+    # both read and write the user's My Drive; service-account credentials remain
+    # the fallback when OAuth is absent or invalid.
+    if oauth_json and (not service_json or oauth_write_info):
         try:
             oauth_info = json.loads(oauth_json)
         except Exception as exc:
