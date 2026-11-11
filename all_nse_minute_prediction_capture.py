@@ -374,6 +374,18 @@ def _snapshot_quote_error(
     return None
 
 
+def _snapshot_quote_error_counts(
+    quotes: list[dict[str, Any]],
+    expected_minute: pd.Timestamp,
+) -> dict[str, int]:
+    """Expose why persisted snapshot rows are rejected without weakening validation."""
+    counts: dict[str, int] = {}
+    for quote in quotes:
+        reason = _snapshot_quote_error(quote, expected_minute) or "ELIGIBLE"
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _capture_snapshot_validation_error(
     capture_manifest: dict[str, Any],
     quote_frame: pd.DataFrame,
@@ -2373,6 +2385,7 @@ class AllNSEMinutePredictor:
         missing_quotes = max(0, expected_universe_count - len(quote_by_symbol))
 
         if not quote_by_symbol:
+            quote_validation_errors = _snapshot_quote_error_counts(snapshot_rows, minute)
             with self._lock:
                 self._last_minute = minute_key
                 self._last_health = {
@@ -2389,6 +2402,19 @@ class AllNSEMinutePredictor:
                 expected_symbol_count=expected_universe_count,
                 snapshot_symbol_count=len(snapshot_symbols),
                 skipped_missing_quote_count=len(skipped_quote_symbols),
+                quote_validation_error_counts=quote_validation_errors,
+                quote_validation_error_samples={
+                    reason: next(
+                        (
+                            str(row.get("symbol") or "")
+                            for row in snapshot_rows
+                            if _snapshot_quote_error(row, minute) == reason
+                        ),
+                        None,
+                    )
+                    for reason in quote_validation_errors
+                    if reason != "ELIGIBLE"
+                },
                 source_snapshot_drive_path=capture_manifest.get("snapshot_drive_path"),
                 status="NO_ELIGIBLE_SYMBOLS",
             )
@@ -2399,6 +2425,7 @@ class AllNSEMinutePredictor:
                 "snapshot_symbol_count": len(snapshot_symbols),
                 "eligible_symbol_count": 0,
                 "skipped_missing_quote_count": len(skipped_quote_symbols),
+                "quote_validation_error_counts": quote_validation_errors,
                 "prediction_count": 0,
                 "prediction_status_counts": {},
                 "source_snapshot_drive_path": capture_manifest.get("snapshot_drive_path"),
