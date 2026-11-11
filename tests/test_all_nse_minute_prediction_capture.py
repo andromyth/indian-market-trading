@@ -1202,6 +1202,34 @@ def test_nse_equity_universe_falls_back_to_indstocks_when_archive_is_blocked(tmp
 
 
 
+def test_snapshot_quote_diagnostics_exposes_persisted_status_and_rejected_row():
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    diagnostics = capture._snapshot_quote_diagnostics([{
+        "symbol": "TATASTEEL",
+        "instrument_code": "NSE_123",
+        "cycle_minute_ist": minute.isoformat(),
+        "quote_status": "MISSING_QUOTE",
+        "quote_error": "provider returned no price",
+        "actual_observed_price": None,
+        "quote_observed_at_ist": None,
+    }], minute)
+
+    assert diagnostics["quote_status_counts"] == {"MISSING_QUOTE": 1}
+    assert diagnostics["rejected_row_samples"][0]["symbol"] == "TATASTEEL"
+    assert diagnostics["rejected_row_samples"][0]["quote_error"] == "provider returned no price"
+    assert diagnostics["rejected_row_samples"][0]["rejection_reason"] == "Quote status is not PASS."
+
+
+def test_snapshot_quote_diagnostics_handles_null_status_and_empty_rows():
+    minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
+    diagnostics = capture._snapshot_quote_diagnostics([
+        {"symbol": "AAA", "quote_status": None},
+    ], minute)
+    assert diagnostics["quote_status_counts"] == {"<NULL>": 1}
+    assert len(diagnostics["rejected_row_samples"]) == 1
+    assert capture._snapshot_quote_diagnostics([], minute)["quote_status_counts"] == {}
+
+
 def test_empty_snapshot_slot_skips_prediction_without_failing_other_slots(tmp_path):
     minute = pd.Timestamp("2026-10-28 10:00:00", tz=IST)
     predictor = capture.AllNSEMinutePredictor(tmp_path)
