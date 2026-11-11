@@ -1363,3 +1363,26 @@ def test_model_drive_path_resolves_complete_bundle_nested_in_models_tree():
             return None
 
     assert model._discover_model_bundle_folder(Store(), "models-id") == "folder-exact-bundle"
+
+
+def test_drive_only_market_context_never_refreshes_from_yahoo(monkeypatch):
+    minute = pd.Timestamp("2026-10-21 10:05:00", tz=IST)
+    predictor = object.__new__(capture.AllNSEMinutePredictor)
+    predictor._market_history = pd.DataFrame(
+        columns=["Open", "High", "Low", "Close", "Volume"],
+        index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+    )
+    predictor._log = lambda *args, **kwargs: None
+
+    def forbidden_refresh(_minute):
+        raise AssertionError("Drive-only prediction attempted an external market-data request")
+
+    predictor._fetch_yahoo_nifty_history = forbidden_refresh
+    result = predictor._fresh_market_history_before(
+        predictor._market_history,
+        minute,
+        allow_refresh=False,
+    )
+
+    assert result.empty
+    assert isinstance(result.index, pd.DatetimeIndex)
