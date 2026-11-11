@@ -256,11 +256,12 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
         tmp_path / "all_nse_minute_predictions" / f"{minute:%Y}" / f"{minute:%m}" /
         f"{minute:%d}" / f"predictions_{minute:%Y%m%d_%H%M}.parquet"
     ).set_index("symbol")
-    assert written.index.tolist() == ["AAA"]
+    assert written.index.tolist() == ["AAA", "BBB"]
     assert written.loc["AAA", "actual_market_value"] == 101.25
     assert written.loc["AAA", "probability_up_30m"] == pytest.approx(0.8)
     assert written.loc["AAA", "signal"] == "BUY"
     assert written.loc["AAA", "history_input_mode"] == "CURRENT_QUOTE_ONLY"
+    assert written.loc["BBB", "prediction_status"] == "MODEL_INFERENCE_ERROR"
 
     import json
     minute_manifest_path = (
@@ -269,8 +270,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     )
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
     assert saved_manifest["model_version"] == predictor._production_model_version()
-    assert saved_manifest["eligible_symbol_count"] == 1
-    assert saved_manifest["skipped_missing_quote_count"] == 2
+    assert saved_manifest["eligible_symbol_count"] == 2
+    assert saved_manifest["skipped_missing_quote_count"] == 1
     assert "quality_gate_pass" not in saved_manifest
 
 
