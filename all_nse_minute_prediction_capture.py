@@ -2612,13 +2612,29 @@ class AllNSEMinutePredictor:
         if feature_rows and not model_error:
             try:
                 x = inference_frame
-                probs = np.clip(self._classifier.predict_proba(x)[:, 1], 0, 1)
-                expected_returns = np.asarray(self._regressor.predict(x), dtype=float)
+                # Infer one symbol at a time. A malformed feature row or model
+                # exception for one stock must not suppress the rest of the
+                # independently eligible snapshot universe.
                 record_by_symbol = {str(row["symbol"]): row for row in current_rows}
                 for idx, symbol in enumerate(feature_symbols):
                     row = record_by_symbol[symbol]
-                    probability = float(probs[idx])
-                    expected_return = float(expected_returns[idx]) if np.isfinite(expected_returns[idx]) else None
+                    try:
+                        one_row = x.iloc[[idx]]
+                        probability = float(np.clip(
+                            self._classifier.predict_proba(one_row)[0, 1], 0, 1
+                        ))
+                        predicted_return = float(self._regressor.predict(one_row)[0])
+                        expected_return = (
+                            predicted_return if np.isfinite(predicted_return) else None
+                        )
+                    except Exception as exc:
+                        row.update({
+                            "prediction_status": "MODEL_INFERENCE_ERROR",
+                            "signal": "HOLD",
+                            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                        })
+                        model_failures += 1
+                        continue
                     readiness = float(x.iloc[idx].notna().mean())
                     decision_ts = _as_ist_timestamp(
                         row.get("actual_observed_at_ist"),
