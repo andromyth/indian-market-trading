@@ -2052,7 +2052,6 @@ if interface_mode == "Live Test":
         if not market_open:
             st.info("Market is closed. The latest persisted GitHub prediction remains available below when present.")
         if auto_refresh and market_open:
-            st.autorefresh = None
             @st.fragment(run_every="60s", key="selected_intraday_prediction_panel")
             def _render_selected_intraday_panel():
                 snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
