@@ -977,6 +977,8 @@ class AllNSEMinutePredictor:
         self,
         market_history: pd.DataFrame | None,
         minute: pd.Timestamp,
+        *,
+        allow_refresh: bool = True,
     ) -> pd.DataFrame:
         """Return fresh pre-decision NIFTY candles, refreshing stale cache independently.
 
@@ -987,7 +989,14 @@ class AllNSEMinutePredictor:
         the decision time; it never fabricates index OHLC or uses future bars.
         """
         before = self._market_history_before(market_history, minute)
-        if not before.empty:
+        if not before.empty or not allow_refresh:
+            if before.empty and not allow_refresh:
+                self._log(
+                    "all_nse_nifty_context_fast_refresh",
+                    status="SKIPPED_DRIVE_ONLY",
+                    cutoff_ist=_as_ist_timestamp(minute).isoformat(),
+                    reason="GitHub prediction may consume persisted context only",
+                )
             return before
 
         try:
@@ -2507,6 +2516,7 @@ class AllNSEMinutePredictor:
         market_history_before_minute = self._fresh_market_history_before(
             market_history,
             minute,
+            allow_refresh=not drive_only,
         )
         if drive_only:
             nifty_price, nifty_observed_at, nifty_error = None, None, "LIVE_INDEX_QUOTE_NOT_REQUESTED_IN_DRIVE_ONLY_MODE"
