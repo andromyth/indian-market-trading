@@ -42,7 +42,7 @@ jobs:
           workflow = os.environ["WORKFLOW_FILE"]
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-          if now.weekday() >= 5 or not (now.hour, now.minute) >= (9, 15) or (now.hour, now.minute) >= (15, 30):
+          if now.weekday() >= 5 or (now.hour, now.minute) < (9, 15) or (now.hour, now.minute) >= (15, 30):
               print(json.dumps({"status": "OUTSIDE_MARKET_WINDOW", "now_ist": now.isoformat()}))
               sys.exit(0)
 
@@ -57,13 +57,19 @@ jobs:
               data = None if body is None else json.dumps(body).encode()
               req = urllib.request.Request(url, data=data, headers=headers, method=method)
               with urllib.request.urlopen(req, timeout=20) as response:
-                  return json.loads(response.read().decode())
+                  raw = response.read().decode()
+                  return json.loads(raw) if raw.strip() else None
 
           try:
               payload = request(api)
               runs = payload.get("workflow_runs", [])
-              active = [
+              relevant = [
                   run for run in runs
+                  if run.get("event") in {"schedule", "workflow_dispatch"}
+                  and run.get("head_branch") == "main"
+              ]
+              active = [
+                  run for run in relevant
                   if run.get("status") in {"queued", "in_progress", "waiting", "pending"}
               ]
               if active:
@@ -74,7 +80,7 @@ jobs:
                   sys.exit(0)
 
               recent = []
-              for run in runs:
+              for run in relevant:
                   created = run.get("created_at")
                   if not created:
                       continue
