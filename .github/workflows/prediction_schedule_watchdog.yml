@@ -1,6 +1,9 @@
 name: Prediction schedule watchdog
 
 on:
+  push:
+    paths:
+      - ".github/workflows/prediction_schedule_watchdog.yml"
   schedule:
     # GitHub cron is UTC. The guard below restricts recovery to NSE cash hours.
     - cron: "*/5 3-10 * * 1-5"
