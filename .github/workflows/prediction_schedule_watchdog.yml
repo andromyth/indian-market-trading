@@ -1,0 +1,101 @@
+name: Prediction schedule watchdog
+
+on:
+  schedule:
+    # GitHub cron is UTC. The guard below restricts recovery to NSE cash hours.
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: prediction-schedule-watchdog
+  cancel-in-progress: true
+
+jobs:
+  recover-missed-prediction-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Dispatch compiler only when its scheduled run is missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: compile_all_nse_predictions_from_drive.yml
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+
+          token = os.environ["GH_TOKEN"]
+          repository = os.environ["REPOSITORY"]
+          workflow = os.environ["WORKFLOW_FILE"]
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+          if now.weekday() >= 5 or not (now.hour, now.minute) >= (9, 15) or (now.hour, now.minute) >= (15, 30):
+              print(json.dumps({"status": "OUTSIDE_MARKET_WINDOW", "now_ist": now.isoformat()}))
+              sys.exit(0)
+
+          api = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/runs?per_page=20"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request(url, method="GET", body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  return json.loads(response.read().decode())
+
+          try:
+              payload = request(api)
+              runs = payload.get("workflow_runs", [])
+              active = [
+                  run for run in runs
+                  if run.get("status") in {"queued", "in_progress", "waiting", "pending"}
+              ]
+              if active:
+                  print(json.dumps({
+                      "status": "COMPILER_ALREADY_ACTIVE",
+                      "runs": [{"id": r.get("id"), "status": r.get("status"), "event": r.get("event")} for r in active[:5]],
+                  }))
+                  sys.exit(0)
+
+              recent = []
+              for run in runs:
+                  created = run.get("created_at")
+                  if not created:
+                      continue
+                  stamp = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                  if datetime.now(timezone.utc) - stamp <= timedelta(minutes=8):
+                      recent.append(run)
+
+              if recent:
+                  print(json.dumps({
+                      "status": "RECENT_COMPILER_RUN_EXISTS",
+                      "runs": [{"id": r.get("id"), "status": r.get("status"), "event": r.get("event"), "created_at": r.get("created_at")} for r in recent[:5]],
+                  }))
+                  sys.exit(0)
+
+              dispatch_url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/dispatches"
+              request(dispatch_url, method="POST", body={"ref": "main"})
+              print(json.dumps({
+                  "status": "MISSED_RUN_RECOVERY_DISPATCHED",
+                  "workflow": workflow,
+                  "ref": "main",
+                  "now_ist": now.isoformat(),
+              }))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode(errors="replace")[:1000]
+              print(json.dumps({"status": "WATCHDOG_API_ERROR", "http_status": exc.code, "detail": detail}))
+              raise
+          PY
