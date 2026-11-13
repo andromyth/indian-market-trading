@@ -32,18 +32,13 @@ DEFAULT_TIMEOUT = 12
 TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS = 60
 # INDstocks documents 5 requests/second for quote and data APIs. A single
 # process-wide gate serializes requests from live capture and backfill threads.
-# When several workers (processes or instances) share one INDstocks token, this
-# in-process lock alone cannot enforce the guideline: each process paces itself
-# independently and the combined rate can exceed five requests/second, causing
-# HTTP 429s and failed captures. Set INDSTOCKS_RATE_LIMIT_LOCK_FILE to a path on
-# storage shared by every worker that shares the token so request starts are
-# serialized across processes too (for example a mounted volume all workers can
-# write to). When unset, behavior is unchanged and only the local process is paced.
+# Only the one coordinated Cloud Run acquisition process calls INDstocks, so
+# this in-process gate is sufficient. Do not treat it (or any local file lock)
+# as distributed coordination: Cloud Run instances have isolated filesystems,
+# so a lock file cannot serialize separate instances.
 API_REQUEST_MIN_INTERVAL_SECONDS = 0.22
 _API_REQUEST_LOCK = threading.Lock()
 _API_REQUEST_LAST_STARTED = 0.0
-INDSTOCKS_RATE_LIMIT_LOCK_FILE: str | None = os.getenv("INDSTOCKS_RATE_LIMIT_LOCK_FILE") or None
-_RATE_LIMIT_FILE_HANDLE: Any = None
 
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
@@ -405,32 +400,15 @@ def _transport_error_reason(exc: requests.RequestException) -> str:
     return "REQUEST_EXCEPTION"
 
 
-def _rate_limit_file_handle() -> Any:
-    """Open (and cache) a shared lock file for cross-process rate-limit coordination.
+def _wait_for_api_request_slot() -> tuple[float, float]:
+    """Return throttle wait and actual request-start spacing in milliseconds.
 
-    Returns None when no shared lock file is configured or the platform cannot
-    support file locking; callers then fall back to the in-process gate only.
+    Serializes request starts inside the single coordinated acquisition process
+    (which runs shard worker threads) so the combined rate stays at or below the
+    provider's documented five-requests-per-second guideline. Cross-instance
+    coordination is deliberately out of scope: it must be handled by a single
+    coordinator, never by a local file lock on isolated Cloud Run filesystems.
     """
-    global _RATE_LIMIT_FILE_HANDLE
-    if _RATE_LIMIT_FILE_HANDLE is not None:
-        return _RATE_LIMIT_FILE_HANDLE
-    if not INDSTOCKS_RATE_LIMIT_LOCK_FILE:
-        return None
-    try:
-        import fcntl
-    except ImportError:
-        # fcntl is Unix-only; without it we cannot coordinate across processes.
-        return None
-    try:
-        handle = open(INDSTOCKS_RATE_LIMIT_LOCK_FILE, "a+")
-    except OSError:
-        return None
-    _RATE_LIMIT_FILE_HANDLE = (handle, fcntl)
-    return _RATE_LIMIT_FILE_HANDLE
-
-
-def _wait_for_api_request_slot_in_process() -> tuple[float, float]:
-    """Pace INDstocks request starts within a single process (original behavior)."""
     global _API_REQUEST_LAST_STARTED
     with _API_REQUEST_LOCK:
         now = time.monotonic()
@@ -445,34 +423,6 @@ def _wait_for_api_request_slot_in_process() -> tuple[float, float]:
         )
         _API_REQUEST_LAST_STARTED = started
     return round(wait * 1000, 1), interval_ms
-
-
-def _wait_for_api_request_slot() -> tuple[float, float]:
-    """Return throttle wait and actual request-start spacing in milliseconds.
-
-    Serializes INDstocks request starts within this process and, when
-    INDSTOCKS_RATE_LIMIT_LOCK_FILE points at storage shared by every worker
-    that shares the INDstocks token, across processes too. This keeps the
-    combined request rate of all workers at or below the provider's documented
-    five-requests-per-second guideline instead of letting each worker pace
-    itself independently (which can produce HTTP 429s when several workers
-    share one API).
-    """
-    lock = _rate_limit_file_handle()
-    if lock is not None:
-        handle, fcntl = lock
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except OSError:
-            return _wait_for_api_request_slot_in_process()
-        try:
-            return _wait_for_api_request_slot_in_process()
-        finally:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    return _wait_for_api_request_slot_in_process()
 
 
 def _indstocks_endpoint_category(path: str) -> str:

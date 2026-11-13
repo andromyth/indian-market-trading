@@ -129,9 +129,9 @@ gcloud run deploy "$SERVICE_NAME" \
   --max 1 \
   --no-cpu-throttling \
   --concurrency 1 \
-  --timeout 300 \
+  --timeout 900 \
   --no-allow-unauthenticated \
-  --set-env-vars "INDSTOCKS_AUTH_MODE=${INDSTOCKS_AUTH_MODE},AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+  --set-env-vars "INDSTOCKS_AUTH_MODE=${INDSTOCKS_AUTH_MODE},AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,ALL_NSE_CAPTURE_WORKERS=8,ALL_NSE_CAPTURE_GRACE_MINUTES=3,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
   --set-secrets "$secrets_arg"
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" \
@@ -178,13 +178,13 @@ upsert_scheduler_job() {
     --http-method POST
     --oidc-service-account-email "$SCHEDULER_SA"
     --oidc-token-audience "$SERVICE_URL"
-    --attempt-deadline 300s
+    --attempt-deadline 540s
     # Retry brief HTTP 5xx/timeout failures only within a short window, so a
     # failed persistence write can recover without overlapping later market slots.
     --max-retry-attempts 2
-    --max-retry-duration 45s
-    --min-backoff 5s
-    --max-backoff 15s
+    --max-retry-duration 60s
+    --min-backoff 10s
+    --max-backoff 30s
     --max-doublings 1
   )
 

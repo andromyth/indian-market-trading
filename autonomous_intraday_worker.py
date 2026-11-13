@@ -34,6 +34,14 @@ FLUSH_EVERY_DEFAULT = 5
 WATCHLIST_REFRESH_SECONDS_DEFAULT = 15 * 60
 MAX_DATA_AGE_SECONDS = 5 * 60
 ALL_NSE_CAPTURE_INTERVAL_MINUTES = 5
+# The coordinated acquisition process fans quote collection out to this many
+# shard workers. They share one process-wide INDstocks request gate; the shard
+# outputs are combined by one explicit assembly step before publication.
+ALL_NSE_CAPTURE_WORKERS = max(1, int(os.getenv("ALL_NSE_CAPTURE_WORKERS", "8") or 8))
+# A scheduler tick can arrive a little after its anchor when the previous tick
+# overran or the instance was starting up. Capturing the anchor's bucket within
+# this grace window prevents one late tick from losing the whole slot.
+ALL_NSE_CAPTURE_GRACE_MINUTES = max(0, int(os.getenv("ALL_NSE_CAPTURE_GRACE_MINUTES", "3") or 3))
 SEGMENT_STOP = {
     "morning": time(12, 15),
     "afternoon": time(15, 30),
@@ -42,20 +50,45 @@ SEGMENT_STOP = {
 }
 
 
-def is_all_nse_capture_slot(value: datetime | pd.Timestamp) -> bool:
-    """Return True only for five-minute NSE cash-session anchors.
+def all_nse_capture_slot(
+    value: datetime | pd.Timestamp, grace_minutes: int | None = None
+) -> pd.Timestamp | None:
+    """Return the five-minute anchor this tick belongs to, or None.
 
-    Slots are 09:15, 09:20, ..., 15:25 Asia/Kolkata. An off-schedule/manual
-    /tick probe may still refresh the small watchlist, but must not trigger a
-    costly full-universe quote plus prediction capture.
+    Slots are 09:15, 09:20, ..., 15:25 Asia/Kolkata. A tick is associated with
+    the anchor of the bucket it falls into, and only when it arrives no later
+    than ``grace_minutes`` after that anchor. The anchor (not the arrival minute)
+    is what the snapshot is stored under, so a slightly late tick still fills
+    the correct, deterministic slot path and remains idempotent.
     """
+    grace = ALL_NSE_CAPTURE_GRACE_MINUTES if grace_minutes is None else max(0, int(grace_minutes))
     stamp = pd.Timestamp(value)
     stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
     local = stamp.to_pydatetime()
     if not is_nse_trading_day(local.date()) or not (OPEN <= local.time() < CLOSE):
-        return False
+        return None
     elapsed_minutes = local.hour * 60 + local.minute - (OPEN.hour * 60 + OPEN.minute)
-    return elapsed_minutes >= 0 and elapsed_minutes % ALL_NSE_CAPTURE_INTERVAL_MINUTES == 0
+    if elapsed_minutes < 0:
+        return None
+    anchor_offset = (
+        elapsed_minutes // ALL_NSE_CAPTURE_INTERVAL_MINUTES
+    ) * ALL_NSE_CAPTURE_INTERVAL_MINUTES
+    if elapsed_minutes - anchor_offset > grace:
+        return None
+    anchor = pd.Timestamp.combine(
+        local.date(), OPEN
+    ).tz_localize(IST) + pd.Timedelta(minutes=anchor_offset)
+    return anchor
+
+
+def is_all_nse_capture_slot(value: datetime | pd.Timestamp) -> bool:
+    """Return True only on an exact five-minute NSE cash-session anchor.
+
+    An off-schedule/manual /tick probe may still refresh the small watchlist, but
+    must not, by itself, trigger a costly full-universe quote capture. The live
+    tick path uses :func:`all_nse_capture_slot` with a small lateness grace.
+    """
+    return all_nse_capture_slot(value, grace_minutes=0) is not None
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -1414,16 +1447,36 @@ class AutonomousIntradayWorker:
         # Capture current market quotes and pooled-model predictions for the
         # official NSE equity universe only on five-minute session anchors.
         # All quote-observation timestamps remain the actual collection times.
-        if is_all_nse_capture_slot(now):
+        # A tick that arrives a few minutes late still fills its anchor slot.
+        capture_slot = all_nse_capture_slot(now, ALL_NSE_CAPTURE_GRACE_MINUTES)
+        if capture_slot is not None:
             try:
-                from all_universe_minute_capture import capture_all_universe_minute_snapshot
+                if ALL_NSE_CAPTURE_WORKERS > 1:
+                    # One coordinated process: parallel shard collectors share
+                    # the in-process INDstocks gate, then one explicit assembly
+                    # validates all shards before publishing the canonical file.
+                    from all_universe_minute_capture import (
+                        capture_all_universe_minute_snapshot_sharded,
+                    )
 
-                all_universe_capture = capture_all_universe_minute_snapshot(
-                    now=now.floor("min"),
-                    worker_root=self.root,
-                    daily_ledger=self.daily_ledger,
-                    prediction_snapshots=self.last_minute_snapshot_rows,
-                )
+                    all_universe_capture = capture_all_universe_minute_snapshot_sharded(
+                        now=capture_slot,
+                        worker_root=self.root,
+                        daily_ledger=self.daily_ledger,
+                        prediction_snapshots=self.last_minute_snapshot_rows,
+                        worker_count=ALL_NSE_CAPTURE_WORKERS,
+                    )
+                else:
+                    from all_universe_minute_capture import (
+                        capture_all_universe_minute_snapshot,
+                    )
+
+                    all_universe_capture = capture_all_universe_minute_snapshot(
+                        now=capture_slot,
+                        worker_root=self.root,
+                        daily_ledger=self.daily_ledger,
+                        prediction_snapshots=self.last_minute_snapshot_rows,
+                    )
                 result["all_universe_capture"] = all_universe_capture
                 if (
                     all_universe_capture.get("status") not in {"OK", "STORED", "PARTIAL"}
@@ -1432,7 +1485,10 @@ class AutonomousIntradayWorker:
                     _log(
                         "all_universe_minute_capture_degraded",
                         minute=minute_key,
+                        capture_slot=pd.Timestamp(capture_slot).isoformat(),
                         capture_status=all_universe_capture.get("status"),
+                        shard_count_completed=all_universe_capture.get("shard_count_completed"),
+                        shard_count_expected=all_universe_capture.get("shard_count_expected"),
                         expected_symbol_count=all_universe_capture.get("expected_symbol_count"),
                         quoted_symbol_count=all_universe_capture.get("quoted_symbol_count"),
                         missing_quote_count=all_universe_capture.get("missing_quote_count"),
@@ -1456,7 +1512,10 @@ class AutonomousIntradayWorker:
                 "status": "NOT_SCHEDULED",
                 "cycle_minute_ist": minute_key,
                 "capture_interval_minutes": ALL_NSE_CAPTURE_INTERVAL_MINUTES,
-                "reason": "Full-NSE capture runs only on five-minute session anchors.",
+                "reason": (
+                    "Full-NSE capture runs only on five-minute session anchors "
+                    f"(grace {ALL_NSE_CAPTURE_GRACE_MINUTES}m)."
+                ),
             }
 
         # Persist immediately on any degraded tick so failed inference rows and

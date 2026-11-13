@@ -10,13 +10,27 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+from all_universe_snapshot_assembly import (
+    DEFAULT_WORKER_COUNT,
+    SHARD_STATUS,
+    SHARD_SUBDIR,
+    assemble_shards,
+    canonical_artifact_names,
+    normalized_cycle_minute,
+    shard_artifact_names,
+    shard_universe,
+    write_assembly_manifest_only,
+    write_canonical_snapshot,
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET URLs.
@@ -282,7 +296,13 @@ def _prediction_map(
             )
             if pd.isna(observed_at):
                 continue
-            if observed_at.tz_convert(IST).floor("min") != cycle_minute:
+            # A tick may run a little after its anchor; forecasts observed
+            # anywhere inside the slot bucket still belong to that slot.
+            observed_minute = observed_at.tz_convert(IST).floor("min")
+            if not (
+                cycle_minute <= observed_minute
+                < cycle_minute + pd.Timedelta(minutes=5)
+            ):
                 continue
             mapped.setdefault(symbol, []).append(_clean(pred))
     return mapped
@@ -404,20 +424,32 @@ def _quote_row(
     }
 
 
-def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    """Persist both a minute-specific audit record and a latest status pointer."""
+def _write_manifest(
+    store: Any,
+    local_dir: Path,
+    payload: dict[str, Any],
+    *,
+    remote_dir: str | None = None,
+    name: str | None = None,
+    write_latest: bool = True,
+) -> dict[str, Any]:
+    """Persist both a minute-specific audit record and an optional latest pointer.
+
+    Shard capture writes into the ``shards`` subfolder with a shard-qualified
+    name and must not update the canonical ``latest_manifest.json`` pointer;
+    only the explicit assembly step does that.
+    """
     path = local_dir / "latest_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(_clean(payload), indent=2, sort_keys=True)
-    path.write_text(encoded, encoding="utf-8")
 
     minute = pd.to_datetime(payload.get("cycle_minute_ist"), errors="coerce")
     if pd.isna(minute):
         raise RuntimeError("Cannot persist a per-minute manifest without cycle_minute_ist")
-    minute_name = f"manifest_{minute:%Y%m%d_%H%M}.json"
+    minute_name = name or f"manifest_{minute:%Y%m%d_%H%M}.json"
     minute_path = local_dir / minute_name
     minute_path.write_text(encoded, encoding="utf-8")
-    minute_remote = f"{REMOTE_ROOT}/{minute:%Y/%m/%d}/{minute_name}"
+    minute_remote = f"{remote_dir or f'{REMOTE_ROOT}/{minute:%Y/%m/%d}'}/{minute_name}"
 
     minute_result = store.upload_or_update(
         minute_path, minute_remote, mime_type="application/json"
@@ -434,6 +466,10 @@ def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dic
         encoding="utf-8",
     )
 
+    if not write_latest:
+        return {"minute_manifest": minute_result, "latest_manifest": None}
+
+    path.write_text(encoded, encoding="utf-8")
     latest_result = store.upload_or_update(
         path, f"{REMOTE_ROOT}/latest_manifest.json", mime_type="application/json"
     )
@@ -441,6 +477,25 @@ def _write_manifest(store: Any, local_dir: Path, payload: dict[str, Any]) -> dic
         raise RuntimeError(f"Drive latest-manifest write was not confirmed: {latest_result}")
     return {"minute_manifest": minute_result, "latest_manifest": latest_result}
 
+
+
+def _remote_for_local_artifact(local_path: Path) -> str | None:
+    """Map a local snapshot/manifest file name to its Drive path.
+
+    Supports both canonical slot artifacts and shard-qualified artifacts such as
+    ``snapshot_20261112_1005_w03of08.parquet``.
+    """
+    match = re.fullmatch(
+        r"(snapshot|manifest)_(\d{8})_(\d{4})(?:_w(\d{2})of(\d{2}))?\.(?:parquet|json)",
+        local_path.name,
+    )
+    if not match:
+        return None
+    kind, yyyymmdd, hhmm, shard_index, shard_count = match.groups()
+    day = f"{yyyymmdd[:4]}/{yyyymmdd[4:6]}/{yyyymmdd[6:]}"
+    if shard_index is not None and shard_count is not None and int(shard_count) > 1:
+        return f"{REMOTE_ROOT}/{day}/shards/{local_path.name}"
+    return f"{REMOTE_ROOT}/{day}/{local_path.name}"
 
 
 def _upload_pending_snapshots(store: Any, local_dir: Path, current_name: str) -> dict[str, Any]:
@@ -453,11 +508,9 @@ def _upload_pending_snapshots(store: Any, local_dir: Path, current_name: str) ->
         if marker_path.is_file():
             continue
         try:
-            stamp = datetime.strptime(local_path.stem, "snapshot_%Y%m%d_%H%M")
-            remote = (
-                f"{REMOTE_ROOT}/{stamp:%Y/%m/%d}/"
-                f"snapshot_{stamp:%Y%m%d_%H%M}.parquet"
-            )
+            remote = _remote_for_local_artifact(local_path)
+            if not remote:
+                raise RuntimeError(f"Unrecognized snapshot file name: {local_path.name}")
             result["attempted"] += 1
             upload = store.upload_or_update(
                 local_path, remote, mime_type="application/vnd.apache.parquet"
@@ -481,7 +534,6 @@ def _upload_pending_snapshots(store: Any, local_dir: Path, current_name: str) ->
     return result
 
 
-
 def _upload_pending_manifests(
     store: Any, local_dir: Path, current_name: str
 ) -> dict[str, Any]:
@@ -489,8 +541,11 @@ def _upload_pending_manifests(
     result: dict[str, Any] = {"attempted": 0, "recovered": 0, "errors": []}
     for local_path in sorted(local_dir.glob("manifest_*.json")):
         # Success receipts are named manifest_YYYYMMDD_HHMM.uploaded.json and
-        # also match the broad glob above. Only retry canonical minute payloads.
-        if not re.fullmatch(r"manifest_\d{8}_\d{4}\.json", local_path.name):
+        # also match the broad glob above. Only retry canonical minute payloads,
+        # including shard-qualified ones.
+        if not re.fullmatch(
+            r"manifest_\d{8}_\d{4}(?:_w\d{2}of\d{2})?\.json", local_path.name
+        ):
             continue
         if local_path.name == current_name:
             continue
@@ -498,8 +553,9 @@ def _upload_pending_manifests(
         if marker_path.is_file():
             continue
         try:
-            stamp = datetime.strptime(local_path.stem, "manifest_%Y%m%d_%H%M")
-            remote = f"{REMOTE_ROOT}/{stamp:%Y/%m/%d}/{local_path.name}"
+            remote = _remote_for_local_artifact(local_path)
+            if not remote:
+                raise RuntimeError(f"Unrecognized manifest file name: {local_path.name}")
             result["attempted"] += 1
             upload = store.upload_or_update(
                 local_path, remote, mime_type="application/json"
@@ -531,17 +587,19 @@ def capture_all_universe_minute_snapshot(
     prediction_snapshots: list[dict[str, Any]] | None = None,
     worker_id: int = 0,
     worker_count: int = 1,
+    universe: Iterable[str] | None = None,
+    instruments: dict[str, str] | None = None,
+    return_frame: bool = False,
 ) -> dict[str, Any]:
-    """Fetch a batch quote for each official NSE equity, match available outcomes,
-    and persist an idempotent Parquet snapshot plus a coverage manifest to Drive.
+    """Collect one slice of the official NSE universe and persist it for a slot.
 
-    When worker_count > 1 the official universe is split into equal shards and
-    this worker only collects its own shard (symbols whose shard index equals
-    worker_id). Several workers can therefore share one INDstocks API without
-    each re-fetching the whole universe, which keeps a full-NSE capture inside
-    the five-minute slot even when a single-process fetch sometimes overruns.
-    Shards write sibling snapshot files named with the worker id; a later
-    assemble/compile step can read every shard for the same slot.
+    With ``worker_count > 1`` the universe is split into disjoint shards and
+    this worker collects only ``symbols[worker_id::worker_count]``, writing a
+    shard-qualified snapshot and manifest under the slot's ``shards`` folder.
+    Shards are combined by the explicit assembly step
+    (:mod:`all_universe_snapshot_assembly`); a shard write is never presented as
+    a complete canonical snapshot. With ``worker_count == 1`` the behavior is
+    the original single-artifact capture.
     """
     worker_count = max(1, int(worker_count))
     worker_id = max(0, min(int(worker_id), worker_count - 1))
@@ -552,22 +610,30 @@ def capture_all_universe_minute_snapshot(
     now_ts = pd.Timestamp(now)
     now_ts = now_ts.tz_localize(IST) if now_ts.tzinfo is None else now_ts.tz_convert(IST)
     cycle_minute = now_ts.floor("5min")
+    artifact_names = shard_artifact_names(cycle_minute, worker_id, worker_count)
     local_dir = Path(worker_root) / "all_universe_minute_snapshots"
     local_dir.mkdir(parents=True, exist_ok=True)
     remote_day = cycle_minute.strftime("%Y/%m/%d")
-    remote_path = (
-        f"{REMOTE_ROOT}/{remote_day}/"
-        f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+    remote_path = artifact_names["snapshot_remote"]
+    remote_manifest_dir = (
+        f"{REMOTE_ROOT}/{remote_day}/{SHARD_SUBDIR}"
+        if worker_count > 1
+        else f"{REMOTE_ROOT}/{remote_day}"
     )
     manifest: dict[str, Any] = {
-        "schema_version": "all-universe-minute-snapshot-v1",
+        "schema_version": "all-universe-minute-snapshot-v2",
+        "artifact_kind": "SHARD" if worker_count > 1 else "CANONICAL_DIRECT",
         "capture_interval_minutes": 5,
         "cycle_minute_ist": cycle_minute.isoformat(),
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "INDSTOCKS_BATCH_QUOTE",
         "status": "STARTING",
         "snapshot_persisted": False,
+        "worker_id": worker_id,
+        "worker_count": worker_count,
         "expected_symbol_count": 0,
+        "universe_symbol_count": 0,
+        "shard_symbol_count": 0,
         "quoted_symbol_count": 0,
         "missing_quote_count": 0,
         "unmapped_symbol_count": 0,
@@ -578,10 +644,10 @@ def capture_all_universe_minute_snapshot(
 
     store = GoogleDriveStore()
     pending_recovery = _upload_pending_snapshots(
-        store, local_dir, f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+        store, local_dir, artifact_names["snapshot_name"]
     )
     pending_manifest_recovery = _upload_pending_manifests(
-        store, local_dir, f"manifest_{cycle_minute:%Y%m%d_%H%M}.json"
+        store, local_dir, artifact_names["manifest_name"]
     )
     manifest["pending_snapshot_recovery"] = pending_recovery
     manifest["pending_manifest_recovery"] = pending_manifest_recovery
@@ -595,22 +661,43 @@ def capture_all_universe_minute_snapshot(
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
         })
         try:
-            _write_manifest(store, local_dir, manifest)
+            _write_manifest(
+                store, local_dir, manifest,
+                remote_dir=remote_manifest_dir,
+                name=artifact_names["manifest_name"],
+                write_latest=(worker_count == 1),
+            )
         except Exception as exc:
             manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
-        return manifest
+        return _clean(manifest)
 
-    universe = sorted({
-        str(s).strip().upper().replace(".NS", "")
-        for s in official_nse_symbols(force_refresh=False)
-        if str(s).strip()
-    })
-    instruments = _instrument_map()
+    if universe is None:
+        universe_symbols = sorted({
+            str(s).strip().upper().replace(".NS", "")
+            for s in official_nse_symbols(force_refresh=False)
+            if str(s).strip()
+        })
+    else:
+        universe_symbols = sorted({
+            str(s).strip().upper().replace(".NS", "")
+            for s in universe
+            if str(s).strip()
+        })
+    if instruments is None:
+        instruments = _instrument_map()
+    assigned_symbols = shard_universe(universe_symbols, worker_count)[worker_id]
     prediction_map = _prediction_map(prediction_snapshots, cycle_minute)
     forecast_rows = _load_forecast_rows(daily_ledger)
-    manifest["expected_symbol_count"] = len(universe)
-    manifest["unmapped_symbol_count"] = sum(1 for symbol in universe if symbol not in instruments)
-    manifest["forecast_symbol_count"] = sum(1 for symbol in universe if prediction_map.get(symbol))
+    manifest["expected_symbol_count"] = len(universe_symbols)
+    manifest["universe_symbol_count"] = len(universe_symbols)
+    manifest["shard_symbol_count"] = len(assigned_symbols)
+    manifest["shard_symbols"] = assigned_symbols
+    manifest["unmapped_symbol_count"] = sum(
+        1 for symbol in assigned_symbols if symbol not in instruments
+    )
+    manifest["forecast_symbol_count"] = sum(
+        1 for symbol in assigned_symbols if prediction_map.get(symbol)
+    )
 
     rows: list[dict[str, Any]] = []
     request_errors = 0
@@ -619,24 +706,9 @@ def capture_all_universe_minute_snapshot(
     provider_auth_error: str | None = None
     all_codes = [
         (symbol, instruments[symbol])
-        for symbol in universe
+        for symbol in assigned_symbols
         if symbol in instruments
     ]
-    if worker_count > 1:
-        # Round-robin shard: worker i collects symbols[i::worker_count]. Every
-        # symbol is collected by exactly one worker, so shards never duplicate
-        # provider requests and the union of all shards is the full universe.
-        all_codes = all_codes[worker_id::worker_count]
-        manifest["worker_id"] = worker_id
-        manifest["worker_count"] = worker_count
-        manifest["shard_symbol_count"] = len(all_codes)
-        manifest["shard_universe_symbol_count"] = len(
-            [
-                (symbol, instruments[symbol])
-                for symbol in universe
-                if symbol in instruments
-            ]
-        )
 
     for batch_index, offset in enumerate(range(0, len(all_codes), BATCH_SIZE), start=1):
         batch = all_codes[offset:offset + BATCH_SIZE]
@@ -707,7 +779,7 @@ def capture_all_universe_minute_snapshot(
                 provider_error=provider_error,
             ))
 
-    for symbol in universe:
+    for symbol in assigned_symbols:
         if symbol not in instruments:
             rows.append(_quote_row(
                 symbol, None, None, pd.Timestamp.now(tz=IST), cycle_minute,
@@ -732,12 +804,13 @@ def capture_all_universe_minute_snapshot(
         manifest["capture_data_status"] = (
             "BLOCKED_PROVIDER_AUTH"
             if provider_auth_circuit_open and manifest["quoted_symbol_count"] == 0
-            else "COMPLETE"
-            if manifest["quoted_symbol_count"] == manifest["expected_symbol_count"]
+            else "COMPLETE_SHARD"
+            if manifest["quoted_symbol_count"] == manifest["shard_symbol_count"]
             else "PARTIAL"
         )
         manifest["matched_outcome_count"] = int(frame["matched_outcome_count"].sum())
         manifest["row_count"] = int(len(frame))
+        manifest["shard_row_count"] = int(len(frame))
         complete_coverage_pct = _snapshot_coverage_pct(
             manifest["quoted_symbol_count"], manifest["expected_symbol_count"]
         )
@@ -745,7 +818,7 @@ def capture_all_universe_minute_snapshot(
         manifest["complete_quote_symbol_coverage_pct"] = complete_coverage_pct
         manifest["coverage_is_informational"] = True
         manifest["forecast_record_count"] = int(frame["forecast_count"].sum())
-        local_path = local_dir / f"snapshot_{cycle_minute:%Y%m%d_%H%M}.parquet"
+        local_path = local_dir / artifact_names["snapshot_name"]
         temp_path = local_path.with_suffix(".tmp.parquet")
         frame.to_parquet(temp_path, index=False, compression="zstd")
         temp_path.replace(local_path)
@@ -764,7 +837,7 @@ def capture_all_universe_minute_snapshot(
                 }, sort_keys=True),
                 encoding="utf-8",
             )
-            manifest["status"] = "STORED"
+            manifest["status"] = SHARD_STATUS if worker_count > 1 else "STORED"
             manifest["snapshot_persisted"] = True
             manifest["snapshot_bytes"] = int(local_path.stat().st_size)
             manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -790,18 +863,255 @@ def capture_all_universe_minute_snapshot(
         if not manifest.get("error"):
             manifest["error"] = manifest["recovery_error"]
 
+    manifest_write_kwargs = {
+        "remote_dir": remote_manifest_dir,
+        "name": artifact_names["manifest_name"],
+        "write_latest": worker_count == 1,
+    }
     try:
-        manifest["manifest_drive_sync"] = _write_manifest(store, local_dir, manifest)
+        manifest["manifest_drive_sync"] = _write_manifest(
+            store, local_dir, manifest, **manifest_write_kwargs
+        )
     except Exception as exc:
         manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
         manifest["status"] = "PERSISTENCE_ERROR"
         # Make a best-effort second write of the per-minute audit showing the
         # failed manifest sync; never mask the original failure in the result.
         try:
-            manifest["manifest_recovery_sync"] = _write_manifest(store, local_dir, manifest)
+            manifest["manifest_recovery_sync"] = _write_manifest(
+                store, local_dir, manifest, **manifest_write_kwargs
+            )
         except Exception as retry_exc:
             manifest["manifest_recovery_sync_error"] = (
                 f"{type(retry_exc).__name__}: {retry_exc}"
             )
 
-    return _clean(manifest)
+    cleaned = _clean(manifest)
+    if return_frame:
+        cleaned["_frame"] = frame
+    return cleaned
+
+
+def _shard_result_is_persisted(result: dict[str, Any]) -> bool:
+    if result.get("_frame") is None:
+        return False
+    return (
+        result.get("snapshot_persisted") is True
+        and str(result.get("status") or "").upper() in {SHARD_STATUS, "STORED"}
+    )
+
+
+def capture_all_universe_minute_snapshot_sharded(
+    *,
+    now: datetime | pd.Timestamp,
+    worker_root: Path,
+    daily_ledger: Path | None,
+    prediction_snapshots: list[dict[str, Any]] | None = None,
+    worker_count: int = DEFAULT_WORKER_COUNT,
+    universe: Iterable[str] | None = None,
+    instruments: dict[str, str] | None = None,
+    store: Any | None = None,
+    retry_failed_shards: int = 1,
+    expected_universe: Iterable[str] | None = None,
+    strict_universe: bool = False,
+) -> dict[str, Any]:
+    """Coordinated sharded capture followed by one explicit assembly.
+
+    One coordinated process fans the universe out to ``worker_count`` shard
+    collectors that share the process-wide INDstocks request gate. Every shard
+    persists its own artifact. Only when all shards are present and valid does
+    the assembly step publish the canonical snapshot that the prediction
+    compiler consumes. If any shard is missing or invalid, no canonical snapshot
+    is written for the slot; an incomplete audit manifest is recorded instead.
+    """
+    cycle_minute = normalized_cycle_minute(now)
+    count = max(1, int(worker_count))
+    worker_root = Path(worker_root)
+
+    if count == 1:
+        # Degenerate non-sharded path: the single collector already writes the
+        # canonical artifact, so no separate assembly pass is required.
+        return capture_all_universe_minute_snapshot(
+            now=cycle_minute,
+            worker_root=worker_root,
+            daily_ledger=daily_ledger,
+            prediction_snapshots=prediction_snapshots,
+            worker_id=0,
+            worker_count=1,
+            universe=universe,
+            instruments=instruments,
+        )
+
+    from delivery_training_universe import official_nse_symbols
+    from indstocks_client import configured
+    from persistent_store import GoogleDriveStore
+
+    if not configured():
+        return _clean({
+            "schema_version": "all-universe-minute-snapshot-v2",
+            "mode": "SHARDED_ASSEMBLY",
+            "status": "BLOCKED_PROVIDER_CREDENTIALS",
+            "snapshot_persisted": False,
+            "cycle_minute_ist": cycle_minute.isoformat(),
+            "worker_count": count,
+            "error": (
+                "INDstocks TOTP credentials are not configured in the Cloud Run "
+                "service's secret-backed environment."
+            ),
+        })
+
+    if universe is None:
+        universe_symbols = sorted({
+            str(s).strip().upper().replace(".NS", "")
+            for s in official_nse_symbols(force_refresh=False)
+            if str(s).strip()
+        })
+    else:
+        universe_symbols = sorted({
+            str(s).strip().upper().replace(".NS", "")
+            for s in universe
+            if str(s).strip()
+        })
+    if instruments is None:
+        instruments = _instrument_map()
+    store = store or GoogleDriveStore()
+
+    def run_shard(index: int) -> dict[str, Any]:
+        try:
+            return capture_all_universe_minute_snapshot(
+                now=cycle_minute,
+                worker_root=worker_root,
+                daily_ledger=daily_ledger,
+                prediction_snapshots=prediction_snapshots,
+                worker_id=index,
+                worker_count=count,
+                universe=universe_symbols,
+                instruments=instruments,
+                return_frame=True,
+            )
+        except Exception as exc:
+            names = shard_artifact_names(cycle_minute, index, count)
+            return {
+                "status": "ERROR",
+                "snapshot_persisted": False,
+                "worker_id": index,
+                "worker_count": count,
+                "cycle_minute_ist": cycle_minute.isoformat(),
+                "remote_snapshot_path": names["snapshot_remote"],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="nse-shard") as pool:
+        results = list(pool.map(run_shard, range(count)))
+
+    for attempt in range(max(0, int(retry_failed_shards))):
+        retry_ids = [
+            index for index, result in enumerate(results)
+            if not _shard_result_is_persisted(result)
+        ]
+        if not retry_ids:
+            break
+        time.sleep(min(2.0, 0.5 * (attempt + 1)))
+        with ThreadPoolExecutor(
+            max_workers=len(retry_ids), thread_name_prefix="nse-shard-retry"
+        ) as pool:
+            retried = list(pool.map(run_shard, retry_ids))
+        for index, retried_result in zip(retry_ids, retried):
+            if _shard_result_is_persisted(retried_result):
+                results[index] = retried_result
+
+    shard_payloads: list[dict[str, Any]] = []
+    for index, result in enumerate(results):
+        names = shard_artifact_names(cycle_minute, index, count)
+        payload = dict(result)
+        frame = payload.pop("_frame", None)
+        shard_payloads.append({
+            "worker_id": index,
+            "manifest": payload,
+            "frame": frame,
+            "snapshot_remote_path": names["snapshot_remote"],
+            "manifest_remote_path": names["manifest_remote"],
+        })
+
+    assembly = assemble_shards(
+        cycle_minute=cycle_minute,
+        worker_count=count,
+        shards=shard_payloads,
+        expected_universe=expected_universe if expected_universe is not None else universe_symbols,
+        strict_universe=strict_universe,
+    )
+    assembly_manifest = assembly["manifest"]
+    canonical_names = canonical_artifact_names(cycle_minute)
+    write_result: dict[str, Any] = {}
+    status = "INCOMPLETE"
+    if assembly["status"] == "VALIDATED":
+        try:
+            write_result = write_canonical_snapshot(
+                store,
+                cycle_minute,
+                assembly["frame"],
+                assembly_manifest,
+                worker_root,
+            )
+            status = "STORED"
+        except Exception as exc:
+            status = "PERSISTENCE_ERROR"
+            assembly_manifest["snapshot_persisted"] = False
+            assembly_manifest["status"] = "ASSEMBLY_WRITE_FAILED"
+            assembly_manifest["error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            write_result["incomplete_manifest"] = write_assembly_manifest_only(
+                store, cycle_minute, assembly_manifest, worker_root
+            )
+        except Exception as exc:
+            write_result["incomplete_manifest_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if write_result:
+        assembly_manifest["assembly_write"] = _clean(write_result)
+
+    shard_summaries = [
+        {
+            key: _clean(value)
+            for key, value in {
+                **result,
+            }.items()
+            if key != "_frame"
+        }
+        for result in results
+    ]
+    combined = {
+        "schema_version": "all-universe-minute-snapshot-v2",
+        "mode": "SHARDED_ASSEMBLY",
+        "status": status,
+        "snapshot_persisted": bool(status == "STORED"),
+        "cycle_minute_ist": cycle_minute.isoformat(),
+        "worker_count": count,
+        "shard_count_expected": count,
+        "shard_count_completed": int(
+            sum(1 for result in results if _shard_result_is_persisted(result))
+        ),
+        "shards": shard_summaries,
+        "assembly": assembly_manifest,
+        "snapshot_drive_path": (
+            canonical_names["snapshot_remote"] if status == "STORED" else None
+        ),
+        "remote_snapshot_path": canonical_names["snapshot_remote"],
+        "expected_symbol_count": assembly_manifest.get("expected_symbol_count"),
+        "row_count": assembly_manifest.get("row_count"),
+        "quoted_symbol_count": assembly_manifest.get("quoted_symbol_count"),
+        "missing_quote_count": assembly_manifest.get("missing_quote_count"),
+        "complete_quote_symbol_coverage_pct": assembly_manifest.get(
+            "complete_quote_symbol_coverage_pct"
+        ),
+        "coverage_is_informational": True,
+    }
+    if status != "STORED":
+        combined["error"] = assembly_manifest.get("error") or (
+            f"Only {combined['shard_count_completed']} of {count} shards completed; "
+            "no canonical snapshot was published."
+        )
+    return _clean(combined)

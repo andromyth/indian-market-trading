@@ -418,3 +418,86 @@ def test_prediction_already_stored_checks_per_slot_manifest(monkeypatch, tmp_pat
 
     monkeypatch.setattr(compiler, "_find_remote", lambda store, remote: None)
     assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False
+
+
+def test_latest_capture_skips_sharded_snapshot_that_was_never_assembled(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    unassembled_remote = "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1445.parquet"
+    assembled_remote = "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1440.parquet"
+    manifests = {
+        "unassembled": {
+            "schema_version": "all-universe-minute-snapshot-v2",
+            "cycle_minute_ist": "2026-11-09T14:45:00+05:30",
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "worker_count": 8,
+            "shard_count_expected": 8,
+            "shard_count_completed": 6,
+            "assembly_status": "INCOMPLETE",
+            "snapshot_drive_path": unassembled_remote,
+            "row_count": 1,
+            "artifact_kind": "SHARD",
+        },
+        "assembled": {
+            "schema_version": "all-universe-minute-snapshot-v2",
+            "cycle_minute_ist": "2026-11-09T14:40:00+05:30",
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "worker_count": 8,
+            "shard_count_expected": 8,
+            "shard_count_completed": 8,
+            "assembly_status": "COMPLETE",
+            "snapshot_drive_path": assembled_remote,
+            "row_count": 1,
+        },
+    }
+    items = [
+        {"id": "unassembled", "name": "manifest_20261109_1445.json"},
+        {"id": "assembled", "name": "manifest_20261109_1440.json"},
+    ]
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        if remote.endswith("/latest_manifest.json"):
+            return {"id": "latest", "name": "latest_manifest.json"}
+        if remote == unassembled_remote:
+            return {"id": "snapshot_unassembled"}
+        if remote == assembled_remote:
+            return {"id": "snapshot_assembled"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if file_id in manifests:
+            destination.write_text(json.dumps(manifests[file_id]), encoding="utf-8")
+        elif file_id == "latest":
+            destination.write_text(json.dumps(manifests["unassembled"]), encoding="utf-8")
+        else:
+            destination.write_bytes(b"parquet-placeholder")
+
+    def read_parquet(path):
+        minute = "14:45" if "1445" in str(path) else "14:40"
+        return pd.DataFrame({
+            "symbol": ["RELIANCE"],
+            "instrument_code": ["NSE_EQ|123"],
+            "cycle_minute_ist": [f"2026-11-09T{minute}:00+05:30"],
+            "quote_status": ["PASS"],
+            "actual_observed_price": [1500.0],
+            "quote_observed_at_ist": [f"2026-11-09T{minute}:05+05:30"],
+            "quote_error": [None],
+        })
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", lambda store, parent_id: items)
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(compiler.pd, "read_parquet", read_parquet)
+
+    manifest, _, minute = compiler._latest_capture(SimpleNamespace(), now=now)
+
+    assert minute == pd.Timestamp("2026-11-09 14:40:00", tz=IST)
+    assert manifest["assembly_status"] == "COMPLETE"

@@ -23,7 +23,7 @@ from autonomous_intraday_worker import (
     AutonomousIntradayWorker,
     _clean_json,
     _log,
-    is_all_nse_capture_slot,
+    all_nse_capture_slot,
 )
 from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 from market_session_guard import IST, is_nse_trading_day
@@ -275,7 +275,7 @@ def _prepare_all_nse_history_before_capture(
     stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
     minute = stamp.floor("min")
     ALL_NSE_MINUTE_PREDICTOR.start()
-    if not is_all_nse_capture_slot(minute):
+    if all_nse_capture_slot(minute) is None:
         return {"status": "NOT_SCHEDULED", "minute": minute.isoformat()}
     try:
         result = ALL_NSE_MINUTE_PREDICTOR._schedule_current_session_history_refresh(minute)

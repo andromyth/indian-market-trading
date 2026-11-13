@@ -51,6 +51,26 @@ def test_all_nse_capture_uses_five_minute_session_anchors():
     assert not is_all_nse_capture_slot(datetime(2026, 10, 24, 10, 0, tzinfo=IST))
 
 
+def test_late_tick_still_resolves_to_its_anchor_within_grace():
+    from autonomous_intraday_worker import all_nse_capture_slot
+
+    assert all_nse_capture_slot(
+        datetime(2026, 10, 21, 10, 7, 30, tzinfo=IST), grace_minutes=3
+    ) == pd.Timestamp("2026-10-21 10:05:00", tz=IST)
+    assert all_nse_capture_slot(
+        datetime(2026, 10, 21, 10, 5, 20, tzinfo=IST), grace_minutes=3
+    ) == pd.Timestamp("2026-10-21 10:05:00", tz=IST)
+    assert all_nse_capture_slot(
+        datetime(2026, 10, 21, 10, 9, 0, tzinfo=IST), grace_minutes=3
+    ) is None
+    assert all_nse_capture_slot(
+        datetime(2026, 10, 21, 10, 9, 0, tzinfo=IST), grace_minutes=0
+    ) is None
+    assert all_nse_capture_slot(
+        datetime(2026, 10, 21, 10, 5, 0, tzinfo=IST), grace_minutes=0
+    ) == pd.Timestamp("2026-10-21 10:05:00", tz=IST)
+
+
 def test_normalize_and_freshness_use_current_completed_candles():
     now = pd.Timestamp("2026-10-13 11:00:30", tz=IST)
     raw = _bars("2026-10-13 10:55", 6)
@@ -509,7 +529,7 @@ def test_all_nse_history_refresh_is_started_before_quote_capture(monkeypatch):
 
     calls.clear()
     result = service._prepare_all_nse_history_before_capture(
-        pd.Timestamp("2026-10-28 14:22:12", tz=IST)
+        pd.Timestamp("2026-10-28 14:24:12", tz=IST)
     )
     assert [name for name, _ in calls] == ["start"]
     assert result["status"] == "NOT_SCHEDULED"

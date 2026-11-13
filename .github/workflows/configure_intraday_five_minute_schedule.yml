@@ -55,7 +55,7 @@ jobs:
               "name": name,
               "schedule": schedule,
               "timeZone": "Asia/Kolkata",
-              "attemptDeadline": "300s",
+              "attemptDeadline": "540s",
           }))
           PY
           )"

@@ -71,9 +71,9 @@ jobs:
             --build-service-account "projects/$PROJECT_ID/serviceAccounts/cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com" \
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --port 8080 --cpu 2 --memory 8Gi --min 1 --max 1 \
-            --no-cpu-throttling --concurrency 1 --timeout 300 \
+            --no-cpu-throttling --concurrency 1 --timeout 900 \
             --no-allow-unauthenticated --no-traffic --tag=telemetry \
-            --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+            --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,ALL_NSE_CAPTURE_WORKERS=8,ALL_NSE_CAPTURE_GRACE_MINUTES=3,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
             --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 
       - name: Validate candidate before promotion

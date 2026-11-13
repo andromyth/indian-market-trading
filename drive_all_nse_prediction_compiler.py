@@ -162,6 +162,21 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         if manifest.get("snapshot_persisted") is not True or status != "STORED":
             skipped.append(f"{item.get('name')}: status={status or 'MISSING'}")
             continue
+        # Only the explicit assembly step may publish the canonical sharded
+        # snapshot. Never compile a shard artifact or an incomplete assembly.
+        worker_count = int(manifest.get("worker_count") or 1)
+        if str(manifest.get("artifact_kind") or "").upper() == "SHARD":
+            skipped.append(f"{item.get('name')}: shard artifact, not assembled canonical snapshot")
+            continue
+        if worker_count > 1:
+            if str(manifest.get("assembly_status") or "").upper() != "COMPLETE":
+                skipped.append(f"{item.get('name')}: sharded snapshot was not assembled")
+                continue
+            if int(manifest.get("shard_count_completed") or 0) < int(
+                manifest.get("shard_count_expected") or worker_count
+            ):
+                skipped.append(f"{item.get('name')}: shard_count_incomplete")
+                continue
         if minute.date() != current.date() or age_seconds < 0 or age_seconds > MAX_CAPTURE_AGE_SECONDS:
             skipped.append(f"{item.get('name')}: stale_or_future age_seconds={round(age_seconds, 1)}")
             continue
