@@ -75,7 +75,7 @@ def _download(store, file_id: str, destination: Path) -> None:
     from persistent_store import download_drive_file_with_retry
 
     download_drive_file_with_retry(
-        store.service,
+        getattr(store, "service", store),
         file_id,
         destination,
         operation="github_drive_prediction_input",

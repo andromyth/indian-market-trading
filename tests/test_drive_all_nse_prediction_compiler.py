@@ -590,3 +590,25 @@ def test_load_drive_history_downloads_seed_symbols_in_parallel(monkeypatch, tmp_
     assert payload["downloaded"] == 3
     assert payload["workers"] == 3
     assert (tmp_path / "history_cache" / "index.json").is_file()
+
+
+def test_download_accepts_store_or_raw_per_thread_service(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import persistent_store
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    seen: dict = {}
+
+    def fake_retry(service, file_id, destination, operation=None, max_attempts=4):
+        seen["service"] = service
+        seen["file_id"] = file_id
+
+    monkeypatch.setattr(persistent_store, "download_drive_file_with_retry", fake_retry)
+
+    compiler._download(SimpleNamespace(service="STORE_SERVICE"), "fid", tmp_path / "a.bin")
+    assert seen == {"service": "STORE_SERVICE", "file_id": "fid"}
+
+    compiler._download("RAW_RESOURCE_SERVICE", "fid2", tmp_path / "b.bin")
+    assert seen == {"service": "RAW_RESOURCE_SERVICE", "file_id": "fid2"}
