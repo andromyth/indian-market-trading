@@ -529,10 +529,22 @@ def capture_all_universe_minute_snapshot(
     worker_root: Path,
     daily_ledger: Path | None,
     prediction_snapshots: list[dict[str, Any]] | None = None,
+    worker_id: int = 0,
+    worker_count: int = 1,
 ) -> dict[str, Any]:
     """Fetch a batch quote for each official NSE equity, match available outcomes,
     and persist an idempotent Parquet snapshot plus a coverage manifest to Drive.
+
+    When worker_count > 1 the official universe is split into equal shards and
+    this worker only collects its own shard (symbols whose shard index equals
+    worker_id). Several workers can therefore share one INDstocks API without
+    each re-fetching the whole universe, which keeps a full-NSE capture inside
+    the five-minute slot even when a single-process fetch sometimes overruns.
+    Shards write sibling snapshot files named with the worker id; a later
+    assemble/compile step can read every shard for the same slot.
     """
+    worker_count = max(1, int(worker_count))
+    worker_id = max(0, min(int(worker_id), worker_count - 1))
     from delivery_training_universe import official_nse_symbols
     from indstocks_client import _request, configured
     from persistent_store import GoogleDriveStore
@@ -610,6 +622,21 @@ def capture_all_universe_minute_snapshot(
         for symbol in universe
         if symbol in instruments
     ]
+    if worker_count > 1:
+        # Round-robin shard: worker i collects symbols[i::worker_count]. Every
+        # symbol is collected by exactly one worker, so shards never duplicate
+        # provider requests and the union of all shards is the full universe.
+        all_codes = all_codes[worker_id::worker_count]
+        manifest["worker_id"] = worker_id
+        manifest["worker_count"] = worker_count
+        manifest["shard_symbol_count"] = len(all_codes)
+        manifest["shard_universe_symbol_count"] = len(
+            [
+                (symbol, instruments[symbol])
+                for symbol in universe
+                if symbol in instruments
+            ]
+        )
 
     for batch_index, offset in enumerate(range(0, len(all_codes), BATCH_SIZE), start=1):
         batch = all_codes[offset:offset + BATCH_SIZE]
