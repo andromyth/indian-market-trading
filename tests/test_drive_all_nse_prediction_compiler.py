@@ -501,3 +501,92 @@ def test_latest_capture_skips_sharded_snapshot_that_was_never_assembled(monkeypa
 
     assert minute == pd.Timestamp("2026-11-09 14:40:00", tz=IST)
     assert manifest["assembly_status"] == "COMPLETE"
+
+
+def test_load_drive_history_downloads_seed_symbols_in_parallel(monkeypatch, tmp_path, capsys):
+    import json
+    import threading
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    minute = pd.Timestamp("2026-11-09 14:40:00", tz=IST)
+    lookback = 2
+    symbols = ["AAA", "BBB", "__NIFTY50__"]
+    folder_rows = [
+        {"id": f"folder_{symbol}", "name": f"symbol={symbol}", "mimeType": compiler.FOLDER_MIME}
+        for symbol in symbols
+    ]
+    files_by_folder = {
+        f"folder_{symbol}": [
+            {
+                "id": f"file_{symbol}",
+                "name": f"{symbol}.parquet",
+                "mimeType": "application/parquet",
+                "modifiedTime": "2026-11-09T09:00:00Z",
+                "size": 100,
+            }
+        ]
+        for symbol in symbols
+    }
+
+    def fake_parquet(symbol):
+        stamps = [
+            pd.Timestamp("2026-11-09 14:35:00", tz=IST),
+            pd.Timestamp("2026-11-09 14:40:00", tz=IST),
+            pd.Timestamp("2026-11-09 14:45:00", tz=IST),
+        ]
+        frame = pd.DataFrame(
+            {column: [1.0 + offset for offset in range(len(stamps))] for column in compiler.OHLCV},
+            index=pd.DatetimeIndex(stamps, name="Datetime"),
+        )
+        return frame
+
+    def find_remote(store, remote):
+        return {"id": "archive"} if remote == compiler.HISTORY_ROOT else None
+
+    def list_children(store, parent_id):
+        if parent_id == "archive":
+            return folder_rows + [
+                {"id": "folder_unwanted", "name": "symbol=UNWANTED", "mimeType": compiler.FOLDER_MIME},
+            ]
+        return files_by_folder.get(parent_id, [])
+
+    downloaded: list[str] = []
+
+    def download(service, file_id, destination):
+        downloaded.append(str(file_id))
+        fake_parquet(str(file_id).removeprefix("file_")).to_parquet(destination)
+
+    thread_services: list[SimpleNamespace] = []
+
+    def fake_thread_service(store):
+        marker = SimpleNamespace(thread=threading.current_thread().name)
+        thread_services.append(marker)
+        return marker
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(compiler, "_list_children", list_children)
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(compiler, "_thread_service", fake_thread_service)
+    monkeypatch.setattr(compiler, "HISTORY_DOWNLOAD_WORKERS", 3)
+
+    store = SimpleNamespace(credentials=None, service=None)
+    history = compiler._load_drive_history(store, {"AAA", "BBB"}, minute, tmp_path, lookback)
+
+    assert set(history) == {"AAA", "BBB", "__NIFTY50__"}
+    for frame in history.values():
+        assert len(frame) == lookback
+        assert frame.index.max() <= minute
+    assert sorted(downloaded) == [f"file_{symbol}" for symbol in symbols]
+    assert thread_services, "parallel download path must hand out worker services"
+
+    payload = None
+    for line in capsys.readouterr().out.splitlines():
+        if "HISTORY_SEED_LOADED" in line:
+            payload = json.loads(line)
+    assert payload is not None
+    assert payload["symbols"] == 3
+    assert payload["downloaded"] == 3
+    assert payload["workers"] == 3
+    assert (tmp_path / "history_cache" / "index.json").is_file()

@@ -7,8 +7,13 @@ indstocks_client; INDstocks access remains inside the singleton Cloud Run worker
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,6 +29,10 @@ MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 MAX_CAPTURE_AGE_SECONDS = 12 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
+# Each seed symbol costs one list + one download Drive call; the full universe
+# therefore needs thousands of calls per fresh compile and must not pay for
+# them sequentially (run 43394173212 died at the 15-minute job cap doing this).
+HISTORY_DOWNLOAD_WORKERS = max(1, int(os.getenv("ALL_NSE_COMPILER_HISTORY_WORKERS", "12") or 12))
 
 
 def _find_remote(store, remote: str):
@@ -40,10 +49,14 @@ def _find_remote(store, remote: str):
 
 
 def _list_children(store, parent_id: str) -> list[dict]:
+    # Accepts either a store object (with a .service attribute) or a raw
+    # googleapiclient Resource, so parallel download threads can hand in their
+    # own per-thread service.
+    client = getattr(store, "service", store)
     rows: list[dict] = []
     page = None
     while True:
-        result = store.service.files().list(
+        result = client.files().list(
             q=f"'{parent_id}' in parents and trashed = false",
             spaces="drive",
             pageSize=1000,
@@ -251,6 +264,118 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
     )
 
 
+def _thread_service(store):
+    """Build one Drive service for a download worker thread.
+
+    googleapiclient Resource objects are not thread-safe, so each history
+    download thread uses its own service built from the store's shared
+    (thread-safe) credentials instead of sharing ``store.service``.
+    """
+    from googleapiclient.discovery import build
+
+    return build("drive", "v3", credentials=store.credentials, cache_discovery=False)
+
+
+def _load_symbol_history(
+    service,
+    symbol: str,
+    folder_id: str,
+    cache_dir: Path,
+    cached: dict,
+    minute: pd.Timestamp,
+    lookback: int,
+) -> tuple[str, pd.DataFrame | None, dict | None]:
+    files = _list_children(service, folder_id)
+    item = next((entry for entry in files if entry.get("name") == f"{symbol}.parquet"), None)
+    if not item:
+        return symbol, None, None
+    local = cache_dir / f"{symbol}.parquet"
+    if (
+        not local.is_file()
+        or cached.get("modifiedTime") != item.get("modifiedTime")
+        or str(cached.get("size") or "") != str(item.get("size") or "")
+    ):
+        _download(service, item["id"], local)
+    try:
+        frame = _read_history(local)
+    except Exception:
+        _download(service, item["id"], local)
+        frame = _read_history(local)
+    frame = frame.loc[frame.index <= minute].tail(lookback)
+    meta = {"modifiedTime": item.get("modifiedTime"), "size": item.get("size")}
+    return symbol, (frame if not frame.empty else None), meta
+
+
+def _download_symbol_histories(
+    store,
+    tasks: list[tuple[str, str]],
+    cache_dir: Path,
+    minute: pd.Timestamp,
+    lookback: int,
+    history: dict[str, pd.DataFrame],
+    cache_index: dict,
+) -> None:
+    """Fetch per-symbol seed parquets in parallel and merge results in-thread.
+
+    Workers share nothing mutable: each returns ``(symbol, frame, meta)`` and
+    only the calling thread touches ``history``/``cache_index``. A worker
+    failure propagates through ``future.result()`` and aborts the compile,
+    matching the previous fail-loud behaviour.
+    """
+    started = time.monotonic()
+    if len(tasks) <= 1 or HISTORY_DOWNLOAD_WORKERS <= 1:
+        service = getattr(store, "service", store)
+        results = [
+            _load_symbol_history(
+                service, symbol, folder_id, cache_dir,
+                cache_index.get(symbol) or {}, minute, lookback,
+            )
+            for symbol, folder_id in tasks
+        ]
+    else:
+        workers = min(HISTORY_DOWNLOAD_WORKERS, len(tasks))
+        # Services are built up front in the main thread so a build failure
+        # raises before any pool work starts.
+        services = [_thread_service(store) for _ in range(workers)]
+        handoff: "queue.SimpleQueue" = queue.SimpleQueue()
+        for service in services:
+            handoff.put(service)
+        thread_local = threading.local()
+
+        def _init_worker() -> None:
+            thread_local.service = handoff.get()
+
+        def _task(symbol: str, folder_id: str):
+            return _load_symbol_history(
+                thread_local.service, symbol, folder_id, cache_dir,
+                cache_index.get(symbol) or {}, minute, lookback,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers, initializer=_init_worker) as pool:
+            futures = [pool.submit(_task, symbol, folder_id) for symbol, folder_id in tasks]
+            results = [future.result() for future in futures]
+
+    downloaded = 0
+    for symbol, frame, meta in results:
+        if frame is not None:
+            history[symbol] = frame
+        if meta:
+            if (cache_index.get(symbol) or {}).get("modifiedTime") != meta["modifiedTime"]:
+                downloaded += 1
+            cache_index[symbol] = meta
+    print(
+        json.dumps({
+            "event": "HISTORY_SEED_LOADED",
+            "symbols": len(tasks),
+            "downloaded": downloaded,
+            "cached": len(tasks) - downloaded,
+            "workers": 1 if len(tasks) <= 1 or HISTORY_DOWNLOAD_WORKERS <= 1 else min(HISTORY_DOWNLOAD_WORKERS, len(tasks)),
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+        }),
+        flush=True,
+    )
+
+
 def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, work: Path, lookback: int) -> dict[str, pd.DataFrame]:
     history: dict[str, pd.DataFrame] = {}
     cache_dir = work / "history_cache"
@@ -263,40 +388,20 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
 
     archive_folder = _find_remote(store, HISTORY_ROOT)
     if archive_folder:
+        wanted = set(quote_symbols) | {MARKET_CONTEXT_SYMBOL}
+        tasks: list[tuple[str, str]] = []
         for folder in _list_children(store, archive_folder["id"]):
             name = str(folder.get("name") or "")
             if folder.get("mimeType") != FOLDER_MIME or not name.startswith("symbol="):
                 continue
             symbol = name.split("=", 1)[1].strip().upper()
-            if symbol not in quote_symbols and symbol != MARKET_CONTEXT_SYMBOL:
+            if symbol not in wanted:
                 continue
-            files = _list_children(store, folder["id"])
-            item = next(
-                (entry for entry in files if entry.get("name") == f"{symbol}.parquet"),
-                None,
+            tasks.append((symbol, folder["id"]))
+        if tasks:
+            _download_symbol_histories(
+                store, tasks, cache_dir, minute, lookback, history, cache_index
             )
-            if not item:
-                continue
-            local = cache_dir / f"{symbol}.parquet"
-            cached = cache_index.get(symbol) or {}
-            if (
-                not local.is_file()
-                or cached.get("modifiedTime") != item.get("modifiedTime")
-                or str(cached.get("size") or "") != str(item.get("size") or "")
-            ):
-                _download(store, item["id"], local)
-            try:
-                frame = _read_history(local)
-            except Exception:
-                _download(store, item["id"], local)
-                frame = _read_history(local)
-            cache_index[symbol] = {
-                "modifiedTime": item.get("modifiedTime"),
-                "size": item.get("size"),
-            }
-            frame = frame.loc[frame.index <= minute].tail(lookback)
-            if not frame.empty:
-                history[symbol] = frame
     index_path.write_text(json.dumps(cache_index, sort_keys=True), encoding="utf-8")
 
     live_folder = _find_remote(
