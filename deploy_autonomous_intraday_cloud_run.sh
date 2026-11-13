@@ -125,7 +125,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --port 8080 \
   --cpu 2 \
   --memory 8Gi \
-  --min 1 \
+  --min 0 \
   --max 1 \
   --no-cpu-throttling \
   --concurrency 1 \
