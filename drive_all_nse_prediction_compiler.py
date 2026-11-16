@@ -56,15 +56,20 @@ def _list_children(store, parent_id: str) -> list[dict]:
     rows: list[dict] = []
     page = None
     while True:
-        result = client.files().list(
-            q=f"'{parent_id}' in parents and trashed = false",
-            spaces="drive",
-            pageSize=1000,
-            pageToken=page,
-            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        from persistent_store import _drive_execute_with_retry
+
+        result = _drive_execute_with_retry(
+            "list_children",
+            lambda page=page: client.files().list(
+                q=f"'{parent_id}' in parents and trashed = false",
+                spaces="drive",
+                pageSize=1000,
+                pageToken=page,
+                fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute(),
+        )
         rows.extend(result.get("files", []))
         page = result.get("nextPageToken")
         if not page:

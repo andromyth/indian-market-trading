@@ -614,6 +614,39 @@ def test_download_accepts_store_or_raw_per_thread_service(monkeypatch, tmp_path)
     assert seen == {"service": "RAW_RESOURCE_SERVICE", "file_id": "fid2"}
 
 
+def test_list_children_retries_transient_drive_500(monkeypatch):
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    class _TransientDriveError(Exception):
+        resp = SimpleNamespace(status=500, reason="Internal Error")
+
+    calls = {"n": 0}
+
+    class _Request:
+        def __init__(self, page):
+            self.page = page
+
+        def execute(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _TransientDriveError("Internal Error")
+            return {"files": [{"id": "f1", "name": "a.parquet"}]}
+
+    class _Files:
+        def list(self, **kwargs):
+            return _Request(kwargs.get("pageToken"))
+
+    client = SimpleNamespace(files=lambda: _Files())
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    rows = compiler._list_children(client, "parent")
+
+    assert calls["n"] == 2
+    assert rows == [{"id": "f1", "name": "a.parquet"}]
+
+
 def _capture_row(symbol: str, timestamp: pd.Timestamp, close: float) -> dict:
     return {
         "symbol": symbol,
