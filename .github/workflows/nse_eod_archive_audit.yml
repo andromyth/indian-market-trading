@@ -5,7 +5,6 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/nse_eod_archive_audit.yml"
       - "nse_eod_archive_audit.py"
       - "tests/test_nse_eod_archive_audit.py"
   workflow_dispatch:
@@ -20,8 +19,10 @@ on:
         default: ''
   # Was triggered after every EOD sync (~3 runs/day, ~200 billed minutes/month).
   # One weekly read-only audit is enough; dispatch for ad-hoc checks.
+  # Tuesday 01:00 UTC (06:30 IST) so Monday's EOD archive is already published;
+  # a Monday-evening run would report today as a missing date and fail.
   schedule:
-    - cron: "0 12 * * 1"
+    - cron: "0 1 * * 2"
 
 concurrency:
   group: nse-eod-archive-audit
