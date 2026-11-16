@@ -683,3 +683,100 @@ def test_watchlist_does_not_use_stale_drive_pit_news_as_fallback(tmp_path, monke
 
     assert worker.symbols == []
     assert worker.watchlist_meta["status"] == "NO_SOURCE_MATCHES"
+
+
+def test_all_nse_in_worker_prediction_disabled_delegates(monkeypatch):
+    import autonomous_intraday_worker_service as service
+
+    calls = []
+
+    class FakePredictor:
+        def run_for_capture(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"status": "STORED"}
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", FakePredictor())
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", False)
+    capture = {
+        "status": "STORED",
+        "cycle_minute_ist": "2026-11-16T09:20:00+05:30",
+        "snapshot_drive_path": "production_data/all_universe_minute_snapshots/2026/11/16/manifest_20261116_0920.json",
+    }
+
+    result = service._run_all_nse_prediction_in_worker(capture)
+
+    assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
+    assert result["cycle_minute_ist"] == capture["cycle_minute_ist"]
+    assert "disabled" in result["reason"]
+    assert calls == []
+
+
+def test_all_nse_in_worker_prediction_runs_predictor_for_captured_slot(monkeypatch):
+    import autonomous_intraday_worker_service as service
+
+    calls = []
+
+    class FakePredictor:
+        def run_for_capture(self, capture, worker_root=None, *, drive_only=True):
+            calls.append((capture, worker_root, drive_only))
+            return {
+                "status": "STORED",
+                "cycle_minute_ist": capture["cycle_minute_ist"],
+                "prediction_count": 3638,
+            }
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", FakePredictor())
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", True)
+    capture = {
+        "status": "STORED",
+        "cycle_minute_ist": "2026-11-16T09:20:00+05:30",
+        "snapshot_drive_path": "production_data/all_universe_minute_snapshots/2026/11/16/manifest_20261116_0920.json",
+    }
+
+    result = service._run_all_nse_prediction_in_worker(capture)
+
+    assert result["status"] == "STORED"
+    assert result["prediction_mode"] == "CLOUD_RUN_IN_WORKER"
+    assert result["prediction_count"] == 3638
+    assert result["prediction_latency_seconds"] >= 0
+    assert calls == [(capture, service.WORKER_ROOT, False)]
+
+
+def test_all_nse_in_worker_prediction_falls_back_on_error(monkeypatch):
+    import autonomous_intraday_worker_service as service
+
+    class FailingPredictor:
+        def run_for_capture(self, *args, **kwargs):
+            raise RuntimeError("simulated drive write failure")
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", FailingPredictor())
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", True)
+    capture = {"status": "STORED", "cycle_minute_ist": "2026-11-16T09:20:00+05:30"}
+
+    result = service._run_all_nse_prediction_in_worker(capture)
+
+    assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
+    assert "simulated drive write failure" in result["error"]
+    assert "GitHub fallback" in result["reason"]
+
+
+def test_all_nse_in_worker_prediction_falls_back_on_deadline(monkeypatch):
+    import time
+
+    import autonomous_intraday_worker_service as service
+
+    class SlowPredictor:
+        def run_for_capture(self, *args, **kwargs):
+            time.sleep(0.4)
+            return {"status": "STORED"}
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", SlowPredictor())
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", True)
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_DEADLINE_SECONDS", 0.05)
+    capture = {"status": "STORED", "cycle_minute_ist": "2026-11-16T09:20:00+05:30"}
+
+    result = service._run_all_nse_prediction_in_worker(capture)
+
+    assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
+    assert "deadline" in result["reason"]
+    assert result["prediction_latency_seconds"] >= 0.05

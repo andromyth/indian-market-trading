@@ -2,6 +2,15 @@ name: Deploy intraday worker recovery revision
 
 on:
   workflow_dispatch:
+    inputs:
+      in_worker_prediction:
+        description: "Run same-slot ALL-NSE prediction inside the Cloud Run tick (1) or delegate to GitHub Actions (0)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
   push:
     branches:
       - main
@@ -91,6 +100,21 @@ jobs:
         with:
           project_id: indian-market-trading
 
+      - name: Resolve in-worker ALL-NSE prediction flag
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAG="${{ github.event.inputs.in_worker_prediction }}"
+          if [[ -z "$FLAG" ]]; then
+            # push deployments keep the previous, safe delegation behaviour
+            FLAG="0"
+          fi
+          case "$FLAG" in
+            1|0) ;;
+            *) echo "Unsupported in_worker_prediction value: $FLAG" >&2; exit 1 ;;
+          esac
+          echo "ALL_NSE_IN_WORKER_PREDICTION_FLAG=$FLAG" >> "$GITHUB_ENV"
+
       - name: Stage candidate revision without production traffic
         shell: bash
         run: |
@@ -116,7 +140,7 @@ jobs:
             --no-allow-unauthenticated \
             --no-traffic \
             --tag=preflight5m \
-            --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,ALL_NSE_CAPTURE_WORKERS=8,ALL_NSE_CAPTURE_GRACE_MINUTES=3,QUANT_TIMEFRAME_DIAGNOSTICS=1" \
+            --update-env-vars "INDSTOCKS_AUTH_MODE=totp,AUTONOMOUS_INTRADAY_ROOT=/tmp/autonomous_intraday,AUTONOMOUS_INTRADAY_MAX_STOCKS=5,AUTONOMOUS_INTRADAY_INTERVAL_SECONDS=300,ALL_NSE_CAPTURE_WORKERS=8,ALL_NSE_CAPTURE_GRACE_MINUTES=3,QUANT_TIMEFRAME_DIAGNOSTICS=1,ALL_NSE_IN_WORKER_PREDICTION=${ALL_NSE_IN_WORKER_PREDICTION_FLAG},ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS=120" \
             --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 
       - name: Validate staged five-minute model bundle with runtime credentials
