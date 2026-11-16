@@ -1,0 +1,24 @@
+{
+  "monthly_capital": 7000,
+  "max_positions": 2,
+  "reserve_amount": 150,
+  "price_cap_multiplier": 0.95,
+  "hard_price_cap": 2500,
+  "growth": "reinvest_realised_pnl",
+  "ladder": [
+    {"capital": 7000, "positions": 2},
+    {"capital": 10000, "positions": 3},
+    {"capital": 15000, "positions": 4},
+    {"capital": 25000, "positions": 5}
+  ],
+  "universe_size": 500,
+  "delivery_lookback_sessions": 20,
+  "intraday_lookback_days": 10,
+  "min_records_profitable": 3,
+  "activity_min_delivery_sessions": 8,
+  "activity_min_intraday_days": 3,
+  "top_active_fallback_count": 250,
+  "min_move_delivery": 0.008,
+  "min_move_intraday": 0.015,
+  "manifest_max_age_days": 14
+}

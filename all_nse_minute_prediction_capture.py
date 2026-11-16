@@ -1189,6 +1189,34 @@ class AllNSEMinutePredictor:
                     official_symbols,
                     codes,
                 )
+                try:
+                    from prediction_universe import active_symbols_cached, restrict_universe
+
+                    restricted, universe_meta = active_symbols_cached()
+                    if restricted:
+                        filtered = restrict_universe(symbols, restricted)
+                        if len(filtered) >= 150:
+                            self._log(
+                                "all_nse_history_universe_filtered",
+                                before=len(symbols),
+                                after=len(filtered),
+                                universe_version=universe_meta.get("universe_version"),
+                                universe_status=universe_meta.get("status"),
+                            )
+                            symbols = filtered
+                        else:
+                            self._log(
+                                "all_nse_history_universe_filter_skipped",
+                                reason="filtered pool too small",
+                                before=len(symbols),
+                                after=len(filtered),
+                                universe_status=universe_meta.get("status"),
+                            )
+                except Exception as exc:
+                    self._log(
+                        "all_nse_history_universe_filter_failed",
+                        error_type=type(exc).__name__,
+                    )
                 if official_universe_error is not None or universe_source != "NSE_OFFICIAL_EQUITY_L":
                     self._log(
                         "all_nse_history_universe_fallback",

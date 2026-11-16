@@ -109,6 +109,11 @@ jobs:
           ALL_NSE_RECOVER_DATE: ${{ github.event.inputs.recover_date }}
         run: python -u drive_all_nse_prediction_compiler.py
 
+      - name: Publish daily tradable picks
+        if: success() && github.event_name != 'pull_request'
+        continue-on-error: true
+        run: python -u daily_picks.py
+
       - name: Save updated Drive history cache
         if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4

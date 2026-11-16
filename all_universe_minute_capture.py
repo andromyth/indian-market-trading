@@ -683,11 +683,36 @@ def capture_all_universe_minute_snapshot(
             for s in universe
             if str(s).strip()
         })
+    universe_filter: dict[str, Any] = {"status": "FULL_ROSTER"}
+    try:
+        from prediction_universe import active_symbols_cached, restrict_universe
+
+        restricted, universe_meta = active_symbols_cached()
+        if restricted:
+            filtered = restrict_universe(universe_symbols, restricted)
+            if len(filtered) >= 150:
+                universe_filter = {
+                    "status": "FILTERED",
+                    "before": len(universe_symbols),
+                    "after": len(filtered),
+                    "universe_version": universe_meta.get("universe_version"),
+                    "manifest_status": universe_meta.get("status"),
+                }
+                universe_symbols = filtered
+            else:
+                universe_filter = {
+                    "status": "SKIPPED_TOO_SMALL",
+                    "before": len(universe_symbols),
+                    "after": len(filtered),
+                }
+    except Exception as exc:
+        universe_filter = {"status": "ERROR", "error_type": type(exc).__name__}
     if instruments is None:
         instruments = _instrument_map()
     assigned_symbols = shard_universe(universe_symbols, worker_count)[worker_id]
     prediction_map = _prediction_map(prediction_snapshots, cycle_minute)
     forecast_rows = _load_forecast_rows(daily_ledger)
+    manifest["universe_filter"] = universe_filter
     manifest["expected_symbol_count"] = len(universe_symbols)
     manifest["universe_symbol_count"] = len(universe_symbols)
     manifest["shard_symbol_count"] = len(assigned_symbols)

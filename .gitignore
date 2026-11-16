@@ -17,3 +17,6 @@ data/paper_trading.sqlite3*
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Universe manifest written by the builder; the canonical copy lives in Drive
+production_data/prediction_universe/
