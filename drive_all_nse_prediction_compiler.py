@@ -125,6 +125,138 @@ def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
     return frame
 
 
+def _normalize_capture_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Return long-format (symbol, Timestamp, OHLCV) rows from one capture file."""
+    if raw.empty or "symbol" not in raw.columns:
+        return pd.DataFrame(columns=["symbol", "Timestamp", *OHLCV])
+    frame = raw.copy()
+    frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+    if "Timestamp" in frame.columns:
+        index = pd.to_datetime(frame.pop("Timestamp"), errors="coerce")
+    elif "Datetime" in frame.columns:
+        index = pd.to_datetime(frame.pop("Datetime"), errors="coerce")
+    else:
+        index = pd.to_datetime(frame.index, errors="coerce")
+    index = pd.DatetimeIndex(index)
+    index = index.tz_localize(IST) if index.tz is None else index.tz_convert(IST)
+    valid = ~index.isna()
+    frame = frame.loc[valid].copy()
+    frame.index = index[valid]
+    for column in OHLCV:
+        if column not in frame:
+            frame[column] = float("nan")
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame.index.name = "Timestamp"
+    return frame.reset_index()[["symbol", "Timestamp", *OHLCV]]
+
+
+def _load_live_history_state(
+    store,
+    quote_symbols: set[str],
+    minute: pd.Timestamp,
+    work: Path,
+    lookback: int,
+    history: dict[str, pd.DataFrame],
+) -> None:
+    """Ingest only captures not yet merged into the day's consolidated live state.
+
+    Every compile used to re-download all of today's capture files and split each
+    one into per-symbol part files (captures x symbols files per run, growing all
+    session). The consolidated state keeps one parquet per trading day plus an
+    ingest ledger, so a run pays only for the captures written since the previous
+    run (normally one).
+    """
+    live_folder = _find_remote(store, f"{LIVE_HISTORY_ROOT}/{minute:%Y/%m/%d}")
+    if not live_folder:
+        return
+    state_dir = work / "live_state" / f"{minute:%Y-%m-%d}"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "state.parquet"
+    ingested_path = state_dir / "ingested.json"
+    try:
+        ingested = json.loads(ingested_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        ingested = {}
+
+    captures = [
+        item
+        for item in _list_children(store, live_folder["id"])
+        if str(item.get("name") or "").startswith("capture_")
+        and str(item.get("name") or "").endswith(".parquet")
+    ]
+    pending: list[dict] = []
+    for item in captures:
+        name = str(item.get("name") or "")
+        meta = {
+            "modifiedTime": item.get("modifiedTime"),
+            "size": str(item.get("size") or ""),
+        }
+        if ingested.get(name) == meta:
+            continue
+        pending.append(item)
+
+    started = time.monotonic()
+    state: pd.DataFrame | None = None
+    if state_path.is_file():
+        try:
+            state = pd.read_parquet(state_path)
+        except Exception:
+            state = None
+
+    if pending:
+        frames: list[pd.DataFrame] = []
+        for item in pending:
+            local = work / "live" / str(item.get("name") or "")
+            _download(store, item["id"], local)
+            frames.append(_normalize_capture_frame(pd.read_parquet(local)))
+        new_rows = pd.concat(frames, ignore_index=True) if frames else None
+        if new_rows is not None and not new_rows.empty:
+            if state is None or state.empty:
+                state = new_rows
+            else:
+                state = pd.concat([state, new_rows], ignore_index=True)
+            state = state.drop_duplicates(subset=["symbol", "Timestamp"], keep="last")
+            state = state.sort_values(["symbol", "Timestamp"])
+            state.to_parquet(state_path, index=False)
+        for item in pending:
+            name = str(item.get("name") or "")
+            ingested[name] = {
+                "modifiedTime": item.get("modifiedTime"),
+                "size": str(item.get("size") or ""),
+            }
+        ingested_path.write_text(json.dumps(ingested, sort_keys=True), encoding="utf-8")
+
+    print(
+        json.dumps({
+            "event": "LIVE_HISTORY_STATE_LOADED",
+            "captures_total": len(captures),
+            "captures_new": len(pending),
+            "state_rows": 0 if state is None else int(len(state)),
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+        }, sort_keys=True),
+        flush=True,
+    )
+
+    if state is None or state.empty:
+        return
+    wanted = set(quote_symbols) | {MARKET_CONTEXT_SYMBOL}
+    state = state.loc[state["symbol"].isin(wanted)]
+    state = state.loc[pd.to_datetime(state["Timestamp"]) <= minute]
+    if state.empty:
+        return
+    for symbol, group in state.groupby("symbol", sort=False):
+        frame = group.set_index("Timestamp")[OHLCV].sort_index()
+        frame.index = pd.DatetimeIndex(frame.index)
+        frame = frame.loc[~frame.index.duplicated(keep="last")].tail(lookback)
+        existing = history.get(symbol)
+        if existing is not None and not existing.empty:
+            combined = pd.concat([existing, frame])
+            combined = combined.loc[~combined.index.duplicated(keep="last")].sort_index()
+            history[symbol] = combined.tail(lookback)
+        else:
+            history[symbol] = frame
+
+
 def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.DataFrame, pd.Timestamp]:
     """Select the newest fresh STORED snapshot, even when latest_manifest is a failure pointer.
 
@@ -262,6 +394,114 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         "No fresh, durably stored unprocessed current-session quote snapshot was found; "
         + "; ".join(skipped[-8:])
     )
+
+
+def _recovery_capture(store, target: pd.Timestamp):
+    """Oldest snapshot for ``target`` date whose prediction is not yet STORED.
+
+    Live runs compile only the newest fresh slot, so a missed slot is never
+    revisited. Recovery scans the day oldest-first and returns the first
+    unprocessed, fully assembled snapshot.
+    """
+    day_folder = _find_remote(store, f"{QUOTE_ROOT}/{target:%Y/%m/%d}")
+    if not day_folder:
+        raise RuntimeError(f"No quote snapshot folder for {target:%Y-%m-%d}")
+    items = [
+        item
+        for item in _list_children(store, day_folder["id"])
+        if re.fullmatch(r"manifest_\d{8}_\d{4}\.json", str(item.get("name") or ""))
+    ]
+    items.sort(key=lambda item: str(item.get("name") or ""))
+    skipped: list[str] = []
+    for index, item in enumerate(items):
+        local = Path("/tmp/drive_all_nse") / f"recovery_manifest_{index}.json"
+        _download(store, item["id"], local)
+        try:
+            manifest = json.loads(local.read_text(encoding="utf-8"))
+            minute = pd.Timestamp(manifest.get("cycle_minute_ist"))
+            minute = minute.tz_localize(IST) if minute.tzinfo is None else minute.tz_convert(IST)
+        except Exception as exc:
+            skipped.append(f"{item.get('name')}: invalid manifest ({type(exc).__name__})")
+            continue
+        if minute.strftime("%Y-%m-%d") != target.strftime("%Y-%m-%d"):
+            skipped.append(f"{item.get('name')}: cycle date mismatch")
+            continue
+        status = str(manifest.get("status") or "").upper()
+        if status != "STORED" or manifest.get("snapshot_persisted") is not True:
+            skipped.append(f"{item.get('name')}: status={status or 'MISSING'}")
+            continue
+        if str(manifest.get("artifact_kind") or "").upper() == "SHARD":
+            skipped.append(f"{item.get('name')}: shard artifact")
+            continue
+        worker_count = int(manifest.get("worker_count") or 1)
+        if worker_count > 1:
+            if str(manifest.get("assembly_status") or "").upper() != "COMPLETE":
+                skipped.append(f"{item.get('name')}: not assembled")
+                continue
+            if int(manifest.get("shard_count_completed") or 0) < int(
+                manifest.get("shard_count_expected") or worker_count
+            ):
+                skipped.append(f"{item.get('name')}: shard_count_incomplete")
+                continue
+        if _prediction_already_stored(store, minute):
+            continue
+        snapshot_remote = str(
+            manifest.get("snapshot_drive_path") or manifest.get("remote_snapshot_path") or ""
+        )
+        if not snapshot_remote:
+            skipped.append(f"{item.get('name')}: missing snapshot path")
+            continue
+        snapshot_item = _find_remote(store, snapshot_remote)
+        if not snapshot_item:
+            skipped.append(f"{item.get('name')}: snapshot file missing")
+            continue
+        snapshot_path = Path("/tmp/drive_all_nse") / Path(snapshot_remote).name
+        _download(store, snapshot_item["id"], snapshot_path)
+        try:
+            quotes = pd.read_parquet(snapshot_path)
+        except Exception as exc:
+            skipped.append(f"{item.get('name')}: unreadable snapshot ({type(exc).__name__})")
+            continue
+        if quotes.empty or "symbol" not in quotes.columns:
+            skipped.append(f"{item.get('name')}: empty snapshot or missing symbol column")
+            continue
+        declared_rows = manifest.get("row_count")
+        if declared_rows is not None and int(declared_rows) != len(quotes):
+            skipped.append(f"{item.get('name')}: row_count_mismatch")
+            continue
+        from all_nse_minute_prediction_capture import _snapshot_quote_diagnostics
+
+        quote_diagnostics = _snapshot_quote_diagnostics(
+            quotes.to_dict(orient="records"), minute
+        )
+        eligible_count = int(
+            quote_diagnostics.get("rejection_reason_counts", {}).get("ELIGIBLE", 0)
+        )
+        if eligible_count < 1:
+            skipped.append(f"{item.get('name')}: no eligible quotes")
+            continue
+        print(
+            "RECOVERY_CAPTURE_SELECTED="
+            + json.dumps({
+                "manifest": item.get("name"),
+                "cycle_minute_ist": minute.isoformat(),
+                "quote_rows": len(quotes),
+                "eligible_quote_rows": eligible_count,
+                "skipped_tail": skipped[-5:],
+            }, sort_keys=True),
+            flush=True,
+        )
+        return manifest, quotes, minute
+    print(
+        json.dumps({
+            "event": "RECOVERY_SCAN_COMPLETE",
+            "date": target.strftime("%Y-%m-%d"),
+            "manifests": len(items),
+            "skipped_tail": skipped[-5:],
+        }, sort_keys=True),
+        flush=True,
+    )
+    return None
 
 
 def _thread_service(store):
@@ -404,31 +644,7 @@ def _load_drive_history(store, quote_symbols: set[str], minute: pd.Timestamp, wo
             )
     index_path.write_text(json.dumps(cache_index, sort_keys=True), encoding="utf-8")
 
-    live_folder = _find_remote(
-        store,
-        f"{LIVE_HISTORY_ROOT}/{minute:%Y/%m/%d}",
-    )
-    if live_folder:
-        for item in _list_children(store, live_folder["id"]):
-            name = str(item.get("name") or "")
-            if not name.startswith("capture_") or not name.endswith(".parquet"):
-                continue
-            local = work / "live" / name
-            _download(store, item["id"], local)
-            raw = pd.read_parquet(local)
-            if "symbol" not in raw.columns:
-                continue
-            raw["symbol"] = raw["symbol"].astype(str).str.strip().str.upper()
-            raw = raw.loc[raw["symbol"].isin(quote_symbols | {MARKET_CONTEXT_SYMBOL})]
-            for symbol, group in raw.groupby("symbol"):
-                part_path = work / "live_parts" / f"{symbol}_{name}"
-                part_path.parent.mkdir(parents=True, exist_ok=True)
-                group.to_parquet(part_path, index=False)
-                part = _read_history(part_path)
-                existing = history.get(symbol)
-                combined = pd.concat([existing, part]) if existing is not None else part
-                combined = combined.loc[~combined.index.duplicated(keep="last")].sort_index()
-                history[symbol] = combined.loc[combined.index <= minute].tail(lookback)
+    _load_live_history_state(store, quote_symbols, minute, work, lookback, history)
     return history
 
 
@@ -440,19 +656,38 @@ def main() -> int:
         HISTORY_LOOKBACK_BARS,
     )
 
+    mode = (os.getenv("ALL_NSE_COMPILER_MODE") or "live").strip().lower()
     now = pd.Timestamp.now(tz=IST)
-    if not is_nse_trading_day(now.date()):
-        print(json.dumps({"status": "SKIPPED", "reason": "NSE_NON_TRADING_DAY", "now_ist": now.isoformat()}))
-        return 0
-    if (now.hour, now.minute) < (9, 15) or (now.hour, now.minute) >= (15, 30):
-        print(json.dumps({"status": "SKIPPED", "reason": "OUTSIDE_NSE_CASH_SESSION", "now_ist": now.isoformat()}))
-        return 0
+    target: pd.Timestamp | None = None
+    if mode == "recover":
+        raw_target = (os.getenv("ALL_NSE_RECOVER_DATE") or "").strip()
+        target = pd.Timestamp(raw_target or now.strftime("%Y-%m-%d"))
+        target = target.tz_localize(IST) if target.tzinfo is None else target.tz_convert(IST)
+    else:
+        if not is_nse_trading_day(now.date()):
+            print(json.dumps({"status": "SKIPPED", "reason": "NSE_NON_TRADING_DAY", "now_ist": now.isoformat()}))
+            return 0
+        if (now.hour, now.minute) < (9, 15) or (now.hour, now.minute) >= (15, 30):
+            print(json.dumps({"status": "SKIPPED", "reason": "OUTSIDE_NSE_CASH_SESSION", "now_ist": now.isoformat()}))
+            return 0
 
     store = GoogleDriveStore()
-    manifest, quotes, minute = _latest_capture(store)
-    age_minutes = (now - minute).total_seconds() / 60.0
-    if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
-        raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
+    if mode == "recover":
+        selection = _recovery_capture(store, target)
+        if selection is None:
+            print(json.dumps({
+                "status": "RECOVER_COMPLETE",
+                "recover_date": target.strftime("%Y-%m-%d"),
+                "now_ist": now.isoformat(),
+            }, sort_keys=True))
+            return 0
+        manifest, quotes, minute = selection
+        age_minutes = (now - minute).total_seconds() / 60.0
+    else:
+        manifest, quotes, minute = _latest_capture(store)
+        age_minutes = (now - minute).total_seconds() / 60.0
+        if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
+            raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
     symbols = set(quotes["symbol"].astype(str).str.strip().str.upper())
     prediction_manifest_remote = (
         "production_data/all_nse_minute_predictions/"
@@ -504,6 +739,7 @@ def main() -> int:
     predictor._seed_universe_source = "GOOGLE_DRIVE_ARCHIVE"
     result = predictor.run_for_capture(manifest, worker_root=work, drive_only=True)
     print(json.dumps({
+        "mode": mode,
         "status": result.get("status"),
         "cycle_minute_ist": minute.isoformat(),
         "expected_symbol_count": manifest.get("expected_symbol_count"),

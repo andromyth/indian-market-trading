@@ -1,0 +1,122 @@
+name: Recover missing ALL-NSE prediction slots
+
+# Opt-in, read-mostly repair for slots the live compiler never revisited.
+# The live compiler intentionally processes only the newest fresh snapshot, so
+# a missed slot stays missing forever. This workflow walks a trading day
+# oldest-first and compiles every snapshot whose prediction manifest is not
+# STORED yet. Run it after the cash session; it never touches the Cloud Run
+# worker and never rewrites an existing STORED prediction.
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Trading date to repair (YYYY-MM-DD, default: today IST)"
+        required: false
+        default: ""
+      max_slots:
+        description: "Maximum snapshots to compile in this run"
+        required: false
+        default: "40"
+
+permissions:
+  contents: read
+
+jobs:
+  recover-slots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Set repository import path
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Resolve India market date for history cache
+        id: market_date
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          value = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("value=" + value + "\n")
+          PY
+
+      - name: Restore Drive history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/drive_all_nse/history_cache
+          key: nse-history-${{ steps.market_date.outputs.value }}
+          restore-keys: |
+            nse-history-
+
+      - name: Restore consolidated live OHLCV state
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/drive_all_nse/live_state
+          key: nse-live-${{ steps.market_date.outputs.value }}-${{ github.run_id }}
+          restore-keys: |
+            nse-live-${{ steps.market_date.outputs.value }}-
+            nse-live-
+
+      - name: Compile every unprocessed slot oldest-first
+        env:
+          RECOVER_DATE: ${{ github.event.inputs.date }}
+          MAX_SLOTS: ${{ github.event.inputs.max_slots }}
+        run: |
+          set -uo pipefail
+          max="${MAX_SLOTS:-40}"
+          recovered=0
+          for i in $(seq 1 "$max"); do
+            echo "::group::recovery attempt $i"
+            if ! ALL_NSE_COMPILER_MODE=recover ALL_NSE_RECOVER_DATE="$RECOVER_DATE" \
+              python -u drive_all_nse_prediction_compiler.py 2>&1 | tee "/tmp/recover_$i.log"; then
+              echo "recovery attempt $i failed"
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "::endgroup::"
+            if grep -q '"status": "RECOVER_COMPLETE"' "/tmp/recover_$i.log"; then
+              echo "No unprocessed slots remain."
+              break
+            fi
+            if ! grep -q '"status": "STORED"' "/tmp/recover_$i.log"; then
+              echo "Recovery stopped without storing a prediction."
+              exit 1
+            fi
+            recovered=$((recovered + 1))
+          done
+          echo "Recovered slots in this run: $recovered"
+
+      - name: Save updated Drive history cache
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /tmp/drive_all_nse/history_cache
+          key: nse-history-${{ steps.market_date.outputs.value }}
+
+      - name: Save consolidated live OHLCV state
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /tmp/drive_all_nse/live_state
+          key: nse-live-${{ steps.market_date.outputs.value }}-${{ github.run_id }}

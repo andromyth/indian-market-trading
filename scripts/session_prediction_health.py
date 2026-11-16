@@ -140,6 +140,8 @@ def prediction_report(service, store, current: datetime) -> dict[str, Any]:
     return {
         "prediction_folder_present": True,
         "prediction_slot_count": len(manifests),
+        "prediction_expected_slots": _expected_slots(current),
+        "prediction_missing_slots": max(0, _expected_slots(current) - len(manifests)),
         "prediction_parquet_count": len(parquets),
         "prediction_latest_manifest": latest.get("name") if latest else None,
         "prediction_cycle_minute_ist": payload.get("cycle_minute_ist"),

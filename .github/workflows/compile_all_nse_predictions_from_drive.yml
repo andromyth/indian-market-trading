@@ -14,6 +14,15 @@ on:
       - "requirements.txt"
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "live (default) or recover missing slots for recover_date"
+        required: false
+        default: live
+      recover_date:
+        description: "Recovery date in YYYY-MM-DD (defaults to today IST)"
+        required: false
+        default: ""
   # GitHub cron is UTC; the Python guard restricts execution to 09:15–15:25 IST
   # on NSE trading days. Cloud Run alone collects INDstocks quotes/history.
   schedule:
@@ -71,6 +80,15 @@ jobs:
           restore-keys: |
             nse-history-
 
+      - name: Restore consolidated live OHLCV state
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/drive_all_nse/live_state
+          key: nse-live-${{ steps.market_date.outputs.value }}-${{ github.run_id }}
+          restore-keys: |
+            nse-live-${{ steps.market_date.outputs.value }}-
+            nse-live-
+
       - name: Compile and test Drive-only prediction path
         run: |
           set -euo pipefail
@@ -99,6 +117,9 @@ jobs:
 
       - name: Compile latest persisted Drive snapshot and upload predictions
         if: github.event_name != 'pull_request'
+        env:
+          ALL_NSE_COMPILER_MODE: ${{ github.event.inputs.mode || 'live' }}
+          ALL_NSE_RECOVER_DATE: ${{ github.event.inputs.recover_date }}
         run: python -u drive_all_nse_prediction_compiler.py
 
       - name: Save updated Drive history cache
@@ -108,3 +129,11 @@ jobs:
         with:
           path: /tmp/drive_all_nse/history_cache
           key: nse-history-${{ steps.market_date.outputs.value }}
+
+      - name: Save consolidated live OHLCV state
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /tmp/drive_all_nse/live_state
+          key: nse-live-${{ steps.market_date.outputs.value }}-${{ github.run_id }}

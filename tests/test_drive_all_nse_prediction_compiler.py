@@ -612,3 +612,147 @@ def test_download_accepts_store_or_raw_per_thread_service(monkeypatch, tmp_path)
 
     compiler._download("RAW_RESOURCE_SERVICE", "fid2", tmp_path / "b.bin")
     assert seen == {"service": "RAW_RESOURCE_SERVICE", "file_id": "fid2"}
+
+
+def _capture_row(symbol: str, timestamp: pd.Timestamp, close: float) -> dict:
+    return {
+        "symbol": symbol,
+        "Timestamp": timestamp,
+        "Open": close,
+        "High": close,
+        "Low": close,
+        "Close": close,
+        "Volume": 1,
+    }
+
+
+def test_normalize_capture_frame_returns_long_rows_in_ist():
+    import drive_all_nse_prediction_compiler as compiler
+
+    frame = compiler._normalize_capture_frame(pd.DataFrame([
+        {
+            "symbol": " aaa ",
+            "Timestamp": "2026-11-16 09:20:00",
+            "Open": 1,
+            "High": 2,
+            "Low": 1,
+            "Close": 1.5,
+            "Volume": 10,
+        }
+    ]))
+
+    assert list(frame.columns) == ["symbol", "Timestamp", "Open", "High", "Low", "Close", "Volume"]
+    assert frame.loc[0, "symbol"] == "AAA"
+    assert str(frame.loc[0, "Timestamp"].tz) == "Asia/Kolkata"
+
+
+def test_live_history_state_ingests_only_captures_not_yet_merged(tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    source = tmp_path / "source"
+    source.mkdir()
+    t0 = pd.Timestamp("2026-11-16 09:20:00", tz=IST)
+    t1 = pd.Timestamp("2026-11-16 09:25:00", tz=IST)
+    pd.DataFrame([
+        _capture_row("AAA", t0, 1.0),
+        _capture_row("BBB", t0, 5.0),
+        _capture_row(compiler.MARKET_CONTEXT_SYMBOL, t0, 100.0),
+    ]).to_parquet(source / "capture_0920.parquet", index=False)
+
+    downloads: list[str] = []
+
+    monkeypatch.setattr(
+        compiler,
+        "_find_remote",
+        lambda store, path: {"id": "live"} if path.endswith("2026/11/16") else None,
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, folder_id: [
+            {
+                "id": path.name,
+                "name": path.name,
+                "modifiedTime": "2026-11-16T03:20:00Z",
+                "size": str(path.stat().st_size),
+            }
+            for path in sorted(source.glob("capture_*.parquet"))
+        ],
+    )
+
+    def fake_download(store, file_id, destination):
+        downloads.append(file_id)
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source / file_id, destination)
+
+    monkeypatch.setattr(compiler, "_download", fake_download)
+
+    work = tmp_path / "work"
+    history: dict = {}
+    symbols = {"AAA", "BBB"}
+
+    compiler._load_live_history_state(object(), symbols, t1, work, 120, history)
+    assert downloads == ["capture_0920.parquet"]
+    assert len(history["AAA"]) == 1
+    assert len(history["BBB"]) == 1
+    assert len(history[compiler.MARKET_CONTEXT_SYMBOL]) == 1
+
+    pd.DataFrame([_capture_row("AAA", t1, 2.0)]).to_parquet(
+        source / "capture_0925.parquet", index=False
+    )
+    downloads.clear()
+    compiler._load_live_history_state(object(), symbols, t1, work, 120, history)
+    assert downloads == ["capture_0925.parquet"]
+    assert history["AAA"]["Close"].tolist() == [1.0, 2.0]
+    assert len(history["BBB"]) == 1
+
+    downloads.clear()
+    compiler._load_live_history_state(object(), symbols, t1, work, 120, history)
+    assert downloads == []
+
+
+def test_load_live_history_state_keeps_seed_rows_when_capture_is_late(tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    source = tmp_path / "source"
+    source.mkdir()
+    t0 = pd.Timestamp("2026-11-16 09:20:00", tz=IST)
+    pd.DataFrame([_capture_row("AAA", t0, 1.0)]).to_parquet(
+        source / "capture_0920.parquet", index=False
+    )
+
+    monkeypatch.setattr(
+        compiler,
+        "_find_remote",
+        lambda store, path: {"id": "live"} if path.endswith("2026/11/16") else None,
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, folder_id: [
+            {"id": path.name, "name": path.name, "modifiedTime": "x", "size": "1"}
+            for path in sorted(source.glob("capture_*.parquet"))
+        ],
+    )
+
+    def fake_download(store, file_id, destination):
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source / file_id, destination)
+
+    monkeypatch.setattr(compiler, "_download", fake_download)
+
+    seed_frame = pd.DataFrame(
+        {"Open": [9.0], "High": [9.0], "Low": [9.0], "Close": [9.0], "Volume": [1]},
+        index=pd.DatetimeIndex([t0], tz=IST, name="Datetime"),
+    )
+    history = {"AAA": seed_frame}
+
+    compiler._load_live_history_state(object(), {"AAA"}, t0, tmp_path / "work", 120, history)
+
+    assert history["AAA"]["Close"].tolist() == [1.0]
