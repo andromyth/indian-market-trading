@@ -11,17 +11,6 @@ on:
         options:
           - "no"
           - "yes"
-  schedule:
-    # One daily kickoff at 16:00 IST (10:30 UTC); Cloud Run owns the resumable backfill.
-    # The NSE calendar/time gate below remains a second safety barrier.
-    # Manual dispatch remains available but is subject to the same gate.
-    - cron: "30 10 * * *"
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/start_cloud_run_5m_backfill.yml"
-
 permissions:
   contents: read
   actions: read

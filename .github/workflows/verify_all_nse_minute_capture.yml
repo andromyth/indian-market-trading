@@ -2,18 +2,6 @@ name: Verify all-NSE minute capture
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/verify_all_nse_minute_capture.yml"
-      - "autonomous_intraday_worker_service.py"
-      - "all_nse_minute_prediction_capture.py"
-      - "all_nse_intraday_model.py"
-      - "colab_build_all_nse_intraday_multifactor.py"
-      - "all_universe_minute_capture.py"
-      - "indstocks_client.py"
-
 permissions:
   contents: read
   actions: read

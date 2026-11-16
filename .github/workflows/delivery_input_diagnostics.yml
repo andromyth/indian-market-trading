@@ -2,10 +2,6 @@ name: Delivery input diagnostics
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - fix/delivery-diagnostics-latest-session
-
 permissions:
   contents: read
 

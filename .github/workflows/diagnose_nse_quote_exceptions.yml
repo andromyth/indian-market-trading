@@ -3,13 +3,6 @@ name: Diagnose latest NSE quote exceptions
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/diagnose_nse_quote_exceptions.yml"
-      - "indstocks_client.py"
-
 permissions:
   contents: read
 

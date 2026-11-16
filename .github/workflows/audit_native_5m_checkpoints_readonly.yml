@@ -1,10 +1,6 @@
 name: Read-only native five-minute checkpoint audit
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/audit_native_5m_checkpoints_readonly.yml"
 permissions:
   contents: read
 jobs:

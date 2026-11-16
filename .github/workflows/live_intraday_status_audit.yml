@@ -7,21 +7,6 @@ on:
   # 16:15 Asia/Kolkata (UTC is 5:30 behind) each weekday.
   # The script skips requiring current-day snapshots on NSE holidays and audits
   # the last completed NSE session's full-universe minute capture separately.
-  schedule:
-    - cron: '45 10 * * 1-5'
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/live_intraday_status_audit.yml"
-      - ".github/workflows/verify_minute_prediction_persistence.yml"
-      - "autonomous_intraday_worker.py"
-      - "all_universe_minute_capture.py"
-      - "all_nse_minute_prediction_capture.py"
-      - "audit_all_universe_minute_snapshots.py"
-      - "verify_minute_prediction_persistence.py"
-      - "tests/test_all_universe_minute_audit.py"
-
 permissions:
   contents: read
 

@@ -1,18 +1,6 @@
 name: Compile ALL-NSE predictions from Google Drive
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/compile_all_nse_predictions_from_drive.yml"
-      - "drive_all_nse_prediction_compiler.py"
-      - "all_nse_minute_prediction_capture.py"
-      - "persistent_store.py"
-      - "all_nse_intraday_model.py"
-      - "market_session_guard.py"
-      - "requirements.txt"
-  pull_request:
   workflow_dispatch:
     inputs:
       mode:
@@ -25,10 +13,9 @@ on:
         default: ""
   # GitHub cron is UTC; the Python guard restricts execution to 09:15–15:25 IST
   # on NSE trading days. Cloud Run alone collects INDstocks quotes/history.
+  # Single post-close safety compile; in-session prediction runs in Cloud Run.
   schedule:
-    - cron: "45-59/5 3 * * 1-5"
-    - cron: "*/5 4-9 * * 1-5"
-
+    - cron: "59 9 * * 1-5"
 permissions:
   contents: read
 

@@ -2,11 +2,6 @@ name: Read live native five-minute backfill status
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/read_live_native_5m_backfill_status.yml"
-
 permissions:
   contents: read
 

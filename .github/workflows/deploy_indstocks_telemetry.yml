@@ -1,12 +1,7 @@
 name: Deploy INDstocks telemetry revision (preserve schedules)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/deploy_indstocks_telemetry.yml"
-      - "indstocks_client.py"
-
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read

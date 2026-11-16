@@ -14,23 +14,6 @@ on:
         description: 'Last date to audit (YYYY-MM-DD; blank = today in IST)'
         required: false
         default: ''
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/prediction_accuracy_audit.yml"
-      - "audit_live_prediction_health.py"
-      - "audit_autonomous_intraday_outcomes.py"
-      - "prediction_ledger.py"
-      - "prediction_validation.py"
-      - "delivery_validation_diagnostics.py"
-      - "validate_intraday_30m_predictions.py"
-      - "validate_delivery_prediction_ledger.py"
-      - "delivery_prediction_csv_ledger.py"
-      - "delivery_production_refresh.py"
-      - "intraday_5m_multihorizon_validation.py"
-      - "tests/test_live_accuracy_audit_inputs.py"
-
 permissions:
   contents: read
 

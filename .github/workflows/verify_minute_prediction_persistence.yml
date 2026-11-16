@@ -5,12 +5,6 @@ on:
   workflow_dispatch:
   # A one-time recovery trigger when this diagnostic workflow is added/changed.
   # Normal application-code pushes do not run it.
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/verify_minute_prediction_persistence.yml"
-
 permissions:
   contents: read
 

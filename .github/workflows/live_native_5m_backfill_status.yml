@@ -1,10 +1,6 @@
 name: Live native five-minute backfill status
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/live_native_5m_backfill_status.yml"
   workflow_dispatch:
 
 permissions:

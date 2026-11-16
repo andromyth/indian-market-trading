@@ -2,12 +2,6 @@ name: Recover minute prediction/actual persistence once
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/recover_minute_prediction_actual_once.yml"
-
 permissions:
   contents: read
 

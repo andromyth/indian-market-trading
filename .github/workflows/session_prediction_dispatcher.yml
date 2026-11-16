@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "supervise (default) or health for a single read-only check"
+        description: "health (default, read-only single check) or supervise (long runner, not for normal use)"
         required: false
-        default: supervise
+        default: health
 
 permissions:
   contents: write

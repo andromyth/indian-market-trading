@@ -7,15 +7,6 @@ on:
         description: "NSE session date YYYY-MM-DD; blank selects the latest weekday session"
         required: false
         default: ""
-  push:
-    branches:
-      - main
-    paths:
-      - "all_nse_prediction_learning.py"
-      - "all_nse_minute_prediction_capture.py"
-      - "all_universe_minute_capture.py"
-      - ".github/workflows/diagnose_all_nse_learning_gate.yml"
-
 permissions:
   contents: read
 

@@ -6,6 +6,12 @@ on:
       - main
       - beta_version
       - beta_version2
+    paths-ignore:
+      - "**.md"
+      - "session_health/**"
+      - "production_data/**"
+      - "health/**"
+      - "*.log"
   pull_request:
     branches:
       - main
@@ -13,6 +19,9 @@ on:
 
 jobs:
   test:
+    # Automated data commits (delivery cycle, EOD sync, health bot) do not
+    # change Python behaviour; skipping them removes ~250 billed runs/month.
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

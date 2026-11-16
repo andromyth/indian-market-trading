@@ -12,8 +12,6 @@ on:
         required: false
         default: ""
   # Learning runs after the 15:30 IST NSE cash close, after outcome matching has time to finish.
-  schedule:
-    - cron: "0 11 * * 1-5"
 permissions:
   contents: read
 
