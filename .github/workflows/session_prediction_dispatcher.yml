@@ -1,15 +1,13 @@
-name: Session prediction dispatcher
+name: Session prediction supervisor
 
-# Opt-in recovery for the ALL-NSE five-minute prediction compiler.
+# Opt-in recovery + health supervision for the ALL-NSE five-minute prediction
+# compiler. GitHub cron throttles this repository's scheduled workflows by hours
+# (observed 2026-11-09..13: compiler schedules only fired after 17:00 IST), so
+# this workflow dispatches the compiler on every five-minute boundary and posts
+# a read-only Drive health report every thirty minutes.
 #
-# GitHub cron throttles this repository's scheduled workflows by hours (observed
-# 2026-11-09..13: compiler schedules only fired after 17:00 IST), so no ALL-NSE
-# slot was compiled during the cash session. The Cloud Run worker still captures
-# quotes every five minutes; only inference needs a reliable trigger.
-#
-# This workflow dispatches compile_all_nse_predictions_from_drive.yml on every
-# five-minute boundary of the NSE session. It is workflow_dispatch-only and is
-# not part of any automatic schedule.
+# It is workflow_dispatch-only, never touches the Cloud Run worker, and is not
+# part of any automatic schedule.
 
 on:
   workflow_dispatch:
@@ -19,20 +17,35 @@ permissions:
   actions: write
 
 jobs:
-  dispatch-morning:
+  supervise-morning:
     runs-on: ubuntu-latest
-    timeout-minutes: 210
+    timeout-minutes: 200
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPOSITORY: ${{ github.repository }}
       WINDOW_START_IST: "09:20"
       WINDOW_END_IST: "12:05"
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
-      - name: Dispatch compiler every five minutes (morning half)
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Drive audit dependencies
+        run: >-
+          python -m pip install --quiet --disable-pip-version-check
+          google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Dispatch compiler and verify Drive persistence (morning half)
         run: |
           python -u - <<'PY'
           import json
           import os
+          import subprocess
+          import sys
           import time
           import urllib.request
           from datetime import datetime, timedelta
@@ -51,13 +64,38 @@ jobs:
           def next_slot(now):
               base = now.replace(second=0, microsecond=0)
               minute = (base.minute // 5 + 1) * 5
-              if minute >= 60:
-                  target = base.replace(minute=0) + timedelta(hours=1)
-              else:
-                  target = base.replace(minute=minute)
+              target = base.replace(minute=0) + timedelta(hours=1) if minute >= 60 else base.replace(minute=minute)
               if (target.hour, target.minute) < (start_h, start_m):
                   target = target.replace(hour=start_h, minute=start_m)
               return target
+
+          def dispatch():
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps({"ref": "main"}).encode(),
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.status
+
+          def health():
+              result = subprocess.run(
+                  [sys.executable, "-u", "scripts/session_prediction_health.py"],
+                  capture_output=True,
+                  text=True,
+              )
+              line = next(
+                  (l for l in result.stdout.splitlines() if l.startswith("SESSION_HEALTH_JSON=")),
+                  None,
+              )
+              print("HEALTH_STAMP", datetime.now(IST).isoformat(), flush=True)
+              print(line or ("HEALTH_ERROR " + (result.stderr or "")[-400:]), flush=True)
 
           while True:
               now = datetime.now(IST)
@@ -71,26 +109,17 @@ jobs:
               delay = (target - now).total_seconds()
               if delay > 0:
                   time.sleep(delay)
-              request = urllib.request.Request(
-                  url,
-                  data=json.dumps({"ref": "main"}).encode(),
-                  method="POST",
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "Content-Type": "application/json",
-                  },
-              )
               stamp = datetime.now(IST).isoformat()
               try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      print("DISPATCH", stamp, response.status, flush=True)
+                  print("DISPATCH", stamp, dispatch(), flush=True)
               except Exception as exc:
                   print("DISPATCH_ERROR", stamp, type(exc).__name__, str(exc)[:200], flush=True)
+              if target.minute % 30 == 0:
+                  health()
+          health()
           PY
 
-  dispatch-afternoon:
+  supervise-afternoon:
     runs-on: ubuntu-latest
     timeout-minutes: 210
     env:
@@ -98,12 +127,27 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       WINDOW_START_IST: "12:10"
       WINDOW_END_IST: "15:25"
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
     steps:
-      - name: Dispatch compiler every five minutes (afternoon half)
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Drive audit dependencies
+        run: >-
+          python -m pip install --quiet --disable-pip-version-check
+          google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Dispatch compiler and verify Drive persistence (afternoon half)
         run: |
           python -u - <<'PY'
           import json
           import os
+          import subprocess
+          import sys
           import time
           import urllib.request
           from datetime import datetime, timedelta
@@ -122,13 +166,38 @@ jobs:
           def next_slot(now):
               base = now.replace(second=0, microsecond=0)
               minute = (base.minute // 5 + 1) * 5
-              if minute >= 60:
-                  target = base.replace(minute=0) + timedelta(hours=1)
-              else:
-                  target = base.replace(minute=minute)
+              target = base.replace(minute=0) + timedelta(hours=1) if minute >= 60 else base.replace(minute=minute)
               if (target.hour, target.minute) < (start_h, start_m):
                   target = target.replace(hour=start_h, minute=start_m)
               return target
+
+          def dispatch():
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps({"ref": "main"}).encode(),
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.status
+
+          def health():
+              result = subprocess.run(
+                  [sys.executable, "-u", "scripts/session_prediction_health.py"],
+                  capture_output=True,
+                  text=True,
+              )
+              line = next(
+                  (l for l in result.stdout.splitlines() if l.startswith("SESSION_HEALTH_JSON=")),
+                  None,
+              )
+              print("HEALTH_STAMP", datetime.now(IST).isoformat(), flush=True)
+              print(line or ("HEALTH_ERROR " + (result.stderr or "")[-400:]), flush=True)
 
           while True:
               now = datetime.now(IST)
@@ -142,59 +211,22 @@ jobs:
               delay = (target - now).total_seconds()
               if delay > 0:
                   time.sleep(delay)
-              request = urllib.request.Request(
-                  url,
-                  data=json.dumps({"ref": "main"}).encode(),
-                  method="POST",
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "Content-Type": "application/json",
-                  },
-              )
               stamp = datetime.now(IST).isoformat()
               try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      print("DISPATCH", stamp, response.status, flush=True)
+                  print("DISPATCH", stamp, dispatch(), flush=True)
               except Exception as exc:
                   print("DISPATCH_ERROR", stamp, type(exc).__name__, str(exc)[:200], flush=True)
-          PY
-
-      - name: Dispatch the closing five-minute slot
-        run: |
-          python -u - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.request
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-
-          IST = ZoneInfo("Asia/Kolkata")
+              if target.minute % 30 == 0:
+                  health()
+          # Closing slot: 15:25 capture is durably stored just after 15:25.
           now = datetime.now(IST)
-          target = now.replace(hour=15, minute=28, second=0, microsecond=0)
-          delay = (target - now).total_seconds()
-          if 0 < delay < 4 * 60 * 60:
-              time.sleep(delay)
-          if datetime.now(IST).weekday() >= 5:
-              print("WEEKEND_STOP", flush=True)
-              raise SystemExit(0)
-          url = (
-              f"https://api.github.com/repos/{os.environ['REPOSITORY']}/actions/workflows/"
-              "compile_all_nse_predictions_from_drive.yml/dispatches"
-          )
-          request = urllib.request.Request(
-              url,
-              data=json.dumps({"ref": "main"}).encode(),
-              method="POST",
-              headers={
-                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "Content-Type": "application/json",
-              },
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              print("CLOSING_DISPATCH", datetime.now(IST).isoformat(), response.status, flush=True)
+          closing = now.replace(hour=15, minute=28, second=0, microsecond=0)
+          if now < closing:
+              time.sleep((closing - now).total_seconds())
+          try:
+              print("CLOSING_DISPATCH", datetime.now(IST).isoformat(), dispatch(), flush=True)
+          except Exception as exc:
+              print("CLOSING_DISPATCH_ERROR", type(exc).__name__, str(exc)[:200], flush=True)
+          time.sleep(150)
+          health()
           PY
