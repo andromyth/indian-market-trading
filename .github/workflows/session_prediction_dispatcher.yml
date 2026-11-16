@@ -44,12 +44,6 @@ jobs:
         run: >-
           python -m pip install --quiet --disable-pip-version-check -r requirements.txt
 
-      - name: Check out session health branch
-        uses: actions/checkout@v4
-        with:
-          ref: session-health
-          path: health
-
       - name: Dispatch compiler and verify Drive persistence (morning half)
         run: |
           python -u - <<'PY'
@@ -95,36 +89,6 @@ jobs:
               with urllib.request.urlopen(request, timeout=30) as response:
                   return response.status
 
-          def publish(line):
-              try:
-                  payload = line.split("=", 1)[1] if line.startswith("SESSION_HEALTH_JSON=") else line
-                  json.loads(payload)
-              except Exception as exc:
-                  print("HEALTH_PUBLISH_SKIP", type(exc).__name__, flush=True)
-                  return
-              root = "health/session_health"
-              os.makedirs(root, exist_ok=True)
-              with open(os.path.join(root, "latest.json"), "w") as fh:
-                  fh.write(payload + "\n")
-              with open(os.path.join(root, "history.jsonl"), "a") as fh:
-                  fh.write(json.dumps({"recorded_at_ist": datetime.now(IST).isoformat(), "health": json.loads(payload)}, default=str) + "\n")
-              env = dict(os.environ)
-              env.update({
-                  "GIT_AUTHOR_NAME": "session-health-bot",
-                  "GIT_AUTHOR_EMAIL": "session-health-bot@users.noreply.github.com",
-                  "GIT_COMMITTER_NAME": "session-health-bot",
-                  "GIT_COMMITTER_EMAIL": "session-health-bot@users.noreply.github.com",
-              })
-              subprocess.run(["git", "-C", "health", "pull", "--quiet", "--rebase", "--autostash"], env=env, check=False)
-              subprocess.run(["git", "-C", "health", "add", "-A"], env=env, check=False)
-              subprocess.run(["git", "-C", "health", "commit", "-q", "-m", "Session health " + datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")], env=env, check=False)
-              for attempt in range(2):
-                  push = subprocess.run(["git", "-C", "health", "push", "--quiet", "origin", "session-health"], env=env, capture_output=True, text=True)
-                  if push.returncode == 0:
-                      break
-                  subprocess.run(["git", "-C", "health", "pull", "--quiet", "--rebase", "--autostash"], env=env, check=False)
-              print("HEALTH_PUBLISH", push.returncode, (push.stderr or "").strip()[:300], flush=True)
-
           def health():
               result = subprocess.run(
                   [sys.executable, "-u", "scripts/session_prediction_health.py"],
@@ -138,7 +102,15 @@ jobs:
               print("HEALTH_STAMP", datetime.now(IST).isoformat(), flush=True)
               print(line or ("HEALTH_ERROR " + (result.stderr or "")[-400:]), flush=True)
               if line:
-                  publish(line)
+                  payload = line.split("=", 1)[1] if line.startswith("SESSION_HEALTH_JSON=") else line
+                  with open("/tmp/session_health.json", "w") as fh:
+                      fh.write(payload)
+                  pub = subprocess.run(
+                      [sys.executable, "scripts/session_health_publish.py", "/tmp/session_health.json"],
+                      capture_output=True,
+                      text=True,
+                  )
+                  print("HEALTH_PUBLISH", pub.returncode, (pub.stdout or "").strip()[:200], (pub.stderr or "").strip()[:300], flush=True)
 
           health()
 
@@ -185,12 +157,6 @@ jobs:
       - name: Install Drive audit dependencies
         run: >-
           python -m pip install --quiet --disable-pip-version-check -r requirements.txt
-
-      - name: Check out session health branch
-        uses: actions/checkout@v4
-        with:
-          ref: session-health
-          path: health
 
       - name: Dispatch compiler and verify Drive persistence (afternoon half)
         run: |
@@ -280,7 +246,15 @@ jobs:
               print("HEALTH_STAMP", datetime.now(IST).isoformat(), flush=True)
               print(line or ("HEALTH_ERROR " + (result.stderr or "")[-400:]), flush=True)
               if line:
-                  publish(line)
+                  payload = line.split("=", 1)[1] if line.startswith("SESSION_HEALTH_JSON=") else line
+                  with open("/tmp/session_health.json", "w") as fh:
+                      fh.write(payload)
+                  pub = subprocess.run(
+                      [sys.executable, "scripts/session_health_publish.py", "/tmp/session_health.json"],
+                      capture_output=True,
+                      text=True,
+                  )
+                  print("HEALTH_PUBLISH", pub.returncode, (pub.stdout or "").strip()[:200], (pub.stderr or "").strip()[:300], flush=True)
 
           health()
 
@@ -321,6 +295,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -338,4 +314,7 @@ jobs:
         run: python -m pip install --quiet --disable-pip-version-check -r requirements.txt
 
       - name: Read-only Drive health check
-        run: python -u scripts/session_prediction_health.py
+        run: |
+          python -u scripts/session_prediction_health.py | tee /tmp/health.log
+          grep SESSION_HEALTH_JSON /tmp/health.log | sed 's/^SESSION_HEALTH_JSON=//' > /tmp/session_health.json
+          python -u scripts/session_health_publish.py /tmp/session_health.json
