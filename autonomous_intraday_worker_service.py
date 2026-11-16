@@ -84,7 +84,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 ALL_NSE_IN_WORKER_PREDICTION = _env_flag("ALL_NSE_IN_WORKER_PREDICTION", False)
 ALL_NSE_IN_WORKER_DEADLINE_SECONDS = max(
     30.0,
-    float(os.getenv("ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS") or 120),
+    float(os.getenv("ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS") or 180),
 )
 
 

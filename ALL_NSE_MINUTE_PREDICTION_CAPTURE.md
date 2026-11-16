@@ -61,7 +61,7 @@ python all_universe_snapshot_assembly.py --minute 2026-11-12T10:05 --worker-coun
   old, unlike a Drive-only compile that must stay inside
   `MAX_HISTORY_CANDLE_AGE_MINUTES = 5`.
 - The call is bounded by `ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS`
-  (default 120). On timeout or error the tick returns
+  (default 180). On timeout or error the tick returns
   `DELEGATED_TO_GITHUB_ACTIONS`, so the compiler and post-close recovery
   workflows still own the slot; the compiler skips slots that are already
   `STORED`.
