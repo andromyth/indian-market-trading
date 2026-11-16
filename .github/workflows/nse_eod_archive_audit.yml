@@ -18,9 +18,10 @@ on:
         description: 'Last date to audit (YYYY-MM-DD)'
         required: false
         default: ''
-  workflow_run:
-    workflows: ["NSE EOD official data sync"]
-    types: [completed]
+  # Was triggered after every EOD sync (~3 runs/day, ~200 billed minutes/month).
+  # One weekly read-only audit is enough; dispatch for ad-hoc checks.
+  schedule:
+    - cron: "0 12 * * 1"
 
 concurrency:
   group: nse-eod-archive-audit
