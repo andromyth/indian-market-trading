@@ -49,6 +49,26 @@ python all_universe_snapshot_assembly.py --minute 2026-11-12T10:05 --worker-coun
 - Cloud Run stays at concurrency 1 and max instances 1: exactly one process owns
   the INDstocks token and the assembly write.
 
+## Same-slot prediction inside the Cloud Run tick
+
+- `ALL_NSE_IN_WORKER_PREDICTION=1` makes the tick that just persisted the
+  snapshot run `AllNSEMinutePredictor.run_for_capture` immediately, using the
+  already-warm model/history cache. The slot then lands on Drive roughly one
+  minute after the five-minute boundary instead of the GitHub Actions lane's
+  ~3.5 minutes (runner setup + pip + pytest + Drive auth).
+- The in-worker run uses `drive_only=False`, so the NIFTY benchmark refresh is
+  allowed and market/relative features are not dropped for being 10 minutes
+  old, unlike a Drive-only compile that must stay inside
+  `MAX_HISTORY_CANDLE_AGE_MINUTES = 5`.
+- The call is bounded by `ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS`
+  (default 180). On timeout or error the tick returns
+  `DELEGATED_TO_GITHUB_ACTIONS`, so the compiler and post-close recovery
+  workflows still own the slot; the compiler skips slots that are already
+  `STORED`.
+- `prediction_mode` and `prediction_latency_seconds` are recorded on the tick
+  result (and surfaced through `/healthz`), so the slot -> prediction latency
+  is measurable from logs and the session-health record.
+
 ## Drive layout
 
 Canonical quote snapshot (the only input the prediction compiler accepts):

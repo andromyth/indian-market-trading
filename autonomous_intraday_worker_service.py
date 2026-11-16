@@ -70,6 +70,24 @@ BACKFILL_THREAD: threading.Thread | None = None
 BACKFILL_CONFIRMATION = "START_NATIVE_5M_BACKFILL"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# When enabled the Cloud Run tick persists ALL-NSE predictions for the slot it
+# just captured instead of delegating inference to GitHub Actions. This keeps
+# the five-minute slot -> prediction latency inside the session budget because
+# the predictor, model cache and history are already warm in this process.
+ALL_NSE_IN_WORKER_PREDICTION = _env_flag("ALL_NSE_IN_WORKER_PREDICTION", False)
+ALL_NSE_IN_WORKER_DEADLINE_SECONDS = max(
+    30.0,
+    float(os.getenv("ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS") or 180),
+)
+
+
 def _update_backfill_status(**fields: Any) -> None:
     with STATE_LOCK:
         current = dict(STATE.get("five_minute_backfill") or {})
@@ -267,6 +285,85 @@ def _run_five_minute_backfill() -> None:
             pass
 
 
+def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]:
+    """Predict the just-persisted ALL-NSE slot in this process.
+
+    Falls back to the GitHub Actions compiler when the in-process run is
+    disabled, fails, or exceeds its deadline so a slot is never lost because
+    of an inference error.
+    """
+    slot = capture.get("cycle_minute_ist")
+    fallback = {
+        "status": "DELEGATED_TO_GITHUB_ACTIONS",
+        "cycle_minute_ist": slot,
+        "source_snapshot_drive_path": capture.get("snapshot_drive_path"),
+    }
+    if not ALL_NSE_IN_WORKER_PREDICTION:
+        fallback["reason"] = "ALL_NSE_IN_WORKER_PREDICTION is disabled."
+        return fallback
+    started = datetime.now(timezone.utc)
+    outcome: dict[str, Any] = {}
+
+    def _predict() -> None:
+        try:
+            outcome["result"] = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
+                capture,
+                worker_root=WORKER_ROOT,
+                drive_only=False,
+            )
+        except Exception as exc:
+            outcome["error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+
+    thread = threading.Thread(
+        target=_predict,
+        name="all-nse-in-worker-prediction",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=ALL_NSE_IN_WORKER_DEADLINE_SECONDS)
+    elapsed = round((datetime.now(timezone.utc) - started).total_seconds(), 3)
+    if thread.is_alive():
+        _log(
+            "all_nse_in_worker_prediction_timeout",
+            cycle_minute_ist=slot,
+            deadline_seconds=ALL_NSE_IN_WORKER_DEADLINE_SECONDS,
+            elapsed_seconds=elapsed,
+        )
+        fallback.update({
+            "prediction_latency_seconds": elapsed,
+            "reason": (
+                "In-worker prediction exceeded the "
+                f"{ALL_NSE_IN_WORKER_DEADLINE_SECONDS:.0f}s deadline; "
+                "GitHub fallback owns this slot."
+            ),
+        })
+        return fallback
+    if outcome.get("error"):
+        _log(
+            "all_nse_in_worker_prediction_failed",
+            cycle_minute_ist=slot,
+            error=outcome["error"],
+            elapsed_seconds=elapsed,
+        )
+        fallback.update({
+            "prediction_latency_seconds": elapsed,
+            "error": outcome["error"],
+            "reason": "In-worker prediction failed; GitHub fallback owns this slot.",
+        })
+        return fallback
+    result = dict(outcome.get("result") or {})
+    result["prediction_mode"] = "CLOUD_RUN_IN_WORKER"
+    result["prediction_latency_seconds"] = elapsed
+    _log(
+        "all_nse_in_worker_prediction_finished",
+        cycle_minute_ist=slot,
+        status=result.get("status"),
+        prediction_count=result.get("prediction_count"),
+        elapsed_seconds=elapsed,
+    )
+    return result
+
+
 def _prepare_all_nse_history_before_capture(
     now: pd.Timestamp | datetime | None = None,
 ) -> dict[str, Any]:
@@ -353,6 +450,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
                 "history_refresh_failed_batches", "remote_path", "manifest_drive_path",
                 "eligible_symbol_count", "skipped_missing_quote_count",
                 "source_snapshot_drive_path", "prediction_policy", "status", "error", "reason",
+                "prediction_mode", "prediction_latency_seconds",
             )
             if key in all_nse
         })
@@ -950,7 +1048,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
             result = WORKER.tick_once()
             result["all_nse_pre_capture_history_refresh"] = history_prefetch
             # Cloud Run owns INDstocks collection and durable snapshot/history writes.
-            # GitHub Actions consumes those Drive artifacts and owns ALL-NSE inference.
+            # When ALL_NSE_IN_WORKER_PREDICTION is enabled it also owns the
+            # same-slot inference so predictions land within one minute of the
+            # five-minute boundary; otherwise GitHub Actions compiles the
+            # persisted Drive artifacts as before.
             capture_result = result.get("all_universe_capture") or {}
             if capture_result.get("status") == "NOT_SCHEDULED":
                 result["all_nse_minute_predictions"] = {
@@ -958,12 +1059,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "reason": "No scheduled five-minute quote snapshot was captured.",
                 }
             else:
-                result["all_nse_minute_predictions"] = {
-                    "status": "DELEGATED_TO_GITHUB_ACTIONS",
-                    "cycle_minute_ist": capture_result.get("cycle_minute_ist"),
-                    "source_snapshot_drive_path": capture_result.get("snapshot_drive_path"),
-                    "reason": "GitHub Actions compiles the persisted Drive snapshot and history archive.",
-                }
+                result["all_nse_minute_predictions"] = _run_all_nse_prediction_in_worker(
+                    capture_result
+                )
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result)
             # A tick completed even if one symbol/source failed; errors are
