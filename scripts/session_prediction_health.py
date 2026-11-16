@@ -8,6 +8,8 @@ Drive, never retrains, and never places orders.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 import os
 from datetime import datetime, timedelta
 from typing import Any
@@ -172,6 +174,8 @@ def live_history_report(service, store, current: datetime) -> dict[str, Any]:
 
 
 def main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
     from persistent_store import GoogleDriveStore
 
     now = datetime.now(IST)
