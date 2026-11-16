@@ -9,12 +9,14 @@ on:
       - "market_watchlist.py"
       - "delivery_training_universe.py"
   workflow_dispatch:
-  # GitHub cron uses UTC. Runs 08:50 IST, every 15 minutes through 14:50, plus a final 15:00 refresh.
-  # Scheduled runs use the market-window guard; pushes/manual runs allow a one-off catch-up.
+  # GitHub cron uses UTC. Hourly in-session (09:00, 09:30-14:30, 15:30 IST) instead of
+  # every 15 minutes: 7 runs/day instead of 26 (~250 billed minutes/month saved; was the
+  # largest scheduled consumer). Scheduled runs use the market-window guard; pushes and
+  # manual dispatch still allow a one-off catch-up.
   schedule:
-    - cron: "20,35,50 3 * * 1-5"
-    - cron: "5,20,35,50 4-8 * * 1-5"
-    - cron: "5,20,30 9 * * 1-5"
+    - cron: "30 3 * * 1-5"
+    - cron: "0 4-9 * * 1-5"
+    - cron: "0 10 * * 1-5"
 
 permissions:
   contents: read
