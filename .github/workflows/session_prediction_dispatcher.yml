@@ -1,0 +1,162 @@
+name: Session prediction dispatcher
+
+# Opt-in recovery for the ALL-NSE five-minute prediction compiler.
+#
+# GitHub cron throttles this repository's scheduled workflows by hours (observed
+# 2026-11-09..13: compiler schedules only fired after 17:00 IST), so no ALL-NSE
+# slot was compiled during the cash session. The Cloud Run worker still captures
+# quotes every five minutes; only inference needs a reliable trigger.
+#
+# This workflow dispatches compile_all_nse_predictions_from_drive.yml on every
+# five-minute boundary of the NSE session. It is workflow_dispatch-only and is
+# not part of any automatic schedule.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch-morning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      WINDOW_START_IST: "09:20"
+      WINDOW_END_IST: "12:10"
+    steps:
+      - name: Dispatch compiler every five minutes (morning half)
+        run: |
+          python -u - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          IST = ZoneInfo("Asia/Kolkata")
+          repo = os.environ["REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          start_h, start_m = (int(x) for x in os.environ["WINDOW_START_IST"].split(":"))
+          end_h, end_m = (int(x) for x in os.environ["WINDOW_END_IST"].split(":"))
+          url = (
+              f"https://api.github.com/repos/{repo}/actions/workflows/"
+              "compile_all_nse_predictions_from_drive.yml/dispatches"
+          )
+
+          def next_slot(now):
+              base = now.replace(second=0, microsecond=0)
+              minute = (base.minute // 5 + 1) * 5
+              if minute >= 60:
+                  target = base.replace(minute=0) + timedelta(hours=1)
+              else:
+                  target = base.replace(minute=minute)
+              if (target.hour, target.minute) < (start_h, start_m):
+                  target = target.replace(hour=start_h, minute=start_m)
+              return target
+
+          while True:
+              now = datetime.now(IST)
+              if now.weekday() >= 5:
+                  print("WEEKEND_STOP", now.isoformat(), flush=True)
+                  break
+              target = next_slot(now)
+              if (target.hour, target.minute) > (end_h, end_m):
+                  print("WINDOW_COMPLETE", now.isoformat(), flush=True)
+                  break
+              delay = (target - now).total_seconds()
+              if delay > 0:
+                  time.sleep(delay)
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps({"ref": "main"}).encode(),
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              stamp = datetime.now(IST).isoformat()
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      print("DISPATCH", stamp, response.status, flush=True)
+              except Exception as exc:
+                  print("DISPATCH_ERROR", stamp, type(exc).__name__, str(exc)[:200], flush=True)
+          PY
+
+  dispatch-afternoon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      WINDOW_START_IST: "12:15"
+      WINDOW_END_IST: "15:25"
+    steps:
+      - name: Dispatch compiler every five minutes (afternoon half)
+        run: |
+          python -u - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          IST = ZoneInfo("Asia/Kolkata")
+          repo = os.environ["REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          start_h, start_m = (int(x) for x in os.environ["WINDOW_START_IST"].split(":"))
+          end_h, end_m = (int(x) for x in os.environ["WINDOW_END_IST"].split(":"))
+          url = (
+              f"https://api.github.com/repos/{repo}/actions/workflows/"
+              "compile_all_nse_predictions_from_drive.yml/dispatches"
+          )
+
+          def next_slot(now):
+              base = now.replace(second=0, microsecond=0)
+              minute = (base.minute // 5 + 1) * 5
+              if minute >= 60:
+                  target = base.replace(minute=0) + timedelta(hours=1)
+              else:
+                  target = base.replace(minute=minute)
+              if (target.hour, target.minute) < (start_h, start_m):
+                  target = target.replace(hour=start_h, minute=start_m)
+              return target
+
+          while True:
+              now = datetime.now(IST)
+              if now.weekday() >= 5:
+                  print("WEEKEND_STOP", now.isoformat(), flush=True)
+                  break
+              target = next_slot(now)
+              if (target.hour, target.minute) > (end_h, end_m):
+                  print("WINDOW_COMPLETE", now.isoformat(), flush=True)
+                  break
+              delay = (target - now).total_seconds()
+              if delay > 0:
+                  time.sleep(delay)
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps({"ref": "main"}).encode(),
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              stamp = datetime.now(IST).isoformat()
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      print("DISPATCH", stamp, response.status, flush=True)
+              except Exception as exc:
+                  print("DISPATCH_ERROR", stamp, type(exc).__name__, str(exc)[:200], flush=True)
+          PY
