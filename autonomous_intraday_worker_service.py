@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import threading
 import time
 from datetime import datetime, timezone
@@ -394,6 +395,16 @@ def _prepare_all_nse_history_before_capture(
         )
         # A failed refresh is surfaced, but must not block quote capture/write.
         return {"status": "ERROR", "minute": minute.isoformat(), "error": detail}
+
+
+def _resource_usage() -> dict[str, Any]:
+    """Peak RSS (MB) and process CPU seconds for cost right-sizing."""
+    peak_rss_mb = None
+    try:
+        peak_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:  # pragma: no cover - getrusage is POSIX-only
+        pass
+    return {"peak_rss_mb": peak_rss_mb, "cpu_seconds": round(time.process_time(), 1)}
 
 
 def _record_tick_result(result: dict[str, Any]) -> None:
@@ -1063,7 +1074,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     capture_result
                 )
             _record_tick_result(result)
-            _log("cloud_run_tick_result", **result)
+            _log("cloud_run_tick_result", **result, **_resource_usage())
             # A tick completed even if one symbol/source failed; errors are
             # persisted in the response/logs and should not rerun the same minute.
             capture_status = str(

@@ -780,3 +780,13 @@ def test_all_nse_in_worker_prediction_falls_back_on_deadline(monkeypatch):
     assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
     assert "deadline" in result["reason"]
     assert result["prediction_latency_seconds"] >= 0.05
+
+
+def test_resource_usage_reports_peak_rss_and_cpu():
+    import autonomous_intraday_worker_service as service
+
+    usage = service._resource_usage()
+
+    assert set(usage) == {"peak_rss_mb", "cpu_seconds"}
+    assert usage["peak_rss_mb"] is None or usage["peak_rss_mb"] > 0
+    assert usage["cpu_seconds"] >= 0
