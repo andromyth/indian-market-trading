@@ -93,7 +93,6 @@ jobs:
           deployment_smoke_test.py
           app.py
           market_session_guard.py
-          COLAB_RUN_FNO_REPAIR_V2_20261003.py
           selfdriving/sd_v2_panel.py
           selfdriving/sd_intraday_v2.py
           selfdriving/sd_v2_runtime.py
@@ -106,9 +105,6 @@ jobs:
           strict_delivery_walkforward_audit.py
           append_delivery_pit_snapshots_to_research_panel.py
           live_signal_guards.py
-          COLAB_SD_V2_RETRAIN.py
-          COLAB_SD_INTRADAY_V2_RETRAIN.py
-          COLAB_SD_INTRADAY_RETURN_HEAD_RETRAIN.py
           daily_ohlc_forecast.py
           cross_sectional_daily_ohlc_audit.py
           rolling_daily_ohlc_audit.py
