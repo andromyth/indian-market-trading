@@ -60,7 +60,6 @@ jobs:
           build_all_nse_pit_fundamentals.py
           validate_multifactor_candidate.py
           final_algorithm_data_readiness_v2.py
-          COLAB_RUN_FINAL_ALGORITHM_DATA_READINESS_V2_20261003.py
           all_nse_delivery_model.py
           all_nse_intraday_model.py
           colab_build_all_nse_intraday_multifactor.py
