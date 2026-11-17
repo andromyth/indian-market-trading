@@ -6,8 +6,9 @@ name: Session prediction supervisor
 # this workflow dispatches the compiler on every five-minute boundary and posts
 # a read-only Drive health report every thirty minutes.
 #
-# It is workflow_dispatch-only, never touches the Cloud Run worker, and is not
-# part of any automatic schedule.
+# Same-slot predictions are produced by the Cloud Run tick; this lane only
+# repairs slots the tick could not store and publishes session health.
+# It never touches the Cloud Run worker.
 
 on:
   workflow_dispatch:
@@ -16,6 +17,12 @@ on:
         description: "health (default, read-only single check) or supervise (long runner, not for normal use)"
         required: false
         default: health
+  # GitHub throttles this repository's crons, but a late start is still useful:
+  # the loop derives its next boundary from the wall clock, so any firing during
+  # the session resumes gap-filling and publishes health. Predictions themselves
+  # are produced by the Cloud Run tick; this is the repair + monitoring lane.
+  schedule:
+    - cron: "5,35 3-10 * * 1-5"
 
 permissions:
   contents: write
