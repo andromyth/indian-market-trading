@@ -72,8 +72,28 @@ jobs:
           set -uo pipefail
           # The worker logs tick results as "[AUTONOMOUS_INTRADAY] {json}" text
           # lines, not structured jsonPayload, so query both shapes.
-          LOG_START="$(TZ=Asia/Kolkata date -d 'today 09:00' -u +%Y-%m-%dT%H:%M:%SZ)"
-          LOG_END="$(TZ=Asia/Kolkata date -d 'today 15:40' -u +%Y-%m-%dT%H:%M:%SZ)"
+          # "date -u -d 'today 09:00'" would parse as UTC, not IST, so convert
+          # the IST session window explicitly instead.
+          LOG_START="$(python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          ist = ZoneInfo("Asia/Kolkata")
+          now = datetime.now(ist)
+          start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+          print(start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"))
+          PY
+          )"
+          LOG_END="$(python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          ist = ZoneInfo("Asia/Kolkata")
+          now = datetime.now(ist)
+          end = now.replace(hour=15, minute=40, second=0, microsecond=0)
+          print(end.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"))
+          PY
+          )"
           echo "TICK_WINDOW_UTC=${LOG_START}..${LOG_END}"
           TICK_FILTER="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND (textPayload:\"cloud_run_tick_result\" OR jsonPayload.event=\"cloud_run_tick_result\") AND timestamp >= \"$LOG_START\""
           if gcloud logging read "$TICK_FILTER" --project="$PROJECT_ID" --limit=3000 --order=asc --format=json > /tmp/tick_timeline.json 2>/tmp/tick_timeline.err; then
