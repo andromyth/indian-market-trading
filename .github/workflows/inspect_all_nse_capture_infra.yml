@@ -66,6 +66,124 @@ jobs:
           PY
           rm -f /tmp/cloud-run-oauth-token.json
 
+      - name: Summarise per-tick prediction timeline and rejected requests
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The worker logs tick results as "[AUTONOMOUS_INTRADAY] {json}" text
+          # lines, not structured jsonPayload, so query both shapes.
+          LOG_START="$(TZ=Asia/Kolkata date -d 'today 09:00' -u +%Y-%m-%dT%H:%M:%SZ)"
+          LOG_END="$(TZ=Asia/Kolkata date -d 'today 15:40' -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "TICK_WINDOW_UTC=${LOG_START}..${LOG_END}"
+          TICK_FILTER="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND (textPayload:\"cloud_run_tick_result\" OR jsonPayload.event=\"cloud_run_tick_result\") AND timestamp >= \"$LOG_START\""
+          if gcloud logging read "$TICK_FILTER" --project="$PROJECT_ID" --limit=3000 --order=asc --format=json > /tmp/tick_timeline.json 2>/tmp/tick_timeline.err; then
+            python - /tmp/tick_timeline.json <<'PY'
+          import json
+          import statistics
+          import sys
+          from datetime import datetime
+          from pathlib import Path
+
+          PREFIX = "[AUTONOMOUS_INTRADAY] "
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8") or "[]")
+          ticks = []
+          for entry in rows:
+              payload = entry.get("jsonPayload") or {}
+              if not payload.get("event"):
+                  text = str(entry.get("textPayload") or "")
+                  if not text.startswith(PREFIX):
+                      continue
+                  try:
+                      payload = json.loads(text[len(PREFIX):])
+                  except Exception:
+                      continue
+              if str(payload.get("event")) != "cloud_run_tick_result":
+                  continue
+              ticks.append((str(entry.get("timestamp") or ""), payload))
+
+          def nested(payload, key):
+              value = payload.get(key)
+              return value.get("status") if isinstance(value, dict) else payload.get(key + "_status")
+
+          print("TICK_ROW_COUNT=" + str(len(ticks)))
+          latencies, cpu_seconds, previous = [], [], None
+          for logged, payload in ticks:
+              latency = payload.get("prediction_latency_seconds")
+              cpu = payload.get("cpu_seconds")
+              if isinstance(latency, (int, float)):
+                  latencies.append(float(latency))
+              if isinstance(cpu, (int, float)):
+                  cpu_seconds.append(float(cpu))
+              cycle = str(payload.get("cycle_minute_ist") or "")
+              gap = ""
+              if previous and cycle:
+                  try:
+                      delta = (datetime.fromisoformat(cycle) - datetime.fromisoformat(previous)).total_seconds() / 60.0
+                      if delta > 5.5:
+                          gap = " SLOT_GAP_MIN=" + str(round(delta, 1))
+                  except Exception:
+                      pass
+              previous = cycle or previous
+              print("TICK " + json.dumps({
+                  "at_ist": logged[11:19],
+                  "cycle_ist": cycle[11:16],
+                  "status": payload.get("status"),
+                  "latency_s": latency,
+                  "cpu_s": cpu,
+                  "rss_mb": payload.get("peak_rss_mb"),
+                  "capture": nested(payload, "all_universe_capture"),
+                  "prediction": nested(payload, "all_nse_minute_predictions"),
+                  "error": str(payload.get("error") or "")[:120] or None,
+              }, sort_keys=True) + gap)
+          if latencies:
+              print("TICK_LATENCY_SUMMARY=" + json.dumps({
+                  "count": len(latencies),
+                  "mean_s": round(statistics.mean(latencies), 1),
+                  "median_s": round(statistics.median(latencies), 1),
+                  "max_s": round(max(latencies), 1),
+                  "over_300s": sum(1 for value in latencies if value > 300),
+              }, sort_keys=True))
+          if cpu_seconds:
+              print("TICK_CPU_SUMMARY=" + json.dumps({
+                  "count": len(cpu_seconds),
+                  "total_cpu_s": round(sum(cpu_seconds), 1),
+                  "mean_cpu_s": round(statistics.mean(cpu_seconds), 1),
+                  "max_cpu_s": round(max(cpu_seconds), 1),
+              }, sort_keys=True))
+          PY
+          else
+            echo "TICK_TIMELINE_READ_FAILED"
+            head -c 600 /tmp/tick_timeline.err 2>/dev/null || true
+          fi
+
+          REJECT_FILTER="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND httpRequest.status>=400 AND timestamp >= \"$LOG_START\""
+          if gcloud logging read "$REJECT_FILTER" --project="$PROJECT_ID" --limit=1000 --order=asc --format=json > /tmp/tick_rejects.json 2>/tmp/tick_rejects.err; then
+            python - /tmp/tick_rejects.json <<'PY'
+          import collections
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8") or "[]")
+          counts = collections.Counter()
+          for entry in rows:
+              http = entry.get("httpRequest") or {}
+              status = http.get("status")
+              if status is None:
+                  continue
+              counts[int(status)] += 1
+              print("REQUEST_REJECT " + json.dumps({
+                  "at_ist": str(entry.get("timestamp") or "")[11:19],
+                  "status": status,
+                  "latency_s": http.get("latency"),
+                  "method": http.get("requestMethod"),
+              }, sort_keys=True))
+          print("REQUEST_REJECT_SUMMARY=" + json.dumps({str(k): v for k, v in sorted(counts.items())}, sort_keys=True))
+          PY
+          else
+            echo "REQUEST_REJECT_READ_FAILED"
+          fi
+
       - name: Inspect deployment revision, build and scheduled tick activity
         shell: bash
         run: |
