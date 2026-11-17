@@ -120,6 +120,45 @@ def test_latest_capture_skips_blocked_pointer_and_uses_fresh_stored_minute_manif
     assert quotes["symbol"].tolist() == ["RELIANCE"]
 
 
+def test_latest_capture_returns_none_when_every_fresh_slot_is_already_predicted(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import drive_all_nse_prediction_compiler as compiler
+
+    now = pd.Timestamp("2026-11-09 14:45:30", tz=IST)
+    fresh = {
+        "cycle_minute_ist": "2026-11-09T14:45:00+05:30",
+        "status": "STORED",
+        "snapshot_persisted": True,
+        "assembly_status": "COMPLETE",
+        "snapshot_drive_path": "production_data/all_universe_minute_snapshots/2026/11/09/snapshot_20261109_1445.parquet",
+        "row_count": 1,
+    }
+
+    def find_remote(store, remote):
+        if remote.endswith("/2026/11/09"):
+            return {"id": "day"}
+        return None
+
+    def download(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(fresh), encoding="utf-8")
+
+    monkeypatch.setattr(compiler, "_find_remote", find_remote)
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, parent_id: [{"id": "fresh", "name": "manifest_20261109_1445.json"}],
+    )
+    monkeypatch.setattr(compiler, "_download", download)
+    monkeypatch.setattr(compiler, "_prediction_already_stored", lambda store, minute: True)
+
+    # In-worker prediction already owns the slot, so the compiler idles instead
+    # of failing the run.
+    assert compiler._latest_capture(SimpleNamespace(), now=now) is None
+
+
 def test_latest_capture_rejects_stale_stored_manifest(monkeypatch):
     import json
     from types import SimpleNamespace

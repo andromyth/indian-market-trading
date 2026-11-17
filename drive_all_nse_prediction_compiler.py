@@ -262,11 +262,14 @@ def _load_live_history_state(
             history[symbol] = frame
 
 
-def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.DataFrame, pd.Timestamp]:
+def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.DataFrame, pd.Timestamp] | None:
     """Select the newest fresh STORED snapshot, even when latest_manifest is a failure pointer.
 
     A failed capture updates latest_manifest.json. That status pointer must not
     hide a valid same-session snapshot whose own per-minute manifest was stored.
+
+    Returns ``None`` when every fresh slot already has a STORED prediction, which
+    is the normal idle state now that the Cloud Run tick predicts in-worker.
     """
     current = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
     current = current.tz_localize(IST) if current.tzinfo is None else current.tz_convert(IST)
@@ -303,6 +306,12 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
     # current-session slot. Historical gaps must never make the dashboard stale.
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     seen_minutes: set[pd.Timestamp] = set()
+    # The Cloud Run tick owns same-slot prediction now, so most compiler runs
+    # find every fresh slot already predicted. That is the healthy idle state,
+    # not an error: callers get ``None`` and exit 0. A run that finds *no*
+    # fresh snapshot at all still raises, because that means the worker stalled.
+    fresh_slots = 0
+    pending_fresh_slots = 0
     for minute, manifest, item in candidates:
         if minute in seen_minutes:
             continue
@@ -330,9 +339,11 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
         if minute.date() != current.date() or age_seconds < 0 or age_seconds > MAX_CAPTURE_AGE_SECONDS:
             skipped.append(f"{item.get('name')}: stale_or_future age_seconds={round(age_seconds, 1)}")
             continue
+        fresh_slots += 1
         if _prediction_already_stored(store, minute):
             skipped.append(f"{item.get('name')}: prediction already STORED")
             continue
+        pending_fresh_slots += 1
 
         snapshot_remote = str(
             manifest.get("snapshot_drive_path") or manifest.get("remote_snapshot_path") or ""
@@ -394,6 +405,18 @@ def _latest_capture(store, now: pd.Timestamp | None = None) -> tuple[dict, pd.Da
             flush=True,
         )
         return manifest, quotes, minute
+
+    if fresh_slots and not pending_fresh_slots:
+        print(
+            "DRIVE_CAPTURE_IDLE="
+            + json.dumps({
+                "reason": "ALL_FRESH_SLOTS_ALREADY_PREDICTED",
+                "fresh_slot_count": fresh_slots,
+                "skipped": skipped[-8:],
+            }, sort_keys=True),
+            flush=True,
+        )
+        return None
 
     raise RuntimeError(
         "No fresh, durably stored unprocessed current-session quote snapshot was found; "
@@ -689,7 +712,16 @@ def main() -> int:
         manifest, quotes, minute = selection
         age_minutes = (now - minute).total_seconds() / 60.0
     else:
-        manifest, quotes, minute = _latest_capture(store)
+        selection = _latest_capture(store)
+        if selection is None:
+            # Every fresh slot already has a STORED prediction, normally because
+            # the Cloud Run tick predicted it in-worker. Idle is success.
+            print(json.dumps({
+                "status": "IDLE_ALL_FRESH_SLOTS_PREDICTED",
+                "now_ist": now.isoformat(),
+            }, sort_keys=True))
+            return 0
+        manifest, quotes, minute = selection
         age_minutes = (now - minute).total_seconds() / 60.0
         if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
             raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")

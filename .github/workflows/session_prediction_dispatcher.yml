@@ -21,6 +21,12 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  # Latest supervisor wins. A re-dispatch cancels the stale runner instead of
+  # leaving two loops dispatching the same compiler every five minutes.
+  group: session-prediction-supervisor
+  cancel-in-progress: true
+
 jobs:
   supervise-morning:
     if: github.event.inputs.mode != 'health'
@@ -39,6 +45,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
       - name: Install Drive audit dependencies
         run: >-
@@ -156,7 +167,9 @@ jobs:
   supervise-afternoon:
     if: github.event.inputs.mode != 'health'
     runs-on: ubuntu-latest
-    timeout-minutes: 210
+    # Covers 12:10 through the 15:25 slot plus the closing verification even
+    # when the run starts early in the morning half.
+    timeout-minutes: 280
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPOSITORY: ${{ github.repository }}
@@ -170,6 +183,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
       - name: Install Drive audit dependencies
         run: >-

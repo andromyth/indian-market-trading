@@ -92,6 +92,27 @@ def _expected_slots(current: datetime) -> int:
     return int((end - open_dt).total_seconds() // 300) + 1
 
 
+def _slot_stamps(current: datetime) -> list[str]:
+    """Every five-minute slot label (HHMM) expected so far today."""
+    open_dt = current.replace(hour=9, minute=15, second=0, microsecond=0)
+    if current < open_dt:
+        return []
+    close_dt = current.replace(hour=15, minute=25, second=0, microsecond=0)
+    end = min(current, close_dt)
+    count = int((end - open_dt).total_seconds() // 300) + 1
+    return [(open_dt + timedelta(minutes=5 * index)).strftime("%H%M") for index in range(count)]
+
+
+def _missing_slot_labels(files: list[dict[str, Any]], stamp: str, current: datetime) -> list[str]:
+    """Slot labels with no manifest yet, so recovery can target exact minutes."""
+    present = {str(item.get("name") or "") for item in files}
+    return [
+        slot
+        for slot in _slot_stamps(current)
+        if f"manifest_{stamp}_{slot}.json" not in present
+    ]
+
+
 def snapshot_report(service, store, current: datetime) -> dict[str, Any]:
     day = current.strftime("%Y/%m/%d")
     stamp = current.strftime("%Y%m%d")
@@ -109,6 +130,7 @@ def snapshot_report(service, store, current: datetime) -> dict[str, Any]:
         "snapshot_slot_count": len(manifests),
         "snapshot_expected_slots": expected,
         "snapshot_missing_slots": max(0, expected - len(manifests)),
+        "snapshot_missing_slot_labels": _missing_slot_labels(manifests, stamp, current),
         "snapshot_latest_manifest": latest.get("name") if latest else None,
         "snapshot_cycle_minute_ist": payload.get("cycle_minute_ist"),
         "snapshot_age_minutes": _age_minutes(current, payload.get("cycle_minute_ist")),
@@ -142,6 +164,7 @@ def prediction_report(service, store, current: datetime) -> dict[str, Any]:
         "prediction_slot_count": len(manifests),
         "prediction_expected_slots": _expected_slots(current),
         "prediction_missing_slots": max(0, _expected_slots(current) - len(manifests)),
+        "prediction_missing_slot_labels": _missing_slot_labels(manifests, stamp, current),
         "prediction_parquet_count": len(parquets),
         "prediction_latest_manifest": latest.get("name") if latest else None,
         "prediction_cycle_minute_ist": payload.get("cycle_minute_ist"),
