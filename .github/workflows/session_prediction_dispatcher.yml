@@ -21,17 +21,17 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  # Latest supervisor wins. A re-dispatch cancels the stale runner instead of
-  # leaving two loops dispatching the same compiler every five minutes.
-  group: session-prediction-supervisor
-  cancel-in-progress: true
-
 jobs:
   supervise-morning:
     if: github.event.inputs.mode != 'health'
     runs-on: ubuntu-latest
     timeout-minutes: 200
+    # Job-level so a read-only "health" dispatch never cancels the supervisor.
+    # Latest supervisor wins: a re-dispatch cancels the stale runner instead of
+    # leaving two loops dispatching the same compiler every five minutes.
+    concurrency:
+      group: session-prediction-supervisor
+      cancel-in-progress: true
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPOSITORY: ${{ github.repository }}
@@ -170,6 +170,9 @@ jobs:
     # Covers 12:10 through the 15:25 slot plus the closing verification even
     # when the run starts early in the morning half.
     timeout-minutes: 280
+    concurrency:
+      group: session-prediction-supervisor-afternoon
+      cancel-in-progress: true
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPOSITORY: ${{ github.repository }}
