@@ -1,2 +1,0 @@
-HOTFIX8
-Deprecated Streamlit use_container_width parameters replaced with width.
