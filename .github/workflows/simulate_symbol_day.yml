@@ -1,0 +1,90 @@
+name: Simulate one symbol's session (rolling 5-minute signals)
+
+# Read-only. Replays every stored prediction slot for one symbol, trading each
+# BUY as a long and each SELL as a short over the model's horizon, sized from
+# capital_plan.json and charged real NSE intraday costs. Never writes to Drive,
+# never retrains, never places orders.
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "NSE symbol without .NS, e.g. SBIN"
+        required: false
+        default: "SBIN"
+      date:
+        description: "Session date YYYY-MM-DD (blank = today IST)"
+        required: false
+        default: ""
+      horizon:
+        description: "Model horizon in minutes"
+        required: false
+        default: "30"
+      gate:
+        description: "Minimum |expected 30m move| to trade (0.015 = production gate). Blank = take every BUY/SELL"
+        required: false
+        default: ""
+      max_positions:
+        description: "Concurrent positions (blank = capital_plan.json)"
+        required: false
+        default: ""
+      target_slot:
+        description: "Fixed exit HH:MM. Every signal from exit-minus-window through exit is held to it. Blank = rolling horizon"
+        required: false
+        default: ""
+      window_minutes:
+        description: "How far back from the fixed exit a signal stays usable (blank = horizon)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulate-symbol-day
+  cancel-in-progress: true
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set repository import path
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Compile the simulator
+        run: python -m py_compile scripts/simulate_symbol_day.py scripts/analyze_symbol_session.py
+
+      - name: Simulate session
+        env:
+          IN_SYMBOL: ${{ github.event.inputs.symbol }}
+          IN_DATE: ${{ github.event.inputs.date }}
+          IN_HORIZON: ${{ github.event.inputs.horizon }}
+          IN_GATE: ${{ github.event.inputs.gate }}
+          IN_MAX_POSITIONS: ${{ github.event.inputs.max_positions }}
+          IN_TARGET_SLOT: ${{ github.event.inputs.target_slot }}
+          IN_WINDOW_MINUTES: ${{ github.event.inputs.window_minutes }}
+        run: |
+          args=(--symbol "${IN_SYMBOL:-SBIN}")
+          [ -n "$IN_DATE" ] && args+=(--date "$IN_DATE")
+          [ -n "$IN_HORIZON" ] && args+=(--horizon "$IN_HORIZON")
+          [ -n "$IN_GATE" ] && args+=(--gate "$IN_GATE")
+          [ -n "$IN_MAX_POSITIONS" ] && args+=(--max-positions "$IN_MAX_POSITIONS")
+          [ -n "$IN_TARGET_SLOT" ] && args+=(--target-slot "$IN_TARGET_SLOT")
+          [ -n "$IN_WINDOW_MINUTES" ] && args+=(--window-minutes "$IN_WINDOW_MINUTES")
+          printf 'ARGS=%s\n' "${args[*]}"
+          python -u scripts/simulate_symbol_day.py "${args[@]}"
