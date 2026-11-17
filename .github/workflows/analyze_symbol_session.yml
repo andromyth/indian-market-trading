@@ -1,0 +1,65 @@
+name: Replay one symbol through one session
+
+# Read-only: downloads the stored prediction frame and quote snapshots for a
+# single symbol, reports the model's call and the rupee P&L. Never writes to
+# Drive, never retrains, never places orders.
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "NSE symbol (no .NS), e.g. SBIN"
+        required: false
+        default: "SBIN"
+      date:
+        description: "Session date YYYY-MM-DD (blank = today IST)"
+        required: false
+        default: ""
+      entry:
+        description: "Entry slot HH:MM IST"
+        required: false
+        default: "11:00"
+      exit:
+        description: "Exit slot HH:MM IST"
+        required: false
+        default: "13:45"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analyze-symbol-session
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set repository import path
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Compile the replay script
+        run: python -m py_compile scripts/analyze_symbol_session.py
+
+      - name: Replay symbol
+        run: |
+          python -u scripts/analyze_symbol_session.py \
+            --symbol "${{ github.event.inputs.symbol || 'SBIN' }}" \
+            --date "${{ github.event.inputs.date }}" \
+            --entry "${{ github.event.inputs.entry || '11:00' }}" \
+            --exit "${{ github.event.inputs.exit || '13:45' }}"
