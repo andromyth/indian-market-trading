@@ -75,17 +75,13 @@ jobs:
 
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           trading_day = is_nse_trading_day(now.date())
-          after_close = (now.hour, now.minute) >= (16, 0)
-          before_open = (now.hour, now.minute) < (9, 15)
-          allowed = (not trading_day) or after_close or before_open
+          allowed = (not trading_day) or (now.hour, now.minute) >= (16, 0)
           reason = (
-              "NSE non-trading day: backfill is eligible all day"
+              "NSE trading day before 16:00 IST: backfill is not eligible"
+              if trading_day and not allowed
+              else "NSE non-trading day: backfill is eligible all day"
               if not trading_day
-              else "NSE trading day before market open: backfill is eligible"
-              if before_open
               else "NSE trading day at or after 16:00 IST: backfill is eligible"
-              if after_close
-              else "NSE trading day during market hours: backfill is not eligible"
           )
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
