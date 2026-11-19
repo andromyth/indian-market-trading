@@ -170,12 +170,33 @@ jobs:
           TARGET_TAG="${BACKFILL_REVISION_TAG:-}"
           if [[ -n "$TARGET_TAG" ]]; then
             [[ "$TARGET_TAG" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ERROR=invalid_revision_tag"; exit 1; }
-            SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="value(status.traffic[?tag=='${TARGET_TAG}'].url)")"
-            [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_revision_tag_url_missing tag=$TARGET_TAG"; exit 1; }
+            gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > "$SERVICE_JSON"
+            SERVICE_URL="$(python - "$SERVICE_JSON" "$TARGET_TAG" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          tag = sys.argv[2]
+          rows = (data.get("status") or {}).get("traffic") or []
+          print(next((row.get("url", "") for row in rows if row.get("tag") == tag), ""))
+          PY
+            )"
+            if [[ "$SERVICE_URL" != https://* ]]; then
+              echo "ERROR=cloud_run_revision_tag_url_missing tag=$TARGET_TAG"
+              python - "$SERVICE_JSON" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = (data.get("status") or {}).get("traffic") or []
+          print("AVAILABLE_TRAFFIC=" + json.dumps([
+              {key: row.get(key) for key in ("tag", "url", "revisionName", "percent")}
+              for row in rows
+          ]))
+          PY
+              exit 1
+            fi
             echo "TARGETING_STAGED_REVISION_TAG=$TARGET_TAG url=$SERVICE_URL"
           fi
           RESPONSE="$(mktemp)"
-          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          SERVICE_JSON="$(mktemp)"
+          trap 'rm -f "$RESPONSE" "$SERVICE_JSON"; unset TOKEN' EXIT
           CALLER_IDENTITY=""
           for attempt in $(seq 1 60); do
             ROUTE_WAIT=false
