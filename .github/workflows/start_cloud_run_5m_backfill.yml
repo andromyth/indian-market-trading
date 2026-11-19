@@ -167,6 +167,9 @@ jobs:
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_service_url_missing"; exit 1; }
           AUDIENCE_URL="$SERVICE_URL"
+          RESPONSE="$(mktemp)"
+          SERVICE_JSON="$(mktemp)"
+          trap 'rm -f "$RESPONSE" "$SERVICE_JSON"; unset TOKEN' EXIT
           TARGET_TAG="${BACKFILL_REVISION_TAG:-}"
           if [[ -n "$TARGET_TAG" ]]; then
             [[ "$TARGET_TAG" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ERROR=invalid_revision_tag"; exit 1; }
@@ -194,9 +197,6 @@ jobs:
             fi
             echo "TARGETING_STAGED_REVISION_TAG=$TARGET_TAG url=$SERVICE_URL"
           fi
-          RESPONSE="$(mktemp)"
-          SERVICE_JSON="$(mktemp)"
-          trap 'rm -f "$RESPONSE" "$SERVICE_JSON"; unset TOKEN' EXIT
           CALLER_IDENTITY=""
           for attempt in $(seq 1 60); do
             ROUTE_WAIT=false
