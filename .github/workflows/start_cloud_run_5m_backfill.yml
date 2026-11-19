@@ -170,7 +170,7 @@ jobs:
           TARGET_TAG="${BACKFILL_REVISION_TAG:-}"
           if [[ -n "$TARGET_TAG" ]]; then
             [[ "$TARGET_TAG" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ERROR=invalid_revision_tag"; exit 1; }
-            SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="value(status.traffic[?tag=${TARGET_TAG}].url)")"
+            SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="value(status.traffic[?tag=='${TARGET_TAG}'].url)")"
             [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_revision_tag_url_missing tag=$TARGET_TAG"; exit 1; }
             echo "TARGETING_STAGED_REVISION_TAG=$TARGET_TAG url=$SERVICE_URL"
           fi
