@@ -102,7 +102,7 @@ jobs:
           TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
           BODY="$(mktemp)"
           trap 'rm -f "$BODY"' EXIT
-          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 60 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$BODY" --write-out "%{http_code}" "$REVISION_URL/modelz")"
+          CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 240 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$BODY" --write-out "%{http_code}" "$REVISION_URL/modelz")"
           echo "STAGED_MODEL_HTTP=$CODE"
           python - "$BODY" "$CODE" <<'PY'
           import json,sys

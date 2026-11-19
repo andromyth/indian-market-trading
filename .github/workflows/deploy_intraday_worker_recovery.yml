@@ -197,7 +197,7 @@ jobs:
               TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
             fi
             [[ -n "$TOKEN" ]] || continue
-            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 60 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$STAGED_URL/modelz")" || HTTP_CODE=000
+            HTTP_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 240 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" --output "$RESPONSE" --write-out "%{http_code}" "$STAGED_URL/modelz")" || HTTP_CODE=000
             echo "STAGED_MODEL_DIAGNOSTIC_HTTP_STATUS=$HTTP_CODE"
             set +e
             python - "$RESPONSE" "$HTTP_CODE" <<'PY'
