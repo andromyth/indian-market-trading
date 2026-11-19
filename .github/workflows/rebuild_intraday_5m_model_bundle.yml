@@ -2,6 +2,12 @@ name: Train and validate ALL-NSE five-minute model bundle
 
 on:
   workflow_dispatch:
+    inputs:
+      minimum_symbol_coverage:
+        description: "Minimum native 5m symbol coverage (0-1). Keep 0.90 for all-NSE; use 0.18 only for an explicit partial-universe emergency retrain."
+        required: false
+        default: "0.90"
+        type: string
   push:
     branches:
       - main
@@ -107,7 +113,7 @@ jobs:
           set -euo pipefail
           python -u rebuild_all_nse_intraday_5m_model_from_drive.py \
             --work-root "$RUNNER_TEMP/all-nse-intraday-5m-model-recovery" \
-            --min-symbol-coverage 0.90 \
+            --min-symbol-coverage "${{ inputs.minimum_symbol_coverage || '0.90' }}" \
             --min-trainable-symbols 100
 
       - name: Confirm deployment was not requested
