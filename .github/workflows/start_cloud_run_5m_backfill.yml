@@ -277,6 +277,8 @@ jobs:
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
           IDLE_STREAK=0
+          STALL_STREAK=0
+          LAST_UPDATED=""
           SAW_PARQUET=false
           for attempt in $(seq 1 180); do
             if [[ "${CALLER_IDENTITY}" == "SELF" ]]; then
@@ -313,17 +315,19 @@ jobs:
           status = str(body.get("status") or "").upper()
           stage = str(progress.get("stage") or "").upper()
           if status in {"COMPLETED", "COMPLETED_WITH_GAPS"}:
-              print(0)
+              code = 0
           elif status in {"FAILED", "ERROR"}:
-              print(2)
+              code = 2
           elif stage == "SYMBOL_PARQUET_PERSISTED":
-              print(3)
+              code = 3
           elif status == "IDLE" and not state.get("started_at_utc"):
-              print(4)
+              code = 4
           else:
-              print(1)
+              code = 1
+          print(f"{code}|{state.get('updated_at_utc') or ''}|{stage}")
           PY
             )"
+            IFS='|' read -r MONITOR_CODE UPDATED_AT STAGE <<< "$MONITOR_CODE"
             case "$MONITOR_CODE" in
               0) echo "BACKFILL_MONITOR=COMPLETED"; exit 0 ;;
               2) echo "BACKFILL_MONITOR=FAILED"; exit 1 ;;
@@ -333,6 +337,15 @@ jobs:
             esac
             if [[ "$IDLE_STREAK" -ge 5 ]]; then
               echo "BACKFILL_MONITOR=FAILED_THREAD_NOT_RUNNING"
+              exit 1
+            fi
+            if [[ -n "$UPDATED_AT" && "$UPDATED_AT" == "$LAST_UPDATED" ]]; then
+              STALL_STREAK=$((STALL_STREAK + 1))
+            else
+              STALL_STREAK=0; LAST_UPDATED="$UPDATED_AT"
+            fi
+            if [[ "$STALL_STREAK" -ge 30 ]]; then
+              echo "BACKFILL_MONITOR=STALLED stage=$STAGE updated_at=$UPDATED_AT"
               exit 1
             fi
             if [[ "$attempt" -eq 30 && "$SAW_PARQUET" != "true" ]]; then
