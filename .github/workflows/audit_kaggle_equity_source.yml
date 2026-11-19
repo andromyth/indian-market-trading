@@ -124,6 +124,7 @@ jobs:
           from google.auth.transport.requests import Request
           from googleapiclient.discovery import build
           import pandas as pd
+          from googleapiclient.http import MediaIoBaseDownload
 
           info = json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
           creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
@@ -131,8 +132,12 @@ jobs:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
           path = "/tmp/nse_equity_research_rows_2016_2026.parquet"
+          request = service.files().get_media(fileId="1I41xG7qiPFPM7UEJIjCd4TNDQYjaP1vt", supportsAllDrives=True)
           with open(path, "wb") as fh:
-              service.files().get_media(fileId="1I41xG7qiPFPM7UEJIjCd4TNDQYjaP1vt", supportsAllDrives=True).execute_to_file(fh)
+              downloader = MediaIoBaseDownload(fh, request)
+              done = False
+              while not done:
+                  _, done = downloader.next_chunk()
           df = pd.read_parquet(path)
           print("EQUITY_PARQUET_SHAPE=" + json.dumps([int(df.shape[0]), int(df.shape[1])]))
           print("EQUITY_PARQUET_COLUMNS=" + json.dumps(list(map(str, df.columns))))
