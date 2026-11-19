@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt pytest
           pytest -q tests/test_backfill_checkpoint_key_stability.py tests/test_indstocks_5m_backfill.py
 
       - name: Authenticate to Google Cloud
