@@ -44,6 +44,11 @@ on:
         options:
           - "1"
           - "0"
+      stage_only:
+        description: "Stage a warm zero-traffic candidate and stop; do not validate or promote (for tagged backfill runs)"
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
   actions: read
@@ -154,6 +159,7 @@ jobs:
             --update-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
 
       - name: Validate staged five-minute model bundle with runtime credentials
+        if: ${{ !inputs.stage_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -251,6 +257,7 @@ jobs:
           echo "STAGED_FIVE_MINUTE_MODEL_PREFLIGHT=PASS"
 
       - name: Promote verified candidate to production traffic
+        if: ${{ !inputs.stage_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -262,6 +269,7 @@ jobs:
           echo "PRODUCTION_TRAFFIC_PROMOTED_REVISION=$STAGED_REVISION"
 
       - name: Change existing intraday jobs to five-minute cadence
+        if: ${{ !inputs.stage_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -346,6 +354,7 @@ jobs:
           verify_retry_config "intraday-worker-1500-1530"
 
       - name: Verify ready revision, traffic, scheduler states and startup diagnostics
+        if: ${{ !inputs.stage_only }}
         shell: bash
         run: |
           set -euo pipefail
