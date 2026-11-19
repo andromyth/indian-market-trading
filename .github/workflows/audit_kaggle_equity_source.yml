@@ -65,14 +65,7 @@ jobs:
           print("KAGGLE_SOURCE_FILE_COUNT=" + str(len(files)))
           print("KAGGLE_SOURCE_TOTAL_BYTES=" + str(sum(int(r.get("size") or 0) for r in files)))
 
-          reports = [
-              "KAGGLE_EQUITY_IMPORT_REPORT.csv",
-              "KAGGLE_DATA_QUALITY_AUDIT.csv",
-              "KAGGLE_ALL_FILES_SOURCE_AUDIT.csv",
-              "KAGGLE_CONTEXT_SESSION_AUDIT.csv",
-              "KAGGLE_CONTEXT_MANIFEST.json",
-          ]
-          for name in reports:
+          def report_text(name):
               res = service.files().list(
                   q=f"name = '{name}' and trashed = false",
                   pageSize=10, fields="files(id,name,size)",
@@ -80,17 +73,42 @@ jobs:
               ).execute().get("files", [])
               if not res:
                   print("KAGGLE_REPORT_MISSING=" + name)
-                  continue
+                  return None
               item = res[0]
-              data = service.files().get_media(fileId=item["id"], supportsAllDrives=True).execute()
-              text = data.decode("utf-8", "replace")
-              print(f"KAGGLE_REPORT_BEGIN={name} id={item['id']} bytes={len(data)}")
-              if name.endswith(".json"):
-                  print(text[:4000])
-              else:
-                  reader = list(csv.reader(io.StringIO(text)))
-                  print("KAGGLE_REPORT_ROWS=" + str(max(0, len(reader) - 1)))
-                  for line in reader[:8]:
-                      print("KAGGLE_REPORT_ROW=" + json.dumps(line))
-              print("KAGGLE_REPORT_END=" + name)
+              return service.files().get_media(fileId=item["id"], supportsAllDrives=True).execute().decode("utf-8", "replace")
+
+          import_text = report_text("KAGGLE_EQUITY_IMPORT_REPORT.csv")
+          quality_text = report_text("KAGGLE_DATA_QUALITY_AUDIT.csv")
+          import_rows = list(csv.DictReader(io.StringIO(import_text))) if import_text else []
+          quality_rows = list(csv.DictReader(io.StringIO(quality_text))) if quality_text else []
+          status_counts = {}
+          for row in import_rows:
+              status_counts[row.get("status", "")] = status_counts.get(row.get("status", ""), 0) + 1
+          print("KAGGLE_IMPORT_STATUS_COUNTS=" + json.dumps(status_counts, sort_keys=True))
+          imported_files = {row.get("file", "") for row in import_rows if row.get("status") == "IMPORTED"}
+          print("KAGGLE_IMPORTED_FILE_COUNT=" + str(len(imported_files)))
+          print("KAGGLE_IMPORTED_SAMPLE=" + json.dumps(sorted(imported_files)[:20]))
+          by_file = {row.get("file", ""): row for row in quality_rows}
+          eq5 = [by_file[name] for name in imported_files if name in by_file and by_file[name].get("timeframe") == "5minute"]
+          sessions = [int(float(row.get("sessions") or 0)) for row in eq5]
+          dates = [(row.get("first_date"), row.get("last_date")) for row in eq5 if row.get("first_date") and row.get("last_date")]
+          print("KAGGLE_EQ_5M_FILE_COUNT=" + str(len(eq5)))
+          if sessions:
+              sessions_sorted = sorted(sessions)
+              print("KAGGLE_EQ_5M_SESSIONS_MIN=" + str(min(sessions)))
+              print("KAGGLE_EQ_5M_SESSIONS_MEDIAN=" + str(sessions_sorted[len(sessions_sorted)//2]))
+              print("KAGGLE_EQ_5M_SESSIONS_MAX=" + str(max(sessions)))
+              print("KAGGLE_EQ_5M_GE_200=" + str(sum(s >= 200 for s in sessions)))
+              print("KAGGLE_EQ_5M_200_TO_500=" + str(sum(200 <= s <= 500 for s in sessions)))
+              print("KAGGLE_EQ_5M_GT_500=" + str(sum(s > 500 for s in sessions)))
+              print("KAGGLE_EQ_5M_FIRST_DATE_MIN=" + min(d[0] for d in dates))
+              print("KAGGLE_EQ_5M_LAST_DATE_MAX=" + max(d[1] for d in dates))
+              for row in sorted(eq5, key=lambda r: int(float(r.get("sessions") or 0)), reverse=True)[:20]:
+                  print("KAGGLE_EQ_5M_ROW=" + json.dumps({k: row.get(k) for k in ("file","sessions","sessions_50plus_bars","first_date","last_date","zero_volume_pct")}, sort_keys=True))
+          else:
+              print("KAGGLE_EQ_5M_SESSIONS=NO_MATCHING_IMPORTED_EQUITY_5M_FILES")
+          cats = {}
+          for row in quality_rows:
+              cats[row.get("category", "")] = cats.get(row.get("category", ""), 0) + 1
+          print("KAGGLE_QUALITY_CATEGORY_COUNTS=" + json.dumps(cats, sort_keys=True))
           PY
