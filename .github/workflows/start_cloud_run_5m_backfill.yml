@@ -25,6 +25,11 @@ on:
           - "auto"
           - "yes"
           - "no"
+      revision_tag:
+        description: "Optional Cloud Run traffic tag to target (e.g. preflight5m) instead of production, to run a staged revision without promoting it"
+        type: string
+        required: false
+        default: ""
   # Fully automated off-hours trigger. 10:30 UTC is 16:00 IST, when the
   # backfill window opens on NSE trading days; non-trading days are eligible
   # all day, and the Cloud Run guard still pauses 09:15-15:59 IST.
@@ -50,6 +55,7 @@ jobs:
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
       BACKFILL_END_DATE: ${{ inputs.end_date || '2026-11-18' }}
       BACKFILL_REPLACE_EXISTING: ${{ inputs.replace_existing_history || 'auto' }}
+      BACKFILL_REVISION_TAG: ${{ inputs.revision_tag || '' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -160,6 +166,14 @@ jobs:
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
           [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_service_url_missing"; exit 1; }
+          AUDIENCE_URL="$SERVICE_URL"
+          TARGET_TAG="${BACKFILL_REVISION_TAG:-}"
+          if [[ -n "$TARGET_TAG" ]]; then
+            [[ "$TARGET_TAG" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ERROR=invalid_revision_tag"; exit 1; }
+            SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format="value(status.traffic[?tag=${TARGET_TAG}].url)")"
+            [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_revision_tag_url_missing tag=$TARGET_TAG"; exit 1; }
+            echo "TARGETING_STAGED_REVISION_TAG=$TARGET_TAG url=$SERVICE_URL"
+          fi
           RESPONSE="$(mktemp)"
           trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
           CALLER_IDENTITY=""
@@ -167,9 +181,9 @@ jobs:
             ROUTE_WAIT=false
             for SA in "SELF" "$INVOKER" "intraday-scheduler@$PROJECT_ID.iam.gserviceaccount.com"; do
               if [[ "$SA" == "SELF" ]]; then
-                TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+                TOKEN="$(gcloud auth print-identity-token --audiences="$AUDIENCE_URL" 2>/dev/null)" || TOKEN=""
               else
-                TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+                TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$SA" --audiences="$AUDIENCE_URL" 2>/dev/null)" || TOKEN=""
               fi
               [[ -n "$TOKEN" ]] || continue
               CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
@@ -177,7 +191,7 @@ jobs:
                 --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
               if [[ "$CODE" == "200" ]]; then
                 PUBLIC_CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 20 \
-                  --output /dev/null --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || PUBLIC_CODE=000
+                  --output /dev/null --write-out '%{http_code}' "$AUDIENCE_URL/backfillz")" || PUBLIC_CODE=000
                 if [[ "$PUBLIC_CODE" == "200" ]]; then
                   echo "ERROR=cloud_run_service_is_public; refusing to start backfill"
                   exit 1
@@ -191,6 +205,7 @@ jobs:
                 echo "CLOUD_RUN_UNAUTHENTICATED_ACCESS=BLOCKED http=$PUBLIC_CODE"
                 echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_OUTPUT"
                 echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
+                echo "AUDIENCE_URL=$AUDIENCE_URL" >> "$GITHUB_ENV"
                 echo "CALLER_IDENTITY=$CALLER_IDENTITY" >> "$GITHUB_ENV"
                 exit 0
               fi
@@ -221,9 +236,9 @@ jobs:
           TRIGGER_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "trigger_started_at=$TRIGGER_STARTED_AT" >> "$GITHUB_OUTPUT"
           if [[ "$CALLER_IDENTITY" == "SELF" ]]; then
-            TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            TOKEN="$(gcloud auth print-identity-token --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
           else
-            TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$CALLER_IDENTITY" --audiences="$SERVICE_URL" 2>/dev/null)" || TOKEN=""
+            TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="$CALLER_IDENTITY" --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
           fi
           [[ -n "$TOKEN" ]] || { echo "ERROR=cloud_run_invoker_identity_token_unavailable"; exit 1; }
           RESPONSE="$(mktemp)"
