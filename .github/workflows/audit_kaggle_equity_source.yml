@@ -112,3 +112,42 @@ jobs:
               cats[row.get("category", "")] = cats.get(row.get("category", ""), 0) + 1
           print("KAGGLE_QUALITY_CATEGORY_COUNTS=" + json.dumps(cats, sort_keys=True))
           PY
+
+      - name: Inspect equity research parquet (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pandas pyarrow
+          python - <<'PY'
+          import json, os
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          import pandas as pd
+
+          info = json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid:
+              creds.refresh(Request())
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+          path = "/tmp/nse_equity_research_rows_2016_2026.parquet"
+          with open(path, "wb") as fh:
+              service.files().get_media(fileId="1I41xG7qiPFPM7UEJIjCd4TNDQYjaP1vt", supportsAllDrives=True).execute_to_file(fh)
+          df = pd.read_parquet(path)
+          print("EQUITY_PARQUET_SHAPE=" + json.dumps([int(df.shape[0]), int(df.shape[1])]))
+          print("EQUITY_PARQUET_COLUMNS=" + json.dumps(list(map(str, df.columns))))
+          for col in df.columns:
+              s = df[col]
+              sample = s.dropna().head(2).tolist()
+              print("EQUITY_PARQUET_COL=" + json.dumps({"name": str(col), "dtype": str(s.dtype), "nunique": int(s.nunique(dropna=True)), "sample": [str(v) for v in sample]}, sort_keys=True))
+          candidates = [c for c in df.columns if any(k in str(c).lower() for k in ("timestamp","datetime","date","time"))]
+          print("EQUITY_PARQUET_TIME_CANDIDATES=" + json.dumps(list(map(str, candidates))))
+          for col in candidates[:4]:
+              try:
+                  ts = pd.to_datetime(df[col], errors="coerce")
+                  print("EQUITY_PARQUET_TIME_RANGE=" + json.dumps({"column": str(col), "min": str(ts.min()), "max": str(ts.max()), "non_null": int(ts.notna().sum())}, sort_keys=True))
+              except Exception as exc:
+                  print("EQUITY_PARQUET_TIME_ERROR=" + json.dumps({"column": str(col), "error": type(exc).__name__}, sort_keys=True))
+          sym = [c for c in df.columns if any(k in str(c).lower() for k in ("symbol","ticker","instrument"))]
+          print("EQUITY_PARQUET_SYMBOL_CANDIDATES=" + json.dumps(list(map(str, sym))))
+          PY
