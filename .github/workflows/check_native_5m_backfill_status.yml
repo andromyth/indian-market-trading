@@ -2,6 +2,12 @@ name: Check native five-minute backfill status
 
 on:
   workflow_dispatch:
+    inputs:
+      revision_tag:
+        description: "Optional Cloud Run traffic tag to query (e.g. preflight5m)"
+        required: false
+        type: string
+        default: ""
 permissions:
   contents: read
 
@@ -247,10 +253,29 @@ jobs:
 
       - name: Read live backfill state and recent Cloud Run progress logs
         shell: bash
+        env:
+          BACKFILL_REVISION_TAG: ${{ inputs.revision_tag || '' }}
         run: |
           set -euo pipefail
           SERVICE_URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
-          TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          AUDIENCE_URL="$SERVICE_URL"
+          TARGET_TAG="${BACKFILL_REVISION_TAG:-}"
+          if [[ -n "$TARGET_TAG" ]]; then
+            [[ "$TARGET_TAG" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ERROR=invalid_revision_tag"; exit 1; }
+            SERVICE_JSON="$(mktemp)"
+            trap 'rm -f "$SERVICE_JSON"' EXIT
+            gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format=json > "$SERVICE_JSON"
+            SERVICE_URL="$(python - "$SERVICE_JSON" "$TARGET_TAG" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = (data.get("status") or {}).get("traffic") or []
+          print(next((row.get("url", "") for row in rows if row.get("tag") == sys.argv[2]), ""))
+          PY
+            )"
+            [[ "$SERVICE_URL" == https://* ]] || { echo "ERROR=cloud_run_revision_tag_url_missing tag=$TARGET_TAG"; exit 1; }
+            echo "TARGETING_STAGED_REVISION_TAG=$TARGET_TAG url=$SERVICE_URL"
+          fi
+          TOKEN="$(gcloud auth print-identity-token --audiences="$AUDIENCE_URL")"
           RESPONSE="$(mktemp)"
           LOGS="$(mktemp)"
           trap 'rm -f "$RESPONSE" "$LOGS"; unset TOKEN' EXIT
