@@ -258,7 +258,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     ).set_index("symbol")
     assert written.index.tolist() == ["AAA", "BBB"]
     assert written.loc["AAA", "actual_market_value"] == 101.25
-    assert written.loc["AAA", "probability_up_30m"] == pytest.approx(0.8)
+    assert written.loc["AAA", "probability_up_session_close"] == pytest.approx(0.8)
+    assert written.loc["AAA", "prediction_horizon"] == "session_close"
     assert written.loc["AAA", "signal"] == "BUY"
     assert written.loc["AAA", "history_input_mode"] == "CURRENT_QUOTE_ONLY"
     assert written.loc["BBB", "prediction_status"] == "MODEL_INFERENCE_ERROR"
@@ -492,6 +493,8 @@ def test_model_hash_mismatch_refreshes_cached_artifacts_from_drive(monkeypatch, 
         "status": "REPLACEMENT",
         "model_version": "unit-test",
         "bar_interval_minutes": 5,
+        "target": "target_session_close",
+        "prediction_horizon": "session_close",
         "classifier_sha256": hashlib.sha256(classifier_bytes).hexdigest(),
         "regressor_sha256": hashlib.sha256(regressor_bytes).hexdigest(),
         "training_symbols": ["AAA"],

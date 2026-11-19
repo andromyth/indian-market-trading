@@ -1,8 +1,11 @@
-"""Live ALL-NSE Intraday 30-minute model adapter.
+"""Live ALL-NSE Intraday session-close model adapter.
 
-The model is pooled across the NSE equity universe. Training artifacts live in
-Google Drive; GitHub contains only the adapter. The adapter never places orders.
-Missing F&O/context inputs remain NaN and are surfaced through readiness fields.
+The model is pooled across the NSE equity universe and predicts the regular
+session close (15:30 IST) from every completed five-minute decision bar. The
+forecast horizon therefore shrinks through the day instead of being a fixed
+30 minutes. Training artifacts live in Google Drive; GitHub contains only the
+adapter. The adapter never places orders. Missing F&O/context inputs remain NaN
+and are surfaced through readiness fields.
 """
 from __future__ import annotations
 
@@ -16,24 +19,37 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from probability_calibration import apply_probability_calibration
+
 FEATURES = [
     "ret_1","ret_3","ret_5","ret_10","ret_15","ret_30",
     "rsi14","atr14_pct","ma5_ratio","ma10_ratio","ma20_ratio","ma50_ratio",
     "range_pct","body_pct","volume_ratio","volume_z20","tod_sin","tod_cos",
+    "minutes_to_close",
     "market_ret_1","market_ret_3","market_ret_5","market_ret_10","market_ret_15","market_ret_30",
     "market_rsi14","relative_ret_1","relative_ret_5","relative_ret_15",
     "fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis","fno_available",
 ]
 
-DRIVE_MODEL_ROOT = "models/all_nse_intraday_5mbar_multifactor_replacement_2026"
-REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json"
-REMOTE_CLASSIFIER = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
-REMOTE_REGRESSOR = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
+DRIVE_MODEL_ROOT = "models/all_nse_intraday_session_close_multifactor_2026"
+REMOTE_MANIFEST = f"{DRIVE_MODEL_ROOT}/ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json"
+REMOTE_CLASSIFIER = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_session_close_multifactor_classifier_2026.joblib"
+REMOTE_REGRESSOR = f"{DRIVE_MODEL_ROOT}/deployment_all_nse_intraday_session_close_multifactor_regressor_2026.joblib"
 
-CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_5mbar_replacement"
-LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json"
-LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
-LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
+CACHE_ROOT = Path(__file__).resolve().parent / "data" / "all_nse_intraday_session_close_replacement"
+LOCAL_MANIFEST = CACHE_ROOT / "ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json"
+LOCAL_CLASSIFIER = CACHE_ROOT / "deployment_all_nse_intraday_session_close_multifactor_classifier_2026.joblib"
+LOCAL_REGRESSOR = CACHE_ROOT / "deployment_all_nse_intraday_session_close_multifactor_regressor_2026.joblib"
+
+SESSION_CLOSE_HOUR = 15
+SESSION_CLOSE_MINUTE = 30
+TARGET_NAME = "target_session_close"
+RETURN_NAME = "future_return_session_close"
+HORIZON_NAME = "session_close"
+# Canonical horizon key used by calibration profiles. The real horizon shrinks
+# every five minutes; this constant keeps every close-target row in one
+# calibration bucket instead of creating dozens of per-minute buckets.
+CALIBRATION_HORIZON_MINUTES = 390
 
 BUY_P = 0.60
 SELL_P = 0.40
@@ -45,6 +61,29 @@ def _safe(v: Any) -> float:
         return x if np.isfinite(x) else np.nan
     except Exception:
         return np.nan
+
+
+def _as_ist_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("Asia/Kolkata")
+    return ts.tz_convert("Asia/Kolkata")
+
+
+def session_close_timestamp(decision_ts: Any) -> pd.Timestamp:
+    """Return the regular-session close (15:30 IST) for the decision date."""
+    ts = _as_ist_timestamp(decision_ts)
+    return ts.normalize() + pd.Timedelta(
+        hours=SESSION_CLOSE_HOUR, minutes=SESSION_CLOSE_MINUTE
+    )
+
+
+def minutes_to_close(decision_ts: Any) -> int:
+    """Minutes from the decision bar to the same-session 15:30 close."""
+    ts = _as_ist_timestamp(decision_ts)
+    target = session_close_timestamp(ts)
+    return int(round((target - ts).total_seconds() / 60.0))
+
 
 
 def _norm(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -135,7 +174,8 @@ def _market_series(market_df: pd.DataFrame | None) -> pd.Series:
 
 def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = None,
                      fno: dict[str, Any] | None = None,
-                     decision_timestamp: Any = None) -> dict[str, float]:
+                     decision_timestamp: Any = None,
+                     feature_names: list[str] | None = None) -> dict[str, float]:
     x = _norm(price_df)
     if x.empty or x["Close"].dropna().empty:
         raise ValueError("No usable intraday OHLC data")
@@ -164,6 +204,10 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     minutes = ts.hour*60+ts.minute
     vals["tod_sin"]=float(np.sin(2*np.pi*minutes/390.0))
     vals["tod_cos"]=float(np.cos(2*np.pi*minutes/390.0))
+    # The target is always the same-session 15:30 close. Expose the remaining
+    # horizon explicitly so the model can separate a 375-minute open signal
+    # from a 5-minute close signal instead of relying on time-of-day alone.
+    vals["minutes_to_close"]=float(minutes_to_close(ts))
 
     mc = _market_series(market_df)
     vals["market_ret_1"]=_session_aware_returns(mc,1)
@@ -184,7 +228,10 @@ def _latest_features(price_df: pd.DataFrame, market_df: pd.DataFrame | None = No
     vals["fno_fut_oi"]=_safe(fno.get("fut_oi", fno.get("fno_fut_oi")))
     vals["fno_basis"]=_safe(fno.get("basis", fno.get("fno_basis")))
     vals["fno_available"]=1.0 if any(pd.notna(vals[k]) for k in ["fno_pcr","fno_oi_change","fno_fut_return","fno_fut_oi","fno_basis"]) else 0.0
-    return {k:_safe(vals.get(k)) for k in FEATURES}
+    # Older deployed artifacts declare 34 features and must keep loading. The
+    # manifest remains the source of truth for the frame columns.
+    active = list(feature_names) if feature_names else list(FEATURES)
+    return {k:_safe(vals.get(k)) for k in active}
 
 
 MODEL_FOLDER_NAME = DRIVE_MODEL_ROOT.rsplit("/", 1)[-1]
@@ -342,18 +389,98 @@ def _manifest() -> dict[str, Any]:
 _MODEL_CACHE = {}
 
 
+def _declared_features(manifest: dict[str, Any]) -> list[str]:
+    """Return the feature contract declared by the deployed manifest.
+
+    Newer artifacts add ``minutes_to_close``. Older 34-feature artifacts keep
+    working because the adapter builds the frame from this list instead of the
+    module-level default.
+    """
+    declared = [str(name) for name in (manifest.get("features") or [])]
+    if not declared:
+        return list(FEATURES)
+    unknown = [name for name in declared if name not in FEATURES]
+    if unknown:
+        raise RuntimeError(
+            "Model manifest declares features this adapter cannot construct: "
+            + ", ".join(unknown[:10])
+        )
+    return declared
+
+
+def _model_context() -> dict[str, Any]:
+    if not _MODEL_CACHE.get("ready"):
+        status = model_status()
+        if not status.get("manifest_sha256_match"):
+            raise RuntimeError(
+                "ALL-NSE session-close model is unavailable or its target "
+                "contract/artifact hashes do not match the manifest"
+            )
+        manifest = _manifest()
+        features = _declared_features(manifest)
+        classifier = joblib.load(LOCAL_CLASSIFIER)
+        regressor = joblib.load(LOCAL_REGRESSOR)
+        _MODEL_CACHE.update({
+            "ready": True,
+            "manifest": manifest,
+            "features": features,
+            "classifier": classifier,
+            "regressor": regressor,
+            "calibration": manifest.get("probability_calibration") or None,
+            "signal_policy": manifest.get("signal_policy") or {},
+        })
+    return _MODEL_CACHE
+
+
+def active_feature_names() -> list[str]:
+    """Feature columns the deployed estimator was actually trained on."""
+    return list(_model_context()["features"])
+
+
+def calibrate_probability(probability: float) -> float:
+    """Apply the manifest-documented probability calibrator, if any."""
+    spec = _model_context().get("calibration")
+    try:
+        return float(apply_probability_calibration([probability], spec)[0])
+    except Exception:
+        # A malformed calibrator must never take the capture down; the raw
+        # probability is still usable and is recorded alongside the signal.
+        return float(probability)
+
+
+def signal_thresholds() -> tuple[float, float]:
+    """Return the deployed BUY/SELL probability thresholds."""
+    policy = _model_context().get("signal_policy") or {}
+    buy = policy.get("buy_probability_threshold", policy.get("buy_probability_minimum", BUY_P))
+    sell = policy.get("sell_probability_threshold", policy.get("sell_probability_maximum", SELL_P))
+    try:
+        buy = float(buy)
+        sell = float(sell)
+    except (TypeError, ValueError):
+        return BUY_P, SELL_P
+    if not (0.50 <= buy <= 0.95) or not (0.05 <= sell <= 0.50) or buy <= sell:
+        return BUY_P, SELL_P
+    return buy, sell
+
+
 def model_target_contract() -> dict[str, Any]:
     return {
         "bar_interval_minutes": 5,
-        "target": "target_30m",
+        "target": TARGET_NAME,
+        "prediction_horizon": HORIZON_NAME,
         "positive_class": 1,
-        "positive_class_meaning": "UP: future 30-minute return > 0",
+        "positive_class_meaning": "UP: price at the 15:30 IST session close is above the decision price",
         "negative_class": 0,
-        "negative_class_meaning": "DOWN/FLAT: future 30-minute return <= 0",
-        "probability_column": "probability_up_30m",
-        "signal_policy": "BUY if p>=0.60, SELL if p<=0.40, otherwise HOLD",
+        "negative_class_meaning": "DOWN/FLAT: price at the 15:30 IST session close is not above the decision price",
+        "probability_column": "probability_up_session_close",
+        "signal_policy": (
+            "BUY if calibrated p >= manifest signal_policy.buy_probability_threshold "
+            "(fallback 0.60), SELL if <= sell_probability_threshold (fallback 0.40), "
+            "otherwise HOLD"
+        ),
         "feature_count": len(FEATURES),
         "features": FEATURES,
+        "session_close_ist": "15:30",
     }
 
 
@@ -364,6 +491,16 @@ def model_status() -> dict[str,Any]:
         return {"status":"MODEL_ARTIFACT_UNAVAILABLE","error_type":type(exc).__name__,"error":str(exc)}
     classifier_sha = str(m.get("classifier_sha256") or "")
     regressor_sha = str(m.get("regressor_sha256") or "")
+    contract = model_target_contract()
+    try:
+        declared_features = _declared_features(m)
+        feature_contract_match = bool(
+            not m.get("feature_count")
+            or int(m.get("feature_count")) == len(declared_features)
+        )
+    except Exception:
+        declared_features = list(FEATURES)
+        feature_contract_match = False
     # Profile identity must change when either deployed estimator changes, even
     # when two builds share the same training cutoff timestamp.
     artifact_version = (
@@ -372,12 +509,29 @@ def model_status() -> dict[str,Any]:
             str(m.get("model_version") or m.get("trained_until") or "unversioned")
         )
     )
+    target_contract_match = (
+        m.get("target") == contract["target"]
+        and str(m.get("prediction_horizon") or "") == HORIZON_NAME
+    )
+    artifact_hashes_match = all([
+        LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
+        LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
+    ])
     return {
         "status":m.get("status","REPLACEMENT"),
         "model_family":m.get("model_family"),
         "target":m.get("target"),
+        "prediction_horizon":m.get("prediction_horizon"),
         "model_version":str(artifact_version or "unversioned"),
-        "feature_count":len(FEATURES),
+        "feature_count":len(declared_features),
+        "manifest_feature_count":int(m.get("feature_count") or len(declared_features)),
+        "features":declared_features,
+        "feature_contract_match":bool(feature_contract_match),
+        "probability_calibration_method":(
+            (m.get("probability_calibration") or {}).get("method")
+            if isinstance(m.get("probability_calibration"), dict) else None
+        ),
+        "signal_policy":m.get("signal_policy") or {},
         "bar_interval_minutes":m.get("bar_interval_minutes"),
         "training_symbols":m.get("training_symbols",[]),
         "training_symbol_count":m.get("training_symbol_count"),
@@ -386,10 +540,13 @@ def model_status() -> dict[str,Any]:
         "trained_until":m.get("trained_until"),
         "classifier_sha256":classifier_sha or None,
         "regressor_sha256":regressor_sha or None,
-        "manifest_sha256_match": int(m.get("bar_interval_minutes") or 0) == 5 and all([
-            LOCAL_CLASSIFIER.exists() and _sha256(LOCAL_CLASSIFIER)==m.get("classifier_sha256"),
-            LOCAL_REGRESSOR.exists() and _sha256(LOCAL_REGRESSOR)==m.get("regressor_sha256"),
-        ]),
+        "target_contract_match":bool(target_contract_match),
+        "manifest_sha256_match": bool(
+            int(m.get("bar_interval_minutes") or 0) == 5
+            and target_contract_match
+            and feature_contract_match
+            and artifact_hashes_match
+        ),
         "model_path_classifier":str(LOCAL_CLASSIFIER),
         "model_path_regressor":str(LOCAL_REGRESSOR),
     }
@@ -403,38 +560,63 @@ def _sha256(path: Path)->str:
 
 
 def _models():
-    if _MODEL_CACHE: return _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]
-    s=model_status()
-    if not s.get("manifest_sha256_match"): raise RuntimeError("ALL-NSE 5-minute-bar model contract or artifact hashes do not match manifest")
-    clf=joblib.load(LOCAL_CLASSIFIER); reg=joblib.load(LOCAL_REGRESSOR)
-    _MODEL_CACHE["classifier"],_MODEL_CACHE["regressor"]=clf,reg
-    return clf,reg
+    context = _model_context()
+    return context["classifier"], context["regressor"]
 
 
 def predict_symbol(symbol: str, price_df: pd.DataFrame, market_df: pd.DataFrame | None=None,
                    fno: dict[str,Any] | None=None, decision_timestamp: Any=None) -> dict[str,Any]:
-    clf,reg=_models()
-    row=_latest_features(price_df,market_df,fno,decision_timestamp)
-    frame=pd.DataFrame([row],columns=FEATURES)
-    p=float(np.clip(clf.predict_proba(frame)[:,1][0],0,1))
+    context = _model_context()
+    clf, reg = context["classifier"], context["regressor"]
+    features = context["features"]
+    decision = _as_ist_timestamp(
+        decision_timestamp
+        if decision_timestamp is not None
+        else (price_df.index[-1] if price_df is not None and len(price_df) else pd.Timestamp.now(tz="Asia/Kolkata"))
+    )
+    target = session_close_timestamp(decision)
+    horizon = minutes_to_close(decision)
+    if horizon <= 0:
+        raise RuntimeError(
+            "Session-close prediction is unavailable at or after the 15:30 IST close"
+        )
+    row=_latest_features(price_df,market_df,fno,decision,feature_names=features)
+    frame=pd.DataFrame([row],columns=features)
+    p_raw=float(np.clip(clf.predict_proba(frame)[:,1][0],0,1))
+    p=float(apply_probability_calibration([p_raw], context.get("calibration"))[0])
     expected=_safe(reg.predict(frame)[0])
-    signal="BUY" if p>=BUY_P else ("SELL" if p<=SELL_P else "HOLD")
+    buy_threshold, sell_threshold = signal_thresholds()
+    signal=(
+        "BUY" if p>=buy_threshold
+        else ("SELL" if p<=sell_threshold else "HOLD")
+    )
     readiness=float(frame.notna().mean(axis=1).iloc[0])
     return {
         "prediction_status":"PASS",
         "symbol":str(symbol),
-        "decision_timestamp":str(pd.Timestamp(decision_timestamp) if decision_timestamp is not None else pd.Timestamp.now(tz="Asia/Kolkata")),
-        "probability_up_30m":p,
+        "decision_timestamp":str(decision),
+        "prediction_horizon":HORIZON_NAME,
+        "horizon_minutes":horizon,
+        "target_timestamp":str(target),
+        "signal_horizon_end":str(target),
+        "forecast_target_timestamp_utc":target.tz_convert("UTC").isoformat(),
+        "probability_up_session_close":p,
+        "probability_up_session_close_raw":p_raw,
         "signal":signal,
-        "expected_return_30m":expected,
+        "signal_thresholds":{
+            "buy":buy_threshold,
+            "sell":sell_threshold,
+        },
+        "probability_calibration_applied":bool(context.get("calibration")),
+        "expected_return_session_close":expected,
         "confidence":"HIGH" if abs(p-.5)>=.25 else ("MEDIUM" if abs(p-.5)>=.12 else "LOW"),
-        "feature_count":len(FEATURES),
+        "feature_count":len(features),
         "non_missing_feature_count":int(frame.notna().sum(axis=1).iloc[0]),
         "data_readiness_score":readiness,
         "model_family":"logistic_regression+ridge",
-        "target":"target_30m",
+        "target":TARGET_NAME,
         "positive_class":1,
-        "positive_class_meaning":"UP: future 30-minute return > 0",
-        "model_coverage_symbols":int(model_status().get("training_symbol_count") or 0),
+        "positive_class_meaning":"UP: price at the 15:30 IST session close is above the decision price",
+        "model_coverage_symbols":int(context["manifest"].get("training_symbol_count") or 0),
         "data_limited":readiness < 0.70,
     }

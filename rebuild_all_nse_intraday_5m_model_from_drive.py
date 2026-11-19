@@ -2,9 +2,9 @@
 """Rebuild the exact ALL-NSE five-minute model bundle from Drive seed data.
 
 Downloads the existing historical seed into a temporary workspace, runs the
-repository's canonical trainer, validates the 34-feature/5-minute/target_30m
-contract and estimator hashes, then uploads the bundle to its canonical Drive
-path. It never changes production traffic or places orders.
+repository's canonical trainer, validates the session-close target, five-minute
+bar contract and estimator hashes, then uploads the bundle to its canonical
+Drive path. It never changes production traffic or places orders.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-MODEL_REMOTE = "models/all_nse_intraday_5mbar_multifactor_replacement_2026"
+MODEL_REMOTE = "models/all_nse_intraday_session_close_multifactor_2026"
 NATIVE_5M_SEED_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 NATIVE_5M_SEED_REL = Path(NATIVE_5M_SEED_REMOTE)
 LIVE_5M_REMOTE = "production_data/nse_official/intraday_5m_live"
@@ -28,9 +28,9 @@ MARKET_FILES = (
     "raw/2026/NIFTY50-INDEX.parquet",
 )
 FNO_FILE = "production_data/nse_official/fno/fno_daily_features_2026.parquet"
-MANIFEST_NAME = "ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json"
-CLASSIFIER_NAME = "deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
-REGRESSOR_NAME = "deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
+MANIFEST_NAME = "ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json"
+CLASSIFIER_NAME = "deployment_all_nse_intraday_session_close_multifactor_classifier_2026.joblib"
+REGRESSOR_NAME = "deployment_all_nse_intraday_session_close_multifactor_regressor_2026.joblib"
 
 
 def _sha256(path: Path) -> str:
@@ -355,7 +355,8 @@ def main() -> int:
     contract = model_target_contract()
     expected = {
         "bar_interval_minutes": 5,
-        "target": "target_30m",
+        "target": contract["target"],
+        "prediction_horizon": contract["prediction_horizon"],
         "feature_count": len(FEATURES),
     }
     for key, value in expected.items():

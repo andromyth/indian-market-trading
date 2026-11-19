@@ -101,7 +101,7 @@ The prediction folder also receives `manifest_YYYYMMDD_HHMM.json` and the `lates
 
 ## Row contents and safeguards
 
-Prediction rows preserve the stock symbol, five-minute slot, actual observed price, quote timestamps, probability and expected return for the 30-minute horizon, raw/manual signals, feature-readiness score, model version, forecast target timestamp/key, and the row's inference status. Missing stocks do not receive fabricated predictions.
+Prediction rows preserve the stock symbol, five-minute slot, actual observed price, quote timestamps, probability and expected return for the **same-session 15:30 IST close** target, raw/manual signals, feature-readiness score, model version, forecast target timestamp/key, and the row's inference status. Every five-minute cycle therefore refreshes a forecast whose remaining horizon shrinks through the day. Missing stocks do not receive fabricated predictions.
 
 The quote timestamp is the collector-observation time, not an exchange-stamped tick timestamp. A live quote supplies the observed price, but does not establish current-slot open/high/low, so unavailable OHLC fields remain null.
 

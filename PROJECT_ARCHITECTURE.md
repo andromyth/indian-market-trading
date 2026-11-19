@@ -139,8 +139,8 @@ flowchart LR
 | `all_universe_snapshot_assembly.py` | Cloud Run or CLI | Validate shards; publish canonical snapshot/manifest; audit-only incomplete manifests |
 | `drive_all_nse_prediction_compiler.py` | GitHub Actions | Select canonical snapshot; load history; run inference; persist predictions |
 | `all_nse_minute_prediction_capture.py` | Actions / Cloud Run | Feature construction, model inference, signal policy, calibration, prediction persistence |
-| `all_nse_intraday_model.py` | Actions / Cloud Run | 30-minute pooled model adapter; hash verification; feature contract |
-| `colab_build_all_nse_intraday_multifactor.py` | Colab | Train the 30-minute pooled classifier + regressor from 5-minute bars |
+| `all_nse_intraday_model.py` | Actions / Cloud Run | Session-close pooled model adapter; hash verification; feature contract |
+| `colab_build_all_nse_intraday_multifactor.py` | Colab | Train the session-close pooled classifier + regressor from 5-minute bars |
 | `persistent_store.py` | Everywhere | Google Drive store, OAuth/service-account handling, retries, uploads |
 | `indstocks_client.py` | Cloud Run only | INDstocks TOTP auth, request gate, quotes, historical bars |
 | `market_session_guard.py` | Everywhere | NSE session/holiday/close guards |
@@ -607,18 +607,18 @@ Prediction row fields include:
 
 ### 6.1 Target
 
-The production intraday model predicts a **30-minute forward return**:
+The live ALL-NSE intraday capture model predicts the **same-session 15:30 IST close**:
 
 ```text
-future_return_30m = close(t + 30m) / close(t) - 1
-target_30m = 1 if future_return_30m > 0 else 0
+future_return_session_close = close(15:30) / decision_close - 1
+target_session_close = 1 if close(15:30) > decision_close else 0
 P(up) = classifier.predict_proba(...)[0, 1]
-expected_return_30m = regressor.predict(...)
+expected_return_session_close = regressor.predict(...)
 ```
 
-The target timestamp is matched by actual timestamp with a one-minute
-tolerance, not by assuming "30 rows = 30 minutes". Training and live inference
-share the same five-minute bar contract.
+The target is the same session's 15:30 bar. The remaining horizon is stored per
+row (`horizon_minutes`) and shrinks on every five-minute cycle. Training and live
+inference share the same five-minute bar contract.
 
 ### 6.2 Features (34)
 
@@ -661,10 +661,10 @@ Feature readiness is the fraction of non-missing features for that row.
 Artifacts:
 
 ```text
-models/all_nse_intraday_5mbar_multifactor_replacement_2026/
-  ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json
-  deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib
-  deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib
+models/all_nse_intraday_session_close_multifactor_2026/
+  ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json
+  deployment_all_nse_intraday_session_close_multifactor_classifier_2026.joblib
+  deployment_all_nse_intraday_session_close_multifactor_regressor_2026.joblib
 ```
 
 The adapter verifies both SHA-256 hashes against the manifest before loading.
@@ -736,8 +736,8 @@ Indian_Market_Research/
 
 Indian_Market_Research/
 └── models/
-    ├── all_nse_intraday_5mbar_multifactor_replacement_2026/
-    │   ├── ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json
+    ├── all_nse_intraday_session_close_multifactor_2026/
+    │   ├── ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json
     │   ├── deployment_..._classifier_2026.joblib
     │   └── deployment_..._regressor_2026.joblib
     └── all_nse_intraday_5m_multifactor_replacement_2026/

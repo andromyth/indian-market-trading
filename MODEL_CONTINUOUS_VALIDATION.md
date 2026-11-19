@@ -19,9 +19,12 @@ arrives.
 
 ## Intraday
 
-The existing production contract remains unchanged: `target_30m`, class 1 = UP,
-class 0 = DOWN/FLAT, and BUY/SELL/HOLD are derived from `P(UP)` using the certified
-thresholds. The production model is never retrained inside Streamlit.
+The live capture contract is `target_session_close`: class 1 = the price at the
+same session's 15:30 IST close is above the decision price, class 0 otherwise.
+The signal is refreshed every five minutes through 15:25 and is validated only
+against the stored 15:30 target. The separately certified historical-replay
+artifact remains `target_30m`; it is not the live capture contract. The
+production model is never retrained inside Streamlit.
 
 ## Error handling
 

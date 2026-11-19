@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Train the ALL-NSE 30-minute model using native completed five-minute OHLCV only.
+"""Train the ALL-NSE session-close model using native completed five-minute OHLCV only.
 
-Training and live inference share the same five-minute bar contract. Legacy
-one-minute archives are deliberately excluded. No orders are placed.
+Every decision bar from the opening range through 15:25 is labelled against the
+same session's 15:30 IST close. Training and live inference therefore share the
+same bar contract and the same target timestamp. The horizon shrinks through the
+day instead of being a fixed 30 minutes. No orders are placed.
 """
 from __future__ import annotations
 
@@ -21,7 +23,19 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 
-from all_nse_intraday_model import FEATURES
+from all_nse_intraday_model import (
+    FEATURES,
+    HORIZON_NAME,
+    RETURN_NAME,
+    TARGET_NAME,
+    session_close_timestamp,
+)
+from probability_calibration import (
+    apply_probability_calibration,
+    choose_threshold,
+    fit_platt,
+    probability_report,
+)
 
 IST = "Asia/Kolkata"
 PERSISTENT_INTRADAY_REL = Path("production_data/nse_official/intraday_1m")
@@ -211,24 +225,37 @@ def make_features(
     out["relative_ret_5"] = out["ret_5"] - out["market_ret_5"]
     out["relative_ret_15"] = out["ret_15"] - out["market_ret_15"]
 
-    # Strict timestamp target: use the actual +30 minute timestamp within a
-    # one-minute tolerance rather than assuming 30 rows == 30 minutes.
-    right = pd.DataFrame({"future_ts": x.index, "future_close": c.to_numpy()}).sort_values("future_ts")
-    left = pd.DataFrame({"decision_ts": x.index, "future_ts": x.index + pd.Timedelta(minutes=30)}).sort_values("future_ts")
-    merged = pd.merge_asof(
-        left,
-        right,
-        on="future_ts",
-        direction="nearest",
-        tolerance=pd.Timedelta(minutes=1),
+    # Session-close target: every decision bar in a session is labelled against
+    # that same session's 15:30 bar close. Grouping by session date prevents a
+    # merge_asof from ever borrowing the next session's close.
+    close_time = pd.Timestamp("15:30").time()
+    session_dates = pd.Index(x.index.date)
+    close_rows = x.loc[[ts.time() == close_time for ts in x.index], "Close"]
+    close_by_session = close_rows.groupby(pd.Index(close_rows.index.date)).last()
+    future_close = pd.Series(session_dates, index=out.index).map(close_by_session)
+    target_timestamps = pd.Series(
+        [session_close_timestamp(ts) for ts in x.index],
+        index=out.index,
     )
-    future_close = merged.set_index("decision_ts")["future_close"].reindex(out.index)
-    out["future_return_30m"] = future_close / c - 1
-    out["target_30m"] = np.where(
-        out["future_return_30m"].notna(),
-        (out["future_return_30m"] > 0).astype(float),
+    # A bar stamped 15:30 is already the close; it has no forward forecast and
+    # must not be trained as a zero-return observation.
+    at_or_after_close = pd.Series(
+        [ts.time() >= close_time for ts in x.index],
+        index=out.index,
+        dtype=bool,
+    )
+    future_close = pd.to_numeric(future_close, errors="coerce").mask(at_or_after_close)
+    out["future_close_session_close"] = future_close
+    out[RETURN_NAME] = future_close / c - 1
+    out[TARGET_NAME] = np.where(
+        out[RETURN_NAME].notna(),
+        (out[RETURN_NAME] > 0).astype(float),
         np.nan,
     )
+    out["minutes_to_close"] = (
+        (target_timestamps - pd.Series(x.index, index=out.index)).dt.total_seconds() / 60.0
+    ).mask(at_or_after_close)
+    out["prediction_horizon"] = HORIZON_NAME
     return out
 
 
@@ -514,7 +541,7 @@ def sample_decisions(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drive-root", default="/content/drive/MyDrive/Indian_Market_Research")
-    ap.add_argument("--out", default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_intraday_5mbar_multifactor_replacement_2026")
+    ap.add_argument("--out", default="/content/drive/MyDrive/Indian_Market_Research/models/all_nse_intraday_session_close_multifactor_2026")
     ap.add_argument("--min-rows-symbol", type=int, default=300)
     ap.add_argument("--sample-minutes", type=int, default=5)
     ap.add_argument("--max-train-rows-per-symbol", type=int, default=2000)
@@ -622,7 +649,7 @@ def main():
         feat = sample_decisions(feat, args.sample_minutes)
         feat = fno_join_features(feat, fno, sym)
         feat = feat.replace([np.inf, -np.inf], np.nan)
-        feat = feat.dropna(subset=["target_30m"])
+        feat = feat.dropna(subset=[TARGET_NAME, RETURN_NAME])
 
         if feat.empty:
             coverage.append((sym, len(raw), usable_sessions, "EXCLUDED_NO_LABELS"))
@@ -667,17 +694,49 @@ def main():
 
     data = data.sort_values("decision_ts")
     data = data.replace([np.inf, -np.inf], np.nan)
-    data = data.dropna(subset=["target_30m"])
+    data = data.dropna(subset=[TARGET_NAME, RETURN_NAME])
 
-    # Deterministic chronological split by decision timestamp.
-    cut = data["decision_ts"].quantile(0.80)
-    train = data[data["decision_ts"] < cut].copy()
-    test = data[data["decision_ts"] >= cut].copy()
+    # Split by complete session date, not by intraday timestamp. A
+    # timestamp split could train on a morning bar whose 15:30 label is realised
+    # after a same-day holdout bar, leaking future information into the
+    # validation set.
+    data["_session_date"] = (
+        pd.to_datetime(data["decision_ts"], utc=True).dt.tz_convert(IST).dt.date
+    )
+    sessions = np.sort(data["_session_date"].unique())
+    if len(sessions) < 5:
+        raise RuntimeError("Insufficient complete sessions for a chronological holdout")
+    cut_position = min(max(int(len(sessions) * 0.80), 1), len(sessions) - 1)
+    cut_session = sessions[cut_position]
+    train = data[data["_session_date"] < cut_session].copy()
+    test = data[data["_session_date"] >= cut_session].copy()
 
-    ytr = train["target_30m"].astype(int)
-    yte = test["target_30m"].astype(int)
-    if ytr.nunique() != 2 or yte.nunique() != 2:
+    ytr = train[TARGET_NAME].astype(int)
+    yte = test[TARGET_NAME].astype(int)
+    if yte.nunique() != 2:
         raise RuntimeError("Target split does not contain both classes")
+
+    # Chronological fit/calibration split inside the training sessions. The
+    # calibration slice never fits the classifier, so Platt parameters are
+    # estimated on genuinely out-of-sample probabilities.
+    train_sessions = np.sort(train["_session_date"].unique())
+    if len(train_sessions) >= 10:
+        cal_position = min(
+            max(int(len(train_sessions) * 0.85), 1),
+            len(train_sessions) - 1,
+        )
+        fit_sessions = train_sessions[:cal_position]
+        calibration_sessions = train_sessions[cal_position:]
+        fit_rows = train[train["_session_date"].isin(fit_sessions)].copy()
+        calibration_rows = train[train["_session_date"].isin(calibration_sessions)].copy()
+    else:
+        fit_rows = train.copy()
+        calibration_rows = train.iloc[0:0].copy()
+    if fit_rows.empty or fit_rows[TARGET_NAME].nunique() != 2:
+        # Never trade a valid model for calibration. Fall back to the full
+        # training window and skip calibration when the split is degenerate.
+        fit_rows = train.copy()
+        calibration_rows = train.iloc[0:0].copy()
 
     clf = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -694,12 +753,53 @@ def main():
         ("model", Ridge(alpha=1.0)),
     ])
 
-    clf.fit(train[FEATURES], ytr)
-    reg.fit(train[FEATURES], train["future_return_30m"].astype(float))
+    clf.fit(fit_rows[FEATURES], fit_rows[TARGET_NAME].astype(int))
+    reg.fit(fit_rows[FEATURES], fit_rows[RETURN_NAME].astype(float))
 
-    p = clf.predict_proba(test[FEATURES])[:, 1]
+    probability_calibration = None
+    calibration_probability = np.array([], dtype=float)
+    if not calibration_rows.empty and calibration_rows[TARGET_NAME].nunique() == 2:
+        calibration_probability = clf.predict_proba(calibration_rows[FEATURES])[:, 1]
+        probability_calibration = fit_platt(
+            calibration_probability,
+            calibration_rows[TARGET_NAME].astype(int),
+            min_rows=200,
+        )
+
+    p_raw = clf.predict_proba(test[FEATURES])[:, 1]
+    p = apply_probability_calibration(p_raw, probability_calibration)
     pred = (p >= 0.5).astype(int)
     pred_ret = reg.predict(test[FEATURES])
+
+    buy_threshold = 0.60
+    sell_threshold = 0.40
+    if probability_calibration is not None and calibration_probability.size:
+        calibrated_calibration_probability = apply_probability_calibration(
+            calibration_probability,
+            probability_calibration,
+        )
+        calibration_labels = calibration_rows[TARGET_NAME].astype(int)
+        buy_threshold = choose_threshold(
+            calibrated_calibration_probability,
+            calibration_labels,
+            "buy",
+            default=0.60,
+        )
+        sell_threshold = choose_threshold(
+            calibrated_calibration_probability,
+            calibration_labels,
+            "sell",
+            default=0.40,
+        )
+        if not (0.50 <= buy_threshold <= 0.95 and 0.05 <= sell_threshold <= 0.50 and buy_threshold > sell_threshold):
+            buy_threshold, sell_threshold = 0.60, 0.40
+
+    raw_report = probability_report(p_raw, yte.to_numpy(), thresholds=(0.60, 0.40))
+    calibrated_report = probability_report(
+        p,
+        yte.to_numpy(),
+        thresholds=(buy_threshold, sell_threshold),
+    )
 
     train_symbols = sorted(data["_symbol"].unique().tolist())
     universe_size = len(universe)
@@ -707,10 +807,13 @@ def main():
 
     manifest = {
         "status": "BRANCH_REPLACEMENT_ONLY",
-        "model_version": "2026-5mbar-multifactor-v1",
+        "model_version": "2026-5mbar-session-close-v2-calibrated",
+        "feature_contract_version": "session_close_v2",
         "bar_interval_minutes": 5,
         "model_family": "logistic_regression+ridge",
-        "target": "target_30m",
+        "target": TARGET_NAME,
+        "prediction_horizon": HORIZON_NAME,
+        "session_close_ist": "15:30",
         "feature_count": len(FEATURES),
         "features": FEATURES,
         "universe_size": universe_size,
@@ -730,15 +833,37 @@ def main():
         "global_retained_row_cap": int(GLOBAL_RETAINED_ROWS),
         "retained_rows_before_split": int(len(data)),
         "training_rows": int(len(train)),
+        "fit_rows": int(len(fit_rows)),
+        "calibration_rows": int(len(calibration_rows)),
+        "fit_sessions": int(len(np.unique(fit_rows["_session_date"]))),
+        "calibration_sessions": int(len(np.unique(calibration_rows["_session_date"]))) if not calibration_rows.empty else 0,
         "holdout_rows": int(len(test)),
-        "trained_until": str(train["decision_ts"].max()),
+        "trained_until": str(fit_rows["decision_ts"].max()),
         "holdout_start": str(test["decision_ts"].min()),
+        "holdout_start_session": str(cut_session),
+        "split_policy": "chronological by complete session date; calibration slice is chronological inside train",
+        "probability_calibration": probability_calibration,
+        "signal_policy": {
+            "buy_probability_threshold": float(buy_threshold),
+            "sell_probability_threshold": float(sell_threshold),
+            "selection": "chronological calibration slice; fallback 0.60/0.40 when evidence is insufficient",
+            "applies_to": "calibrated probability_up_session_close",
+        },
         "validation": {
             "accuracy": float(accuracy_score(yte, pred)),
             "roc_auc": float(roc_auc_score(yte, p)),
             "mean_abs_return_error": float(
-                mean_absolute_error(test["future_return_30m"], pred_ret)
+                mean_absolute_error(test[RETURN_NAME], pred_ret)
             ),
+            "base_rate_up": calibrated_report["base_rate_up"],
+            "balanced_accuracy": calibrated_report["balanced_accuracy"],
+            "brier_score": calibrated_report["brier"],
+            "brier_score_raw": raw_report["brier"],
+            "action_precision": calibrated_report["action"]["precision"],
+            "action_coverage": calibrated_report["action"]["coverage"],
+            "action_precision_ci95": calibrated_report["action"]["precision_ci95"],
+            "raw_probability_metrics": raw_report,
+            "calibrated_probability_metrics": calibrated_report,
         },
         "classifier_sha256": "",
         "regressor_sha256": "",
@@ -755,8 +880,8 @@ def main():
     }
 
     out.mkdir(parents=True, exist_ok=True)
-    cp = out / "deployment_all_nse_intraday_5mbar_multifactor_classifier_2026.joblib"
-    rp = out / "deployment_all_nse_intraday_5mbar_multifactor_regressor_2026.joblib"
+    cp = out / "deployment_all_nse_intraday_session_close_multifactor_classifier_2026.joblib"
+    rp = out / "deployment_all_nse_intraday_session_close_multifactor_regressor_2026.joblib"
 
     joblib.dump(clf, cp)
     joblib.dump(reg, rp)
@@ -764,7 +889,7 @@ def main():
     manifest["classifier_sha256"] = hashlib.sha256(cp.read_bytes()).hexdigest()
     manifest["regressor_sha256"] = hashlib.sha256(rp.read_bytes()).hexdigest()
 
-    (out / "ALL_NSE_INTRADAY_5MBAR_MULTIFACTOR_2026_MODEL_MANIFEST.json").write_text(
+    (out / "ALL_NSE_INTRADAY_SESSION_CLOSE_MULTIFACTOR_2026_MODEL_MANIFEST.json").write_text(
         json.dumps(manifest, indent=2),
         encoding="utf-8",
     )

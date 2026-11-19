@@ -86,3 +86,61 @@ def test_fno_join_normalizes_millisecond_and_nanosecond_session_dates():
     # Same-session F&O data is excluded; the prior session remains available.
     assert joined["fno_pcr"].iloc[0] == 1.25
     assert joined["fno_available"].iloc[0] == 1.0
+
+
+def test_session_close_labels_use_the_same_sessions_1530_bar():
+    from colab_build_all_nse_intraday_multifactor import make_features
+    from all_nse_intraday_model import RETURN_NAME, TARGET_NAME
+
+    index = pd.date_range("2026-10-29 09:20:00", "2026-10-29 15:30:00", freq="5min", tz=IST)
+    close = np.arange(100.0, 100.0 + len(index))
+    frame = pd.DataFrame(
+        {
+            "Open": close - 0.25,
+            "High": close + 0.5,
+            "Low": close - 0.5,
+            "Close": close,
+            "Volume": np.full(len(index), 1000.0),
+        },
+        index=index,
+    )
+
+    features = make_features(frame, pd.DataFrame())
+
+    close_at_1530 = float(frame.loc[pd.Timestamp("2026-10-29 15:30", tz=IST), "Close"])
+    ten_am = pd.Timestamp("2026-10-29 10:00", tz=IST)
+    assert features.loc[ten_am, "future_close_session_close"] == close_at_1530
+    assert features.loc[ten_am, RETURN_NAME] == close_at_1530 / frame.loc[ten_am, "Close"] - 1
+    assert features.loc[ten_am, TARGET_NAME] == 1.0
+    assert features.loc[ten_am, "minutes_to_close"] == 330
+
+    # The 15:30 bar is the target itself and cannot be a training decision.
+    assert pd.isna(features.loc[pd.Timestamp("2026-10-29 15:30", tz=IST), TARGET_NAME])
+
+
+def test_session_close_labels_never_borrow_the_next_session_close():
+    from colab_build_all_nse_intraday_multifactor import make_features
+    from all_nse_intraday_model import TARGET_NAME
+
+    first = pd.date_range("2026-10-29 14:00:00", "2026-10-29 15:20:00", freq="5min", tz=IST)
+    second = pd.date_range("2026-10-30 14:00:00", "2026-10-30 15:30:00", freq="5min", tz=IST)
+    index = first.append(second)
+    frame = pd.DataFrame(
+        {
+            "Open": 100.0,
+            "High": 101.0,
+            "Low": 99.0,
+            "Close": np.arange(100.0, 100.0 + len(index)),
+            "Volume": 1000.0,
+        },
+        index=index,
+    )
+
+    features = make_features(frame, pd.DataFrame())
+
+    # 29 Oct has no 15:30 bar in this sample, so its rows must stay unlabelled
+    # instead of silently using 30 Oct's close.
+    assert features.loc[pd.Timestamp("2026-10-29 15:20", tz=IST), TARGET_NAME] != features.loc[
+        pd.Timestamp("2026-10-29 15:20", tz=IST), TARGET_NAME
+    ]
+    assert pd.notna(features.loc[pd.Timestamp("2026-10-30 15:25", tz=IST), TARGET_NAME])

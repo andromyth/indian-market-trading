@@ -540,15 +540,27 @@ def tradable_picks(predictions: pd.DataFrame, plan: dict[str, Any] | None = None
         frame = frame[good]
     if "signal" in frame.columns:
         frame = frame[frame["signal"].astype(str).str.upper() == "BUY"]
-    for column in ("probability_up_30m", "expected_return_30m"):
+    # Session-close predictions are the live contract. Legacy 30-minute
+    # snapshots remain readable so archived days can still be inspected.
+    probability_column = (
+        "probability_up_session_close"
+        if "probability_up_session_close" in frame.columns
+        else "probability_up_30m"
+    )
+    expected_return_column = (
+        "expected_return_session_close"
+        if "expected_return_session_close" in frame.columns
+        else "expected_return_30m"
+    )
+    for column in (probability_column, expected_return_column):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if "expected_return_30m" not in frame.columns:
-        return {**empty, "reason": "no expected_return_30m"}
+    if expected_return_column not in frame.columns:
+        return {**empty, "reason": f"no {expected_return_column}"}
     min_move = float(plan["min_move_intraday"])
-    frame = frame[frame["expected_return_30m"] >= min_move]
-    if "probability_up_30m" in frame.columns:
-        frame = frame[frame["probability_up_30m"].fillna(0) >= 0.6]
+    frame = frame[frame[expected_return_column] >= min_move]
+    if probability_column in frame.columns:
+        frame = frame[frame[probability_column].fillna(0) >= 0.6]
     if frame.empty:
         return {**empty, "reason": "no qualifying signals"}
 
@@ -571,8 +583,8 @@ def tradable_picks(predictions: pd.DataFrame, plan: dict[str, Any] | None = None
         if quantity < 1:
             skipped += 1
             continue
-        prob = float(row.get("probability_up_30m", 0.0) or 0.0)
-        ret = float(row["expected_return_30m"])
+        prob = float(row.get(probability_column, 0.0) or 0.0)
+        ret = float(row[expected_return_column])
         candidates.append({
             "symbol": row["symbol"],
             "price": round(price, 2),

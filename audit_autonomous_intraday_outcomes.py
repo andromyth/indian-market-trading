@@ -241,15 +241,40 @@ def evaluate_record(
             out["validation_reason"] = "missing_or_invalid_decision_timestamp"
             return out
         decision = pd.Timestamp(parsed_decision)
-        horizon = int(record.get("horizon_min"))
-        if horizon <= 0 or horizon > 240:
+        horizon_raw = record.get("horizon_min")
+        if horizon_raw in (None, ""):
+            horizon_raw = record.get("horizon_minutes")
+        horizon = int(horizon_raw)
+        if horizon <= 0 or horizon > 390:
             out["validation_reason"] = "horizon_min_outside_supported_range"
             return out
+        stored_target_raw = (
+            record.get("signal_horizon_end")
+            or record.get("target_timestamp")
+            or record.get("target_timestamp_utc")
+            or record.get("forecast_target_timestamp_utc")
+        )
+        stored_target = pd.to_datetime(stored_target_raw, errors="coerce", utc=True)
+        if pd.isna(stored_target):
+            stored_target = None
+        else:
+            stored_target = pd.Timestamp(stored_target)
     except Exception as exc:
         out["validation_reason"] = f"invalid_decision_timestamp_or_horizon:{type(exc).__name__}"
         return out
 
-    target = decision + pd.Timedelta(minutes=horizon)
+    # Session-close rows store the exact 15:30 target. Prefer it over the
+    # canonical 390-minute bucket so the outcome is scored at the real close
+    # instead of a synthetic decision+390 timestamp.
+    target = (
+        stored_target
+        if stored_target is not None
+        else decision + pd.Timedelta(minutes=horizon)
+    )
+    horizon = int(round((target - decision).total_seconds() / 60.0))
+    if horizon <= 0:
+        out["validation_reason"] = "stored_target_is_not_after_decision"
+        return out
     out["horizon_min"] = horizon
     out["decision_timestamp_utc"] = decision.isoformat()
     out["target_timestamp_utc"] = target.isoformat()

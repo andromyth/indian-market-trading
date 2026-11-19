@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from probability_calibration import wilson_interval
+
 
 def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7, min_samples: int = 7) -> dict[str, Any]:
     if validation_df.empty:
@@ -36,13 +38,13 @@ def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7,
 
     matches = pd.Series(
         ((signal == "BUY") & actual.eq("UP"))
-        | ((signal == "SELL") & actual.eq("DOWN"))
-        | ((signal == "HOLD") & actual.eq("FLAT")),
+        | ((signal == "SELL") & actual.eq("DOWN")),
         index=x.index,
         dtype="float64",
     )
-    usable = actual.isin(["UP", "DOWN", "FLAT"]) & signal.isin(["BUY", "SELL", "HOLD"])
+    usable = actual.isin(["UP", "DOWN"]) & signal.isin(["BUY", "SELL"])
     matches = matches[usable].dropna()
+    hold_samples = int((signal.eq("HOLD") & actual.isin(["UP", "DOWN", "FLAT"])).sum())
 
     mape = pd.to_numeric(
         x.get("percentage_error_d1", pd.Series(index=x.index, dtype="float64")),
@@ -54,12 +56,18 @@ def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7,
             "status": "INSUFFICIENT_HISTORY",
             "sample_count": int(len(matches)),
             "directional_accuracy": float(matches.mean()) if len(matches) else None,
+            "directional_accuracy_ci95_low": None,
+            "directional_accuracy_ci95_high": None,
+            "action_precision": float(matches.mean()) if len(matches) else None,
+            "hold_samples": hold_samples,
             "mean_absolute_percentage_error": float(mape) if pd.notna(mape) else None,
             "retraining_candidate": False,
+            "retraining_min_samples": max(int(min_samples), 10),
             "reason": f"Need at least {min_samples} completed delivery predictions for the rolling health gate.",
         }
 
     accuracy = float(matches.mean())
+    ci_low, ci_high = wilson_interval(float(matches.sum()), len(matches))
 
     action = signal.isin(["BUY", "SELL"])
     action_correct = (
@@ -82,15 +90,20 @@ def assess_delivery_health(validation_df: pd.DataFrame, rolling_window: int = 7,
         else accuracy
     )
 
+    min_retrain_samples = max(int(min_samples), 10)
     return {
         "status": "MONITOR",
         "sample_count": int(len(matches)),
         "directional_accuracy": accuracy,
+        "directional_accuracy_ci95_low": ci_low,
+        "directional_accuracy_ci95_high": ci_high,
         "action_precision": action_precision,
         "action_coverage": action_coverage,
+        "hold_samples": hold_samples,
         "brier_score": float(brier) if pd.notna(brier) else None,
         "mean_absolute_percentage_error": float(mape) if pd.notna(mape) else None,
-        "retraining_candidate": primary_health < 0.50,
+        "retraining_candidate": bool(len(matches) >= min_retrain_samples and primary_health < 0.50),
+        "retraining_min_samples": int(min_retrain_samples),
         "health_metric_used": "action_precision" if action_precision is not None and int(action.sum()) >= 10 else "directional_accuracy",
-        "rule": "candidate flag when the primary OOS health metric falls below 50%; candidate still requires full retraining + walk-forward + validation before promotion.",
+        "rule": "candidate flag only when the primary OOS action metric falls below 50% with at least %d scored BUY/SELL rows; HOLD rows are reported separately and are never treated as directional misses." % min_retrain_samples,
     }

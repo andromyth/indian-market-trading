@@ -14,6 +14,8 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from probability_calibration import wilson_interval
+
 
 @dataclass(frozen=True)
 class ValidationConfig:
@@ -49,7 +51,9 @@ def _norm_history(df: pd.DataFrame) -> pd.DataFrame:
 def _direction(actual_return: float, tol: float) -> str:
     if not np.isfinite(actual_return):
         return "UNKNOWN"
-    t = tol / 100.0
+    t = abs(float(tol))
+    if t > 0.05:
+        t = t / 100.0
     if actual_return > t:
         return "UP"
     if actual_return < -t:
@@ -192,9 +196,17 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
         x = x.dropna(subset=["decision_timestamp"]).sort_values("decision_timestamp").tail(7)
     if x.empty:
         return {"status": "NO_DATA"}
-    raw_matches = x.get("direction_match_d1", pd.Series(index=x.index, dtype="object"))
+    signal_series = x.get("signal", pd.Series(index=x.index, dtype="object")).astype(str).str.strip().str.upper()
+    action = signal_series.isin(["BUY", "SELL"])
+    action_rows = x.loc[action].copy()
+    raw_matches = action_rows.get("direction_match_d1", pd.Series(index=action_rows.index, dtype="object"))
     matches = raw_matches.astype(str).str.strip().str.lower().map({"true": 1.0, "false": 0.0, "1": 1.0, "0": 0.0})
     valid_matches = matches.dropna()
+    action_up = action_rows.get("actual_direction_d1", pd.Series(index=action_rows.index, dtype="object")).astype(str).str.upper().map({"UP": 1.0, "DOWN": 0.0})
+    base_rate_up = float(action_up.dropna().mean()) if action_up.notna().any() else None
+    ci_low = ci_high = None
+    if len(valid_matches):
+        ci_low, ci_high = wilson_interval(float(valid_matches.sum()), len(valid_matches))
     mae = pd.to_numeric(x.get("percentage_error_d1"), errors="coerce").abs().mean()
     probs = pd.to_numeric(x.get("probability_up_next_session"), errors="coerce")
     actual_up = x.get("actual_direction_d1", pd.Series(index=x.index)).astype(str).str.upper().map({"UP":1.0,"DOWN":0.0})
@@ -213,6 +225,15 @@ def rolling_7day_scorecard(validation_df: pd.DataFrame) -> dict[str, Any]:
         "scored_predictions": int(len(valid_matches)),
         "completed_predictions": int(len(x)),
         "directional_accuracy_7_predictions": float(valid_matches.mean()) if len(valid_matches) else None,
+        "directional_accuracy_scored_samples": int(len(valid_matches)),
+        "directional_accuracy_ci95_low": ci_low,
+        "directional_accuracy_ci95_high": ci_high,
+        "actual_up_base_rate_7_predictions": base_rate_up,
+        "directional_accuracy_minus_base_rate": (
+            float(valid_matches.mean()) - base_rate_up
+            if len(valid_matches) and base_rate_up is not None
+            else None
+        ),
         "mean_absolute_percentage_price_error": float(mae) if pd.notna(mae) else None,
         "brier_score_7_predictions": float(brier) if pd.notna(brier) else None,
         "action_precision_7_predictions": float(action_correct[action].mean()) if bool(action.any()) else None,

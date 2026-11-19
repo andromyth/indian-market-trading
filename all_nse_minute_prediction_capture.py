@@ -25,6 +25,13 @@ import pandas as pd
 import os
 
 import calibration_overlay as calibration_overlay_module
+from all_nse_intraday_model import (
+    CALIBRATION_HORIZON_MINUTES,
+    HORIZON_NAME,
+    TARGET_NAME,
+    minutes_to_close,
+    session_close_timestamp,
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 REMOTE_ROOT = "production_data/all_nse_minute_predictions"
@@ -285,14 +292,17 @@ def _current_minute_row(
         "prediction_status": "WARMING_HISTORY" if quote_ok else "MISSING_CURRENT_QUOTE",
         "raw_model_signal": None,
         "signal": "HOLD",
-        "probability_up_30m": None,
-        "expected_return_30m": None,
+        "prediction_horizon": "session_close",
+        "horizon_minutes": None,
+        "target_timestamp": None,
+        "probability_up_session_close": None,
+        "expected_return_session_close": None,
         "confidence": None,
         "model_family": "logistic_regression+ridge",
-        "model_target": "target_30m",
+        "model_target": "target_session_close",
         "model_coverage_symbols": None,
         "trained_for_symbol": None,
-        "feature_count": 34,
+        "feature_count": 35,
         "non_missing_feature_count": 0,
         "data_readiness_score": 0.0,
         "data_limited": True,
@@ -303,10 +313,44 @@ def _current_minute_row(
     return output, price_row, raw_day_volume
 
 
-def _signal(probability_up: float, readiness: float) -> tuple[str, str]:
+def _signal(
+    probability_up: float,
+    readiness: float,
+    buy_threshold: float = 0.60,
+    sell_threshold: float = 0.40,
+) -> tuple[str, str]:
     """Return (raw model class signal, conservative manual signal)."""
-    raw = "BUY" if probability_up >= 0.60 else ("SELL" if probability_up <= 0.40 else "HOLD")
+    raw = (
+        "BUY" if probability_up >= buy_threshold
+        else ("SELL" if probability_up <= sell_threshold else "HOLD")
+    )
     return raw, raw if readiness >= MIN_SIGNAL_READINESS else "HOLD"
+
+
+def _model_feature_names(model_api: Any) -> list[str]:
+    """Feature contract for the loaded artifact, with a legacy fallback."""
+    getter = getattr(model_api, "active_feature_names", None)
+    if callable(getter):
+        return list(getter())
+    return list(getattr(model_api, "FEATURES", []))
+
+
+def _model_calibrate_probability(model_api: Any, probability: float) -> float:
+    calibrator = getattr(model_api, "calibrate_probability", None)
+    if callable(calibrator):
+        return float(calibrator(probability))
+    return float(probability)
+
+
+def _model_signal_thresholds(model_api: Any) -> tuple[float, float]:
+    getter = getattr(model_api, "signal_thresholds", None)
+    if callable(getter):
+        try:
+            buy, sell = getter()
+            return float(buy), float(sell)
+        except Exception:
+            pass
+    return 0.60, 0.40
 
 
 def _is_auth_recovery_error(error: Any) -> bool:
@@ -2279,7 +2323,7 @@ class AllNSEMinutePredictor:
             prediction_frame = pd.DataFrame(columns=[
                 "record_type", "schema_version", "snapshot_minute_ist", "symbol",
                 "actual_market_value", "actual_quote_status", "prediction_status",
-                "probability_up_30m", "signal",
+                "probability_up_session_close", "signal",
             ])
         prediction_frame.to_parquet(tmp_path, index=False, compression="zstd")
         tmp_path.replace(local_path)
@@ -2643,12 +2687,24 @@ class AllNSEMinutePredictor:
                             ~feature_history.index.duplicated(keep="last")
                         ].tail(HISTORY_LOOKBACK_BARS)
                         quote_info["history_input_mode"] = "FRESH_5M_HISTORY_PLUS_CURRENT_QUOTE"
-                    model_feature_row = self._model_api._latest_features(
-                        feature_history,
-                        market_df=market_history_before_minute,
-                        fno=fno_context_by_symbol.get(symbol),
-                        decision_timestamp=actual_ts,
-                    )
+                    feature_names = _model_feature_names(self._model_api)
+                    try:
+                        model_feature_row = self._model_api._latest_features(
+                            feature_history,
+                            market_df=market_history_before_minute,
+                            fno=fno_context_by_symbol.get(symbol),
+                            decision_timestamp=actual_ts,
+                            feature_names=feature_names,
+                        )
+                    except TypeError:
+                        # Older adapters (and test doubles) predate the
+                        # manifest-driven feature list.
+                        model_feature_row = self._model_api._latest_features(
+                            feature_history,
+                            market_df=market_history_before_minute,
+                            fno=fno_context_by_symbol.get(symbol),
+                            decision_timestamp=actual_ts,
+                        )
                     feature_rows.append(model_feature_row)
                     feature_symbols.append(symbol)
                     current_rows.append(quote_info)
@@ -2671,7 +2727,7 @@ class AllNSEMinutePredictor:
             "missing_count_by_feature": {},
         }
         inference_frame = pd.DataFrame(
-            feature_rows, columns=self._model_api.FEATURES
+            feature_rows, columns=_model_feature_names(self._model_api)
         ) if feature_rows and self._model_api is not None else pd.DataFrame()
         if not inference_frame.empty:
             row_coverage = inference_frame.notna().mean(axis=1) * 100.0
@@ -2732,20 +2788,29 @@ class AllNSEMinutePredictor:
                     idx, symbol = item
                     try:
                         one_row = x.iloc[[idx]]
-                        probability = float(np.clip(
+                        raw_probability = float(np.clip(
                             self._classifier.predict_proba(one_row)[0, 1], 0, 1
                         ))
+                        probability = _model_calibrate_probability(
+                            self._model_api, raw_probability
+                        )
                         predicted_return = float(self._regressor.predict(one_row)[0])
-                        return idx, symbol, probability, predicted_return, None
+                        return (
+                            idx, symbol, probability, raw_probability,
+                            predicted_return, None,
+                        )
                     except Exception as exc:
-                        return idx, symbol, None, None, f"{type(exc).__name__}: {str(exc)[:240]}"
+                        return (
+                            idx, symbol, None, None, None,
+                            f"{type(exc).__name__}: {str(exc)[:240]}",
+                        )
 
                 # Eight read-only workers share the loaded model. Drive persistence
                 # remains single-writer after every symbol has completed.
                 with ThreadPoolExecutor(max_workers=8, thread_name_prefix="nse-symbol-inference") as pool:
                     inference_results = list(pool.map(infer_symbol, enumerate(feature_symbols)))
 
-                for idx, symbol, probability, predicted_return, inference_error in inference_results:
+                for idx, symbol, probability, raw_probability, predicted_return, inference_error in inference_results:
                     row = record_by_symbol[symbol]
                     if inference_error:
                         row.update({
@@ -2763,7 +2828,24 @@ class AllNSEMinutePredictor:
                         row.get("actual_observed_at_ist"),
                         fallback=minute,
                     )
-                    raw_signal, proposed_signal = _signal(probability, readiness)
+                    target = session_close_timestamp(decision_ts)
+                    horizon_minutes = minutes_to_close(decision_ts)
+                    if horizon_minutes <= 0:
+                        row.update({
+                            "prediction_status": "SESSION_CLOSED_NO_TARGET",
+                            "signal": "HOLD",
+                            "error": "No forward session-close target remains at/after 15:30 IST",
+                        })
+                        continue
+                    buy_threshold, sell_threshold = _model_signal_thresholds(
+                        self._model_api
+                    )
+                    _, proposed_signal = _signal(
+                        probability, readiness, buy_threshold, sell_threshold
+                    )
+                    raw_signal, _ = _signal(
+                        raw_probability, readiness, buy_threshold, sell_threshold
+                    )
                     trained_for_symbol = (
                         symbol in self._trained_symbols
                         if self._trained_symbols else None
@@ -2785,28 +2867,38 @@ class AllNSEMinutePredictor:
                         "raw_model_signal": raw_signal,
                         "signal": signal,
                         "trained_for_symbol": trained_for_symbol,
-                        "probability_up_30m": probability,
-                        "expected_return_30m": expected_return,
+                        "prediction_horizon": HORIZON_NAME,
+                        "horizon_minutes": horizon_minutes,
+                        "target_timestamp": target.isoformat(),
+                        "probability_up_session_close": probability,
+                        "probability_up_session_close_raw": raw_probability,
+                        "signal_thresholds": {
+                            "buy": buy_threshold,
+                            "sell": sell_threshold,
+                        },
+                        "probability_calibration_applied": bool(
+                            self._model_status.get("probability_calibration_method")
+                        ),
+                        "expected_return_session_close": expected_return,
                         "confidence": (
                             "HIGH" if abs(probability - 0.5) >= 0.25
                             else "MEDIUM" if abs(probability - 0.5) >= 0.12
                             else "LOW"
                         ),
                         "model_family": "logistic_regression+ridge",
-                        "model_target": "target_30m",
+                        "model_target": TARGET_NAME,
                         "model_coverage_symbols": int(
                             self._model_status.get("training_symbol_count")
                             or len(self._trained_symbols)
                         ),
-                        "feature_count": len(self._model_api.FEATURES),
+                        "feature_count": len(_model_feature_names(self._model_api)),
                         "non_missing_feature_count": int(x.iloc[idx].notna().sum()),
                         "data_readiness_score": readiness if np.isfinite(readiness) else None,
                         "data_limited": data_limited,
-                        "forecast_target_timestamp_utc": (
-                            (decision_ts + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat()
-                        ),
+                        "forecast_target_timestamp_utc": target.tz_convert("UTC").isoformat(),
+                        "signal_horizon_end": target.isoformat(),
                         "forecast_key": (
-                            f"{symbol}|{decision_ts.tz_convert('UTC').isoformat()}|30|"
+                            f"{symbol}|{decision_ts.tz_convert('UTC').isoformat()}|{HORIZON_NAME}|"
                             f"{self._model_status.get('trained_until') or 'all-nse-pooled'}"
                         ),
                         "error": None,
@@ -2822,9 +2914,9 @@ class AllNSEMinutePredictor:
                     row["base_model_version"] = base_model_version
                     row["readiness_segment"] = readiness_segment
                     row["model_version"] = model_version
-                    row["probability_up_30m_raw"] = probability
-                    row["expected_return_30m_raw"] = expected_return
-                    row["signal_raw"] = signal
+                    row["probability_up_session_close_raw"] = raw_probability
+                    row["expected_return_session_close_raw"] = expected_return
+                    row["signal_raw"] = raw_signal
                     reference_price = _safe_float(row.get("actual_market_value"))
                     predicted_price = (
                         reference_price * (1.0 + expected_return)
@@ -2832,17 +2924,18 @@ class AllNSEMinutePredictor:
                         and np.isfinite(expected_return) else None
                     )
                     overlay = self._apply_calibration_overlay({
-                        "horizon_min": 30,
+                        "horizon_min": CALIBRATION_HORIZON_MINUTES,
+                        "prediction_horizon": HORIZON_NAME,
                         "model_version": model_version,
-                        "probability_up": probability,
+                        "probability_up": raw_probability,
                         "expected_return": expected_return,
                         "predicted_price": predicted_price,
                         "reference_close": reference_price,
-                        "signal": signal,
+                        "signal": raw_signal,
                     })
-                    row["probability_up_30m_calibrated"] = overlay.get("probability_up_calibrated")
-                    row["expected_return_30m_calibrated"] = overlay.get("expected_return_calibrated")
-                    row["predicted_price_30m_calibrated"] = overlay.get("predicted_price_calibrated")
+                    row["probability_up_session_close_calibrated"] = overlay.get("probability_up_calibrated")
+                    row["expected_return_session_close_calibrated"] = overlay.get("expected_return_calibrated")
+                    row["predicted_price_session_close_calibrated"] = overlay.get("predicted_price_calibrated")
                     row["calibrated_signal_advisory"] = overlay.get("signal_calibrated")
                     # A data-limited inference must remain HOLD even if an
                     # active probability calibrator would otherwise suggest BUY/SELL.
@@ -2855,14 +2948,14 @@ class AllNSEMinutePredictor:
                     row["calibration_stage"] = overlay.get("calibration_stage")
                     row["calibration_applied"] = bool(overlay.get("calibration_applied", False))
                     if row["calibration_applied"]:
-                        row["probability_up_30m"] = overlay.get("probability_up", probability)
-                        row["expected_return_30m"] = overlay.get("expected_return", expected_return)
+                        row["probability_up_session_close"] = overlay.get("probability_up", probability)
+                        row["expected_return_session_close"] = overlay.get("expected_return", expected_return)
                         row["signal"] = _primary_signal_with_readiness_guard(
                             row.get("prediction_status"),
                             row.get("data_limited"),
                             overlay.get("signal", signal),
                         )
-                        calibrated_probability = _safe_float(row.get("probability_up_30m"))
+                        calibrated_probability = _safe_float(row.get("probability_up_session_close"))
                         if calibrated_probability is not None:
                             row["confidence"] = (
                                 "HIGH" if abs(calibrated_probability - 0.5) >= 0.25
@@ -2908,7 +3001,7 @@ class AllNSEMinutePredictor:
             prediction_status_counts[status_key] = prediction_status_counts.get(status_key, 0) + 1
 
         prediction_count = sum(
-            1 for row in records if _safe_float(row.get("probability_up_30m")) is not None
+            1 for row in records if _safe_float(row.get("probability_up_session_close")) is not None
         )
         data_limited_count = sum(
             1 for row in records
@@ -2960,7 +3053,8 @@ class AllNSEMinutePredictor:
             "untrained_symbol_count": untrained_symbol_count,
             "trained_symbol_manifest_available": trained_symbol_manifest_available,
             "model_artifact_verified": model_artifact_verified,
-            "model_target": "target_30m",
+            "model_target": TARGET_NAME,
+            "prediction_horizon": HORIZON_NAME,
             "model_status": seed_status,
             "history_ready": history_ready,
             "history_seed_complete": history_seed_complete,

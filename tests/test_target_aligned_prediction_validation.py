@@ -125,3 +125,62 @@ def test_minute_partition_naive_index_is_interpreted_as_ist():
     result = intraday._normalise_bars(bars)
 
     assert str(result.index[0]) == "2026-10-08 10:30:00+05:30"
+
+
+def _close_record(**updates):
+    row = {
+        "prediction_id": "intraday-close-1",
+        "symbol": "RELIANCE",
+        "mode": "Intraday",
+        "prediction_horizon": "session_close",
+        "horizon_minutes": 330,
+        "model_version": "2026-session-close",
+        "decision_timestamp": "2026-10-08T10:00:00+05:30",
+        "signal_horizon_end": "2026-10-08T15:30:00+05:30",
+        "forecast_target_timestamp_utc": "2026-10-08T10:00:00Z",
+        "probability_up_session_close": 0.7,
+        "signal_price_reference": 100.0,
+        "signal": "BUY",
+    }
+    row.update(updates)
+    return row
+
+
+def test_session_close_validation_scores_the_1530_close():
+    idx = pd.DatetimeIndex(
+        ["2026-10-08T15:25:00+05:30", "2026-10-08T15:29:00+05:30", "2026-10-08T15:30:00+05:30"]
+    )
+    bars = pd.DataFrame({"close": [101.0, 102.0, 103.0]}, index=idx)
+
+    result = intraday.validate_one(_close_record(), bars)
+
+    assert result["validation_status"] == "VALIDATED"
+    assert result["prediction_horizon"] == "session_close"
+    assert result["horizon_minutes"] == 330
+    assert result["actual_timestamp"] == "2026-10-08T15:30:00+05:30"
+    assert abs(result["actual_return"] - 0.03) < 1e-9
+    assert result["direction_match"] is True
+
+
+def test_session_close_validation_rejects_a_non_close_target():
+    record = _close_record(signal_horizon_end="2026-10-08T10:30:00+05:30")
+    bars = pd.DataFrame(
+        {"close": [103.0]},
+        index=pd.DatetimeIndex(["2026-10-08T15:30:00+05:30"]),
+    )
+
+    result = intraday.validate_one(record, bars)
+
+    assert result["validation_status"] == "INVALID_PREDICTION"
+    assert "15:30" in result["validation_reason"]
+
+
+def test_session_close_validation_never_scores_a_pre_close_bar():
+    bars = pd.DataFrame(
+        {"close": [102.0]},
+        index=pd.DatetimeIndex(["2026-10-08T15:29:00+05:30"]),
+    )
+
+    result = intraday.validate_one(_close_record(), bars)
+
+    assert result["validation_status"] == "WAITING"

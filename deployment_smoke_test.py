@@ -76,9 +76,9 @@ def main() -> None:
         raise SystemExit("ALL-NSE Delivery adapter has no trainable-universe gate")
     checks.append("OK active ALL-NSE Delivery adapter import / universe gate / 59-feature runtime contract")
 
-    if len(legacy_intraday.FEATURES) != 34:
+    if len(legacy_intraday.FEATURES) != 35:
         raise SystemExit("Legacy/compatibility Intraday adapter feature contract changed unexpectedly")
-    checks.append("OK compatibility Intraday adapter remains 34-feature and isolated")
+    checks.append("OK compatibility Intraday adapter exposes the 35-feature session-close contract")
     if len(intraday_5m.FEATURES) != 49:
         raise SystemExit("5-minute Intraday V2 adapter feature contract is not 49")
     if tuple(intraday_5m.HORIZONS) != (5, 10, 15, 20, 25, 30):

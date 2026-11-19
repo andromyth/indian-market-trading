@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-symbol outcome learning for the deployed full-NSE 30-minute predictor.
+"""Per-symbol outcome learning for the deployed full-NSE session-close predictor.
 
 Stored partial slots are evaluated row by row. Universe coverage and slot-level
 quality flags do not exclude other symbols; each learning row still needs a
@@ -442,7 +442,8 @@ def match_matured_outcomes(
         "expected_return", "expected_return_calibrated", "signal", "signal_calibrated",
         "calibrated_signal_advisory",
         "calibration_profile_id", "model_version", "base_model_version", "model_version_source",
-        "readiness_segment", "model_family", "horizon_min", "input_age_seconds", "feature_coverage",
+        "readiness_segment", "model_family", "prediction_horizon", "horizon_min",
+        "minutes_to_close", "input_age_seconds", "feature_coverage",
         "validation_status", "source", "quote_basis", "prediction_status",
         "trained_for_symbol", "trained_membership_status", "data_limited",
         "prediction_slot_status", "quote_slot_status", "slot_quality_gate_pass",
@@ -461,22 +462,34 @@ def match_matured_outcomes(
     # probabilities/returns. Use the raw field only when it is populated, then
     # fall back row-by-row to the legacy/model output field.
     probability_raw = pd.to_numeric(
-        pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)),
+        pred.get("probability_up_session_close_raw", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     probability_legacy = pd.to_numeric(
-        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)),
+        pred.get("probability_up_session_close", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     pred["_probability"] = probability_raw.where(probability_raw.notna(), probability_legacy)
 
     return_raw = pd.to_numeric(
-        pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)),
+        pred.get("expected_return_session_close_raw", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     return_legacy = pd.to_numeric(
-        pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)),
+        pred.get("expected_return_session_close", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     pred["_expected_return"] = return_raw.where(return_raw.notna(), return_legacy)
     if "model_version" not in pred:
@@ -489,7 +502,8 @@ def match_matured_outcomes(
         pred["readiness_segment"] = pd.to_numeric(
             pred.get("data_readiness_score", pd.Series(np.nan, index=pred.index)), errors="coerce"
         ).map(readiness_segment)
-    for col in ("probability_up_30m_calibrated", "expected_return_30m_calibrated",
+    for col in ("probability_up_session_close_calibrated", "expected_return_session_close_calibrated",
+                "probability_up_30m_calibrated", "expected_return_30m_calibrated",
                 "actual_quote_age_seconds", "data_readiness_score"):
         if col not in pred:
             pred[col] = np.nan
@@ -556,16 +570,36 @@ def match_matured_outcomes(
     merged["reference_price"] = reference
     merged["actual_target_price"] = target_price
     merged["probability_up"] = merged["_probability"]
-    merged["probability_up_calibrated"] = pd.to_numeric(merged["probability_up_30m_calibrated"], errors="coerce")
+    calibrated_probability = pd.to_numeric(
+        merged.get("probability_up_session_close_calibrated", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(merged.get("probability_up_30m_calibrated", pd.Series(np.nan, index=merged.index)), errors="coerce"),
+    )
+    merged["probability_up_calibrated"] = calibrated_probability
     merged["expected_return"] = merged["_expected_return"]
-    merged["expected_return_calibrated"] = pd.to_numeric(merged["expected_return_30m_calibrated"], errors="coerce")
+    calibrated_return = pd.to_numeric(
+        merged.get("expected_return_session_close_calibrated", pd.Series(np.nan, index=merged.index)),
+        errors="coerce",
+    ).where(
+        lambda value: value.notna(),
+        pd.to_numeric(merged.get("expected_return_30m_calibrated", pd.Series(np.nan, index=merged.index)), errors="coerce"),
+    )
+    merged["expected_return_calibrated"] = calibrated_return
     signal = merged["signal_raw"].fillna("").astype(str).str.strip()
     fallback = merged["raw_model_signal"].fillna("").astype(str).str.strip()
     signal = signal.mask(signal.eq(""), fallback)
     signal = signal.mask(signal.eq(""), merged["signal"].fillna("").astype(str).str.strip())
     merged["signal"] = signal.mask(signal.eq(""), "HOLD").str.upper()
     merged["calibrated_signal_advisory"] = merged["calibrated_signal_advisory"].fillna("").astype(str).str.upper()
-    merged["horizon_min"] = 30
+    # Canonical calibration bucket for every session-close row. The actual
+    # remaining horizon is retained separately because it shrinks each cycle.
+    merged["prediction_horizon"] = "session_close"
+    merged["horizon_min"] = 390
+    merged["minutes_to_close"] = (
+        (merged["_target_ts"] - merged["_decision_ts"]).dt.total_seconds() / 60.0
+    )
     merged["input_age_seconds"] = pd.to_numeric(merged["actual_quote_age_seconds"], errors="coerce")
     merged["feature_coverage"] = pd.to_numeric(merged["data_readiness_score"], errors="coerce")
     merged["source"] = "all_nse_intraday_production"
@@ -628,8 +662,11 @@ def load_clean_session_data(
         "symbol", "actual_observed_at_utc", "actual_market_value", "actual_quote_status",
         "actual_quote_age_seconds", "forecast_target_timestamp_utc", "forecast_key",
         "prediction_status", "trained_for_symbol", "data_limited", "base_model_version",
-        "readiness_segment", "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
+        "readiness_segment", "probability_up_session_close", "probability_up_session_close_raw",
+        "expected_return_session_close", "expected_return_session_close_raw",
+        "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
         "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
+        "probability_up_session_close_calibrated", "expected_return_session_close_calibrated",
         "probability_up_30m_calibrated", "expected_return_30m_calibrated",
         "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
         "model_version", "model_version_source", "model_family",
@@ -889,7 +926,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         "schema_version": "all-nse-production-outcome-learning-v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
-        "scope": "ALL-NSE pooled production 30-minute classifier/regressor",
+        "scope": "ALL-NSE pooled production session-close classifier/regressor",
         "capture_interval_minutes": 5,
         "readiness_calibration_policy": {
             "segment_threshold": MIN_DATA_READINESS,
@@ -899,7 +936,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
             "low_readiness_primary_signal_policy": "HOLD",
         },
         "partial_data_policy": "Coverage and slot status are informational. Evaluate any individually usable prediction row from a stored slot when the same-symbol quote belongs to the five-minute slot and its target observation is available. Exclude only unreadable artifacts or rows whose symbol/quote, probability, target timestamp, model version, or minimum per-row feature data is unusable. Preserve low-readiness forecasts in their readiness-scoped segment; low-readiness primary signals remain HOLD.",
-        "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of nominal +30-minute target; quote observations are not exchange-stamped 1-minute candle closes.",
+        "target_matching_policy": "Nearest clean same-symbol provider quote observation within 180 seconds of the stored same-session 15:30 IST close target; quote observations are not exchange-stamped 1-minute candle closes.",
         "ingestion": ingest,
         "outcome_summary": {
             "prediction_rows_in_clean_slots": prediction_rows_for_outcome_summary,
@@ -934,7 +971,8 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         full_fit_rows = int(len(fit_frame))
         runtime_frame = bounded_calibration_sample(fit_frame)
         runtime_frame["validation_status"] = "VALIDATED"
-        runtime_frame["horizon_min"] = 30
+        runtime_frame["prediction_horizon"] = "session_close"
+        runtime_frame["horizon_min"] = 390
         runtime_frame["probability_up"] = pd.to_numeric(runtime_frame["probability_up"], errors="coerce")
         runtime_frame["expected_return"] = pd.to_numeric(runtime_frame["expected_return"], errors="coerce")
         runtime_frame["input_age_seconds"] = pd.to_numeric(runtime_frame["input_age_seconds"], errors="coerce")
@@ -942,7 +980,7 @@ def run_learning(start_date: date, end_date: date, *, output_dir: str | Path = "
         calibration_result = _run_calibration_autopilot(store, runtime_frame, autopilot_dir)
         from calibration_autopilot import profile_key
         full_nse_keys = {
-            profile_key(30, version)
+            profile_key(390, version)
             for version in fit_frame["model_version"].dropna().astype(str).unique()
         }
         active_keys = sorted(set(calibration_result.get("active_profile_keys", [])) & full_nse_keys)

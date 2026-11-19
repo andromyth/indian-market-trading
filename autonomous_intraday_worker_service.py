@@ -670,15 +670,18 @@ def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
 
         status = model.model_status()
         manifest = model._manifest()
+        contract = model.model_target_contract()
         drive = drive_status(require_write=True)
-        features_match = manifest.get("features") == model.FEATURES
+        runtime_features = model.active_feature_names()
+        features_match = manifest.get("features") == runtime_features
         checks = {
             "model_status": status.get("status"),
             "bar_interval_minutes": manifest.get("bar_interval_minutes"),
             "target": manifest.get("target"),
             "feature_count_manifest": manifest.get("feature_count"),
-            "feature_count_runtime": len(model.FEATURES),
+            "feature_count_runtime": len(runtime_features),
             "feature_list_matches_runtime": features_match,
+            "probability_calibration_method": status.get("probability_calibration_method"),
             "training_symbol_count": manifest.get("training_symbol_count"),
             "artifact_hashes_match": status.get("manifest_sha256_match") is True,
             "drive_configured": drive.get("configured") is True,
@@ -690,8 +693,9 @@ def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
         valid = all([
             status.get("manifest_sha256_match") is True,
             manifest.get("bar_interval_minutes") == 5,
-            manifest.get("target") == "target_30m",
-            manifest.get("feature_count") == len(model.FEATURES),
+            manifest.get("target") == contract["target"],
+            manifest.get("prediction_horizon") == contract["prediction_horizon"],
+            manifest.get("feature_count") == len(runtime_features),
             features_match,
             int(manifest.get("training_symbol_count") or 0) > 0,
             drive.get("configured") is True,
