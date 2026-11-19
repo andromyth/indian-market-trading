@@ -47,7 +47,7 @@ jobs:
   start-backfill:
     if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]')) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
     env:
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
@@ -291,7 +291,7 @@ jobs:
           raise SystemExit("BACKFILL_START_FAILED http=" + code + " status=" + str(body.get("status")))
           PY
 
-      - name: Verify a durable symbol-wise Parquet write after kickoff
+      - name: Monitor backfill to completion while keeping the instance warm
         if: steps.schedule_gate.outputs.should_run == 'true'
         env:
           TRIGGER_STARTED_AT: ${{ steps.start.outputs.trigger_started_at }}
@@ -299,40 +299,75 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "${TRIGGER_STARTED_AT}" ]] || { echo "ERROR=trigger_timestamp_missing"; exit 1; }
-          for attempt in $(seq 1 30); do
-            gcloud logging read \
-              'resource.type="cloud_run_revision" AND resource.labels.service_name="indian-market-intraday-worker" AND timestamp >= "'"${TRIGGER_STARTED_AT}"'"' \
-              --project="${PROJECT_ID}" --limit=1000 --order=desc --format=json > "${RUNNER_TEMP}/backfill_verify_logs.json"
-            set +e
-            python - "${RUNNER_TEMP}/backfill_verify_logs.json" <<'PY'
+          RESPONSE="$(mktemp)"
+          trap 'rm -f "$RESPONSE"; unset TOKEN' EXIT
+          IDLE_STREAK=0
+          SAW_PARQUET=false
+          for attempt in $(seq 1 180); do
+            if [[ "${CALLER_IDENTITY}" == "SELF" ]]; then
+              TOKEN="$(gcloud auth print-identity-token --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
+            else
+              TOKEN="$(gcloud auth print-identity-token --impersonate-service-account="${CALLER_IDENTITY}" --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
+            fi
+            [[ -n "$TOKEN" ]] || { echo "ERROR=keepalive_identity_token_unavailable"; exit 1; }
+            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
+            if [[ "$CODE" != "200" ]]; then
+              echo "KEEPALIVE_STATUS_HTTP=$CODE attempt=$attempt/180"
+              sleep 30
+              continue
+            fi
+            MONITOR_CODE="$(python - "$RESPONSE" <<'PY'
           import json, sys
-          logs = json.load(open(sys.argv[1], encoding="utf-8"))
-          rendered = [json.dumps(row, sort_keys=True, default=str) for row in logs]
-          progress = [row for row in rendered if "indstocks_5m_backfill_progress" in row or "BACKFILL_PROGRESS" in row]
-          persisted = [row for row in progress if "SYMBOL_PARQUET_PERSISTED" in row]
-          failures = [row for row in rendered if "indstocks_5m_backfill_failed" in row]
-          print("BACKFILL_PROGRESS_LOG_EVENTS=" + str(len(progress)))
-          print("DURABLE_SYMBOL_PARQUET_EVENT_COUNT=" + str(len(persisted)))
-          if persisted:
-              print("DURABLE_SYMBOL_PARQUET_EVENT_EXAMPLES=" + json.dumps([row[:1200] for row in persisted[-10:]]))
-              print("BACKFILL_VERIFICATION=PASS_SYMBOL_PARQUET_UPLOAD_CONFIRMED")
-              raise SystemExit(0)
-          if failures:
-              print("BACKFILL_FAILURE_LOG_EVENT=" + failures[-1][:1500])
-              raise SystemExit(2)
-          raise SystemExit(1)
+          body = json.load(open(sys.argv[1], encoding="utf-8"))
+          state = body.get("five_minute_backfill") or {}
+          progress = state.get("progress") or {}
+          summary = {
+              "status": body.get("status"),
+              "phase": state.get("phase"),
+              "started_at_utc": state.get("started_at_utc"),
+              "updated_at_utc": state.get("updated_at_utc"),
+              "finished_at_utc": state.get("finished_at_utc"),
+              "exit_code": state.get("exit_code"),
+              "error": state.get("error"),
+              "counters": state.get("counters") or {},
+              "progress": progress,
+          }
+          print("BACKFILL_LIVE_STATE=" + json.dumps(summary, sort_keys=True, default=str), file=sys.stderr)
+          status = str(body.get("status") or "").upper()
+          stage = str(progress.get("stage") or "").upper()
+          if status in {"COMPLETED", "COMPLETED_WITH_GAPS"}:
+              print(0)
+          elif status in {"FAILED", "ERROR"}:
+              print(2)
+          elif stage == "SYMBOL_PARQUET_PERSISTED":
+              print(3)
+          elif status == "IDLE" and not state.get("started_at_utc"):
+              print(4)
+          else:
+              print(1)
           PY
-            VERIFY_CODE=$?
-            set -e
-            if [[ "${VERIFY_CODE}" -eq 0 ]]; then
-              exit 0
-            elif [[ "${VERIFY_CODE}" -eq 2 ]]; then
+            )"
+            case "$MONITOR_CODE" in
+              0) echo "BACKFILL_MONITOR=COMPLETED"; exit 0 ;;
+              2) echo "BACKFILL_MONITOR=FAILED"; exit 1 ;;
+              3) SAW_PARQUET=true; IDLE_STREAK=0; echo "DURABLE_SYMBOL_PARQUET_OBSERVED=true" ;;
+              4) IDLE_STREAK=$((IDLE_STREAK + 1)) ;;
+              *) IDLE_STREAK=0 ;;
+            esac
+            if [[ "$IDLE_STREAK" -ge 5 ]]; then
+              echo "BACKFILL_MONITOR=FAILED_THREAD_NOT_RUNNING"
               exit 1
             fi
-            echo "WAITING_FOR_SYMBOL_PARQUET_PERSISTENCE attempt=${attempt}/30"
+            if [[ "$attempt" -eq 30 && "$SAW_PARQUET" != "true" ]]; then
+              echo "BACKFILL_MONITOR=WARNING_NO_SYMBOL_PARQUET_AFTER_30_MIN"
+            fi
+            if [[ "$attempt" -ge 180 ]]; then
+              echo "BACKFILL_MONITOR=TIMEOUT"
+              exit 1
+            fi
             sleep 60
           done
-          echo "BACKFILL_VERIFICATION=FAILED_NO_SYMBOL_PARQUET_WRITE_AFTER_TRIGGER"
-          exit 1
 
 # Resume request after verifier correction: use Cloud Run persistence events; preserve all existing checkpoints.
