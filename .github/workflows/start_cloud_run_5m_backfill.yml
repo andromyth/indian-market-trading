@@ -11,6 +11,25 @@ on:
         options:
           - "no"
           - "yes"
+      end_date:
+        description: "Inclusive backfill end date in IST (a bare date means that session's 15:30 close)"
+        type: string
+        required: false
+        default: "2026-11-18"
+      replace_existing_history:
+        description: "Replace legacy bars that lack normalized date definitions (auto replaces once when the schema changes)"
+        type: choice
+        required: false
+        default: "auto"
+        options:
+          - "auto"
+          - "yes"
+          - "no"
+  # Fully automated off-hours trigger. 10:30 UTC is 16:00 IST, when the
+  # backfill window opens on NSE trading days; non-trading days are eligible
+  # all day, and the Cloud Run guard still pauses 09:15-15:59 IST.
+  schedule:
+    - cron: "30 10 * * *"
 permissions:
   contents: read
   actions: read
@@ -29,6 +48,8 @@ jobs:
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
+      BACKFILL_END_DATE: ${{ inputs.end_date || '2026-11-18' }}
+      BACKFILL_REPLACE_EXISTING: ${{ inputs.replace_existing_history || 'auto' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -210,7 +231,7 @@ jobs:
           CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
             -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            --data '{"confirm":"START_NATIVE_5M_BACKFILL"}' \
+            --data "{\"confirm\":\"START_NATIVE_5M_BACKFILL\",\"end_date\":\"${BACKFILL_END_DATE}\",\"replace_existing_history\":\"${BACKFILL_REPLACE_EXISTING}\"}" \
             --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfill")" || CODE=000
           python - "$RESPONSE" "$CODE" <<'PY'
           import json, sys

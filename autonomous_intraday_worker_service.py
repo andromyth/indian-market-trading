@@ -13,7 +13,7 @@ import os
 import resource
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -68,6 +68,7 @@ WORKER = AutonomousIntradayWorker(
 ALL_NSE_MINUTE_PREDICTOR = AllNSEMinutePredictor(WORKER_ROOT)
 BACKFILL_START_LOCK = threading.Lock()
 BACKFILL_THREAD: threading.Thread | None = None
+BACKFILL_OPTIONS: dict[str, Any] = {}
 BACKFILL_CONFIRMATION = "START_NATIVE_5M_BACKFILL"
 
 
@@ -178,6 +179,27 @@ def _backfill_start_allowed(now: datetime) -> bool:
     return (now.hour, now.minute) >= (16, 0)
 
 
+def _parse_backfill_options(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Validate optional /backfill controls sent by the scheduled workflow.
+
+    ``replace_existing_history`` accepts auto/yes/no; "auto" leaves the choice to
+    the runner, which replaces once when the history schema marker changes.
+    """
+    options: dict[str, Any] = {}
+    raw_end_date = payload.get("end_date")
+    if raw_end_date not in (None, ""):
+        try:
+            options["end_date"] = date.fromisoformat(str(raw_end_date).strip()).isoformat()
+        except (TypeError, ValueError):
+            return {}, "BACKFILL_END_DATE_INVALID"
+    raw_replace = payload.get("replace_existing_history")
+    if raw_replace is not None:
+        options["replace_existing_history"] = str(raw_replace).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    return options, None
+
+
 BACKFILL_MARKET_PAUSED = False
 
 
@@ -201,6 +223,7 @@ def _wait_for_backfill_request_slot() -> None:
 
 def _run_five_minute_backfill() -> None:
     """Run in this process to share INDstocks TOTP token cache with live capture."""
+    global BACKFILL_OPTIONS
     _reset_backfill_counters()
     _update_backfill_status(
         counters={},
@@ -224,6 +247,7 @@ def _run_five_minute_backfill() -> None:
             raise RuntimeError("INDstocks read-only credentials are not configured in Cloud Run.")
         backfill.REQUEST_GUARD = _wait_for_backfill_request_slot
         backfill.BACKFILL_PROGRESS_CALLBACK = _backfill_progress
+        backfill.RUNTIME_OPTIONS = dict(BACKFILL_OPTIONS)
         # If a transient provider/network failure outlasts the per-request retry
         # budget, rerun the job from Drive checkpoints instead of requiring a
         # manual trigger. Existing windows are skipped after integrity checks.
@@ -282,8 +306,10 @@ def _run_five_minute_backfill() -> None:
             import indstocks_backfill_all_nse_5m_history as backfill
             backfill.REQUEST_GUARD = None
             backfill.BACKFILL_PROGRESS_CALLBACK = None
+            backfill.RUNTIME_OPTIONS = {"end_date": None, "replace_existing_history": False}
         except Exception:
             pass
+        BACKFILL_OPTIONS = {}
 
 
 def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]:
@@ -926,7 +952,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self._send_json(503 if payload["status"] == "degraded" else 200, payload)
 
     def do_POST(self) -> None:  # noqa: N802
-        global BACKFILL_THREAD
+        global BACKFILL_OPTIONS, BACKFILL_THREAD
         route = self.path.rstrip("/")
         if route == "/backfill":
             try:
@@ -948,6 +974,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "status": "BACKFILL_CONFIRMATION_REQUIRED",
                     "required_confirmation": BACKFILL_CONFIRMATION,
                 })
+                return
+            options, option_error = _parse_backfill_options(request_payload)
+            if option_error:
+                self._send_json(400, {"status": option_error})
                 return
             if not BACKFILL_START_LOCK.acquire(blocking=False):
                 self._send_json(409, {"status": "BACKFILL_START_IN_PROGRESS"})
@@ -998,6 +1028,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 if not configured():
                     self._send_json(503, {"status": "INDSTOCKS_CREDENTIALS_NOT_CONFIGURED"})
                     return
+                BACKFILL_OPTIONS = options
                 BACKFILL_THREAD = threading.Thread(
                     target=_run_five_minute_backfill,
                     name="indstocks-native-5m-backfill",
@@ -1007,6 +1038,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._send_json(202, {
                     "status": "BACKFILL_STARTED",
                     "status_endpoint": "/backfillz",
+                    "end_date": options.get("end_date"),
+                    "replace_existing_history": options.get("replace_existing_history"),
                     "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; historical requests pause from 09:15 through 15:59 IST on NSE trading days and resume after 16:00, or run throughout non-trading days.",
                 })
                 return

@@ -5,8 +5,12 @@ on:
     paths:
       - "autonomous_intraday_worker_service.py"
       - "indstocks_backfill_all_nse_5m_history.py"
+      - "backfill_universe.json"
       - "tests/test_autonomous_intraday_backfill_trigger.py"
       - "tests/test_indstocks_backfill_request_guard.py"
+      - "tests/test_backfill_checkpoint_key_stability.py"
+      - "tests/test_backfill_universe_replacement.py"
+      - "tests/test_indstocks_5m_backfill.py"
       - ".github/workflows/start_cloud_run_5m_backfill.yml"
       - ".github/workflows/backfill-trigger-safety-ci.yml"
   push:
@@ -15,8 +19,12 @@ on:
     paths:
       - "autonomous_intraday_worker_service.py"
       - "indstocks_backfill_all_nse_5m_history.py"
+      - "backfill_universe.json"
       - "tests/test_autonomous_intraday_backfill_trigger.py"
       - "tests/test_indstocks_backfill_request_guard.py"
+      - "tests/test_backfill_checkpoint_key_stability.py"
+      - "tests/test_backfill_universe_replacement.py"
+      - "tests/test_indstocks_5m_backfill.py"
       - ".github/workflows/start_cloud_run_5m_backfill.yml"
       - ".github/workflows/backfill-trigger-safety-ci.yml"
 
@@ -40,4 +48,4 @@ jobs:
       - name: Compile Cloud Run worker and INDstocks backfill
         run: python -m py_compile autonomous_intraday_worker_service.py indstocks_backfill_all_nse_5m_history.py
       - name: Test controlled backfill trigger and request guard
-        run: python -m pytest -q tests/test_autonomous_intraday_backfill_trigger.py tests/test_indstocks_backfill_request_guard.py
+        run: python -m pytest -q tests/test_autonomous_intraday_backfill_trigger.py tests/test_indstocks_backfill_request_guard.py tests/test_backfill_checkpoint_key_stability.py tests/test_backfill_universe_replacement.py tests/test_indstocks_5m_backfill.py

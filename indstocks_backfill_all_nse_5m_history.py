@@ -48,6 +48,20 @@ LIVE_REMOTE_ROOT = "production_data/nse_official/intraday_5m_live"
 REQUEST_GUARD = None
 BACKFILL_PROGRESS_CALLBACK = None
 
+# Authoritative owner-supplied roster for this backfill exercise.
+PINNED_UNIVERSE_FILENAME = "backfill_universe.json"
+# Bumping either constant invalidates previously written window checkpoints so
+# bars collected before explicit date definitions existed are re-fetched once.
+CHECKPOINT_SCHEMA_VERSION = "indstocks-5m-date-def-v2-2026-11-19"
+HISTORY_SCHEMA = "indstocks_5m_completed_close_ist_v2"
+
+# Defaults supplied by the Cloud Run /backfill request payload. Explicit CLI
+# arguments still win; these matter because the worker calls main([]).
+RUNTIME_OPTIONS: dict[str, Any] = {
+    "end_date": None,
+    "replace_existing_history": False,
+}
+
 
 def normalize_indstocks_5m(frame: pd.DataFrame | None, cutoff: pd.Timestamp | None = None) -> pd.DataFrame:
     """Convert INDstocks candle-open timestamps into completed five-minute bar closes."""
@@ -134,6 +148,65 @@ def _align_to_monday(value: datetime) -> datetime:
     stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
     stamp = stamp.normalize() - pd.Timedelta(days=stamp.weekday())
     return stamp.to_pydatetime()
+
+
+def _checkpoint_key(symbols: list[str] | set[str]) -> str:
+    """Stable checkpoint folder key scoped to the current date-definition schema."""
+    payload = "|".join(sorted(str(symbol) for symbol in symbols)) + "|" + CHECKPOINT_SCHEMA_VERSION
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def _pinned_universe() -> list[str]:
+    """Load the owner-supplied 500-symbol roster shipped with the worker image."""
+    path = Path(__file__).with_name(PINNED_UNIVERSE_FILENAME)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    values = data.get("symbols") if isinstance(data, dict) else data
+    if not isinstance(values, list):
+        return []
+    return sorted({
+        str(value).strip().upper().replace(".NS", "").replace(".BO", "")
+        for value in values if str(value).strip()
+    })
+
+
+def merge_symbol_history(
+    existing: pd.DataFrame | None,
+    fetched: pd.DataFrame | None,
+    *,
+    fetched_wins: bool,
+) -> pd.DataFrame:
+    """Merge archive and provider frames; keep the last duplicate for the winning source."""
+    frames = [
+        frame for frame in ((existing, fetched) if fetched_wins else (fetched, existing))
+        if frame is not None and not frame.empty
+    ]
+    if not frames:
+        return pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
+    merged = pd.concat(frames).sort_index()
+    merged = merged.loc[~merged.index.duplicated(keep="last")]
+    return merged[OHLCV].sort_index()
+
+
+def _download_manifest_json(store: Any, local_root: Path) -> dict[str, Any]:
+    """Read the previous manifest to detect a date-definition schema change."""
+    item = _resolve_remote_file(store, MANIFEST_REMOTE)
+    if not item:
+        return {}
+    local = local_root / "backfill_manifest.prior.json"
+    try:
+        from persistent_store import download_drive_file_with_retry
+        download_drive_file_with_retry(
+            store.service, item["id"], local, operation="backfill_manifest_download"
+        )
+        data = json.loads(local.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _recent_incomplete_session_dates(
@@ -327,7 +400,7 @@ def fetch_indstocks_5m_batch(
     from indstocks_client import _request
 
     symbols_by_code = {code: symbol for symbol, code in symbols_and_codes}
-    batch_key = hashlib.sha1("|".join(sorted(symbols_by_code.values())).encode()).hexdigest()[:16]
+    batch_key = _checkpoint_key(list(symbols_by_code.values()))
     # Checkpoints written before FULL_BATCH_V2 were keyed by the *active* subset
     # (symbols not yet complete), so the folder changed whenever a peer finished.
     # New checkpoints are keyed by the full five-symbol group. Old folders stay
@@ -335,7 +408,7 @@ def fetch_indstocks_5m_batch(
     full_symbols = sorted(symbols_by_code.values())
     legacy_symbols = sorted(set(active_symbols or ()) & set(full_symbols))
     legacy_key = (
-        hashlib.sha1("|".join(legacy_symbols).encode()).hexdigest()[:16]
+        _checkpoint_key(legacy_symbols)
         if legacy_symbols and legacy_symbols != full_symbols else None
     )
     accumulated: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol, _ in symbols_and_codes}
@@ -644,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minimum-symbol-coverage", type=float, default=0.90)
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--symbols", default="")
+    parser.add_argument("--replace-existing-history", action="store_true")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--work-root", default="/tmp/nse_5m_indstocks_backfill")
     args = parser.parse_args(argv)
@@ -661,6 +735,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.pause_seconds < 0.20:
         raise ValueError("INDstocks Data API is limited to five requests/second; pause must be at least 0.20s.")
 
+    raw_runtime_replace = RUNTIME_OPTIONS.get("replace_existing_history")
+    runtime_replace = (
+        raw_runtime_replace
+        if isinstance(raw_runtime_replace, bool)
+        else str(raw_runtime_replace).strip().lower() in {"1", "true", "yes", "on"}
+    )
+    replace_history = bool(args.replace_existing_history or runtime_replace)
+
     from indstocks_client import configured
     from delivery_training_universe import official_nse_symbols
     from persistent_store import GoogleDriveStore, drive_status
@@ -676,11 +758,18 @@ def main(argv: list[str] | None = None) -> int:
             value.strip().upper().replace(".NS", "").replace(".BO", "")
             for value in args.symbols.split(",") if value.strip()
         })
+        universe_source = "CLI_SYMBOLS"
     else:
-        symbols = sorted({
-            str(value).strip().upper().replace(".NS", "").replace(".BO", "")
-            for value in official_nse_symbols(force_refresh=True) if str(value).strip()
-        })
+        pinned_symbols = _pinned_universe()
+        if pinned_symbols:
+            symbols = pinned_symbols
+            universe_source = "PINNED_BACKFILL_UNIVERSE"
+        else:
+            symbols = sorted({
+                str(value).strip().upper().replace(".NS", "").replace(".BO", "")
+                for value in official_nse_symbols(force_refresh=True) if str(value).strip()
+            })
+            universe_source = "OFFICIAL_NSE_EQUITY"
     if args.max_symbols > 0:
         symbols = symbols[:args.max_symbols]
     if not symbols:
@@ -695,8 +784,18 @@ def main(argv: list[str] | None = None) -> int:
     if not resolvable:
         raise RuntimeError("INDstocks instrument master did not resolve any official NSE equity symbols.")
 
-    if args.end_date:
-        end = pd.Timestamp(args.end_date, tz=IST).to_pydatetime()
+    raw_end_date = (args.end_date or str(RUNTIME_OPTIONS.get("end_date") or "")).strip()
+    if raw_end_date:
+        end_stamp = pd.Timestamp(raw_end_date)
+        end_stamp = (
+            end_stamp.tz_localize(IST)
+            if end_stamp.tzinfo is None
+            else end_stamp.tz_convert(IST)
+        )
+        # A bare calendar date means that session's 15:30 IST close, never midnight.
+        if len(raw_end_date) <= 10 and end_stamp.hour == 0 and end_stamp.minute == 0:
+            end_stamp = end_stamp.replace(hour=15, minute=30)
+        end = end_stamp.to_pydatetime()
     else:
         now = datetime.now(IST)
         # The Cloud Run request may arrive during market hours and wait until
@@ -708,6 +807,9 @@ def main(argv: list[str] | None = None) -> int:
     local_root = Path(args.work_root)
     local_root.mkdir(parents=True, exist_ok=True)
     store = GoogleDriveStore()
+    if not replace_history:
+        prior_manifest = _download_manifest_json(store, local_root)
+        replace_history = str(prior_manifest.get("history_schema") or "") != HISTORY_SCHEMA
     results: list[dict[str, Any]] = list(resolution_errors)
     total_api_calls = 0
     live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
@@ -753,23 +855,27 @@ def main(argv: list[str] | None = None) -> int:
         for symbol, code in batch:
             remote = f"{REMOTE_ROOT}/symbol={symbol}/{symbol}.parquet"
             local = local_root / f"symbol={symbol}" / f"{symbol}.existing.parquet"
-            existing = _download_existing(store, remote, local)
-            # Merge Kaggle primary history before deciding what INDstocks must
-            # backfill. The two sources remain in separate Drive files.
-            kaggle_remote = (
-                f"{REMOTE_ROOT}/symbol={symbol}/source=KAGGLE/"
-                f"{symbol}_kaggle_5m.parquet"
-            )
-            kaggle_local = local.with_name(f"{symbol}.kaggle.parquet")
-            kaggle = _download_existing(store, kaggle_remote, kaggle_local)
-            kaggle_seed_rows = int(len(kaggle))
             live = live_history.get(symbol, pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST)))
             # The current batch is the only live-history slice retained in memory.
             live_rows = int(len(live))
-            existing_parts = [frame for frame in (existing, kaggle, live) if frame is not None and not frame.empty]
-            if existing_parts:
-                existing = pd.concat(existing_parts).sort_index()
-                existing = existing.loc[~existing.index.duplicated(keep="last")]
+            if replace_history:
+                # Rebuild from provider history plus durable live captures. The
+                # previous archive (including any legacy Kaggle rows) is not read,
+                # so corrected date definitions are never shadowed by old bars.
+                existing = live
+            else:
+                archive = _download_existing(store, remote, local)
+                existing_parts = [
+                    frame for frame in (archive, live)
+                    if frame is not None and not frame.empty
+                ]
+                if existing_parts:
+                    existing = pd.concat(existing_parts).sort_index()
+                    existing = existing.loc[~existing.index.duplicated(keep="last")]
+                else:
+                    existing = archive
+            # Kaggle seeds remain in their own Drive files and are excluded from
+            # this INDstocks backfill by design.
             existing_by_symbol[symbol] = existing
             summary = usable_session_summary(existing, args.minimum_bars_per_session)
             latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
@@ -779,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
                 lookback_days=args.recent_session_lookback_days,
                 expected_bars=args.minimum_bars_per_session,
             )
-            is_complete = (
+            is_complete = (not replace_history) and (
                 int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
                 and pd.notna(latest)
                 and latest >= pd.Timestamp(end) - pd.Timedelta(days=FRESHNESS_WINDOW_DAYS)
@@ -792,7 +898,6 @@ def main(argv: list[str] | None = None) -> int:
                     "source": "INDSTOCKS_HISTORICAL_5M",
                     "remote_path": remote,
                     "rows": int(len(existing)),
-                    "kaggle_seed_rows": kaggle_seed_rows,
                     "live_history_rows": live_rows,
                     "recent_incomplete_session_dates": recent_gaps,
                     "usable_sessions": int(summary["usable_sessions"]),
@@ -802,7 +907,9 @@ def main(argv: list[str] | None = None) -> int:
                 })
                 continue
             active_batch.append((symbol, code))
-            if (
+            if replace_history:
+                starts[symbol] = initial_start
+            elif (
                 recent_gaps
                 and int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
                 and pd.notna(latest)
@@ -863,11 +970,10 @@ def main(argv: list[str] | None = None) -> int:
             if not fetched.empty:
                 cutoff = pd.Timestamp.now(tz=IST).floor("5min")
                 fetched = fetched.loc[fetched.index <= cutoff].sort_index()
-            # Existing coverage (Kaggle primary, then live capture) wins on duplicate timestamps;
-            # INDstocks supplies only timestamps not already present in the saved sources.
-            parts = [frame for frame in (fetched, existing) if frame is not None and not frame.empty]
-            merged = pd.concat(parts).sort_index() if parts else pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=IST))
-            merged = merged.loc[~merged.index.duplicated(keep="last")]
+            # Replacement runs let freshly fetched provider bars win so corrected
+            # date definitions overwrite legacy rows. Normal runs preserve the
+            # previous archive/live coverage on duplicate timestamps.
+            merged = merge_symbol_history(existing, fetched, fetched_wins=replace_history)
             merged = retain_latest_sessions(merged, args.sessions, args.minimum_bars_per_session)
             summary = usable_session_summary(merged, args.minimum_bars_per_session)
             latest = pd.to_datetime(summary.get("last_timestamp_ist"), errors="coerce")
@@ -913,7 +1019,6 @@ def main(argv: list[str] | None = None) -> int:
                 "remote_path": remote,
                 "rows": int(len(merged)),
                 "fetched_rows": int(len(fetched)),
-                "kaggle_seed_rows": kaggle_seed_rows,
                 "live_history_rows": live_rows,
                 "recent_incomplete_session_dates": recent_gaps,
                 "remaining_recent_incomplete_session_dates": remaining_recent_gaps,
@@ -952,6 +1057,11 @@ def main(argv: list[str] | None = None) -> int:
         "audit": "nse_native_five_minute_historical_backfill",
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "INDSTOCKS_HISTORICAL_5M_BATCH_API",
+        "history_schema": HISTORY_SCHEMA,
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "replace_existing_history": replace_history,
+        "universe_source": universe_source,
+        "kaggle_excluded_from_backfill": True,
         "bar_interval_minutes": 5,
         "timestamp_convention": "provider_candle_start_plus_5_minutes_as_bar_close",
         "maximum_instruments_per_request": MAX_CODES_PER_REQUEST,

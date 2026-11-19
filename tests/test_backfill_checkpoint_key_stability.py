@@ -17,7 +17,8 @@ WINDOW_KEY = "20261026T0000_20261102T0000"
 
 
 def _key(symbols):
-    return hashlib.sha1("|".join(sorted(symbols)).encode()).hexdigest()[:16]
+    payload = "|".join(sorted(symbols)) + "|" + backfill.CHECKPOINT_SCHEMA_VERSION
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
 class Store:
