@@ -35,6 +35,9 @@ from dhan_backfill_all_nse_5m_history import (
     usable_session_summary,
 )
 
+BATCH_PROGRESS_REMOTE = "production_data/nse_official/intraday_seed/olo_5m_archive/backfill_batch_progress.json"
+
+
 IST = ZoneInfo("Asia/Kolkata")
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 MAX_CODES_PER_REQUEST = 5
@@ -740,6 +743,39 @@ def fetch_indstocks_5m_batch(
     return result, calls
 
 
+def _load_batch_progress(store: Any) -> set[int]:
+    """Return batch numbers already fully completed and persisted on Drive."""
+    local = Path("/tmp/nse_5m_batch_progress.json")
+    try:
+        item = _resolve_remote_file(store, BATCH_PROGRESS_REMOTE)
+    except Exception:
+        return set()
+    if not item:
+        return set()
+    try:
+        download_drive_file_with_retry(store.service, item["id"], local, operation="batch_progress_download")
+        data = json.loads(local.read_text(encoding="utf-8"))
+        return {int(x) for x in data.get("completed_batches", []) if str(x).isdigit()}
+    except Exception:
+        return set()
+
+
+def _save_batch_progress(store: Any, completed: set[int]) -> None:
+    """Persist the set of completed batch numbers so restarts skip them."""
+    local = Path("/tmp/nse_5m_batch_progress.json")
+    local.write_text(
+        json.dumps(
+            {"completed_batches": sorted(completed),
+             "updated_at_utc": datetime.now(timezone.utc).isoformat()},
+            indent=2, sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    uploaded = store.upload_or_update(local, BATCH_PROGRESS_REMOTE, mime_type="application/json")
+    if str(uploaded.get("status") or "").upper() != "OK":
+        print("BACKFILL_BATCH_PROGRESS_UPLOAD_FAILED " + str(uploaded), flush=True)
+
+
 def _write_manifest(store: Any, root: Path, report: dict[str, Any]) -> None:
     path = root / "backfill_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -858,9 +894,24 @@ def main(argv: list[str] | None = None) -> int:
     total_api_calls = 0
     live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
+    completed_batches = _load_batch_progress(store)
     live_file_listing_cache: dict[str, list[dict[str, Any]]] = {}
 
     for batch_no, batch in enumerate(batches, start=1):
+        if batch_no in completed_batches:
+            print("BACKFILL_BATCH_SKIPPED batch=%d completed_symbols=%d" % (
+                batch_no, min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable))
+            ), flush=True)
+            if callable(BACKFILL_PROGRESS_CALLBACK):
+                BACKFILL_PROGRESS_CALLBACK({
+                    "provider": "INDSTOCKS", "batch": batch_no,
+                    "total_batches": len(batches),
+                    "completed_symbols": min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable)),
+                    "resolved_symbols": len(resolvable),
+                    "api_calls": total_api_calls,
+                    "skipped_batch": True,
+                })
+            continue
         if callable(REQUEST_GUARD):
             REQUEST_GUARD()
         # Load recent live captures only for the current <=5-symbol API batch.
@@ -1092,6 +1143,12 @@ def main(argv: list[str] | None = None) -> int:
             pass
         if callable(BACKFILL_PROGRESS_CALLBACK):
             BACKFILL_PROGRESS_CALLBACK(progress)
+
+        batch_symbols = {symbol for symbol, _ in batch}
+        batch_rows = [row for row in results if row.get("symbol") in batch_symbols]
+        if batch_rows and all(row.get("status") != "ERROR" for row in batch_rows):
+            completed_batches.add(batch_no)
+            _save_batch_progress(store, completed_batches)
 
     results.sort(key=lambda row: row["symbol"])
     ready = [row for row in results if row.get("status") in {"OK", "SKIPPED_EXISTING"} and row.get("fresh_latest_data") is True]
