@@ -54,6 +54,15 @@ jobs:
             | grep -aE "BACKFILL_PROGRESS|BACKFILL_MANIFEST|BACKFILL_JOB|SYMBOL_PARQUET|CHUNK|STOPPED|Traceback|ERROR" \
             | tail -n 25 || true
 
+      - name: Raw recent job log lines
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\" AND labels.\"run.googleapis.com/execution_name\"=\"native-5m-backfill-4mrlh\"" \
+            --project="$PROJECT_ID" --limit=80 --order=desc \
+            --format='value(timestamp,textPayload)' 2>/dev/null | tail -n 60 || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
