@@ -59,9 +59,9 @@ jobs:
         run: |
           set -uo pipefail
           gcloud logging read \
-            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\" AND labels.\"run.googleapis.com/execution_name\"=\"native-5m-backfill-4mrlh\"" \
-            --project="$PROJECT_ID" --limit=80 --order=desc \
-            --format='value(timestamp,textPayload)' 2>/dev/null | tail -n 60 || true
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=200 --order=desc \
+            --format='value(timestamp,textPayload)' 2>/dev/null | tail -n 120 || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
