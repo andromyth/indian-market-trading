@@ -39,10 +39,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          IMAGE="gcr.io/$PROJECT_ID/native-5m-backfill:$GITHUB_SHA"
+          gcloud builds submit \
+            --project="$PROJECT_ID" \
+            --config=cloudbuild-backfill-job.yaml \
+            --substitutions="_IMAGE=$IMAGE" \
+            .
           gcloud run jobs deploy "$JOB" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
-            --source . \
+            --image="$IMAGE" \
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --cpu 4 --memory 8Gi --task-timeout 1800 --max-retries 0 \
             --command python --args="-u,backfill_job.py" \
