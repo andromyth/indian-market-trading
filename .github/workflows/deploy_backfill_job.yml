@@ -1,0 +1,91 @@
+name: Deploy and start native 5m backfill job
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-native-5m-backfill-job
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+      END_DATE: "2026-11-18"
+      IMAGE_REPO: asia-south1-docker.pkg.dev/indian-market-trading/cloud-run-source-deploy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Build and deploy full job
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$IMAGE_REPO/native-5m-backfill:$GITHUB_SHA"
+          echo "FULL_JOB_IMAGE=$IMAGE"
+          if ! gcloud builds submit \
+            --project="$PROJECT_ID" \
+            --config=cloudbuild-backfill-job.yaml \
+            --substitutions="_IMAGE=$IMAGE" \
+            . ; then
+            echo "CLOUD_BUILD_FAILED"
+            BUILD_ID="$(gcloud builds list --project="$PROJECT_ID" --limit=1 --format='value(id)')"
+            echo "CLOUD_BUILD_FAILED_ID=$BUILD_ID"
+            gcloud builds log "$BUILD_ID" --project="$PROJECT_ID" 2>&1 | tail -n 80 || true
+            exit 1
+          fi
+          gcloud run jobs deploy "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="$IMAGE" \
+            --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+            --cpu 4 --memory 8Gi --task-timeout 61200 --max-retries 1 \
+            --command python --args="-u,backfill_job.py" \
+            --set-env-vars "INDSTOCKS_AUTH_MODE=totp,BACKFILL_END_DATE=$END_DATE" \
+            --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest,INDSTOCKS_CLIENT_ID=indstocks-client-id:latest,INDSTOCKS_MPIN=indstocks-mpin:latest,INDSTOCKS_TOTP_SECRET=indstocks-totp-secret:latest"
+          gcloud run jobs describe "$JOB" --project="$PROJECT_ID" --region="$REGION" \
+            --format='yaml(spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.timeoutSeconds,spec.template.spec.template.spec.maxRetries,spec.template.spec.template.spec.serviceAccountName)'
+
+      - name: Start the backfill execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXECUTION="$(gcloud run jobs execute "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --format='value(name)')"
+          echo "BACKFILL_EXECUTION=$EXECUTION"
+          gcloud run jobs executions describe "$EXECUTION" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --format='yaml(name,status.startTime,status.completionTime,status.conditions)'
+
+      - name: Show first log lines
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          sleep 20
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=40 --order=asc \
+            --format='value(textPayload)' 2>/dev/null \
+            | grep -aE "BACKFILL_|Traceback|ERROR|Error|FAILED|STOPPED" || true
