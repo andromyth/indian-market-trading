@@ -7,7 +7,7 @@ on:
         description: "dry_run to list, delete to wipe the archive contents"
         required: true
         type: choice
-        options: [dry_run, delete]
+        options: [dry_run, delete, seed]
         default: dry_run
       confirm:
         description: "Type DELETE_ENTIRE_5M_ARCHIVE to allow delete"
@@ -34,10 +34,12 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet google-api-python-client google-auth
           python - <<'PY'
-          import json, os, sys
+          import io, json, os, sys
+          from datetime import datetime, timezone
           from google.oauth2.credentials import Credentials
           from google.auth.transport.requests import Request
           from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseUpload
 
           mode = os.environ.get("MODE", "dry_run")
           confirm = os.environ.get("CONFIRM", "")
@@ -87,6 +89,26 @@ jobs:
           ]
           print("CLEAN_ARCHIVE_PATH=production_data/nse_official/intraday_seed/olo_5m_archive")
           print("CLEAN_ROOT_INVENTORY=" + json.dumps(inventory, sort_keys=True))
+          if mode == "seed":
+              for item in root:
+                  if item["name"] == "backfill_manifest.json":
+                      service.files().delete(fileId=item["id"]).execute(num_retries=3)
+              payload = {
+                  "history_schema": "indstocks_5m_completed_close_ist_v2",
+                  "checkpoint_schema_version": "indstocks-5m-date-def-v2-2026-11-19",
+                  "seeded_after_clean_utc": datetime.now(timezone.utc).isoformat(),
+                  "note": "Seeded fresh after wiping the archive so nightly runs resume instead of replacing every night.",
+              }
+              data = json.dumps(payload, sort_keys=True).encode("utf-8")
+              created = service.files().create(
+                  body={"name": "backfill_manifest.json", "parents": [archive_id]},
+                  media_body=MediaIoBaseUpload(io.BytesIO(data), mimetype="application/json", resumable=False),
+                  fields="id,name,size",
+              ).execute(num_retries=3)
+              print("CLEAN_SEEDED_MANIFEST_ID=" + created["id"])
+              print("CLEAN_SEEDED_HISTORY_SCHEMA=" + payload["history_schema"])
+              print("CLEAN_RESULT=SEEDED_MANIFEST")
+              sys.exit(0)
           if mode != "delete":
               print("CLEAN_RESULT=DRY_RUN_ENTIRE_ARCHIVE")
               sys.exit(0)
