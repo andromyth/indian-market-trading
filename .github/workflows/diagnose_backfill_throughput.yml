@@ -1,0 +1,44 @@
+name: Diagnose native 5m backfill throughput (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Count retries and show recent events
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --freshness=3h --limit=2000 --order=desc \
+            --format='value(timestamp,textPayload)' > /tmp/joblogs.txt 2>/dev/null || true
+          echo "LINES=$(wc -l < /tmp/joblogs.txt)"
+          for pat in indstocks_backfill_request_retry indstocks_backfill_request_failed google_drive_retry BACKFILL_PROGRESS; do
+            echo "COUNT $pat = $(grep -c "$pat" /tmp/joblogs.txt || true)"
+          done
+          echo "=== last retries ==="
+          grep -aE "indstocks_backfill_request_retry|google_drive_retry|request_failed" /tmp/joblogs.txt | head -n 20 || true
+          echo "=== last progress ==="
+          grep -aE "BACKFILL_PROGRESS|BACKFILL_JOB_START" /tmp/joblogs.txt | head -n 10 || true
