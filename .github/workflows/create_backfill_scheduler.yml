@@ -15,7 +15,7 @@ jobs:
       REGION: asia-south1
       JOB: native-5m-backfill
       SCHED: native-5m-backfill-daily
-      TRIGGER_SA: google-service-account-json@indian-market-trading.iam.gserviceaccount.com
+      TRIGGER_SA: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
