@@ -1,0 +1,41 @@
+name: Diagnose failed backfill execution (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+      EXEC: native-5m-backfill-84s5k
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Execution error details
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "=== EXECUTION DESCRIBE ==="
+          gcloud run jobs executions describe "$EXEC" --project="$PROJECT_ID" --region="$REGION" --format=json 2>&1 | head -c 4000 || true
+          echo
+          echo "=== ALL JOB LOGS (last 400, any severity) ==="
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\" AND labels.\"run.googleapis.com/execution_name\"=\"$EXEC\"" \
+            --project="$PROJECT_ID" --limit=400 --order=desc \
+            --format='value(timestamp,severity,textPayload)' 2>/dev/null || true
