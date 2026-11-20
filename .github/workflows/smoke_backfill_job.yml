@@ -20,6 +20,7 @@ jobs:
       REGION: asia-south1
       JOB: native-5m-backfill
       END_DATE: "2026-11-18"
+      IMAGE_REPO: asia-south1-docker.pkg.dev/indian-market-trading/cloud-run-source-deploy
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -39,12 +40,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="gcr.io/$PROJECT_ID/native-5m-backfill:$GITHUB_SHA"
-          gcloud builds submit \
+          IMAGE="$IMAGE_REPO/native-5m-backfill:$GITHUB_SHA"
+          echo "SMOKE_IMAGE=$IMAGE"
+          if ! gcloud builds submit \
             --project="$PROJECT_ID" \
             --config=cloudbuild-backfill-job.yaml \
             --substitutions="_IMAGE=$IMAGE" \
-            .
+            . ; then
+            echo "CLOUD_BUILD_FAILED"
+            BUILD_ID="$(gcloud builds list --project="$PROJECT_ID" --limit=1 --format='value(id)')"
+            echo "CLOUD_BUILD_FAILED_ID=$BUILD_ID"
+            gcloud builds log "$BUILD_ID" --project="$PROJECT_ID" 2>&1 | tail -n 80 || true
+            exit 1
+          fi
           gcloud run jobs deploy "$JOB" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
