@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import indstocks_backfill_all_nse_5m_history as runner
+import indstocks_client
 
 IST = ZoneInfo("Asia/Kolkata")
 JOB_NAME = "native-5m-backfill"
+TOKEN_COOLDOWN_MAX_RETRIES = 5
 STOP_AT_IST = (8, 30)
 NEXT_WINDOW_IST = (16, 0)
 
@@ -97,13 +100,35 @@ def main() -> int:
         return 3
 
     runner.REQUEST_GUARD = _guard_request_slot
-    try:
-        code = runner.main(_args(smoke))
-    except BackfillStop as exc:
-        print("BACKFILL_JOB_STOPPED_RESUMABLE " + str(exc), flush=True)
-        return 0
-    except Exception:
+    last_exc = None
+    for attempt in range(1, TOKEN_COOLDOWN_MAX_RETRIES + 1):
+        try:
+            code = runner.main(_args(smoke))
+        except BackfillStop as exc:
+            print("BACKFILL_JOB_STOPPED_RESUMABLE " + str(exc), flush=True)
+            return 0
+        except RuntimeError as exc:
+            msg = str(exc)
+            is_token_cooldown = (
+                "token generation" in msg
+                or "cooling down" in msg
+                or "suppressed for" in msg
+            )
+            if is_token_cooldown and attempt < TOKEN_COOLDOWN_MAX_RETRIES:
+                last_exc = exc
+                wait_s = int(indstocks_client.TOKEN_GENERATION_FAILURE_COOLDOWN_SECONDS) + 5
+                print(
+                    "BACKFILL_TOKEN_COOLDOWN_RETRY attempt=%d/%d waiting %ds "
+                    % (attempt, TOKEN_COOLDOWN_MAX_RETRIES, wait_s),
+                    flush=True,
+                )
+                time.sleep(wait_s)
+                continue
+            traceback.print_exc()
+            return 1
+    if last_exc is not None:
         traceback.print_exc()
+        print("BACKFILL_TOKEN_COOLDOWN_EXHAUSTED " + str(last_exc), flush=True)
         return 1
 
     if code == 2:
