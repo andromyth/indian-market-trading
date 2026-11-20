@@ -1,0 +1,65 @@
+name: Diagnose Cloud Build failure for backfill job image (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROJECT_ID: indian-market-trading
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Show default build service account
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud builds get-default-service-account --project="$PROJECT_ID" 2>&1 || true
+          gcloud builds describe 7766dedc-133d-4da4-acb0-b8e963a447d4             --project="$PROJECT_ID" --format=json > /tmp/build.json 2>/tmp/build.err || true
+          python - <<'PY'
+          import json
+          try:
+              b=json.load(open("/tmp/build.json",encoding="utf-8"))
+          except Exception as exc:
+              print("BUILD_DESCRIBE_ERROR", exc)
+              print(open("/tmp/build.err",encoding="utf-8").read()[:2000] if __import__("os").path.exists("/tmp/build.err") else "")
+              raise SystemExit(0)
+          print("BUILD_STATUS="+json.dumps(b.get("status")))
+          print("BUILD_STATUS_DETAIL="+json.dumps(b.get("statusDetail")))
+          print("BUILD_SERVICE_ACCOUNT="+json.dumps(b.get("serviceAccount")))
+          print("BUILD_FAILURE_INFO="+json.dumps(b.get("failureInfo")))
+          for i,step in enumerate(b.get("steps") or []):
+              print(f"STEP[{i}] name={step.get('name')} status={step.get('status')} exitCode={step.get('exitCode')}")
+          print("BUILD_LOG_URL="+str(b.get("logUrl")))
+          PY
+
+      - name: Show Cloud Build log tail
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud builds log 7766dedc-133d-4da4-acb0-b8e963a447d4 --project="$PROJECT_ID" 2>&1 | tail -n 120
+
+      - name: Show build SA IAM roles
+        shell: bash
+        run: |
+          set -uo pipefail
+          for SA in cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com; do
+            echo "=== $SA"
+            gcloud iam service-accounts get-iam-policy "$SA" --project="$PROJECT_ID" --format=json 2>&1 | head -c 3000 || true
+          done
+          echo "=== PROJECT ROLE BINDINGS FOR BUILD SAs"
+          gcloud projects get-iam-policy "$PROJECT_ID"             --flatten="bindings[].members"             --filter="bindings.members:cloud-run-source-builder OR bindings.members:cloudbuild"             --format='table(bindings.role,bindings.members)' 2>&1 | head -n 60 || true
