@@ -120,7 +120,7 @@ jobs:
               raise SystemExit(0)
 
           symbols_folder = child(archive, "symbols")
-          checkpoint_folder = child(symbols_folder, "window_checkpoints") if symbols_folder else None
+          checkpoint_folder = child(symbols_folder["id"], "window_checkpoints") if symbols_folder else None
           symbol_dirs = list_all(symbols_folder["id"]) if symbols_folder else []
           symbol_parquets = 0
           symbol_bytes = 0
