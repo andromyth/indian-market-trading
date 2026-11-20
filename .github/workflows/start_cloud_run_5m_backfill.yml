@@ -280,7 +280,7 @@ jobs:
           STALL_STREAK=0
           LAST_UPDATED=""
           SAW_PARQUET=false
-          for attempt in $(seq 1 350); do
+          for attempt in $(seq 1 330); do
             if [[ "${CALLER_IDENTITY}" == "SELF" ]]; then
               TOKEN="$(gcloud auth print-identity-token --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
             else
@@ -291,7 +291,7 @@ jobs:
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
               --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
             if [[ "$CODE" != "200" ]]; then
-              echo "KEEPALIVE_STATUS_HTTP=$CODE attempt=$attempt/350"
+              echo "KEEPALIVE_STATUS_HTTP=$CODE attempt=$attempt/330"
               sleep 30
               continue
             fi
@@ -351,7 +351,7 @@ jobs:
             if [[ "$attempt" -eq 30 && "$SAW_PARQUET" != "true" ]]; then
               echo "BACKFILL_MONITOR=WARNING_NO_SYMBOL_PARQUET_AFTER_30_MIN"
             fi
-            if [[ "$attempt" -ge 350 ]]; then
+            if [[ "$attempt" -ge 330 ]]; then
               echo "BACKFILL_MONITOR=TIMEOUT"
               exit 1
             fi
