@@ -42,7 +42,7 @@ jobs:
           set -uo pipefail
           for ex in $(gcloud run jobs executions list --job="$JOB" \
             --project="$PROJECT_ID" --region="$REGION" --format='value(name)'); do
-            gcloud run jobs executions cancel "$ex" --job="$JOB" \
+            gcloud run jobs executions cancel "$ex" \
               --project="$PROJECT_ID" --region="$REGION" --quiet || true
           done
 
