@@ -52,8 +52,10 @@ _INSTRUMENTS_LOCK = threading.Lock()
 
 
 def _is_cloud_run_owner() -> bool:
-    """Only the production market-data Cloud Run service may access INDstocks."""
-    return os.getenv("K_SERVICE", "").strip() == "indian-market-intraday-worker"
+    """Only the production service or the dedicated backfill job may access INDstocks."""
+    service = os.getenv("K_SERVICE", "").strip()
+    job = os.getenv("CLOUD_RUN_JOB", "").strip()
+    return service == "indian-market-intraday-worker" or job == "native-5m-backfill"
 
 
 def _setting(name: str, default: str | None = None) -> str | None:

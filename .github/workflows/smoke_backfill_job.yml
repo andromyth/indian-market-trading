@@ -1,0 +1,74 @@
+name: Smoke test native 5m backfill job
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: smoke-native-5m-backfill-job
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+      END_DATE: "2026-11-18"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Deploy smoke job
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run jobs deploy "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --source . \
+            --build-service-account "projects/$PROJECT_ID/serviceAccounts/cloud-run-source-builder@$PROJECT_ID.iam.gserviceaccount.com" \
+            --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+            --cpu 4 --memory 8Gi --task-timeout 1800 --max-retries 0 \
+            --command python --args="-u,backfill_job.py" \
+            --set-env-vars "INDSTOCKS_AUTH_MODE=totp,BACKFILL_SMOKE=1,BACKFILL_END_DATE=$END_DATE" \
+            --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest,INDSTOCKS_CLIENT_ID=indstocks-client-id:latest,INDSTOCKS_MPIN=indstocks-mpin:latest,INDSTOCKS_TOTP_SECRET=indstocks-totp-secret:latest"
+
+      - name: Execute smoke job
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run jobs execute "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --wait
+
+      - name: Show smoke job logs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud run jobs executions list \
+            --job="$JOB" --project="$PROJECT_ID" --region="$REGION" \
+            --limit=1 --format='yaml(name,status)' || true
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=400 --order=asc \
+            --format='value(textPayload)' 2>/dev/null \
+            | grep -aE "BACKFILL_|SYMBOL_PARQUET|CHUNK|Traceback|ERROR|Error|FAILED|SMOKE|INVALID|Unrecognized|not configured|permission" || true
