@@ -415,6 +415,22 @@ def fetch_indstocks_5m_batch(
     cursor = start
     calls = 0
     last_request_started = 0.0
+    # List the batch checkpoint folder once per batch. Resolving each window
+    # against Drive individually multiplied API calls by the window count.
+    checkpoint_folder_id: str | None = None
+    checkpoint_folder_items: dict[str, dict[str, Any]] = {}
+    if store is not None and checkpoint_root is not None:
+        list_folder = getattr(store, "list_folder", None)
+        ensure_path = getattr(store, "ensure_path", None)
+        if callable(list_folder) and callable(ensure_path):
+            checkpoint_folder_remote = f"{REMOTE_ROOT}/window_checkpoints/{batch_key}"
+            checkpoint_folder_id = ensure_path(
+                checkpoint_folder_remote, service=store._get_write_service()
+            )
+            checkpoint_folder_items = {
+                str(item.get("name") or ""): item
+                for item in list_folder(checkpoint_folder_id)
+            }
     while cursor < end:
         window_end = min(end, cursor + timedelta(days=MAX_DAYS_PER_REQUEST))
         window_key = f"{cursor:%Y%m%dT%H%M}_{window_end:%Y%m%dT%H%M}"
@@ -423,8 +439,12 @@ def fetch_indstocks_5m_batch(
         checkpoint_manifest_remote = checkpoint_remote + ".json"
         checkpoint_manifest_local = checkpoint_local.with_suffix(".parquet.json")
         lookup_enabled = store is not None and checkpoint_root is not None
-        checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if lookup_enabled else None
-        checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if lookup_enabled else None
+        if lookup_enabled and checkpoint_folder_id is not None:
+            checkpoint_item = checkpoint_folder_items.get(f"{window_key}.parquet")
+            checkpoint_manifest_item = checkpoint_folder_items.get(f"{window_key}.parquet.json")
+        else:
+            checkpoint_item = _resolve_remote_file(store, checkpoint_remote) if lookup_enabled else None
+            checkpoint_manifest_item = _resolve_remote_file(store, checkpoint_manifest_remote) if lookup_enabled else None
         expected_symbols = full_symbols
         reuse_expected = full_symbols
         read_local = checkpoint_local
@@ -644,7 +664,20 @@ def fetch_indstocks_5m_batch(
             checkpoint_local.parent.mkdir(parents=True, exist_ok=True)
             window_data = pd.concat(window_frames).sort_index() if window_frames else pd.DataFrame(columns=["Symbol", *OHLCV], index=pd.DatetimeIndex([], tz=IST, name="Datetime"))
             window_data.to_parquet(checkpoint_local, index=True, compression="zstd")
-            uploaded = store.upload_or_update(checkpoint_local, checkpoint_remote, mime_type="application/vnd.apache.parquet")
+            checkpoint_upload_kwargs = (
+                {
+                    "folder_id": checkpoint_folder_id,
+                    "existing_id": (checkpoint_item or {}).get("id"),
+                }
+                if checkpoint_folder_id is not None
+                else {}
+            )
+            uploaded = store.upload_or_update(
+                checkpoint_local,
+                checkpoint_remote,
+                mime_type="application/vnd.apache.parquet",
+                **checkpoint_upload_kwargs,
+            )
             if str(uploaded.get("status") or "").upper() != "OK":
                 raise RuntimeError(f"Drive checkpoint write failed for window {window_key}: {uploaded}")
             # The manifest is the commit marker: only a fully written parquet plus
@@ -661,8 +694,19 @@ def fetch_indstocks_5m_batch(
                 "batch_key": batch_key,
                 "key_scheme": "FULL_BATCH_V2",
             }, sort_keys=True), encoding="utf-8")
+            manifest_upload_kwargs = (
+                {
+                    "folder_id": checkpoint_folder_id,
+                    "existing_id": (checkpoint_manifest_item or {}).get("id"),
+                }
+                if checkpoint_folder_id is not None
+                else {}
+            )
             uploaded_manifest = store.upload_or_update(
-                checkpoint_manifest_local, checkpoint_manifest_remote, mime_type="application/json"
+                checkpoint_manifest_local,
+                checkpoint_manifest_remote,
+                mime_type="application/json",
+                **manifest_upload_kwargs,
             )
             if str(uploaded_manifest.get("status") or "").upper() != "OK":
                 raise RuntimeError(f"Drive checkpoint manifest write failed for window {window_key}: {uploaded_manifest}")

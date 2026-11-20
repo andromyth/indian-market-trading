@@ -717,6 +717,7 @@ class GoogleDriveStore:
         cfg = gdrive_config()
         self.cfg = cfg
         self._write_service = None
+        self._folder_id_cache: dict[tuple[str, str], str] = {}
         if not cfg.get("configured"):
             raise RuntimeError(cfg.get("reason", "Google Drive is not configured"))
         try:
@@ -810,21 +811,29 @@ class GoogleDriveStore:
         return files[0] if files else None
 
     def _ensure_folder(self, parent_id: str, name: str, service=None) -> str:
+        cache_key = (str(parent_id), str(name))
+        cached = self._folder_id_cache.get(cache_key)
+        if cached:
+            return cached
         svc = service or self.service
         hit = self._find_child(parent_id, name, "application/vnd.google-apps.folder", service=svc)
         if hit:
+            self._folder_id_cache[cache_key] = hit["id"]
             return hit["id"]
         meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
         for attempt in range(1, 5):
             hit = self._find_child(parent_id, name, "application/vnd.google-apps.folder", service=svc)
             if hit:
+                self._folder_id_cache[cache_key] = hit["id"]
                 return hit["id"]
             try:
-                return svc.files().create(
+                folder_id = svc.files().create(
                     body=meta,
                     fields="id",
                     supportsAllDrives=True,
                 ).execute()["id"]
+                self._folder_id_cache[cache_key] = folder_id
+                return folder_id
             except Exception as exc:
                 if not _is_retryable_drive_error(exc) or attempt == 4:
                     _DRIVE_LOGGER.error(
@@ -848,18 +857,63 @@ class GoogleDriveStore:
             parent = self._ensure_folder(parent, part, service=svc)
         return parent
 
-    def upload_or_update(self, local_path: Path, remote_relative_path: str, mime_type: str = "application/octet-stream") -> dict:
+    def list_folder(self, parent_id: str) -> list[dict]:
+        """Return every direct child of a Drive folder (single paginated listing)."""
+        rows: list[dict] = []
+        page_token = None
+        while True:
+            params = {
+                "q": f"'{parent_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            response = _drive_execute_with_retry(
+                "folder_list",
+                lambda: self.service.files().list(**params).execute(),
+            )
+            rows.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                return rows
+
+    def upload_or_update(
+        self,
+        local_path: Path,
+        remote_relative_path: str,
+        mime_type: str = "application/octet-stream",
+        *,
+        folder_id: str | None = None,
+        existing_id: str | None = None,
+    ) -> dict:
         remote = remote_relative_path.replace("\\", "/").strip("/")
         parts = remote.split("/")
         name = parts[-1]
         folder = "/".join(parts[:-1])
         write_service = self._get_write_service()
-        parent_id = self.ensure_path(folder, service=write_service)
+        parent_id = folder_id if folder_id is not None else self.ensure_path(folder, service=write_service)
         try:
             result = None
             action = "created"
+            if existing_id:
+                action = "updated"
+                result = _drive_execute_with_retry(
+                    "file_update",
+                    lambda: write_service.files().update(
+                        fileId=existing_id,
+                        media_body=self.MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True),
+                        fields="id,name,modifiedTime,size",
+                        supportsAllDrives=True,
+                    ).execute(),
+                )
             for attempt in range(1, 5):
-                existing = self._find_child(parent_id, name, service=write_service)
+                if result is not None:
+                    break
+                existing = None if folder_id is not None else self._find_child(parent_id, name, service=write_service)
                 if existing:
                     action = "updated"
                     result = _drive_execute_with_retry(

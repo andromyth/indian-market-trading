@@ -69,6 +69,10 @@ def _args(smoke: bool) -> list[str]:
     max_symbols = int(os.getenv("BACKFILL_MAX_SYMBOLS") or "0")
     return [
         f"--max-symbols={max_symbols}",
+        # One recent session is enough to refresh the latest bars; the provider
+        # already returns the full 500-session window, so a longer live-history
+        # lookback only multiplies Drive reads across all 100 symbol batches.
+        "--recent-session-lookback-days=1",
         f"--end-date={end_date}",
     ]
 
