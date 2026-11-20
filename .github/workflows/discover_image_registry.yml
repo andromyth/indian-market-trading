@@ -1,0 +1,43 @@
+name: Discover existing image registry (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+      JOB: native-5m-backfill
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Show current images and Artifact Registry repos
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "=== CALLER"
+          gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>&1 || true
+          echo "=== SERVICE IMAGE"
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION"             --format='value(spec.template.spec.containers[0].image)' 2>&1 || true
+          echo "=== JOB IMAGE (if exists)"
+          gcloud run jobs describe "$JOB" --project="$PROJECT_ID" --region="$REGION"             --format='value(spec.template.spec.template.spec.containers[0].image)' 2>&1 || true
+          echo "=== ARTIFACT REGISTRY REPOS"
+          gcloud artifacts repositories list --project="$PROJECT_ID"             --format='table(name,format,location,mode)' 2>&1 || true
+          echo "=== ARTIFACT REGISTRY DOCKER REPOS (locations)"
+          gcloud artifacts repositories list --project="$PROJECT_ID"             --format=json 2>&1 | head -c 6000 || true
