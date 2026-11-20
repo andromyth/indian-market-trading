@@ -1,0 +1,152 @@
+name: Monitor native 5m backfill job (read only)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: monitor-native-5m-backfill-job
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Latest execution status
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud run jobs executions list --job="$JOB" \
+            --project="$PROJECT_ID" --region="$REGION" --limit=3 \
+            --format='table(name,status.startTime,status.completionTime,status.conditions[0].status,status.conditions[0].message)' || true
+
+      - name: Recent backfill progress
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=300 --order=desc \
+            --format='value(textPayload)' 2>/dev/null \
+            | grep -aE "BACKFILL_PROGRESS|BACKFILL_MANIFEST|BACKFILL_JOB|SYMBOL_PARQUET|CHUNK|STOPPED|Traceback|ERROR" \
+            | tail -n 25 || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Drive client
+        run: python -m pip install --disable-pip-version-check google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Drive archive inventory (read only)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+
+          info = json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid:
+              creds.refresh(Request())
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+          root = os.environ["GOOGLE_DRIVE_ROOT_ID"].strip()
+
+          def child(parent, name):
+              page = None
+              while True:
+                  res = service.files().list(
+                      q=f"'{parent}' in parents and name = '{name}' and trashed = false",
+                      pageSize=1000, pageToken=page, fields="nextPageToken,files(id,name,mimeType)"
+                  ).execute()
+                  for item in res.get("files", []):
+                      if item.get("name") == name:
+                          return item
+                  page = res.get("nextPageToken")
+                  if not page:
+                      return None
+
+          def walk(path):
+              cur = root
+              for part in path.split("/"):
+                  item = child(cur, part)
+                  if not item:
+                      return None
+                  cur = item["id"]
+              return cur
+
+          def list_all(folder_id):
+              rows, page = [], None
+              while True:
+                  res = service.files().list(
+                      q=f"'{folder_id}' in parents and trashed = false",
+                      pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)"
+                  ).execute()
+                  rows.extend(res.get("files", []))
+                  page = res.get("nextPageToken")
+                  if not page:
+                      return rows
+
+          archive = walk("production_data/nse_official/intraday_seed/olo_5m_archive")
+          if not archive:
+              print("ARCHIVE_MISSING")
+              raise SystemExit(0)
+
+          symbols_folder = child(archive, "symbols")
+          checkpoint_folder = child(archive, "window_checkpoints")
+          symbol_dirs = list_all(symbols_folder["id"]) if symbols_folder else []
+          symbol_parquets = 0
+          symbol_bytes = 0
+          for d in symbol_dirs:
+              if d.get("mimeType") != "application/vnd.google-apps.folder":
+                  continue
+              for f in list_all(d["id"]):
+                  if str(f.get("name", "")).endswith(".parquet"):
+                      symbol_parquets += 1
+                      symbol_bytes += int(f.get("size") or 0)
+          batches = list_all(checkpoint_folder["id"]) if checkpoint_folder else []
+          checkpoint_files = 0
+          checkpoint_bytes = 0
+          for b in batches:
+              if b.get("mimeType") != "application/vnd.google-apps.folder":
+                  continue
+              for f in list_all(b["id"]):
+                  if str(f.get("name", "")).endswith(".parquet"):
+                      checkpoint_files += 1
+                      checkpoint_bytes += int(f.get("size") or 0)
+          print("BACKFILL_DRIVE_INVENTORY=" + json.dumps({
+              "symbol_directories": sum(1 for d in symbol_dirs if d.get("mimeType") == "application/vnd.google-apps.folder"),
+              "symbol_parquets": symbol_parquets,
+              "symbol_bytes": symbol_bytes,
+              "checkpoint_batches": sum(1 for b in batches if b.get("mimeType") == "application/vnd.google-apps.folder"),
+              "checkpoint_parquets": checkpoint_files,
+              "checkpoint_bytes": checkpoint_bytes,
+          }, sort_keys=True))
+          PY
