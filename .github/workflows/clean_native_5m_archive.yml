@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run to list, delete to remove native backfill artifacts"
+        description: "dry_run to list, delete to wipe the archive contents"
         required: true
         type: choice
         options: [dry_run, delete]
         default: dry_run
       confirm:
-        description: "Type DELETE_NATIVE_5M_ARCHIVE to allow delete"
+        description: "Type DELETE_ENTIRE_5M_ARCHIVE to allow delete"
         required: false
         type: string
         default: ""
@@ -21,14 +21,14 @@ permissions:
 jobs:
   clean:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
       GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
       MODE: ${{ inputs.mode }}
       CONFIRM: ${{ inputs.confirm }}
     steps:
-      - name: Clean native backfill artifacts
+      - name: Wipe the five-minute archive folder
         shell: bash
         run: |
           set -euo pipefail
@@ -52,7 +52,6 @@ jobs:
           if not creds.valid:
               creds.refresh(Request())
           service = build("drive", "v3", credentials=creds, cache_discovery=False)
-
           FOLDER = "application/vnd.google-apps.folder"
 
           def children(parent_id, name=None):
@@ -81,84 +80,34 @@ jobs:
               return current
 
           archive_id = descend(root_id, ["production_data", "nse_official", "intraday_seed", "olo_5m_archive"])
-          root_files = children(archive_id)
-          manifest = [x for x in root_files if x["name"] == "backfill_manifest.json"]
-          kaggle_manifest = [x for x in root_files if x["name"] == "kaggle_equity_history_manifest.json"]
-          symbols = [x for x in children(archive_id, "symbols") if x["mimeType"] == FOLDER]
-          if not symbols:
-              raise RuntimeError("symbols folder is missing under the archive")
-          symbols_id = symbols[0]["id"]
-          symbol_children = children(symbols_id)
-          checkpoints = [x for x in symbol_children if x["name"] == "window_checkpoints" and x["mimeType"] == FOLDER]
-          symbol_dirs = [x for x in symbol_children if x["name"].startswith("symbol=") and x["mimeType"] == FOLDER]
-
-          native, kaggle, empty_dirs = [], [], []
-          for folder in symbol_dirs:
-              if folder["name"] == "symbol=__NIFTY50__":
-                  continue
-              files = children(folder["id"])
-              if not files:
-                  empty_dirs.append(folder)
-                  continue
-              has_remaining = False
-              for item in files:
-                  if item["mimeType"] == FOLDER:
-                      has_remaining = True
-                  elif item["name"].endswith("_kaggle_5m.parquet"):
-                      kaggle.append(item)
-                      has_remaining = True
-                  else:
-                      native.append((folder, item))
-              if not has_remaining:
-                  empty_dirs.append(folder)
-
-          checkpoint_files, checkpoint_folders = [], []
-          if checkpoints:
-              stack = [checkpoints[0]]
-              while stack:
-                  parent = stack.pop()
-                  for item in children(parent["id"]):
-                      if item["mimeType"] == FOLDER:
-                          checkpoint_folders.append(item)
-                          stack.append(item)
-                      else:
-                          checkpoint_files.append(item)
-
+          root = children(archive_id)
+          inventory = [
+              {"name": x["name"], "type": "folder" if x["mimeType"] == FOLDER else "file", "id": x["id"]}
+              for x in root
+          ]
           print("CLEAN_ARCHIVE_PATH=production_data/nse_official/intraday_seed/olo_5m_archive")
-          print("CLEAN_NATIVE_PARQUETS=" + str(len(native)))
-          print("CLEAN_NATIVE_SYMBOL_DIRS=" + str(len({f["id"] for f, _ in native})))
-          print("CLEAN_CHECKPOINT_FILES=" + str(len(checkpoint_files)))
-          print("CLEAN_CHECKPOINT_FOLDERS=" + str(len(checkpoint_folders)))
-          print("CLEAN_NATIVE_MANIFEST_PRESENT=" + str(bool(manifest)))
-          print("CLEAN_KAGGLE_PARQUETS_PRESERVED=" + str(len(kaggle)))
-          print("CLEAN_KAGGLE_MANIFEST_PRESERVED=" + str(bool(kaggle_manifest)))
-          print("CLEAN_EMPTY_SYMBOL_DIRS=" + str(len(empty_dirs)))
-          print("CLEAN_NATIVE_SAMPLE=" + json.dumps([i["name"] for _, i in native[:10]]))
-          print("CLEAN_KAGGLE_SAMPLE=" + json.dumps([i["name"] for i in kaggle[:10]]))
-
+          print("CLEAN_ROOT_INVENTORY=" + json.dumps(inventory, sort_keys=True))
           if mode != "delete":
-              print("CLEAN_RESULT=DRY_RUN")
+              print("CLEAN_RESULT=DRY_RUN_ENTIRE_ARCHIVE")
               sys.exit(0)
-          if confirm != "DELETE_NATIVE_5M_ARCHIVE":
+          if confirm != "DELETE_ENTIRE_5M_ARCHIVE":
               print("CLEAN_RESULT=REFUSED_MISSING_CONFIRMATION")
               sys.exit(2)
 
-          deleted = {"native": 0, "checkpoint_files": 0, "checkpoint_folder": 0, "empty_dirs": 0, "manifest": 0}
-          for item in manifest:
+          for item in root:
               service.files().delete(fileId=item["id"]).execute(num_retries=3)
-              deleted["manifest"] += 1
-          for folder, item in native:
-              service.files().delete(fileId=item["id"]).execute(num_retries=3)
-              deleted["native"] += 1
-          if checkpoints:
-              service.files().delete(fileId=checkpoints[0]["id"]).execute(num_retries=3)
-              deleted["checkpoint_folder"] = 1
-              deleted["checkpoint_files"] = len(checkpoint_files)
-          for folder in empty_dirs:
-              remaining = children(folder["id"])
-              if not remaining:
-                  service.files().delete(fileId=folder["id"]).execute(num_retries=3)
-                  deleted["empty_dirs"] += 1
-          print("CLEAN_DELETED=" + json.dumps(deleted, sort_keys=True))
-          print("CLEAN_RESULT=DELETED")
+              print("CLEAN_DELETED=" + item["name"] + " type=" + ("folder" if item["mimeType"] == FOLDER else "file"))
+
+          created = service.files().create(
+              body={"name": "symbols", "mimeType": FOLDER, "parents": [archive_id]},
+              fields="id,name",
+          ).execute(num_retries=3)
+          print("CLEAN_RECREATED_SYMBOLS_ID=" + created["id"])
+
+          after = children(archive_id)
+          symbols = [x for x in after if x["name"] == "symbols" and x["mimeType"] == FOLDER]
+          empty = bool(symbols) and not children(symbols[0]["id"])
+          print("CLEAN_VERIFY_ROOT=" + json.dumps([x["name"] for x in after], sort_keys=True))
+          print("CLEAN_VERIFY_SYMBOLS_EMPTY=" + str(empty))
+          print("CLEAN_RESULT=DELETED_ENTIRE_ARCHIVE")
           PY
