@@ -53,9 +53,9 @@ jobs:
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
-      BACKFILL_END_DATE: ${{ inputs.end_date || '2026-11-18' }}
-      BACKFILL_REPLACE_EXISTING: ${{ inputs.replace_existing_history || 'auto' }}
-      BACKFILL_REVISION_TAG: ${{ inputs.revision_tag || (github.event_name == 'schedule' && 'preflight5m') || '' }}
+      BACKFILL_END_DATE: ${{ github.event.inputs.end_date || '2026-11-18' }}
+      BACKFILL_REPLACE_EXISTING: ${{ github.event.inputs.replace_existing_history || 'auto' }}
+      BACKFILL_REVISION_TAG: ${{ (github.event_name == 'schedule' && 'preflight5m') || github.event.inputs.revision_tag || '' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -280,7 +280,7 @@ jobs:
           STALL_STREAK=0
           LAST_UPDATED=""
           SAW_PARQUET=false
-          for attempt in $(seq 1 180); do
+          for attempt in $(seq 1 350); do
             if [[ "${CALLER_IDENTITY}" == "SELF" ]]; then
               TOKEN="$(gcloud auth print-identity-token --audiences="${AUDIENCE_URL:-$SERVICE_URL}" 2>/dev/null)" || TOKEN=""
             else
@@ -291,7 +291,7 @@ jobs:
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
               --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfillz")" || CODE=000
             if [[ "$CODE" != "200" ]]; then
-              echo "KEEPALIVE_STATUS_HTTP=$CODE attempt=$attempt/180"
+              echo "KEEPALIVE_STATUS_HTTP=$CODE attempt=$attempt/350"
               sleep 30
               continue
             fi
@@ -351,7 +351,7 @@ jobs:
             if [[ "$attempt" -eq 30 && "$SAW_PARQUET" != "true" ]]; then
               echo "BACKFILL_MONITOR=WARNING_NO_SYMBOL_PARQUET_AFTER_30_MIN"
             fi
-            if [[ "$attempt" -ge 180 ]]; then
+            if [[ "$attempt" -ge 350 ]]; then
               echo "BACKFILL_MONITOR=TIMEOUT"
               exit 1
             fi
