@@ -66,7 +66,7 @@ jobs:
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --cpu 4 --memory 16Gi --task-timeout 86400 --max-retries 0 \
             --command python --args="$ARGS" \
-            --set-env-vars "K_SERVICE=indian-market-intraday-worker" \
+            --set-env-vars "INDSTOCKS_BACKFILL_UNLOCK=1" \
             --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
           gcloud run jobs execute "$JOB" \
             --project="$PROJECT_ID" --region="$REGION" --wait

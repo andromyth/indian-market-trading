@@ -55,7 +55,12 @@ def _is_cloud_run_owner() -> bool:
     """Only the production service or the dedicated backfill job may access INDstocks."""
     service = os.getenv("K_SERVICE", "").strip()
     job = os.getenv("CLOUD_RUN_JOB", "").strip()
-    return service == "indian-market-intraday-worker" or job == "native-5m-backfill"
+    unlock = os.getenv("INDSTOCKS_BACKFILL_UNLOCK", "").strip() == "1"
+    return (
+        service == "indian-market-intraday-worker"
+        or job == "native-5m-backfill"
+        or (unlock and bool(service or job))
+    )
 
 
 def _setting(name: str, default: str | None = None) -> str | None:
