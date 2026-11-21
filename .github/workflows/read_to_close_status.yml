@@ -87,4 +87,7 @@ jobs:
                   st = [x for x in children(rf["id"]) if x["name"] == "retrain_status.json"]
                   if st:
                       print("RUN_STATUS " + rf["name"] + "=" + read_text(st[0]).replace("\n", " "))
+                  aud = [x for x in children(rf["id"]) if x["name"] == "input_audit.json"]
+                  if aud:
+                      print("AUDIT_JSON " + rf["name"] + "=" + read_text(aud[0]).replace("\n", " ")[:6000])
           PY
