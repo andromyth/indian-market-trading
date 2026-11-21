@@ -1,0 +1,83 @@
+name: Build NIFTY 5m context in Drive (Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "Inclusive IST end date for NIFTY 5m context"
+        required: false
+        default: "2026-11-18"
+      start_date:
+        description: "Optional inclusive IST start date (default: derive from base or 2024-01-01)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nifty-5m-context-backfill
+  cancel-in-progress: false
+
+jobs:
+  build-nifty-context:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      IMAGE_REPO: asia-south1-docker.pkg.dev/indian-market-trading/cloud-run-source-deploy
+      JOB: nifty-5m-context
+      END_DATE: ${{ github.event.inputs.end_date || '2026-11-18' }}
+      START_DATE: ${{ github.event.inputs.start_date || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$IMAGE_REPO/nifty-context:$GITHUB_SHA"
+          gcloud builds submit --config=cloudbuild-backfill-job.yaml \
+            --project="$PROJECT_ID" \
+            --substitutions="_IMAGE=$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy NIFTY context Cloud Run job and execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS="-u,indstocks_backfill_nifty_5m.py,--end,$END_DATE"
+          if [[ -n "$START_DATE" ]]; then
+            ARGS="$ARGS,--start,$START_DATE"
+          fi
+          gcloud run jobs deploy "$JOB" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --image="$IMAGE" \
+            --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+            --cpu 4 --memory 16Gi --task-timeout 86400 --max-retries 0 \
+            --command python --args="$ARGS" \
+            --set-env-vars "K_SERVICE=indian-market-intraday-worker" \
+            --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
+          gcloud run jobs execute "$JOB" \
+            --project="$PROJECT_ID" --region="$REGION" --wait
+
+      - name: Show NIFTY context logs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=120 --order=desc \
+            --format='value(timestamp,textPayload)' 2>/dev/null \
+            | grep -aE "NIFTY_|FETCH_RANGE|BASE_CONTEXT|MANIFEST|Traceback|UPLOAD|Error|ERROR" || true
