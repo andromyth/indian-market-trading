@@ -50,7 +50,7 @@ jobs:
 
           path = [
               "production_data", "nse_official", "intraday_seed",
-              "olo_5m_archive", "symbols", "symbol=__NIFTY50__",
+              "olo_5m_archive", "symbols",
           ]
           current = root_id
           for part in path:
@@ -59,6 +59,21 @@ jobs:
                   print("NIFTY_CONTEXT_MISSING_FOLDER=" + part)
                   raise SystemExit(0)
               current = matches[0]["id"]
+          sym_entries = [
+              {"name": x.get("name"), "type": x.get("mimeType"),
+               "size_bytes": int(x.get("size") or 0), "modifiedTime": x.get("modifiedTime")}
+              for x in sorted(children(current), key=lambda x: x.get("name", ""))
+          ]
+          print("SYMBOLS_FOLDER_ENTRIES=" + json.dumps(sym_entries, sort_keys=True))
+          nifty_matches = [x for x in sym_entries if "NIFTY" in x["name"].upper()]
+          print("SYMBOLS_FOLDER_NIFTY_MATCHES=" + json.dumps(nifty_matches, sort_keys=True))
+          nifty_folder = next((x for x in children(current)
+                               if "NIFTY" in x["name"].upper()
+                               and x["mimeType"] == "application/vnd.google-apps.folder"), None)
+          if not nifty_folder:
+              print("NIFTY_CONTEXT_NO_FOLDER_IN_SYMBOLS")
+              raise SystemExit(0)
+          current = nifty_folder["id"]
           rows = [
               {"name": x.get("name"), "type": x.get("mimeType"),
                "size_bytes": int(x.get("size") or 0), "modifiedTime": x.get("modifiedTime")}
