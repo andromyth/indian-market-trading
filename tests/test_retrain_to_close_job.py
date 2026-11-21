@@ -4,20 +4,23 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import retrain_to_close_job as job
 
 
-def test_training_window_uses_200_and_500_thresholds():
-    assert job.training_window(200) == (80, 40)
-    assert job.training_window(499) == (80, 40)
+def test_training_window_tiers_and_floor():
     assert job.training_window(500) == (150, 60)
-    try:
-        job.training_window(199)
-    except ValueError as exc:
-        assert "200" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("199 sessions must be rejected")
+    assert job.training_window(499) == (80, 40)
+    assert job.training_window(200) == (80, 40)
+    assert job.training_window(199) == (50, 30)
+    assert job.training_window(120) == (50, 30)
+    assert job.training_window(119) == (35, 20)
+    assert job.training_window(80) == (35, 20)
+    assert job.training_window(79) == (20, 12)
+    assert job.training_window(45) == (20, 12)
+    with pytest.raises(ValueError):
+        job.training_window(44)
 
 
 def test_choose_universe_prefers_fno_liquidity_and_drops_index():
@@ -122,4 +125,33 @@ def test_local_mode_runs_full_pipeline(tmp_path):
     assert status["covered_sessions"] == 200
     assert status["symbols_selected"] == 20
     assert (out / "candidate_bundle.joblib").is_file()
+    assert (out / "training_report.json").is_file()
+
+
+def test_local_mode_continues_below_200_and_flags(tmp_path):
+    symbols = tuple(f"L{i:02d}" for i in range(10))
+    _write_local_inputs(tmp_path / "drive", symbols, n_sessions=60)
+    out = tmp_path / "out"
+    work = tmp_path / "work"
+    code = job.main(
+        [
+            "--drive-root", str(tmp_path / "drive"),
+            "--work-root", str(work),
+            "--out", str(out),
+            "--no-upload",
+            "--universe", "fno",
+            "--max-symbols", "10",
+            "--sessions", "60",
+            "--n-splits", "1",
+            "--max-train-rows", "20000",
+            "--cost", "0.0011",
+            "--warmup-bars", "3",
+        ]
+    )
+    assert code == 0
+    status = json.loads((work / "retrain_status.json").read_text())
+    assert status["status"] in {"COMPLETED_PASS", "COMPLETED_FAIL"}, status
+    assert status["covered_sessions"] == 60
+    assert status["insufficient_history"] is True
+    assert "history_warning" in status
     assert (out / "training_report.json").is_file()

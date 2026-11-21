@@ -69,13 +69,29 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+MIN_TRAINABLE_SESSIONS = 45
+
+
 def training_window(sessions: int) -> tuple[int, int]:
-    """Return (min_train_sessions, holdout_sessions) for the available window."""
+    """Return (min_train_sessions, holdout_sessions) for the available window.
+
+    The 200/500 tiers are preferred. Below 200 we keep going with a smaller
+    window (flagged in the status) down to the technical floor, because the
+    user explicitly prefers a flagged weak model over no training run.
+    """
     if sessions >= 500:
         return 150, 60
     if sessions >= 200:
         return 80, 40
-    raise ValueError(f"only {sessions} covered sessions; at least 200 are required")
+    if sessions >= 120:
+        return 50, 30
+    if sessions >= 80:
+        return 35, 20
+    if sessions >= MIN_TRAINABLE_SESSIONS:
+        return 20, 12
+    raise ValueError(
+        f"only {sessions} covered sessions; at least {MIN_TRAINABLE_SESSIONS} are required to fit"
+    )
 
 
 def choose_universe(
@@ -435,8 +451,13 @@ def main(argv: list[str] | None = None) -> int:
             "--md-out",
             str(audit_md),
         ]
-        if _run(audit_cmd, log_dir / "audit.log") != 0:
-            write_status(status="DATA_NOT_READY", reason="input audit did not pass")
+        audit_code = _run(audit_cmd, log_dir / "audit.log")
+        if not audit_json.is_file():
+            write_status(
+                status="DATA_NOT_READY",
+                reason="input audit produced no report (missing NIFTY/FNO or unreadable inputs)",
+                audit_exit_code=audit_code,
+            )
             return finish(2)
 
         report = json.loads(audit_json.read_text(encoding="utf-8"))
@@ -445,16 +466,32 @@ def main(argv: list[str] | None = None) -> int:
         status.update(
             {
                 "audit_verdict": report.get("verdict"),
+                "audit_exit_code": audit_code,
                 "covered_sessions": sessions,
                 "covered_start": ready.get("start"),
                 "covered_end": ready.get("end"),
             }
         )
-        if sessions < 200:
-            write_status(status="DATA_NOT_READY", reason="fewer than 200 covered sessions")
+        try:
+            min_train, holdout = training_window(sessions)
+        except ValueError as exc:
+            write_status(
+                status="DATA_NOT_READY",
+                reason=str(exc),
+                insufficient_history=True,
+            )
             return finish(2)
-        min_train, holdout = training_window(sessions)
         status.update({"min_train_sessions": min_train, "holdout_sessions": holdout})
+        if sessions < 200:
+            warning = (
+                f"only {sessions} covered sessions (<200); continuing with a reduced "
+                f"window (min_train={min_train}, holdout={holdout}) by operator request"
+            )
+            status.update({"insufficient_history": True, "history_warning": warning})
+            write_status()
+            print("HISTORY_WARNING " + warning, flush=True)
+        else:
+            status["insufficient_history"] = False
 
         bars_dir = work / "bars_5m"
         assemble_cmd = [

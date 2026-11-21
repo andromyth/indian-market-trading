@@ -20,8 +20,11 @@ token the live Cloud Run worker uses. The supported path is already wired:
 
 Defaults: `--universe fno` (liquid F&O underlyings), `--max-symbols 300`, `--sessions 500`, `--cost 0.0011`,
 `--warmup-bars 3`. The job auto-selects `--min-train-sessions`/`--holdout-sessions` from the audit: 150/60 for
-500 covered sessions, 80/40 for 200-499. A result of `COMPLETED_FAIL` is a normal, uploaded outcome; serving stays HOLD.
-The 6h GitHub wrapper timeout is only for the wait — the Cloud Run task can run up to 24h.
+500+ covered sessions and 80/40 for 200-499. **Below 200 it still continues** by operator request, using a smaller
+window (50/30 for 120-199, 35/20 for 80-119, 20/12 for 45-79), and records `insufficient_history: true` plus a
+`history_warning` in `retrain_status.json`/`latest.json`. Only below the technical floor of 45 covered sessions does
+it stop with `DATA_NOT_READY` (a model cannot be fit on less). A result of `COMPLETED_FAIL` is a normal, uploaded
+outcome; serving stays HOLD. The 6h GitHub wrapper timeout is only for the wait — the Cloud Run task can run up to 24h.
 
 Local debug without Drive auth (uses a mounted/copied research root, no upload):
 ```
@@ -62,8 +65,9 @@ The retrain job itself performs the audit, assembly and training steps. This sec
    `nse_fno_udiff_ingest.py --rebuild-derived-start 2024-11-01 --rebuild-derived-end <today>`.
    The retrain job prefers the multi-year file and falls back to `fno_daily_features_2026.parquet`.
 
-If the audit's largest ready window is only ~200 sessions, the retrain job uses the 200-session
-settings automatically. `fno_available_share` below ~0.90 means the F&O history is incomplete.
+If the audit's largest ready window is below 200, the retrain job still runs with a smaller window and flags
+`insufficient_history` instead of aborting; below 45 sessions it will not train. `fno_available_share` below ~0.90
+means the F&O history is incomplete.
 
 ## 1. First model (GitHub Actions -> Cloud Run)
 
