@@ -74,3 +74,13 @@ def test_build_report_detects_nifty_gap(tmp_path):
     assert report["nifty"]["missing_run_count"] == 1
     assert report["largest_ready_window"]["sessions"] == 2
     assert report["verdict"] == "INSUFFICIENT_COVERED_SESSIONS"
+
+
+def test_largest_ready_window_ignores_trailing_gaps():
+    days = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]
+    nifty = {"2026-01-02", "2026-01-05", "2026-01-06"}
+    fno = set(days)
+    largest = audit._largest_ready_window(days, nifty, fno)
+    assert largest["sessions"] == 3
+    assert largest["start"] == "2026-01-02"
+    assert largest["end"] == "2026-01-06"

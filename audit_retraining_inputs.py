@@ -208,16 +208,20 @@ def _largest_ready_window(
     nifty_min: float = 0.95,
     fno_min: float = 0.90,
 ) -> dict[str, Any] | None:
-    for size in range(len(days), 0, -1):
-        window = days[-size:]
-        if _coverage(window, nifty_present) >= nifty_min and _coverage(window, fno_present) >= fno_min:
-            return {
-                "sessions": size,
-                "start": window[0],
-                "end": window[-1],
-                "nifty_coverage": round(_coverage(window, nifty_present), 6),
-                "fno_date_coverage": round(_coverage(window, fno_present), 6),
-            }
+    # Prefer the largest window ending at the newest session (the original
+    # behaviour), but fall back to earlier contiguous windows: trailing NIFTY
+    # or F&O gaps must not hide an otherwise fully covered historical window.
+    for end in range(len(days), 0, -1):
+        for size in range(end, 0, -1):
+            window = days[end - size : end]
+            if _coverage(window, nifty_present) >= nifty_min and _coverage(window, fno_present) >= fno_min:
+                return {
+                    "sessions": size,
+                    "start": window[0],
+                    "end": window[-1],
+                    "nifty_coverage": round(_coverage(window, nifty_present), 6),
+                    "fno_date_coverage": round(_coverage(window, fno_present), 6),
+                }
     return None
 
 
