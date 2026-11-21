@@ -1,0 +1,95 @@
+name: Check backfill index and current execution logs (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: native-5m-backfill
+      EXEC: native-5m-backfill-cbtt5
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Current execution text logs (all recent, this execution)
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --freshness=20m --limit=300 --order=desc \
+            --format='value(timestamp,severity,textPayload)' 2>/dev/null | \
+            grep -aE "BACKFILL_|batch=|SKIPPED|COOLDOWN|Traceback|Error|ERROR|WARN|live_capture|api_calls" | head -n 60 || true
+
+      - name: Drive batch progress index
+        shell: bash
+        run: |
+          python -m pip install -q --disable-pip-version-check google-api-python-client google-auth google-auth-oauthlib
+          python - <<'PY'
+          import json, os
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          info=json.loads(os.environ["GOOGLE_OAUTH_TOKEN_JSON"])
+          creds=Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid: creds.refresh(Request())
+          svc=build("drive","v3",credentials=creds,cache_discovery=False)
+          root=os.environ["GOOGLE_DRIVE_ROOT_ID"].strip()
+          def child(pid,name):
+              r=svc.files().list(q=f"'{pid}' in parents and name = '{name}' and trashed = false",fields="files(id,name,mimeType,size,modifiedTime)",pageSize=10).execute()
+              return (r.get("files") or [None])[0]
+          def walk(path):
+              cur=root
+              for part in path.split("/"):
+                  it=child(cur,part)
+                  if not it: return None
+                  cur=it["id"]
+              return cur
+          arc=walk("production_data/nse_official/intraday_seed/olo_5m_archive")
+          print("ARCHIVE_ID",arc)
+          for name in ("backfill_batch_progress.json","backfill_manifest.json"):
+              it=child(arc,name) if arc else None
+              if not it:
+                  print(name,"MISSING"); continue
+              print(name,"id=",it["id"],"size=",it.get("size"),"modified=",it.get("modifiedTime"))
+              # download and print small summary
+              import io
+              data=svc.files().get_media(fileId=it["id"]).execute()
+              try:
+                  d=json.loads(data)
+                  if "completed_batches" in d:
+                      print(name,"completed_batches_count=",len(d["completed_batches"]),"last5=",d["completed_batches"][-5:],"updated=",d.get("updated_at_utc"))
+                  else:
+                      print(name,"overall_status=",d.get("overall_status"),"symbols_resolved=",d.get("symbols_resolved"),"with_200=",d.get("symbols_with_200_plus_sessions"),"requested=",d.get("official_symbols_requested"))
+              except Exception as e:
+                  print(name,"PARSE_ERR",type(e).__name__,str(e)[:100])
+          # count symbol parquets
+          syms=child(arc,"symbols")
+          print("SYMBOLS_FOLDER",syms["id"] if syms else None)
+          count=0
+          if syms:
+              page=None
+              while True:
+                  r=svc.files().list(q=f"'{syms['id']}' in parents and trashed = false",fields="nextPageToken,files(id,name,mimeType)",pageSize=1000,pageToken=page).execute()
+                  for f in r.get("files",[]):
+                      if f.get("name","").startswith("symbol="):
+                          count+=1
+                  page=r.get("nextPageToken")
+                  if not page: break
+          print("SYMBOL_DIRECTORIES",count)
+          PY
