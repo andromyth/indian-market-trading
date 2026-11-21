@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import indstocks_backfill_all_nse_5m_history as runner
 import indstocks_client
+from market_session_guard import is_nse_trading_day
 
 IST = ZoneInfo("Asia/Kolkata")
 JOB_NAME = "native-5m-backfill"
@@ -40,6 +41,10 @@ def _guard_request_slot() -> None:
     INDstocks history requests during the 09:15-15:59 NSE live window.
     """
     now = datetime.now(IST)
+    # On NSE non-trading days there is no live market to protect, so the job
+    # may run continuously to finish the remaining batches.
+    if not is_nse_trading_day(now.date()):
+        return
     current = (now.hour, now.minute)
     if STOP_AT_IST <= current < NEXT_WINDOW_IST:
         raise BackfillStop(
@@ -48,7 +53,13 @@ def _guard_request_slot() -> None:
 
 
 def _inside_start_window(now: datetime, *, smoke: bool) -> bool:
-    """Full runs start 16:00-08:29 IST; a manual smoke may run until 09:14."""
+    """Full runs start 16:00-08:29 IST on trading days; all day on holidays.
+
+    NSE non-trading days have no live snapshot to protect, so the backfill may
+    run continuously to finish the remaining batches.
+    """
+    if not is_nse_trading_day(now.date()):
+        return True
     minutes = now.hour * 60 + now.minute
     if minutes >= 16 * 60:
         return True
