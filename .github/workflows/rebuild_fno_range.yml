@@ -1,0 +1,56 @@
+name: Rebuild NSE F&O daily features (bhavcopy range)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Rebuild start (YYYY-MM-DD)"
+        required: false
+        default: "2024-11-01"
+      end_date:
+        description: "Rebuild end (YYYY-MM-DD); default last trading day"
+        required: false
+        default: "2026-11-20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nse-fno-range-rebuild
+  cancel-in-progress: false
+
+jobs:
+  rebuild-fno:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      INDIAN_MARKET_RESEARCH_ROOT: ${{ github.workspace }}/.market_data
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      START_DATE: ${{ github.event.inputs.start_date || '2024-11-01' }}
+      END_DATE: ${{ github.event.inputs.end_date || '2026-11-20' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Rebuild F&O derived daily features from NSE bhavcopy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u nse_fno_udiff_ingest.py \
+            --rebuild-derived-start "$START_DATE" \
+            --rebuild-derived-end "$END_DATE" \
+            --derived-out "fno_daily_features_${START_DATE:0:4}_${END_DATE:0:4}.parquet"
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          p = Path(".market_data/production_data/nse_official/fno")
+          files = sorted(p.glob("fno_daily_features_*.parquet"))
+          for f in files:
+              df = pd.read_parquet(f)
+              print("FNO_FILE", f.name, "rows", len(df), "min", str(df["date"].min()), "max", str(df["date"].max()))
+          PY
