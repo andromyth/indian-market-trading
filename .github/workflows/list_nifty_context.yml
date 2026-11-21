@@ -70,15 +70,16 @@ jobs:
           nifty_folder = next((x for x in children(current)
                                if "NIFTY" in x["name"].upper()
                                and x["mimeType"] == "application/vnd.google-apps.folder"), None)
-          if not nifty_folder:
+          if nifty_folder:
+              current = nifty_folder["id"]
+              rows = [
+                  {"name": x.get("name"), "type": x.get("mimeType"),
+                   "size_bytes": int(x.get("size") or 0), "modifiedTime": x.get("modifiedTime")}
+                  for x in sorted(children(current), key=lambda x: x.get("modifiedTime", ""), reverse=True)
+              ]
+          else:
               print("NIFTY_CONTEXT_NO_FOLDER_IN_SYMBOLS")
-              raise SystemExit(0)
-          current = nifty_folder["id"]
-          rows = [
-              {"name": x.get("name"), "type": x.get("mimeType"),
-               "size_bytes": int(x.get("size") or 0), "modifiedTime": x.get("modifiedTime")}
-              for x in sorted(children(current), key=lambda x: x.get("modifiedTime", ""), reverse=True)
-          ]
+              rows = []
           print("NIFTY_CONTEXT_FILES=" + json.dumps(rows, sort_keys=True))
           print("NIFTY_CONTEXT_FILE_COUNT=" + str(len(rows)))
 
