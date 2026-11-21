@@ -42,5 +42,6 @@ Source quote snapshots:
 ## Provider limits and scope
 
 - Historical INDstocks requests are issued only by Cloud Run.
+- Retraining notebooks (Colab/Kaggle) read the merged NIFTY 5m artifact and per-symbol Parquets from Drive. They do not import `indstocks_client` or hold a token; see `INTEGRATION.md` section 0.
 - The native five-minute backfill is resumable from the per-symbol Drive checkpoints and retains the 200–500 usable-session target.
 - This integration is read-only. It does not place, modify, or cancel orders.

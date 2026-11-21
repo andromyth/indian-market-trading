@@ -644,8 +644,16 @@ def _drive_download(remote: str, local: Path) -> bool:
         return False
 
 
-def _persist_derived_rows(rows: pd.DataFrame) -> None:
-    DERIVED.parent.mkdir(parents=True, exist_ok=True)
+def _persist_derived_rows(
+    rows: pd.DataFrame,
+    *,
+    derived: Path | None = None,
+    meta_path: Path | None = None,
+    upload: bool = True,
+) -> None:
+    derived = Path(derived) if derived is not None else DERIVED
+    meta_path = Path(meta_path) if meta_path is not None else DERIVED_META
+    derived.parent.mkdir(parents=True, exist_ok=True)
 
     all_rows = rows.copy()
     all_rows["symbol"] = all_rows["symbol"].astype(str).str.upper()
@@ -678,7 +686,7 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
         "symbol"
     )["fno_atm_iv"].diff()
 
-    all_rows.to_parquet(DERIVED, index=False)
+    all_rows.to_parquet(derived, index=False)
 
     meta = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -705,10 +713,14 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
             "close fallback in candidate panel"
         ),
     }
-    DERIVED_META.write_text(
+    meta_path.write_text(
         json.dumps(meta, indent=2),
         encoding="utf-8",
     )
+
+    if not upload:
+        print("DRIVE_API_SYNC: SKIPPED_BY_FLAG", flush=True)
+        return
 
     mounted_drive = str(BASE).startswith(
         "/content/drive/MyDrive/"
@@ -720,15 +732,14 @@ def _persist_derived_rows(rows: pd.DataFrame) -> None:
         )
     else:
         g = GoogleDriveStore()
+        remote_dir = "production_data/nse_official/fno"
         g.upload_or_update(
-            DERIVED,
-            "production_data/nse_official/fno/"
-            "fno_daily_features_2026.parquet",
+            derived,
+            f"{remote_dir}/{derived.name}",
         )
         g.upload_or_update(
-            DERIVED_META,
-            "production_data/nse_official/fno/"
-            "fno_daily_features_2026.meta.json",
+            meta_path,
+            f"{remote_dir}/{meta_path.name}",
             mime_type="application/json",
         )
 
@@ -750,9 +761,16 @@ def _merge_and_persist(day_features: pd.DataFrame) -> None:
     _persist_derived_rows(all_rows)
 
 
-def _rebuild_derived_2026() -> None:
-    start = date(2026, 1, 1)
-    end = min(date.today(), date(2026, 12, 31))
+def _rebuild_derived_range(
+    start: date,
+    end: date,
+    *,
+    derived: Path | None = None,
+    meta_path: Path | None = None,
+    upload: bool = True,
+) -> None:
+    if start > end:
+        raise ValueError("F&O rebuild start must be on or before end")
     frames = []
     scanned = 0
     loaded = 0
@@ -810,19 +828,32 @@ def _rebuild_derived_2026() -> None:
 
     if not frames:
         raise RuntimeError(
-            "No 2026 F&O archives could be rebuilt"
+            f"No F&O archives could be rebuilt for {start}..{end}"
         )
 
     combined = pd.concat(frames, ignore_index=True)
-    _persist_derived_rows(combined)
+    _persist_derived_rows(
+        combined,
+        derived=derived,
+        meta_path=meta_path,
+        upload=upload,
+    )
 
     print(
         "F&O derived rebuild complete: "
+        f"start={start} end={end} "
         f"weekday_dates_scanned={scanned:,} "
         f"dates_loaded={loaded:,} "
         f"rows={len(combined):,} "
         f"symbols={combined['symbol'].nunique():,}",
         flush=True,
+    )
+
+
+def _rebuild_derived_2026() -> None:
+    _rebuild_derived_range(
+        date(2026, 1, 1),
+        min(date.today(), date(2026, 12, 31)),
     )
 
 
@@ -836,7 +867,55 @@ def main() -> None:
         action="store_true",
         help="Rebuild the 2026 derived F&O feature file from cached raw archives.",
     )
+    ap.add_argument(
+        "--rebuild-derived-start",
+        default="",
+        help="Range rebuild start date (YYYY-MM-DD); enables multi-year rebuild.",
+    )
+    ap.add_argument(
+        "--rebuild-derived-end",
+        default="",
+        help="Range rebuild end date (YYYY-MM-DD); defaults to today.",
+    )
+    ap.add_argument(
+        "--derived-out",
+        default="",
+        help="Output Parquet for range rebuild; defaults to a year-range filename.",
+    )
+    ap.add_argument(
+        "--derived-meta-out",
+        default="",
+        help="Output metadata JSON for range rebuild.",
+    )
+    ap.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Keep range-rebuild outputs local instead of uploading to Drive.",
+    )
     args = ap.parse_args()
+
+    if args.rebuild_derived_start:
+        start = pd.Timestamp(args.rebuild_derived_start).date()
+        end = pd.Timestamp(args.rebuild_derived_end or date.today().isoformat()).date()
+        default_name = f"fno_daily_features_{start.year}_{end.year}.parquet"
+        derived = (
+            Path(args.derived_out)
+            if args.derived_out
+            else BASE / "production_data/nse_official/fno" / default_name
+        )
+        meta_path = (
+            Path(args.derived_meta_out)
+            if args.derived_meta_out
+            else derived.with_name(derived.stem + ".meta.json")
+        )
+        _rebuild_derived_range(
+            start,
+            end,
+            derived=derived,
+            meta_path=meta_path,
+            upload=not args.no_upload,
+        )
+        return
 
     if args.rebuild_derived_2026:
         _rebuild_derived_2026()

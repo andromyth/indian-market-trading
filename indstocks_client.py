@@ -567,6 +567,71 @@ def _load_instruments(exchange: str) -> pd.DataFrame:
     return frame.copy()
 
 
+def _canonical_index_name(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value).strip().upper())
+
+
+def _load_index_instruments() -> pd.DataFrame:
+    """Load the provider's index master (`source=index`).
+
+    The index CSV is only three columns: EXCH, SEGMENT, SECURITY_ID. In this
+    file SEGMENT holds the index name (for example ``NIFTY 50``), not a market
+    segment, so it is exposed here as INDEX_NAME.
+    """
+    cache_key = "INDEX_MASTER"
+    now = time.time()
+    with _INSTRUMENTS_LOCK:
+        cached = _INSTRUMENTS.get(cache_key)
+        if cached and now - cached[0] < 6 * 3600:
+            return cached[1].copy()
+    response = _request("GET", "/market/instruments", params={"source": "index"})
+    try:
+        frame = pd.read_csv(io.BytesIO(response.content), dtype=str)
+    except Exception:
+        raise RuntimeError("Could not parse INDstocks index instrument master CSV") from None
+    frame.columns = [str(c).strip().upper() for c in frame.columns]
+    needed = {"EXCH", "SEGMENT", "SECURITY_ID"}
+    if not needed.issubset(frame.columns):
+        raise RuntimeError("INDstocks index master is missing required columns")
+    frame["EXCH"] = frame["EXCH"].astype(str).str.strip().str.upper()
+    frame["INDEX_NAME"] = frame["SEGMENT"].astype(str).str.strip()
+    frame["SECURITY_ID"] = frame["SECURITY_ID"].astype(str).str.strip()
+    frame["_INDEX_KEY"] = frame["INDEX_NAME"].map(_canonical_index_name)
+    with _INSTRUMENTS_LOCK:
+        _INSTRUMENTS[cache_key] = (now, frame)
+    return frame.copy()
+
+
+def resolve_index_scrip_code(index_name: str = "NIFTY 50", exchange: str = "NSE") -> str:
+    """Resolve an index name to the provider's ``NSE_<security_id>`` form."""
+    target = _canonical_index_name(index_name)
+    aliases = {
+        "NIFTY": {"NIFTY", "NIFTY50", "NIFTY50INDEX"},
+        "NIFTY50": {"NIFTY", "NIFTY50", "NIFTY50INDEX"},
+        "NIFTYBANK": {"NIFTYBANK", "BANKNIFTY", "NIFTYBANKINDEX"},
+        "BANKNIFTY": {"NIFTYBANK", "BANKNIFTY", "NIFTYBANKINDEX"},
+    }
+    wanted = {target, *aliases.get(target, set())}
+    frame = _load_index_instruments()
+    matches = frame[
+        frame["EXCH"].eq(str(exchange).strip().upper())
+        & frame["SECURITY_ID"].str.fullmatch(r"\d+")
+    ].copy()
+    hits = matches[matches["_INDEX_KEY"].isin(wanted)]
+    if hits.empty:
+        available = sorted(matches["INDEX_NAME"].dropna().unique().tolist())[:20]
+        raise RuntimeError(
+            f"INDstocks index master has no {exchange} index match for {index_name}; "
+            f"available sample={available}"
+        )
+    security_id = str(hits.iloc[0]["SECURITY_ID"]).strip()
+    return f"{str(exchange).strip().upper()}_{security_id}"
+
+
+def _is_provider_scrip_code(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:NSE|BSE|NFO|BFO)_\d+", str(value).strip().upper()))
+
+
 def resolve_scrip_code(symbol: str) -> str:
     """Resolve an NSE/BSE listed equity to the provider's SEGMENT_SECURITY_ID form."""
     root, exchange = _root_symbol(symbol)
@@ -667,7 +732,11 @@ def historical(
     if end_dt - start_dt > timedelta(days=window_days * max_calls):
         raise ValueError(f"Requested range exceeds the {max_calls}-call safety cap for {interval}")
 
-    code = resolve_scrip_code(symbol)
+    code = (
+        str(symbol).strip().upper()
+        if _is_provider_scrip_code(symbol)
+        else resolve_scrip_code(symbol)
+    )
     step = timedelta(days=window_days)
     cursor = start_dt
     frames: list[pd.DataFrame] = []

@@ -48,3 +48,68 @@ def test_normalize_supports_strike_price():
     out = fno._normalize(raw, pd.Timestamp("2026-01-02").date())
     assert "strike_price" in out.columns
     assert out.loc[0, "strike_price"] == 100.0
+
+
+def test_persist_derived_rows_accepts_custom_paths_and_skips_upload(tmp_path):
+    rows = pd.DataFrame(
+        {
+            "symbol": ["ABC", "ABC"],
+            "date": ["2026-01-02", "2026-01-05"],
+            "fno_fut_close": [100.0, 101.0],
+            "fno_atm_iv": [0.20, 0.21],
+        }
+    )
+    derived = tmp_path / "fno_2026_custom.parquet"
+    meta = tmp_path / "fno_2026_custom.meta.json"
+
+    fno._persist_derived_rows(rows, derived=derived, meta_path=meta, upload=False)
+
+    out = pd.read_parquet(derived)
+    assert len(out) == 2
+    assert out["fno_fut_return"].iloc[1] == pytest.approx(0.01)
+    assert out["fno_iv_change"].iloc[1] == pytest.approx(0.01)
+    report = pd.read_json(meta, typ="series")
+    assert int(report["rows"]) == 2
+    assert report["min_date"] == "2026-01-02"
+    assert report["max_date"] == "2026-01-05"
+
+
+def test_rebuild_derived_range_walks_weekdays_and_persists(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_normalize(raw, current):
+        return pd.DataFrame({"date": [pd.Timestamp(current)]})
+
+    def fake_build(day):
+        current = pd.Timestamp(day["date"].iloc[0])
+        seen.append(current.date().isoformat())
+        return pd.DataFrame(
+            {
+                "symbol": ["ABC"],
+                "date": [current],
+                "fno_fut_close": [100.0],
+                "fno_atm_iv": [0.2],
+            }
+        )
+
+    fake_zip = tmp_path / "x.zip"
+    fake_zip.write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(fno, "_existing_local_archive", lambda current: fake_zip)
+    monkeypatch.setattr(fno, "_read_zip", lambda content: pd.DataFrame())
+    monkeypatch.setattr(fno, "_normalize", fake_normalize)
+    monkeypatch.setattr(fno, "_build_features", fake_build)
+
+    derived = tmp_path / "fno_range.parquet"
+    meta = tmp_path / "fno_range.meta.json"
+    fno._rebuild_derived_range(
+        pd.Timestamp("2026-01-02").date(),
+        pd.Timestamp("2026-01-05").date(),
+        derived=derived,
+        meta_path=meta,
+        upload=False,
+    )
+
+    assert seen == ["2026-01-02", "2026-01-05"]
+    out = pd.read_parquet(derived)
+    assert len(out) == 2
+    assert out["date"].dt.strftime("%Y-%m-%d").tolist() == ["2026-01-02", "2026-01-05"]

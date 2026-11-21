@@ -455,3 +455,70 @@ def test_request_retry_telemetry_marks_second_attempt(monkeypatch, capsys):
     assert event["attempt"] == 2
     assert event["http_status"] == 200
     assert "secret" not in json.dumps(event)
+
+
+def test_index_master_parses_three_column_csv(monkeypatch):
+    class FakeResponse:
+        content = b"EXCH,SEGMENT,SECURITY_ID\nNSE,NIFTY 50,40000001\nNSE,NIFTY IT,40000004\n"
+
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: FakeResponse())
+    client._INSTRUMENTS.clear()
+    frame = client._load_index_instruments()
+
+    assert list(frame.columns) == ["EXCH", "SEGMENT", "SECURITY_ID", "INDEX_NAME", "_INDEX_KEY"]
+    assert frame.loc[0, "INDEX_NAME"] == "NIFTY 50"
+    assert frame.loc[0, "_INDEX_KEY"] == "NIFTY50"
+
+
+def test_resolve_index_scrip_code_accepts_common_aliases(monkeypatch):
+    frame = pd.DataFrame(
+        [
+            {"EXCH": "NSE", "INDEX_NAME": "NIFTY 50", "SECURITY_ID": "40000001", "_INDEX_KEY": "NIFTY50"},
+            {"EXCH": "NSE", "INDEX_NAME": "NIFTY BANK", "SECURITY_ID": "40000009", "_INDEX_KEY": "NIFTYBANK"},
+        ]
+    )
+    monkeypatch.setattr(client, "_load_index_instruments", lambda: frame)
+
+    assert client.resolve_index_scrip_code("NIFTY 50") == "NSE_40000001"
+    assert client.resolve_index_scrip_code("NIFTY50") == "NSE_40000001"
+    assert client.resolve_index_scrip_code("NIFTY") == "NSE_40000001"
+    assert client.resolve_index_scrip_code("BANKNIFTY") == "NSE_40000009"
+    assert client.resolve_index_scrip_code("nifty bank") == "NSE_40000009"
+
+
+def test_historical_accepts_already_resolved_provider_code(monkeypatch):
+    start = pd.Timestamp("2026-10-07 09:15:00", tz=client.IST)
+    end = start + pd.Timedelta(days=1)
+    epoch = int(start.timestamp())
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "NSE_40000001": {
+                        "candles": [
+                            {"ts": epoch, "o": 25000, "h": 25010, "l": 24990, "c": 25005, "v": 0}
+                        ]
+                    }
+                },
+            }
+
+    monkeypatch.setattr(
+        client,
+        "resolve_scrip_code",
+        lambda symbol: pytest.fail("provider codes must bypass equity resolution"),
+    )
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: FakeResponse())
+    frame = client.historical("NSE_40000001", start, end, "5m")
+
+    assert len(frame) == 1
+    assert float(frame.iloc[0]["Close"]) == 25005.0
+
+
+def test_provider_scrip_code_detection():
+    assert client._is_provider_scrip_code("NSE_40000001")
+    assert client._is_provider_scrip_code("BSE_500325")
+    assert client._is_provider_scrip_code("NFO_51011")
+    assert not client._is_provider_scrip_code("NIFTY 50")
+    assert not client._is_provider_scrip_code("RELIANCE.NS")

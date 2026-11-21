@@ -1,0 +1,121 @@
+name: Retrain to-close champion (Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: "fno = liquid F&O underlyings (recommended) or all"
+        required: false
+        default: "fno"
+        type: choice
+        options: ["fno", "all"]
+      sessions:
+        description: "Maximum sessions retained per symbol"
+        required: false
+        default: "500"
+      max_symbols:
+        description: "Maximum symbols downloaded/trained (0 = no cap)"
+        required: false
+        default: "300"
+      cost:
+        description: "Assumed round-trip cost + slippage (0.0011 = 11 bps)"
+        required: false
+        default: "0.0011"
+      warmup_bars:
+        description: "3 = first decision 09:35"
+        required: false
+        default: "3"
+  # Enable after the first successful manual run. 20:15 IST, after the 19:15 IST F&O sync.
+  # schedule:
+  #   - cron: "45 14 * * 1-5"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: retrain-to-close
+  cancel-in-progress: false
+
+jobs:
+  deploy-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      JOB: to-close-retrain
+      IMAGE_REPO: asia-south1-docker.pkg.dev/indian-market-trading/cloud-run-source-deploy
+      UNIVERSE: ${{ inputs.universe || 'fno' }}
+      SESSIONS: ${{ inputs.sessions || '500' }}
+      MAX_SYMBOLS: ${{ inputs.max_symbols || '300' }}
+      COST: ${{ inputs.cost || '0.0011' }}
+      WARMUP_BARS: ${{ inputs.warmup_bars || '3' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Build training image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$IMAGE_REPO/to-close-retrain:$GITHUB_SHA"
+          echo "TRAIN_IMAGE=$IMAGE"
+          gcloud builds submit \
+            --project="$PROJECT_ID" \
+            --config=cloudbuild-backfill-job.yaml \
+            --substitutions="_IMAGE=$IMAGE" \
+            .
+
+      - name: Deploy Cloud Run training job
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$IMAGE_REPO/to-close-retrain:$GITHUB_SHA"
+          gcloud run jobs deploy "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="$IMAGE" \
+            --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
+            --cpu 8 --memory 32Gi --task-timeout 86400 --max-retries 0 \
+            --command python \
+            --args="-u,retrain_to_close_job.py,--universe=$UNIVERSE,--sessions=$SESSIONS,--max-symbols=$MAX_SYMBOLS,--cost=$COST,--warmup-bars=$WARMUP_BARS" \
+            --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
+          gcloud run jobs describe "$JOB" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --format='yaml(spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.containers[0].args,spec.template.spec.template.spec.timeoutSeconds,spec.template.spec.template.spec.maxRetries,spec.template.spec.template.spec.serviceAccountName)'
+
+      - name: Run training job and wait
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run jobs execute "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --wait
+          gcloud run jobs executions list \
+            --job="$JOB" --project="$PROJECT_ID" --region="$REGION" \
+            --limit=1 \
+            --format='table(name,status.startTime,status.completionTime,status.conditions[0].status,status.conditions[0].message)'
+
+      - name: Show recent training logs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit=120 --order=desc \
+            --format='value(timestamp,textPayload)' 2>/dev/null \
+            | grep -aE "RETRAIN_STATUS|TRAIN_UNIVERSE|DATA_NOT_READY|TRAIN_FAILED|Traceback|COMPLETED_|UPLOAD_FAILED" || true
