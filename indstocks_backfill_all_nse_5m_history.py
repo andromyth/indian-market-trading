@@ -743,21 +743,63 @@ def fetch_indstocks_5m_batch(
     return result, calls
 
 
-def _load_batch_progress(store: Any) -> set[int]:
-    """Return batch numbers already fully completed and persisted on Drive."""
+def _load_batch_progress(store: Any, resolvable: list[tuple[str, str]] | None = None) -> set[int]:
+    """Return batch numbers already fully completed and persisted on Drive.
+
+    The small JSON index can be overwritten or lost between restarts, so the
+    authoritative signal is the actual per-symbol parquet folders on Drive: a
+    batch is complete only when every one of its five symbols has a parquet.
+    """
+    from persistent_store import _drive_execute_with_retry
+
+    completed: set[int] = set()
     local = Path("/tmp/nse_5m_batch_progress.json")
     try:
         item = _resolve_remote_file(store, BATCH_PROGRESS_REMOTE)
+        if item:
+            download_drive_file_with_retry(store.service, item["id"], local, operation="batch_progress_download")
+            data = json.loads(local.read_text(encoding="utf-8"))
+            completed = {int(x) for x in data.get("completed_batches", []) if str(x).isdigit()}
     except Exception:
-        return set()
-    if not item:
-        return set()
+        pass
+
+    if store is None or not resolvable:
+        return completed
     try:
-        download_drive_file_with_retry(store.service, item["id"], local, operation="batch_progress_download")
-        data = json.loads(local.read_text(encoding="utf-8"))
-        return {int(x) for x in data.get("completed_batches", []) if str(x).isdigit()}
-    except Exception:
-        return set()
+        folder = _resolve_remote_file(store, REMOTE_ROOT)
+        if not folder:
+            return completed
+        existing: set[str] = set()
+        page_token = None
+        while True:
+            params = {
+                "q": f"'{folder['id']}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            resp = _drive_execute_with_retry(
+                "batch_progress_symbol_list",
+                lambda: store.service.files().list(**params).execute(),
+            )
+            for f in resp.get("files", []):
+                name = str(f.get("name") or "")
+                if name.startswith("symbol="):
+                    existing.add(name.split("=", 1)[1].upper().replace(".NS", ""))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        for batch_no in range(1, math.ceil(len(resolvable) / MAX_CODES_PER_REQUEST) + 1):
+            members = resolvable[(batch_no - 1) * MAX_CODES_PER_REQUEST:batch_no * MAX_CODES_PER_REQUEST]
+            if members and all(sym in existing for sym, _ in members):
+                completed.add(batch_no)
+    except Exception as exc:
+        print("BACKFILL_BATCH_PROGRESS_DRIVE_CHECK_FAILED " + type(exc).__name__, flush=True)
+    return completed
 
 
 def _save_batch_progress(store: Any, completed: set[int]) -> None:
@@ -894,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
     total_api_calls = 0
     live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
-    completed_batches = _load_batch_progress(store)
+    completed_batches = _load_batch_progress(store, resolvable)
     live_file_listing_cache: dict[str, list[dict[str, Any]]] = {}
 
     for batch_no, batch in enumerate(batches, start=1):
