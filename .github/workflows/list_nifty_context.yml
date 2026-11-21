@@ -81,4 +81,26 @@ jobs:
           ]
           print("NIFTY_CONTEXT_FILES=" + json.dumps(rows, sort_keys=True))
           print("NIFTY_CONTEXT_FILE_COUNT=" + str(len(rows)))
+
+          # Search the whole Drive for any NIFTY-named parquet that may already hold the 18th data.
+          found, page = [], None
+          while True:
+              res = service.files().list(
+                  q="(name contains 'nifty' or name contains 'NIFTY') and trashed = false",
+                  pageSize=1000, pageToken=page,
+                  fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)",
+                  supportsAllDrives=True, includeItemsFromAllDrives=True,
+              ).execute()
+              found.extend(res.get("files", []))
+              page = res.get("nextPageToken")
+              if not page:
+                  break
+          hits = [
+              {"name": x.get("name"), "type": x.get("mimeType"),
+               "size_bytes": int(x.get("size") or 0), "modifiedTime": x.get("modifiedTime"),
+               "id": x.get("id"), "parents": x.get("parents")}
+              for x in sorted(found, key=lambda x: x.get("modifiedTime", ""), reverse=True)
+          ]
+          print("DRIVE_NIFTY_FILES=" + json.dumps(hits, sort_keys=True))
+          print("DRIVE_NIFTY_FILE_COUNT=" + str(len(hits)))
           PY
