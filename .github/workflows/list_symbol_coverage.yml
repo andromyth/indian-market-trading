@@ -57,7 +57,6 @@ jobs:
 
           archive = find_folder("production_data/nse_official/intraday_seed/olo_5m_archive/symbols")
           archive_symbols = []
-          fno_parquet = None
           if archive:
               for x in children(archive):
                   if x["name"].startswith("symbol=") and not str(x["name"]).startswith("symbol=__NIFTY"):
@@ -67,9 +66,10 @@ jobs:
           fno_folder = find_folder("production_data/nse_official/fno")
           fno_symbols = []
           fno_parquet_name = None
+          PREFS = ["fno_daily_features_2024_2026.parquet", "fno_daily_features_2025_2026.parquet", "fno_daily_features_2024_2025.parquet", "fno_daily_features_2026.parquet", "fno_daily_features_history_2022_2024.parquet"]
           if fno_folder:
               for x in children(fno_folder):
-                  if x["name"].startswith("fno_daily_features") and x["name"].endswith(".parquet"):
+                  if x["name"] in PREFS and x["mimeType"] == "application/vnd.google-apps.file":
                       fno_parquet_name = x["name"]
                       p = Path("/tmp") / ("cov_" + x["name"])
                       with p.open("wb") as fh:
@@ -85,12 +85,12 @@ jobs:
           missing = sorted(set(fno_symbols) - set(archive_symbols))
           print("COVERAGE_ANALYSIS=" + json.dumps({
               "fno_parquet_name": fno_parquet_name,
-              "fno_symbols": fno_symbols,
-              "archive_symbols": archive_symbols,
-              "covered": covered,
-              "missing": missing,
+              "fno_symbol_count": len(fno_symbols),
+              "archive_symbol_count": len(archive_symbols),
               "covered_count": len(covered),
               "missing_count": len(missing),
+              "covered_sample": covered[:200],
+              "missing": missing,
               "archive_folder_found": archive is not None,
           }, default=str))
           print("LISTING_DONE")
