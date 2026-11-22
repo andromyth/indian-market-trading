@@ -1,0 +1,56 @@
+name: Promote staged worker revision to production traffic
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Exact Cloud Run revision name to promote"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-staged-worker-revision
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+      REVISION: ${{ github.event.inputs.revision }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Verify revision exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run revisions describe "$REVISION" --project="$PROJECT_ID" --region="$REGION" --format='value(name)'
+
+      - name: Promote revision to production traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --to-revisions="$REVISION=100" --quiet
+          echo "PROMOTED_REVISION=$REVISION"
+
+      - name: Verify production traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.traffic)'
