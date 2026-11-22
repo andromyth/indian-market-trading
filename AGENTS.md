@@ -6,7 +6,7 @@ Before creating any commit or pushing changes in this repository, set and verify
 
 ```bash
 git config --local user.name "andromyth"
-git config --local user.email "arindamsil@duck.com"
+git config --local user.email "279280717+andromyth@users.noreply.github.com"
 git config --local --get user.name
 git config --local --get user.email
 ```
@@ -14,7 +14,7 @@ git config --local --get user.email
 The expected output is exactly:
 
 - `andromyth`
-- `arindamsil@duck.com`
+- `279280717+andromyth@users.noreply.github.com`
 
 Repository-local configuration is intentional: it overrides any global identity supplied by an agent runtime. Do not use `OpenCode`, `opencode@users.noreply.github.com`, or another agent/runtime identity as author or committer.
 
