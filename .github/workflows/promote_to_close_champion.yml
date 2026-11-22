@@ -42,7 +42,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --disable-pip-version-check joblib numpy pandas scipy scikit-learn google-api-python-client google-auth google-auth-oauthlib
+      # Same pinned environment as the training image: the candidate bundle is a pickle,
+      # so a different scikit-learn (or numpy ABI) can fail to load. requirements.txt pins
+      # scikit-learn==1.6.1; keep this job in lockstep with the Dockerfile.
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt "pyarrow<25"
       - name: Promote candidate
         shell: bash
         run: |
