@@ -33,6 +33,7 @@ import pandas as pd
 IST = ZoneInfo("Asia/Kolkata")
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_PLAN_PATH = REPO_ROOT / "capital_plan.json"
+PINNED_ROSTER_PATH = REPO_ROOT / "backfill_universe.json"
 
 DELIVERY_LEDGER = "production_data/predictions/delivery_prediction_actual_ledger.csv"
 FNO_FEATURES = "production_data/nse_official/fno/fno_daily_features_2026.parquet"
@@ -86,6 +87,22 @@ def load_capital_plan(path: str | Path | None = None) -> dict[str, Any]:
     except (OSError, ValueError):
         pass
     return plan
+
+
+def authoritative_roster(path: str | Path | None = None) -> list[str]:
+    """Owner-supplied authoritative symbol roster; never re-selected."""
+    roster_path = Path(path) if path else PINNED_ROSTER_PATH
+    try:
+        data = json.loads(roster_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    values = data.get("symbols") if isinstance(data, dict) else data
+    if not isinstance(values, list):
+        return []
+    return sorted({
+        str(value).strip().upper().replace(".NS", "").replace(".BO", "")
+        for value in values if str(value).strip()
+    })
 
 
 def position_budget(plan: dict[str, Any], realised_pnl: float = 0.0) -> dict[str, Any]:
@@ -426,6 +443,12 @@ def build_manifest(store=None, plan: dict[str, Any] | None = None,
             "sources": status,
             "stats": selection["stats"],
         }
+
+    pinned = sorted(set(authoritative_roster()))
+    if pinned:
+        selection = dict(selection)
+        selection["symbols"] = pinned
+        selection["universe_version"] = hashlib.sha1("|".join(pinned).encode("utf-8")).hexdigest()[:12]
 
     manifest = {
         "status": "OK",

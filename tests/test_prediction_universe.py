@@ -138,3 +138,31 @@ def test_build_manifest_selects_from_fake_sources(monkeypatch):
                                  now=datetime(2026, 11, 16, 16, 0))
     assert manifest["status"] == "ABORTED"
     assert manifest["stats"]["selected"] == 3
+
+
+def test_authoritative_roster_loads_owner_file():
+    roster = pu.authoritative_roster()
+    assert len(roster) == 500
+
+
+def test_build_manifest_publishes_authoritative_roster(monkeypatch):
+    symbols = [f"S{i:03d}" for i in range(200)]
+    ledger_csv = _ledger([
+        ["2026-11-02", s, "BUY", 100, 102, True, "MATURED"] for s in symbols
+    ]).to_csv(index=False).encode()
+
+    def fake_download(store, remote):
+        if remote == pu.DELIVERY_LEDGER:
+            return ledger_csv
+        return None
+
+    monkeypatch.setattr(pu, "_download_bytes", fake_download)
+    monkeypatch.setattr(pu, "_outcomes_frames", lambda store, now, days: ([], []))
+    monkeypatch.setattr(pu, "fno_universe", lambda frame: set())
+    monkeypatch.setattr(pu, "authoritative_roster", lambda: ["ZZZ", "AAA"])
+
+    manifest = pu.build_manifest(store=object(), plan=dict(PLAN, universe_size=200), sync=False,
+                                 now=datetime(2026, 11, 16, 16, 0))
+    assert manifest["status"] == "OK"
+    assert manifest["symbols"] == ["AAA", "ZZZ"]
+    assert manifest["universe_version"] == pu.hashlib.sha1("AAA|ZZZ".encode()).hexdigest()[:12]
