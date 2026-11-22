@@ -112,8 +112,19 @@ def _fno_asof(idx: pd.DatetimeIndex, fno_sym: pd.DataFrame | None) -> pd.DataFra
     out["fno_available"] = 0.0
     if fno_sym is None:
         return out.set_index(idx)
-    left = pd.DataFrame({"d": idx.floor("D").tz_localize(None), "i": np.arange(len(idx))}).sort_values("d")
-    m = pd.merge_asof(left, fno_sym, left_on="d", right_on="_date", direction="backward",
+    # Normalize both join keys to nanosecond resolution: parquet round-trips can
+    # store datetimes as micro/millisecond units and pandas rejects mixed-unit
+    # merge_asof keys.
+    dtype = "datetime64[ns]"
+    left = pd.DataFrame(
+        {
+            "d": pd.to_datetime(idx.floor("D")).tz_localize(None).astype(dtype),
+            "i": np.arange(len(idx)),
+        }
+    ).sort_values("d")
+    right = fno_sym.copy()
+    right["_date"] = pd.to_datetime(right["_date"]).astype(dtype)
+    m = pd.merge_asof(left, right, left_on="d", right_on="_date", direction="backward",
                       allow_exact_matches=False, tolerance=pd.Timedelta(days=7)).sort_values("i")
     vals = m[FNO_COLS].to_numpy()
     out = pd.DataFrame(vals, columns=FNO_COLS, index=idx)
