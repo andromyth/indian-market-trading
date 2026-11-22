@@ -38,7 +38,7 @@ REMOTE_ROOT = "production_data/all_nse_minute_predictions"
 FNO_DAILY_REMOTE = "production_data/nse_official/fno/fno_daily_features_2026.parquet"
 FNO_CONTEXT_MAX_AGE_DAYS = 7
 FNO_CONTEXT_RETRY_SECONDS = 900
-HISTORY_LOOKBACK_BARS = 120
+HISTORY_LOOKBACK_BARS = 240
 HISTORY_BAR_INTERVAL_MINUTES = 5
 HISTORY_BATCH_SIZE = 5
 HISTORY_REQUEST_PAUSE_SECONDS = 0.22
@@ -47,6 +47,9 @@ HISTORY_REFRESH_WINDOW_MINUTES = 90
 HISTORY_REFRESH_WORKERS = 8
 MAX_HISTORY_CANDLE_AGE_MINUTES = 5
 MIN_SIGNAL_READINESS = 0.70
+LOG_SERVED_FEATURES = os.getenv("ALL_NSE_LOG_SERVED_FEATURES", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def _history_seed_batches(
@@ -353,6 +356,54 @@ def _model_signal_thresholds(model_api: Any) -> tuple[float, float]:
     return 0.60, 0.40
 
 
+def _model_signal_min_edge(model_api: Any) -> float | None:
+    """Cost hurdle the served model was validated with (None = probability-only model)."""
+    getter = getattr(model_api, "signal_min_edge", None)
+    if callable(getter):
+        try:
+            value = getter()
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+    return None
+
+
+def _model_serving_mode(model_api: Any) -> str | None:
+    getter = getattr(model_api, "serving_mode", None)
+    if callable(getter):
+        try:
+            return str(getter())
+        except Exception:
+            return None
+    return None
+
+
+def _apply_edge_rule(
+    signal: str,
+    expected_return: float | None,
+    min_edge: float | None,
+) -> str:
+    """Hold unless the predicted move clears the trained cost hurdle in its direction."""
+    if signal not in {"BUY", "SELL"} or not min_edge:
+        return signal
+    if expected_return is None or not np.isfinite(expected_return):
+        return "HOLD"
+    edge = float(expected_return)
+    if signal == "BUY":
+        return signal if edge > min_edge else "HOLD"
+    return signal if edge < -min_edge else "HOLD"
+
+
+def _is_closed_5m_bar(ts: pd.Timestamp) -> bool:
+    """True for a bar-close-stamped candle that lands on the 5-minute grid."""
+    stamp = _as_ist_timestamp(ts)
+    return (
+        stamp.minute % HISTORY_BAR_INTERVAL_MINUTES == 0
+        and stamp.second == 0
+        and stamp.microsecond == 0
+    )
+
+
 def _is_auth_recovery_error(error: Any) -> bool:
     """Identify errors that mean the shared provider token is unusable.
 
@@ -526,6 +577,7 @@ class AllNSEMinutePredictor:
         self._last_day_volume: dict[str, tuple[date, float]] = {}
         self._last_minute: str | None = None
         self._model_api = None
+        self._champion_configured = False
         self._classifier = None
         self._regressor = None
         self._model_status: dict[str, Any] = {}
@@ -615,7 +667,7 @@ class AllNSEMinutePredictor:
     def _apply_calibration_overlay(self, row: dict[str, Any]) -> dict[str, Any]:
         """Fail-open, version-specific calibration; SHADOW never changes live outputs."""
         mode = calibration_overlay_module.resolve_mode(
-            os.getenv("ALL_NSE_CALIBRATION_MODE", "active")
+            os.getenv("ALL_NSE_CALIBRATION_MODE", "off")
         )
         if mode == "off":
             return row
@@ -1656,26 +1708,67 @@ class AllNSEMinutePredictor:
             flush=True,
         )
 
+    def _champion_api(self):
+        """Drive-backed champion API, configured once. None when disabled or Drive is absent."""
+        mode = os.getenv("ALL_NSE_MODEL_API", "champion").strip().lower()
+        if mode in {"legacy", "pooled", "all_nse"}:
+            return None
+        try:
+            from persistent_store import gdrive_config
+
+            if not gdrive_config().get("configured"):
+                return None
+        except Exception:
+            return None
+        try:
+            import champion_model_api as model
+        except Exception as exc:
+            self._log("all_nse_champion_import_failed", error=f"{type(exc).__name__}: {exc}")
+            return None
+        if not getattr(self, "_champion_configured", False):
+            try:
+                import daily_cycle
+
+                model.configure(daily_cycle.make_drive_store())
+            except Exception as exc:
+                self._log("all_nse_champion_configure_failed", error=f"{type(exc).__name__}: {exc}")
+                return None
+            self._champion_configured = True
+        return model
+
+    def _model_api_candidates(self):
+        champion = self._champion_api()
+        if champion is not None:
+            yield champion
+        import all_nse_intraday_model as legacy
+
+        yield legacy
+
     def _ensure_model(self) -> None:
         if self._classifier is not None and self._regressor is not None:
             return
-        import all_nse_intraday_model as model
-
-        status = model.model_status()
-        if not status.get("manifest_sha256_match"):
-            raise RuntimeError(
-                "Pooled ALL-NSE intraday model is unavailable or its hashes do not match the manifest"
-            )
-        classifier, regressor = model._models()
-        with self._lock:
-            self._model_api = model
-            self._classifier = classifier
-            self._regressor = regressor
-            self._model_status = status
-            self._trained_symbols = {
-                str(s).strip().upper().replace(".NS", "")
-                for s in (status.get("training_symbols") or [])
-            }
+        errors: list[str] = []
+        for model in self._model_api_candidates():
+            try:
+                status = model.model_status()
+                if not status.get("manifest_sha256_match", False):
+                    raise RuntimeError(status.get("error") or "model artifact unavailable")
+                classifier, regressor = model._models()
+            except Exception as exc:
+                errors.append(f"{getattr(model, '__name__', 'model')}: {type(exc).__name__}: {exc}")
+                continue
+            with self._lock:
+                self._model_api = model
+                self._classifier = classifier
+                self._regressor = regressor
+                self._model_status = status
+                self._trained_symbols = {
+                    str(s).strip().upper().replace(".NS", "")
+                    for s in (status.get("training_symbols") or [])
+                }
+            self._log("all_nse_model_bound", model_api=getattr(model, "__name__", "model"))
+            return
+        raise RuntimeError("No usable ALL-NSE model API: " + " | ".join(errors))
 
     def _load_completed_fno_context(
         self,
@@ -2594,7 +2687,15 @@ class AllNSEMinutePredictor:
             nifty_price, nifty_observed_at, nifty_error = None, None, "LIVE_INDEX_QUOTE_NOT_REQUESTED_IN_DRIVE_ONLY_MODE"
         else:
             nifty_price, nifty_observed_at, nifty_error = self._fetch_current_nifty_quote()
+        serving_mode = None
         try:
+            # A swapped champion is picked up at the start of a bar, never mid-batch.
+            try:
+                champion_rotated = getattr(self._model_api, "champion_changed", lambda: False)()
+            except Exception:
+                champion_rotated = False
+            if champion_rotated:
+                self._classifier = self._regressor = None
             # Model initialization is independent of universe-wide history
             # coverage; each stored stock quote is evaluated with its own data.
             self._ensure_model()
@@ -2602,6 +2703,7 @@ class AllNSEMinutePredictor:
             model_error = f"{type(exc).__name__}: {str(exc)[:240]}"
         else:
             model_error = None
+            serving_mode = _model_serving_mode(self._model_api)
 
         fno_context_by_symbol: dict[str, dict[str, Any]] = {}
         fno_context_status = "NOT_ATTEMPTED"
@@ -2681,12 +2783,16 @@ class AllNSEMinutePredictor:
                     ):
                         feature_history = current_quote_frame
                         quote_info["history_input_mode"] = "CURRENT_QUOTE_ONLY"
-                    else:
+                    elif _is_closed_5m_bar(actual_ts):
                         feature_history = pd.concat([hist, current_quote_frame]).sort_index()
                         feature_history = feature_history.loc[
                             ~feature_history.index.duplicated(keep="last")
                         ].tail(HISTORY_LOOKBACK_BARS)
-                        quote_info["history_input_mode"] = "FRESH_5M_HISTORY_PLUS_CURRENT_QUOTE"
+                        quote_info["history_input_mode"] = "FRESH_5M_HISTORY_PLUS_CLOSED_QUOTE"
+                    else:
+                        # Off-grid quote: train/serve parity requires candles only.
+                        feature_history = hist.tail(HISTORY_LOOKBACK_BARS)
+                        quote_info["history_input_mode"] = "CLOSED_5M_HISTORY_ONLY"
                     feature_names = _model_feature_names(self._model_api)
                     try:
                         model_feature_row = self._model_api._latest_features(
@@ -2774,6 +2880,7 @@ class AllNSEMinutePredictor:
                     for name in inference_frame.columns
                 },
             })
+        signal_min_edge = _model_signal_min_edge(self._model_api)
         if feature_rows and not model_error:
             try:
                 x = inference_frame
@@ -2856,17 +2963,32 @@ class AllNSEMinutePredictor:
                         if not data_limited and trained_for_symbol is not False
                         else "HOLD"
                     )
+                    signal = _apply_edge_rule(signal, expected_return, signal_min_edge)
                     if data_limited:
                         prediction_status = "PREDICTED_DATA_LIMITED"
                     elif trained_for_symbol is False:
                         prediction_status = "PREDICTED_UNTRAINED_SYMBOL"
                     else:
                         prediction_status = "PREDICTED"
+                    served_features_json = None
+                    if LOG_SERVED_FEATURES:
+                        served_values: dict[str, float | None] = {}
+                        for feature_name, feature_value in x.iloc[idx].items():
+                            try:
+                                served_values[str(feature_name)] = (
+                                    None if pd.isna(feature_value) else round(float(feature_value), 6)
+                                )
+                            except (TypeError, ValueError):
+                                served_values[str(feature_name)] = None
+                        served_features_json = json.dumps(served_values, sort_keys=True)
                     row.update({
                         "prediction_status": prediction_status,
                         "raw_model_signal": raw_signal,
                         "signal": signal,
                         "trained_for_symbol": trained_for_symbol,
+                        "model_serving_mode": serving_mode,
+                        "signal_min_edge": signal_min_edge,
+                        "served_features_json": served_features_json,
                         "prediction_horizon": HORIZON_NAME,
                         "horizon_minutes": horizon_minutes,
                         "target_timestamp": target.isoformat(),

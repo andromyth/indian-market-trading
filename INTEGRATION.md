@@ -117,7 +117,14 @@ python promote_to_close_candidate.py --run-id 20261122T011557Z
 The nightly retrain runs at 20:15 IST (`45 14 * * 1-5`); set repo variable `RETRAIN_SCHEDULE=off`
 to pause it without editing code.
 
-## 2. Capture changes (PATCH)
+## 2. Capture changes (applied)
+
+All eight items below are in `all_nse_minute_prediction_capture.py`. Switches:
+`ALL_NSE_MODEL_API=champion` (default) uses the Drive champion and falls back to the pooled
+`all_nse_intraday_model` when Drive is unconfigured or the champion is missing/hash-mismatched;
+set `ALL_NSE_MODEL_API=legacy` to pin the old model. `ALL_NSE_CALIBRATION_MODE` now defaults to
+`off` (the champion already applies its isotonic map once). `ALL_NSE_LOG_SERVED_FEATURES=1` adds
+the served feature vector to each prediction row (off by default; large files).
 
 1. **Use the champion API.** In `_ensure_model`, `import champion_model_api as model` instead of `all_nse_intraday_model`.
    Keep the constants/helpers (`HORIZON_NAME`, `TARGET_NAME`, `minutes_to_close`, `session_close_timestamp`) imported from

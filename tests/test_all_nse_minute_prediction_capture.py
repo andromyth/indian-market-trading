@@ -140,7 +140,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
 
     from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 
-    minute = pd.Timestamp.now(tz=IST).floor("5min")
+    # Pin the decision clock to mid-session: a bare now() fails after 15:30 IST.
+    minute = pd.Timestamp.now(tz=IST).normalize() + pd.Timedelta(hours=11, minutes=30)
     predictor = AllNSEMinutePredictor(tmp_path)
     predictor.start = lambda: pytest.fail("Drive-only inference must not start the INDstocks history seed")
     predictor._seed_ready = False
