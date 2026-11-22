@@ -197,6 +197,14 @@ def _parse_backfill_options(payload: dict[str, Any]) -> tuple[dict[str, Any], st
         options["replace_existing_history"] = str(raw_replace).strip().lower() in {
             "1", "true", "yes", "on",
         }
+    raw_symbols = payload.get("symbols")
+    if raw_symbols not in (None, ""):
+        values: list[str] = []
+        if isinstance(raw_symbols, (list, tuple)):
+            values = [str(value) for value in raw_symbols if str(value).strip()]
+        else:
+            values = [value.strip() for value in str(raw_symbols).split(",") if value.strip()]
+        options["symbols"] = sorted({value.strip().upper() for value in values if value.strip()})
     return options, None
 
 
@@ -1040,6 +1048,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "status_endpoint": "/backfillz",
                     "end_date": options.get("end_date"),
                     "replace_existing_history": options.get("replace_existing_history"),
+                    "symbols": options.get("symbols"),
                     "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; historical requests pause from 09:15 through 15:59 IST on NSE trading days and resume after 16:00, or run throughout non-trading days.",
                 })
                 return

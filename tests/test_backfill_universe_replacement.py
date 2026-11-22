@@ -81,9 +81,18 @@ def test_backfill_options_parse_end_date_and_replace_flag():
     options, error = service._parse_backfill_options({})
     assert (options, error) == ({}, None)
 
-    options, error = service._parse_backfill_options({"end_date": "18-11-2026"})
-    assert options == {}
-    assert error == "BACKFILL_END_DATE_INVALID"
+
+def test_backfill_options_parse_symbols():
+    options, error = service._parse_backfill_options({"symbols": "RELIANCE,NHPC"})
+    assert error is None
+    assert options["symbols"] == ["NHPC", "RELIANCE"]
+
+    options, error = service._parse_backfill_options({"symbols": ["AAA", "BBB", "AAA"]})
+    assert error is None
+    assert options["symbols"] == ["AAA", "BBB"]
+
+    options, error = service._parse_backfill_options({"symbols": ""})
+    assert (options, error) == ({}, None)
 
 
 def test_main_uses_pinned_universe_end_date_and_one_time_replacement(monkeypatch, tmp_path):

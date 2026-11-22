@@ -875,12 +875,27 @@ def main(argv: list[str] | None = None) -> int:
     if not preflight.get("configured") or preflight.get("reachable") is not True or preflight.get("write_ready") is not True:
         raise RuntimeError("Google Drive read/write preflight failed: " + str(preflight.get("reason")))
 
+    raw_runtime_symbols = RUNTIME_OPTIONS.get("symbols")
+    runtime_symbols: list[str] = []
+    if isinstance(raw_runtime_symbols, str):
+        runtime_symbols = [
+            value.strip().upper().replace(".NS", "").replace(".BO", "")
+            for value in raw_runtime_symbols.split(",") if value.strip()
+        ]
+    elif isinstance(raw_runtime_symbols, (list, tuple, set)):
+        runtime_symbols = sorted({
+            str(value).strip().upper().replace(".NS", "").replace(".BO", "")
+            for value in raw_runtime_symbols if str(value).strip()
+        })
     if args.symbols.strip():
         symbols = sorted({
             value.strip().upper().replace(".NS", "").replace(".BO", "")
             for value in args.symbols.split(",") if value.strip()
         })
         universe_source = "CLI_SYMBOLS"
+    elif runtime_symbols:
+        symbols = sorted(set(runtime_symbols))
+        universe_source = "RUNTIME_SYMBOLS"
     else:
         pinned_symbols = _pinned_universe()
         if pinned_symbols:

@@ -16,6 +16,11 @@ on:
         type: string
         required: false
         default: ""
+      symbols:
+        description: "Comma-separated NSE equity symbols for the backfill roster (blank = pinned backfill_universe.json)"
+        type: string
+        required: false
+        default: ""
       replace_existing_history:
         description: "Replace legacy bars that lack normalized date definitions (auto replaces once when the schema changes)"
         type: choice
@@ -55,6 +60,7 @@ jobs:
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
       REQUESTED_END_DATE: ${{ github.event.inputs.end_date }}
       BACKFILL_REPLACE_EXISTING: ${{ github.event.inputs.replace_existing_history || 'auto' }}
+      BACKFILL_SYMBOLS: ${{ github.event.inputs.symbols }}
       BACKFILL_REVISION_TAG: ${{ (github.event_name == 'schedule' && 'preflight5m') || github.event.inputs.revision_tag || '' }}
     steps:
       - name: Check out repository
@@ -256,7 +262,7 @@ jobs:
           CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 25 \
             -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            --data "{\"confirm\":\"START_NATIVE_5M_BACKFILL\",\"end_date\":\"${BACKFILL_END_DATE}\",\"replace_existing_history\":\"${BACKFILL_REPLACE_EXISTING}\"}" \
+            --data "{\"confirm\":\"START_NATIVE_5M_BACKFILL\",\"end_date\":\"${BACKFILL_END_DATE}\",\"replace_existing_history\":\"${BACKFILL_REPLACE_EXISTING}\",\"symbols\":\"${BACKFILL_SYMBOLS}\"}" \
             --output "$RESPONSE" --write-out '%{http_code}' "$SERVICE_URL/backfill")" || CODE=000
           python - "$RESPONSE" "$CODE" <<'PY'
           import json, sys
