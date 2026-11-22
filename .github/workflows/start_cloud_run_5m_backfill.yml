@@ -12,10 +12,10 @@ on:
           - "no"
           - "yes"
       end_date:
-        description: "Inclusive backfill end date in IST (a bare date means that session's 15:30 close)"
+        description: "Inclusive backfill end date in IST (blank = latest completed NSE session)"
         type: string
         required: false
-        default: "2026-11-18"
+        default: ""
       replace_existing_history:
         description: "Replace legacy bars that lack normalized date definitions (auto replaces once when the schema changes)"
         type: choice
@@ -53,7 +53,7 @@ jobs:
       REGION: asia-south1
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
-      BACKFILL_END_DATE: ${{ github.event.inputs.end_date || '2026-11-18' }}
+      REQUESTED_END_DATE: ${{ github.event.inputs.end_date }}
       BACKFILL_REPLACE_EXISTING: ${{ github.event.inputs.replace_existing_history || 'auto' }}
       BACKFILL_REVISION_TAG: ${{ (github.event_name == 'schedule' && 'preflight5m') || github.event.inputs.revision_tag || '' }}
     steps:
@@ -69,13 +69,24 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import os
-          from datetime import datetime
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from nse_trading_calendar import is_nse_trading_day
 
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           trading_day = is_nse_trading_day(now.date())
           allowed = (not trading_day) or (now.hour, now.minute) >= (16, 0)
+          requested = (os.environ.get("REQUESTED_END_DATE") or "").strip()
+          if requested:
+              target = requested
+          else:
+              # Blank input: latest completed session. Today counts only after 16:00 IST.
+              day = now.date()
+              if not (is_nse_trading_day(day) and (now.hour, now.minute) >= (16, 0)):
+                  day -= timedelta(days=1)
+              while not is_nse_trading_day(day):
+                  day -= timedelta(days=1)
+              target = day.isoformat()
           reason = (
               "NSE trading day before 16:00 IST: backfill is not eligible"
               if trading_day and not allowed
@@ -83,9 +94,10 @@ jobs:
               if not trading_day
               else "NSE trading day at or after 16:00 IST: backfill is eligible"
           )
-          print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} REASON={reason}")
+          print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} TARGET_END_DATE={target} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("should_run=" + ("true" if allowed else "false") + "\n")
+              output.write("end_date=" + target + "\n")
           PY
 
       - name: Require successful deployment when worker code changed
@@ -226,6 +238,8 @@ jobs:
       - name: Start resumable backfill using Cloud Run's existing TOTP cache
         if: steps.schedule_gate.outputs.should_run == 'true'
         id: start
+        env:
+          BACKFILL_END_DATE: ${{ steps.schedule_gate.outputs.end_date }}
         shell: bash
         run: |
           set -euo pipefail
