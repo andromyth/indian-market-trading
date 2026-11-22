@@ -72,7 +72,8 @@ means the F&O history is incomplete.
 ## 1. First model (GitHub Actions -> Cloud Run)
 
 Trigger GitHub Actions -> "Retrain to-close champion (Cloud Run)" (`retrain_to_close.yml`) with the
-defaults: `universe=fno`, `max_symbols=300`, `sessions=500`, `cost=0.0011`, `warmup_bars=3`.
+defaults: `universe=all`, `max_symbols=500`, `sessions=500`, `cost=0.0011`, `warmup_bars=3`
+(`universe=all` trains every backfilled symbol; `universe=fno` restricts to F&O underlyings).
 It does the audit, assembly and training in the job and uploads the candidate to
 `models/to_close/runs/<run_id>/`. Watch the run summary and "Show recent training logs"; then read
 `models/to_close/latest.json` in Drive for the verdict and metrics.
@@ -95,6 +96,26 @@ python pretrain_pipeline.py --backfill-parquet out/bars_5m/parts \
 ₹1-lakh round-trip assumption including 3 bps slippage; stress it at 0.0015.
 Read `training_report.json` before anything else: `holdout_trading.se_bps` (can a real 2 to 5 bps edge be seen at all?),
 `holdout_auc_by_time_left`, `open_stamped_sessions`, `source_agreement`, `coverage.fno_available_by_month`. A FAIL is a valid result.
+
+## 1b. Promotion (candidate -> live champion)
+
+The retrain job never moves the live champion. Run GitHub Actions ->
+"Promote to-close champion (Drive)" (`promote_to_close_champion.yml`) after reviewing a run:
+
+* default `dry_run=true` prints `PROMOTE_RESULT` and writes nothing;
+* set `dry_run=false` to publish. A `FAIL` verdict returns `KEEP_PREVIOUS` (exit 3) and never
+  touches `champion.json`; `--force` publishes a FAIL but keeps serving in HOLD;
+* a `PASS` candidate is copied to `production_data/all_nse_champion/versions/<v>/bundle.joblib`,
+  read back and SHA-256 checked, then `champion.json` is written last;
+* serving leaves HOLD only after `activate_after=3` consecutive PASS nights (`active: true`), so
+  the first two promotions publish a bundle that `champion_model_api` reports as HOLD.
+
+```
+python promote_to_close_candidate.py --dry-run          # inspect the newest candidate
+python promote_to_close_candidate.py --run-id 20261122T011557Z
+```
+The nightly retrain runs at 20:15 IST (`45 14 * * 1-5`); set repo variable `RETRAIN_SCHEDULE=off`
+to pause it without editing code.
 
 ## 2. Capture changes (PATCH)
 

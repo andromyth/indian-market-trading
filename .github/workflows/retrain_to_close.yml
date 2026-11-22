@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       universe:
-        description: "fno = liquid F&O underlyings (recommended) or all"
+        description: "all = every backfilled symbol (default); fno = only F&O underlyings"
         required: false
-        default: "fno"
+        default: "all"
         type: choice
         options: ["fno", "all"]
       sessions:
@@ -16,7 +16,7 @@ on:
       max_symbols:
         description: "Maximum symbols downloaded/trained (0 = no cap)"
         required: false
-        default: "300"
+        default: "500"
       cost:
         description: "Assumed round-trip cost + slippage (0.0011 = 11 bps)"
         required: false
@@ -25,9 +25,10 @@ on:
         description: "3 = first decision 09:35"
         required: false
         default: "3"
-  # Enable after the first successful manual run. 20:15 IST, after the 19:15 IST F&O sync.
-  # schedule:
-  #   - cron: "45 14 * * 1-5"
+  # Nightly retrain at 20:15 IST (14:45 UTC), after the 19:15 IST F&O sync. Enabled after the
+  # first two manual runs passed. Set the repo variable RETRAIN_SCHEDULE=off to pause it.
+  schedule:
+    - cron: "45 14 * * 1-5"
 
 permissions:
   contents: read
@@ -39,6 +40,8 @@ concurrency:
 
 jobs:
   deploy-and-run:
+    # Pause the nightly run without editing code: set repo variable RETRAIN_SCHEDULE=off.
+    if: github.event_name != 'schedule' || vars.RETRAIN_SCHEDULE != 'off'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -46,9 +49,9 @@ jobs:
       REGION: asia-south1
       JOB: to-close-retrain
       IMAGE_REPO: asia-south1-docker.pkg.dev/indian-market-trading/cloud-run-source-deploy
-      UNIVERSE: ${{ inputs.universe || 'fno' }}
+      UNIVERSE: ${{ inputs.universe || 'all' }}
       SESSIONS: ${{ inputs.sessions || '500' }}
-      MAX_SYMBOLS: ${{ inputs.max_symbols || '300' }}
+      MAX_SYMBOLS: ${{ inputs.max_symbols || '500' }}
       COST: ${{ inputs.cost || '0.0011' }}
       WARMUP_BARS: ${{ inputs.warmup_bars || '3' }}
     steps:

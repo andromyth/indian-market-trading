@@ -512,6 +512,18 @@ def main(argv: list[str] | None = None) -> int:
             return finish(1)
         bars_manifest = bars_dir / "manifest.json"
         artifacts.append(bars_manifest)
+        if bars_manifest.is_file():
+            manifest = json.loads(bars_manifest.read_text(encoding="utf-8"))
+            status.update(
+                {
+                    "trained_through": manifest.get("last_session"),
+                    "training_first_session": manifest.get("first_session"),
+                    "training_sessions": manifest.get("sessions"),
+                    "training_rows": manifest.get("rows"),
+                    "training_symbols_written": manifest.get("symbols_written"),
+                }
+            )
+            write_status()
         if not list((bars_dir / "parts").glob("part-*.parquet")):
             raise RuntimeError("assembler produced no training parts")
 
