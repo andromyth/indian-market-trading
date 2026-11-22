@@ -1,0 +1,48 @@
+name: Read Cloud Run retrain job logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Cloud Run job name"
+        required: false
+        default: "to-close-retrain"
+      limit:
+        description: "Max log entries"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+jobs:
+  read-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: indian-market-trading
+      JOB: ${{ inputs.job || 'to-close-retrain' }}
+      LIMIT: ${{ inputs.limit || '500' }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+      - name: Dump job logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "EXECUTIONS:"
+          gcloud run jobs executions list --job="$JOB" --project="$PROJECT_ID" --region=asia-south1 --limit=3 \
+            --format='table(name,status.startTime,status.completionTime,status.conditions[0].status,status.conditions[0].message)' || true
+          echo "=== LOGS (oldest first) ==="
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
+            --project="$PROJECT_ID" --limit="$LIMIT" --order=desc \
+            --format='value(timestamp,textPayload)' 2>/dev/null \
+            | tac
