@@ -69,7 +69,7 @@ jobs:
           PREFS = ["fno_daily_features_2024_2026.parquet", "fno_daily_features_2025_2026.parquet", "fno_daily_features_2024_2025.parquet", "fno_daily_features_2026.parquet", "fno_daily_features_history_2022_2024.parquet"]
           if fno_folder:
               for x in children(fno_folder):
-                  if x["name"] in PREFS and x["mimeType"] == "application/vnd.google-apps.file":
+                  if x["name"].startswith("fno_daily_features") and x["name"].endswith(".parquet") and x["mimeType"] != "application/vnd.google.apps/folder":
                       fno_parquet_name = x["name"]
                       p = Path("/tmp") / ("cov_" + x["name"])
                       with p.open("wb") as fh:
