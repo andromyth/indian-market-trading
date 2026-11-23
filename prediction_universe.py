@@ -469,8 +469,8 @@ def active_symbols(store=None, plan: dict[str, Any] | None = None,
                    now: datetime | None = None) -> tuple[list[str], dict[str, Any]]:
     """Return the fixed owner-selected roster; Drive manifests never reselect it."""
     symbols = authoritative_roster()
-    if not symbols:
-        return [], {"status": "BLOCKED", "reason": "pinned roster unavailable"}
+    if len(symbols) != 500:
+        return [], {"status": "BLOCKED", "reason": f"pinned roster must contain exactly 500 symbols; found {len(symbols)}"}
     version = hashlib.sha1("|".join(symbols).encode("utf-8")).hexdigest()[:12]
     return symbols, {
         "status": "PINNED_500_ROSTER",
