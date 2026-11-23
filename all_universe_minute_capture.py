@@ -688,8 +688,8 @@ def capture_all_universe_minute_snapshot(
             manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
         return _clean(manifest)
 
-    universe_symbols = _selected_roster(universe)
-    universe_filter: dict[str, Any] = {
+    selected_symbols = _selected_roster(universe)
+    roster_selection: dict[str, Any] = {
         "status": "PINNED_500_ROSTER",
         "selected_symbol_count": len(universe_symbols),
     }
