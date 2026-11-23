@@ -691,16 +691,16 @@ def capture_all_universe_minute_snapshot(
     selected_symbols = _selected_roster(universe)
     roster_selection: dict[str, Any] = {
         "status": "PINNED_500_ROSTER",
-        "selected_symbol_count": len(universe_symbols),
+        "selected_symbol_count": len(selected_symbols),
     }
     if instruments is None:
         instruments = _instrument_map()
-    assigned_symbols = shard_universe(universe_symbols, worker_count)[worker_id]
+    assigned_symbols = shard_universe(selected_symbols, worker_count)[worker_id]
     prediction_map = _prediction_map(prediction_snapshots, cycle_minute)
     forecast_rows = _load_forecast_rows(daily_ledger)
-    manifest["roster_selection"] = universe_filter
-    manifest["expected_symbol_count"] = len(universe_symbols)
-    manifest["selected_symbol_count"] = len(universe_symbols)
+    manifest["roster_selection"] = roster_selection
+    manifest["expected_symbol_count"] = len(selected_symbols)
+    manifest["selected_symbol_count"] = len(selected_symbols)
     manifest["shard_symbol_count"] = len(assigned_symbols)
     manifest["shard_symbols"] = assigned_symbols
     manifest["unmapped_symbol_count"] = sum(
@@ -970,7 +970,7 @@ def capture_all_universe_minute_snapshot_sharded(
             ),
         })
 
-    universe_symbols = _selected_roster(universe)
+    selected_symbols = _selected_roster(universe)
     if instruments is None:
         instruments = _instrument_map()
     store = store or GoogleDriveStore()
@@ -984,7 +984,7 @@ def capture_all_universe_minute_snapshot_sharded(
                 prediction_snapshots=prediction_snapshots,
                 worker_id=index,
                 worker_count=count,
-                universe=universe_symbols,
+                universe=selected_symbols,
                 instruments=instruments,
                 return_frame=True,
             )
@@ -1037,7 +1037,7 @@ def capture_all_universe_minute_snapshot_sharded(
         cycle_minute=cycle_minute,
         worker_count=count,
         shards=shard_payloads,
-        expected_universe=universe_symbols,
+        expected_universe=selected_symbols,
         strict_universe=True,
     )
     assembly_manifest = assembly["manifest"]
