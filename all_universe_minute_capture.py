@@ -1,9 +1,8 @@
-"""Minute-level full-NSE market quote snapshots and forecast outcome matching.
+"""Five-minute quote snapshots for the fixed owner-selected 500-symbol roster.
 
-This module records observed INDstocks prices for the full official NSE equity
-universe. It deliberately distinguishes a provider quote snapshot from an
-exchange-timestamped OHLCV candle. Predictions are attached only when the
-existing prediction engine actually emitted them.
+This module records observed INDstocks prices only for the pinned roster. It
+deliberately distinguishes a provider quote snapshot from an exchange-timestamped
+OHLCV candle. Predictions are attached only when the prediction engine emitted them.
 """
 from __future__ import annotations
 
@@ -37,10 +36,29 @@ BATCH_SIZE = 500  # Below the 1,000-symbol API limit and avoids oversized GET UR
 
 
 def _snapshot_coverage_pct(complete_symbols: int, expected_symbols: int) -> float:
-    """Return quote coverage as an informational metric; never use it as a gate."""
+    """Return selected-roster quote coverage as an informational metric."""
     expected = max(0, int(expected_symbols))
     complete = max(0, int(complete_symbols))
     return round(100.0 * complete / expected, 3) if expected else 0.0
+
+
+def _selected_roster(universe: Iterable[str] | None = None) -> list[str]:
+    """Return only symbols in the owner-pinned 500-symbol roster."""
+    from prediction_universe import authoritative_roster
+
+    pinned = authoritative_roster()
+    if not pinned:
+        raise RuntimeError("backfill_universe.json is missing or has no selected symbols")
+    if universe is None:
+        return pinned
+    requested = {
+        str(symbol).strip().upper().replace(".NS", "").replace(".BO", "")
+        for symbol in universe if str(symbol).strip()
+    }
+    selected = [symbol for symbol in pinned if symbol in requested]
+    if not selected:
+        raise RuntimeError("Requested capture symbols do not intersect the pinned 500-symbol roster")
+    return selected
 
 
 QUOTE_REQUEST_MAX_ATTEMPTS = 3
@@ -603,7 +621,6 @@ def capture_all_universe_minute_snapshot(
     """
     worker_count = max(1, int(worker_count))
     worker_id = max(0, min(int(worker_id), worker_count - 1))
-    from delivery_training_universe import official_nse_symbols
     from indstocks_client import _request, configured
     from persistent_store import GoogleDriveStore
 
@@ -671,42 +688,11 @@ def capture_all_universe_minute_snapshot(
             manifest["manifest_sync_error"] = f"{type(exc).__name__}: {exc}"
         return _clean(manifest)
 
-    if universe is None:
-        universe_symbols = sorted({
-            str(s).strip().upper().replace(".NS", "")
-            for s in official_nse_symbols(force_refresh=False)
-            if str(s).strip()
-        })
-    else:
-        universe_symbols = sorted({
-            str(s).strip().upper().replace(".NS", "")
-            for s in universe
-            if str(s).strip()
-        })
-    universe_filter: dict[str, Any] = {"status": "FULL_ROSTER"}
-    try:
-        from prediction_universe import active_symbols_cached, restrict_universe
-
-        restricted, universe_meta = active_symbols_cached()
-        if restricted:
-            filtered = restrict_universe(universe_symbols, restricted)
-            if len(filtered) >= 150:
-                universe_filter = {
-                    "status": "FILTERED",
-                    "before": len(universe_symbols),
-                    "after": len(filtered),
-                    "universe_version": universe_meta.get("universe_version"),
-                    "manifest_status": universe_meta.get("status"),
-                }
-                universe_symbols = filtered
-            else:
-                universe_filter = {
-                    "status": "SKIPPED_TOO_SMALL",
-                    "before": len(universe_symbols),
-                    "after": len(filtered),
-                }
-    except Exception as exc:
-        universe_filter = {"status": "ERROR", "error_type": type(exc).__name__}
+    universe_symbols = _selected_roster(universe)
+    universe_filter: dict[str, Any] = {
+        "status": "PINNED_500_ROSTER",
+        "selected_symbol_count": len(universe_symbols),
+    }
     if instruments is None:
         instruments = _instrument_map()
     assigned_symbols = shard_universe(universe_symbols, worker_count)[worker_id]
@@ -967,7 +953,6 @@ def capture_all_universe_minute_snapshot_sharded(
             instruments=instruments,
         )
 
-    from delivery_training_universe import official_nse_symbols
     from indstocks_client import configured
     from persistent_store import GoogleDriveStore
 
@@ -985,18 +970,7 @@ def capture_all_universe_minute_snapshot_sharded(
             ),
         })
 
-    if universe is None:
-        universe_symbols = sorted({
-            str(s).strip().upper().replace(".NS", "")
-            for s in official_nse_symbols(force_refresh=False)
-            if str(s).strip()
-        })
-    else:
-        universe_symbols = sorted({
-            str(s).strip().upper().replace(".NS", "")
-            for s in universe
-            if str(s).strip()
-        })
+    universe_symbols = _selected_roster(universe)
     if instruments is None:
         instruments = _instrument_map()
     store = store or GoogleDriveStore()
@@ -1063,8 +1037,8 @@ def capture_all_universe_minute_snapshot_sharded(
         cycle_minute=cycle_minute,
         worker_count=count,
         shards=shard_payloads,
-        expected_universe=expected_universe if expected_universe is not None else universe_symbols,
-        strict_universe=strict_universe,
+        expected_universe=universe_symbols,
+        strict_universe=True,
     )
     assembly_manifest = assembly["manifest"]
     canonical_names = canonical_artifact_names(cycle_minute)
