@@ -76,37 +76,6 @@ def _history_seed_batches(
     return batches
 
 
-def _history_seed_universe(
-    official_symbols: list[str] | None,
-    instrument_codes: dict[str, str],
-) -> tuple[list[str], str]:
-    """Resolve the history-seed roster, with a provider-master fallback.
-
-    The live capture can continue using the official NSE roster, but the
-    background feature warm-up must not be permanently blocked when NSE's
-    EQUITY_L.csv endpoint returns 403. Its fallback is limited to NSE equity
-    symbols already mapped by the validated INDstocks instrument master.
-    """
-    official = sorted({
-        str(symbol).strip().upper().replace(".NS", "")
-        for symbol in (official_symbols or [])
-        if str(symbol).strip()
-    })
-    if official:
-        return official, "NSE_OFFICIAL_EQUITY_L"
-
-    fallback = sorted({
-        str(symbol).strip().upper().replace(".NS", "")
-        for symbol in instrument_codes
-        if str(symbol).strip()
-    })
-    if fallback:
-        return fallback, "INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK"
-    raise RuntimeError(
-        "Neither the official NSE equity roster nor the INDstocks NSE instrument master yielded symbols"
-    )
-
-
 def _latest_completed_fno_context(
     frame: pd.DataFrame | None,
     decision_date: date,
@@ -1188,7 +1157,7 @@ class AllNSEMinutePredictor:
         failed_batches: int,
         complete: bool = False,
     ) -> None:
-        """Publish completed history batches immediately instead of waiting for the full universe."""
+        """Publish completed history batches immediately instead of waiting for the selected roster."""
         with self._lock:
             for symbol, frame in updates.items():
                 if frame.empty:
@@ -1885,7 +1854,7 @@ class AllNSEMinutePredictor:
     ) -> dict[str, Any]:
         """Refresh already-seeded history in the background for the next slot.
 
-        The full-universe quote capture already takes roughly two minutes. Running
+        The selected-roster quote capture already takes roughly two minutes. Running
         another 500+ provider requests synchronously after capture can push the
         whole Scheduler request past its 300-second deadline. During bootstrap,
         refresh only instruments whose history is already cached; the seed thread
@@ -1976,7 +1945,7 @@ class AllNSEMinutePredictor:
     ) -> dict[str, Any]:
         """Wait briefly for a pre-capture refresh to finish before inference.
 
-        The full-universe quote collector runs in parallel with history refresh.
+        The selected-roster quote collector runs in parallel with history refresh.
         This bounded hand-off gives the refresh time to complete without allowing
         a slow provider request to hang Cloud Scheduler. If the wait expires, the
         stale-history guard still rejects outdated inputs.
@@ -2472,12 +2441,12 @@ class AllNSEMinutePredictor:
         *,
         drive_only: bool = False,
     ) -> dict[str, Any]:
-        """Predict for the captured NSE universe and write one row per symbol to Drive."""
+        """Predict only for captured selected-roster symbols and write eligible rows to Drive."""
         capture_manifest = capture_manifest or {}
         if not capture_manifest.get("cycle_minute_ist"):
             return {
                 "status": "NOT_RUN",
-                "reason": "This worker tick did not produce a live full-universe quote capture.",
+                "reason": "This worker tick did not produce a live selected-roster quote capture.",
             }
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
@@ -2676,7 +2645,7 @@ class AllNSEMinutePredictor:
                 champion_rotated = False
             if champion_rotated:
                 self._classifier = self._regressor = None
-            # Model initialization is independent of universe-wide history
+            # Model initialization is independent of selected-roster history
             # coverage; each stored stock quote is evaluated with its own data.
             self._ensure_model()
         except Exception as exc:
