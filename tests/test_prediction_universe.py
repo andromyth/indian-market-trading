@@ -106,10 +106,15 @@ def test_tradable_picks_ignores_sub_threshold_moves():
     assert pu.tradable_picks(predictions, PLAN, prices={"AAA": 100.0})["picks"] == []
 
 
-def test_active_symbols_falls_back_without_store():
+def test_active_symbols_always_uses_owner_pinned_roster():
     symbols, meta = pu.active_symbols(store=None)
-    assert symbols is None
-    assert meta["status"] == "FALLBACK_FULL_ROSTER"
+    assert symbols == pu.authoritative_roster()
+    assert len(symbols) == 500
+    assert meta["status"] == "PINNED_500_ROSTER"
+
+
+def test_restrict_universe_empty_allowlist_denies_all():
+    assert pu.restrict_universe(["AAA", "BBB"], []) == []
 
 
 def test_build_manifest_aborts_without_closes(monkeypatch):
