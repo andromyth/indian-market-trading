@@ -76,37 +76,6 @@ def _history_seed_batches(
     return batches
 
 
-def _history_seed_universe(
-    official_symbols: list[str] | None,
-    instrument_codes: dict[str, str],
-) -> tuple[list[str], str]:
-    """Resolve the history-seed roster, with a provider-master fallback.
-
-    The live capture can continue using the official NSE roster, but the
-    background feature warm-up must not be permanently blocked when NSE's
-    EQUITY_L.csv endpoint returns 403. Its fallback is limited to NSE equity
-    symbols already mapped by the validated INDstocks instrument master.
-    """
-    official = sorted({
-        str(symbol).strip().upper().replace(".NS", "")
-        for symbol in (official_symbols or [])
-        if str(symbol).strip()
-    })
-    if official:
-        return official, "NSE_OFFICIAL_EQUITY_L"
-
-    fallback = sorted({
-        str(symbol).strip().upper().replace(".NS", "")
-        for symbol in instrument_codes
-        if str(symbol).strip()
-    })
-    if fallback:
-        return fallback, "INDSTOCKS_NSE_INSTRUMENT_MASTER_FALLBACK"
-    raise RuntimeError(
-        "Neither the official NSE equity roster nor the INDstocks NSE instrument master yielded symbols"
-    )
-
-
 def _latest_completed_fno_context(
     frame: pd.DataFrame | None,
     decision_date: date,
@@ -1188,7 +1157,7 @@ class AllNSEMinutePredictor:
         failed_batches: int,
         complete: bool = False,
     ) -> None:
-        """Publish completed history batches immediately instead of waiting for the full universe."""
+        """Publish completed history batches immediately instead of waiting for the selected roster."""
         with self._lock:
             for symbol, frame in updates.items():
                 if frame.empty:
@@ -1222,8 +1191,8 @@ class AllNSEMinutePredictor:
         while True:
             try:
                 from all_universe_minute_capture import _instrument_map
-                from delivery_training_universe import official_nse_symbols
                 from indstocks_client import _request, configured
+                from prediction_universe import authoritative_roster
 
                 # NIFTY is independent of the INDstocks equity instrument master.
                 # Fetch benchmark history first so an INDstocks token failure cannot
@@ -1270,59 +1239,20 @@ class AllNSEMinutePredictor:
 
                 if not configured():
                     raise RuntimeError("INDstocks credentials are not configured")
-                # Load the validated provider instrument master first. If the NSE
-                # archive roster is blocked (for example HTTP 403 on EQUITY_L.csv),
-                # use the mapped NSE equity symbols for model warm-up instead of
-                # leaving this revision with a zero-symbol predictor.
+                # The pinned file chooses the 500 symbols. The provider master
+                # is used only to map those selected symbols to instrument codes.
                 codes = _instrument_map()
-                official_universe_error = None
-                try:
-                    official_symbols = official_nse_symbols(force_refresh=False)
-                except Exception as exc:
-                    official_symbols = []
-                    official_universe_error = exc
-                symbols, universe_source = _history_seed_universe(
-                    official_symbols,
-                    codes,
+                symbols = authoritative_roster()
+                if len(symbols) != 500:
+                    raise RuntimeError(
+                        f"backfill_universe.json must contain exactly 500 unique symbols; found {len(symbols)}"
+                    )
+                universe_source = "PINNED_500_ROSTER"
+                self._log(
+                    "all_nse_history_roster_selected",
+                    source=universe_source,
+                    symbol_count=len(symbols),
                 )
-                try:
-                    from prediction_universe import active_symbols_cached, restrict_universe
-
-                    restricted, universe_meta = active_symbols_cached()
-                    if restricted:
-                        filtered = restrict_universe(symbols, restricted)
-                        if len(filtered) >= 150:
-                            self._log(
-                                "all_nse_history_universe_filtered",
-                                before=len(symbols),
-                                after=len(filtered),
-                                universe_version=universe_meta.get("universe_version"),
-                                universe_status=universe_meta.get("status"),
-                            )
-                            symbols = filtered
-                        else:
-                            self._log(
-                                "all_nse_history_universe_filter_skipped",
-                                reason="filtered pool too small",
-                                before=len(symbols),
-                                after=len(filtered),
-                                universe_status=universe_meta.get("status"),
-                            )
-                except Exception as exc:
-                    self._log(
-                        "all_nse_history_universe_filter_failed",
-                        error_type=type(exc).__name__,
-                    )
-                if official_universe_error is not None or universe_source != "NSE_OFFICIAL_EQUITY_L":
-                    self._log(
-                        "all_nse_history_universe_fallback",
-                        source=universe_source,
-                        symbol_count=len(symbols),
-                        official_error_type=(
-                            type(official_universe_error).__name__
-                            if official_universe_error is not None else None
-                        ),
-                    )
                 try:
                     nifty_code = self._nifty_instrument_code()
                 except Exception as exc:
@@ -1922,7 +1852,7 @@ class AllNSEMinutePredictor:
     ) -> dict[str, Any]:
         """Refresh already-seeded history in the background for the next slot.
 
-        The full-universe quote capture already takes roughly two minutes. Running
+        The selected-roster quote capture already takes roughly two minutes. Running
         another 500+ provider requests synchronously after capture can push the
         whole Scheduler request past its 300-second deadline. During bootstrap,
         refresh only instruments whose history is already cached; the seed thread
@@ -2013,7 +1943,7 @@ class AllNSEMinutePredictor:
     ) -> dict[str, Any]:
         """Wait briefly for a pre-capture refresh to finish before inference.
 
-        The full-universe quote collector runs in parallel with history refresh.
+        The selected-roster quote collector runs in parallel with history refresh.
         This bounded hand-off gives the refresh time to complete without allowing
         a slow provider request to hang Cloud Scheduler. If the wait expires, the
         stale-history guard still rejects outdated inputs.
@@ -2509,12 +2439,12 @@ class AllNSEMinutePredictor:
         *,
         drive_only: bool = False,
     ) -> dict[str, Any]:
-        """Predict for the captured NSE universe and write one row per symbol to Drive."""
+        """Predict only for captured selected-roster symbols and write eligible rows to Drive."""
         capture_manifest = capture_manifest or {}
         if not capture_manifest.get("cycle_minute_ist"):
             return {
                 "status": "NOT_RUN",
-                "reason": "This worker tick did not produce a live full-universe quote capture.",
+                "reason": "This worker tick did not produce a live selected-roster quote capture.",
             }
         minute = _as_ist_timestamp(
             capture_manifest.get("cycle_minute_ist"),
@@ -2581,6 +2511,25 @@ class AllNSEMinutePredictor:
             }
 
         quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.strip().str.upper()
+        from prediction_universe import authoritative_roster
+
+        selected_roster = set(authoritative_roster())
+        if len(selected_roster) != 500:
+            return {
+                "status": "BLOCKED_ROSTER_CONFIG",
+                "cycle_minute_ist": minute_key,
+                "prediction_count": 0,
+                "error": f"backfill_universe.json must contain exactly 500 unique symbols; found {len(selected_roster)}",
+            }
+        non_selected_symbols = sorted(set(quote_frame["symbol"]) - selected_roster)
+        if non_selected_symbols:
+            quote_frame = quote_frame.loc[quote_frame["symbol"].isin(selected_roster)].copy()
+            self._log(
+                "all_nse_prediction_non_selected_symbols_excluded",
+                cycle_minute_ist=minute_key,
+                excluded_symbol_count=len(non_selected_symbols),
+                excluded_symbol_samples=non_selected_symbols[:20],
+            )
         snapshot_rows = quote_frame.to_dict(orient="records")
         snapshot_symbols = sorted({
             str(row.get("symbol") or "").strip().upper()
@@ -2594,9 +2543,7 @@ class AllNSEMinutePredictor:
                 continue
             quote_by_symbol[symbol] = row
         skipped_quote_symbols = sorted(set(snapshot_symbols) - set(quote_by_symbol))
-        expected_universe_count = max(
-            0, int(capture_manifest.get("expected_symbol_count") or len(snapshot_symbols))
-        )
+        expected_universe_count = len(selected_roster)
         missing_quotes = max(0, expected_universe_count - len(quote_by_symbol))
 
         if not quote_by_symbol:
@@ -2696,7 +2643,7 @@ class AllNSEMinutePredictor:
                 champion_rotated = False
             if champion_rotated:
                 self._classifier = self._regressor = None
-            # Model initialization is independent of universe-wide history
+            # Model initialization is independent of selected-roster history
             # coverage; each stored stock quote is evaluated with its own data.
             self._ensure_model()
         except Exception as exc:

@@ -8,6 +8,19 @@ from zoneinfo import ZoneInfo
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def test_prediction_input_excludes_symbols_outside_pinned_roster(monkeypatch):
+    import drive_all_nse_prediction_compiler as compiler
+
+    monkeypatch.setattr(compiler, "_selected_roster", lambda: {"AAA", "BBB"})
+    quotes, excluded = compiler._restrict_to_selected_roster(pd.DataFrame({
+        "symbol": ["AAA", "OUTSIDE", "BBB.NS"],
+        "actual_observed_price": [100.0, 200.0, 300.0],
+    }))
+
+    assert quotes["symbol"].tolist() == ["AAA", "BBB"]
+    assert excluded == ["OUTSIDE"]
+
+
 def test_read_history_normalizes_timestamps_and_keeps_last_duplicate(tmp_path):
     path = tmp_path / "history.parquet"
     pd.DataFrame({

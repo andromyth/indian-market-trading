@@ -1,6 +1,6 @@
 """Explicit assembly and validation for sharded five-minute NSE snapshots.
 
-The capture path collects the official NSE universe in non-overlapping shards.
+The capture path collects the fixed owner-selected roster in non-overlapping shards.
 Each shard writes its own persisted Parquet file plus a shard manifest. This
 module is the single, explicit assembly step:
 
@@ -62,8 +62,8 @@ FATAL_ISSUE_CODES = {
     "EMPTY_ASSEMBLY",
 }
 WARNING_ISSUE_CODES = {
-    "UNIVERSE_DRIFT_MISSING",
-    "UNIVERSE_DRIFT_EXTRA",
+    "ROSTER_DRIFT_MISSING",
+    "ROSTER_DRIFT_EXTRA",
 }
 
 
@@ -102,7 +102,7 @@ def shard_universe(symbols: Iterable[str], worker_count: int) -> list[list[str]]
 
     Round-robin assignment (``symbols[i::worker_count]``) keeps shard sizes
     balanced even when the universe is not a multiple of the worker count. Every
-    symbol is assigned to exactly one shard, so the union is the full universe
+    symbol is assigned to exactly one shard, so the union is the selected roster
     and no provider request is duplicated.
     """
     count = max(1, int(worker_count))
@@ -347,7 +347,7 @@ def assemble_shards(
         )
         issues.extend(shard_issues)
         if manifest:
-            universe_count = manifest.get("universe_symbol_count")
+            universe_count = manifest.get("selected_symbol_count", manifest.get("universe_symbol_count"))
             if universe_count is not None:
                 try:
                     universe_counts.add(int(universe_count))
@@ -413,7 +413,7 @@ def assemble_shards(
         if absent:
             issues.append(_issue(
                 "UNIVERSE_DRIFT_MISSING",
-                f"{len(absent)} official universe symbols are absent from the assembly",
+                f"{len(absent)} selected-roster symbols are absent from the assembly",
                 symbols=absent[:50],
             ))
             if strict_universe:
@@ -474,6 +474,7 @@ def assemble_shards(
         "shards": shard_summaries,
         "missing_shards": missing_ids,
         "expected_symbol_count": int(expected_symbol_count),
+        "selected_symbol_count": int(expected_symbol_count),
         "row_count": int(len(frame)) if frame is not None else 0,
         "quoted_symbol_count": quoted_symbol_count,
         "missing_quote_count": missing_quote_count,

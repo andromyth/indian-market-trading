@@ -17,7 +17,7 @@ the final authority; this document is the map.
 
 An NSE cash-equity decision-support and prediction system. It:
 
-- captures the full official NSE equity universe during market hours;
+- captures only the fixed 500-symbol owner-selected roster during market hours;
 - builds point-in-time features from official EOD, delivery, F&O, news and
   five-minute intraday data;
 - runs pooled machine-learning models for **30-minute intraday** and
@@ -28,7 +28,7 @@ An NSE cash-equity decision-support and prediction system. It:
   data quality;
 - **never places orders.** There is no order-placement code in the repository.
 
-The primary production product is the **five-minute ALL-NSE intraday
+The primary production product is the **five-minute selected-500 intraday
 prediction and actual-price capture pipeline**. The daily Delivery pipeline is
 a second, slower lane that shares the same Drive storage and governance
 principles.
@@ -299,8 +299,8 @@ The service explicitly delegates prediction to GitHub Actions:
 
 ### 5.3 Stage 1 — pre-capture history refresh
 
-Before the slow full-universe quote fetch, Cloud Run starts refreshing
-current-session five-minute bars for the universe:
+Before the selected-roster quote fetch, Cloud Run starts refreshing
+current-session five-minute bars for the same fixed 500 symbols:
 
 - reads the seed archive and live archive from Drive;
 - requests missing recent bars from INDstocks through the same request gate;
@@ -315,11 +315,12 @@ Doing the refresh first reduces prediction latency and feature staleness.
 
 `capture_all_universe_minute_snapshot_sharded()`:
 
-1. Resolve the official NSE equity universe
-   (`delivery_training_universe.official_nse_symbols`), strip `.NS`, uppercase,
-   sort and deduplicate.
+1. Load `backfill_universe.json`, normalize and deduplicate its symbols, and
+   fail closed unless it contains exactly 500 unique entries. This file alone
+   selects live capture/prediction symbols; the official NSE master is not a
+   selection source.
 2. Resolve the INDstocks instrument master (`symbol → instrument_code`).
-3. Split the universe deterministically:
+3. Split the selected 500-symbol roster deterministically:
    `symbols[worker_id::worker_count]`.
 4. Run `worker_count` threads (default 8) through a `ThreadPoolExecutor`.
 5. Each thread captures its assigned slice in batches of **500** instrument
@@ -354,7 +355,7 @@ production_data/all_universe_minute_snapshots/YYYY/MM/DD/shards/
 Every shard manifest records:
 
 - `worker_id`, `worker_count`;
-- `shard_symbols`, `shard_symbol_count`, `universe_symbol_count`;
+- `shard_symbols`, `shard_symbol_count`, `selected_symbol_count`;
 - `expected_symbol_count`, `quoted_symbol_count`, `missing_quote_count`;
 - `row_count`, `shard_row_count`;
 - `status = SHARD_STORED`, `snapshot_persisted`, `snapshot_drive_path`;
@@ -390,7 +391,7 @@ publishing anything:
 | Manifest `row_count` equals actual Parquet rows | `SHARD_ROW_COUNT_MISMATCH` |
 | Every row's `cycle_minute_ist` equals the slot | `SHARD_TIMESTAMP_MISMATCH` |
 | Quote observation times fall in the slot window | `SHARD_OBSERVED_AT_OUT_OF_WINDOW` |
-| All shards agree on universe size | `UNIVERSE_COUNT_MISMATCH` |
+| All shards agree on selected-roster size | `UNIVERSE_COUNT_MISMATCH` |
 | Duplicate symbols across shards | `DUPLICATE_SYMBOL` |
 | Assembled frame is non-empty and has a `symbol` column | `EMPTY_ASSEMBLY` |
 
@@ -434,7 +435,7 @@ production_data/all_universe_minute_snapshots/YYYY/MM/DD/
   latest_manifest.json
 ```
 
-Canonical snapshot row shape (one row per universe symbol, including failures):
+Canonical snapshot row shape (one row per selected symbol, including quote failures):
 
 | Field | Meaning |
 |---|---|
