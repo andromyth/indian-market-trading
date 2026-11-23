@@ -4,8 +4,7 @@
 
 The five-minute cycle is a single coordinated pipeline for the fixed 500 symbols in `backfill_universe.json`. That file is the sole live snapshot/prediction roster; dynamic selection manifests and the full NSE symbol master do not expand or replace it.
 
-1. **Sharded acquisition.** One coordinated Cloud Run tick fans the official NSE
-   selected roster out to `ALL_NSE_CAPTURE_WORKERS` shard collectors (default 8). Every
+1. **Sharded acquisition.** One coordinated Cloud Run tick fans the pinned selected roster out to `ALL_NSE_CAPTURE_WORKERS` shard collectors (default 8). Every
    shard owns a disjoint slice (`symbols[worker_id::worker_count]`) and all
    shards share the process-wide INDstocks request gate. Shards are worker
    threads inside the one acquisition process; they are not independent
