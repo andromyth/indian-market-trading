@@ -35,11 +35,8 @@ on:
         type: string
         required: false
         default: ""
-  # Fully automated off-hours trigger. 10:30 UTC is 16:00 IST, when the
-  # backfill window opens on NSE trading days; non-trading days are eligible
-  # all day, and the Cloud Run guard still pauses 09:15-15:59 IST.
-  schedule:
-    - cron: "30 10 * * *"
+  # Production backfill is triggered by Cloud Scheduler native-5m-backfill-daily
+  # at 16:00 IST. This workflow is retained for manual and staged/preflight runs.
 permissions:
   contents: read
   actions: read
@@ -50,7 +47,7 @@ concurrency:
 
 jobs:
   start-backfill:
-    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]')) || github.event_name == 'schedule'
+    if: (github.event_name == 'workflow_dispatch' && inputs.confirm_backfill == 'yes') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[start-native-5m-backfill]'))
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -61,7 +58,7 @@ jobs:
       REQUESTED_END_DATE: ${{ github.event.inputs.end_date }}
       BACKFILL_REPLACE_EXISTING: ${{ github.event.inputs.replace_existing_history || 'auto' }}
       BACKFILL_SYMBOLS: ${{ github.event.inputs.symbols }}
-      BACKFILL_REVISION_TAG: ${{ (github.event_name == 'schedule' && 'preflight5m') || github.event.inputs.revision_tag || '' }}
+      BACKFILL_REVISION_TAG: ${{ github.event.inputs.revision_tag || '' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

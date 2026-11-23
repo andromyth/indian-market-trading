@@ -29,10 +29,31 @@ MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 MAX_CAPTURE_AGE_SECONDS = 12 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
-# Each seed symbol costs one list + one download Drive call; the full universe
-# therefore needs thousands of calls per fresh compile and must not pay for
-# them sequentially (run 43394173212 died at the 15-minute job cap doing this).
+# Each selected symbol costs one list + one download Drive call; fetch history
+# concurrently so the fixed 500-symbol roster stays inside the compiler time cap.
 HISTORY_DOWNLOAD_WORKERS = max(1, int(os.getenv("ALL_NSE_COMPILER_HISTORY_WORKERS", "12") or 12))
+
+
+def _selected_roster() -> set[str]:
+    """Load the fixed owner-selected roster; never infer symbols from NSE."""
+    from prediction_universe import authoritative_roster
+
+    symbols = set(authoritative_roster())
+    if len(symbols) != 500:
+        raise RuntimeError(f"backfill_universe.json must contain exactly 500 unique symbols; found {len(symbols)}")
+    return symbols
+
+
+def _restrict_to_selected_roster(quotes: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Exclude any snapshot rows outside the pinned roster before inference."""
+    allowed = _selected_roster()
+    frame = quotes.copy()
+    frame["symbol"] = (
+        frame["symbol"].astype(str).str.strip().str.upper()
+        .str.replace(r"\.NS$", "", regex=True)
+    )
+    excluded = sorted(set(frame["symbol"]) - allowed)
+    return frame.loc[frame["symbol"].isin(allowed)].copy(), excluded
 
 
 def _find_remote(store, remote: str):
@@ -725,6 +746,15 @@ def main() -> int:
         age_minutes = (now - minute).total_seconds() / 60.0
         if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
             raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
+    quotes, outside_roster = _restrict_to_selected_roster(quotes)
+    if outside_roster:
+        print(json.dumps({
+            "event": "NON_SELECTED_SYMBOLS_EXCLUDED",
+            "excluded_symbol_count": len(outside_roster),
+            "excluded_symbol_samples": outside_roster[:20],
+        }, sort_keys=True), flush=True)
+    if quotes.empty:
+        raise RuntimeError("Selected snapshot contains no symbols from the pinned 500-symbol roster")
     symbols = set(quotes["symbol"].astype(str).str.strip().str.upper())
     prediction_manifest_remote = (
         "production_data/all_nse_minute_predictions/"

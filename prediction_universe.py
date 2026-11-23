@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""Build the focused prediction universe and tradable picks.
+"""Maintain the owner-pinned 500-symbol roster and affordable tradable picks.
 
-The live pipeline used to capture and predict every NSE symbol (~3,600).  At a
-Rs 7,000/month trading capital that is wasted compute: most symbols can never be
-bought (price cap) and most have no realised edge.  This module selects the few
-hundred symbols worth paying for and turns the newest predictions into an
-affordable, ranked pick list.
+The live five-minute capture and prediction pipeline uses only
+backfill_universe.json. Dynamic selection statistics may be reported for
+research, but they cannot replace or expand that live roster.
 
-Selection rule (all inputs already live in Drive):
-
-    eligible = affordable(close <= price_cap)
-               AND (profitable OR liquid OR top-ranked activity)
-    rank     = 4*delivery-profit + 3*intraday-profit + 2*fno + activity
-
-Pure selection functions take plain frames so they are unit-testable without
-Drive; ``build_manifest``/``active_symbols``/``tradable_picks`` add the IO.
+Pure selection functions remain independently testable; active_symbols
+always returns the pinned roster.
 """
 from __future__ import annotations
 
@@ -485,44 +477,20 @@ def build_manifest(store=None, plan: dict[str, Any] | None = None,
 
 
 def active_symbols(store=None, plan: dict[str, Any] | None = None,
-                   now: datetime | None = None) -> tuple[list[str] | None, dict[str, Any]]:
-    """Symbols the capture/predict stage should use, or None to keep the roster."""
-    plan = plan or load_capital_plan()
-    if store is None:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": "no store"}
-    try:
-        payload = _download_bytes(store, UNIVERSE_CURRENT)
-        manifest = json.loads(payload) if payload else {}
-    except Exception as exc:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": f"{type(exc).__name__}"}
-    symbols = [str(s) for s in manifest.get("symbols") or []]
-    if len(symbols) < 150:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": "manifest missing or too small"}
-    now = now or datetime.now(IST)
-    try:
-        age_days = (now - datetime.fromisoformat(manifest["generated_at"])).total_seconds() / 86400
-    except Exception:
-        age_days = 0.0
-    status = "OK" if age_days <= float(plan["manifest_max_age_days"]) else "STALE"
+                   now: datetime | None = None) -> tuple[list[str], dict[str, Any]]:
+    """Return the fixed owner-selected roster; Drive manifests never reselect it."""
+    symbols = authoritative_roster()
+    if len(symbols) != 500:
+        return [], {"status": "BLOCKED", "reason": f"pinned roster must contain exactly 500 symbols; found {len(symbols)}"}
+    version = hashlib.sha1("|".join(symbols).encode("utf-8")).hexdigest()[:12]
     return symbols, {
-        "status": status,
-        "universe_version": manifest.get("universe_version"),
-        "age_days": round(age_days, 1),
+        "status": "PINNED_500_ROSTER",
+        "universe_version": version,
+        "selected_symbol_count": len(symbols),
     }
 
 
 _SHARED: dict[str, Any] = {}
-
-
-def _shared_store():
-    """One Drive client per process; failures are cached so ticks stay cheap."""
-    if "store" not in _SHARED:
-        try:
-            from persistent_store import GoogleDriveStore
-            _SHARED["store"] = GoogleDriveStore()
-        except Exception:
-            _SHARED["store"] = None
-    return _SHARED["store"]
 
 
 def active_symbols_cached(plan: dict[str, Any] | None = None, ttl_seconds: float = 900.0,
@@ -532,14 +500,14 @@ def active_symbols_cached(plan: dict[str, Any] | None = None, ttl_seconds: float
     fetched = _SHARED.get("fetched_at")
     if fetched is not None and (now - fetched).total_seconds() < ttl_seconds:
         return _SHARED.get("symbols"), _SHARED.get("meta") or {}
-    symbols, meta = active_symbols(store=_shared_store(), plan=plan, now=now)
+    symbols, meta = active_symbols()
     _SHARED.update({"symbols": symbols, "meta": meta, "fetched_at": now})
     return symbols, meta
 
 
 def restrict_universe(symbols: Iterable[str], allowed: Iterable[str] | None) -> list[str]:
-    """Keep only allowed symbols; an empty/absent allow-list keeps everything."""
-    if not allowed:
+    """Keep only allowed symbols; an empty allow-list denies all symbols."""
+    if allowed is None:
         return list(symbols)
     keep = {str(s).strip().upper().replace(".NS", "") for s in allowed}
     return [s for s in symbols if str(s).strip().upper().replace(".NS", "") in keep]

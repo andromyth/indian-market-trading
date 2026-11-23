@@ -17,7 +17,7 @@ the final authority; this document is the map.
 
 An NSE cash-equity decision-support and prediction system. It:
 
-- captures the full official NSE equity universe during market hours;
+- captures only the fixed 500-symbol owner-selected roster during market hours;
 - builds point-in-time features from official EOD, delivery, F&O, news and
   five-minute intraday data;
 - runs pooled machine-learning models for **30-minute intraday** and
@@ -28,7 +28,7 @@ An NSE cash-equity decision-support and prediction system. It:
   data quality;
 - **never places orders.** There is no order-placement code in the repository.
 
-The primary production product is the **five-minute ALL-NSE intraday
+The primary production product is the **five-minute selected-500 intraday
 prediction and actual-price capture pipeline**. The daily Delivery pipeline is
 a second, slower lane that shares the same Drive storage and governance
 principles.
@@ -198,12 +198,22 @@ Actions runs the Drive-consumer half of the system:
 
 | Workflow | Cadence | Purpose |
 |---|---|---|
-| `compile_all_nse_predictions_from_drive.yml` | Every 5 min, 09:15–15:25 IST | Compile canonical snapshot → predictions |
+| `compile_all_nse_predictions_from_drive.yml` | 15:29 IST weekdays (single safety run) | Compile canonical snapshot → predictions |
 | `nse_eod_sync.yml` | 3 attempts after close | Official EOD/delivery archive sync |
 | `nse_delivery_production_cycle.yml` | 21:45, 01:45, 06:45 IST | Delivery PIT refresh + validation + policy |
-| `autonomous_prediction_learning.yml` | 16:30 IST weekdays | Calibration/learning diagnostics |
+| `autonomous_prediction_learning.yml` | Manual dispatch only | Calibration/learning diagnostics |
+| `consolidate_live_5m_into_archive.yml` | 16:15 IST (convenience) | Fold live 5m snapshots into the training archive; fails if a decision slot is missing |
+| `retrain_to_close.yml` | 20:15 IST weekdays | Self-sufficient retrain: consolidates live snapshots, audits freshness, then trains |
+| `start_cloud_run_5m_backfill.yml` | Manual / staged preflight only | Production backfill is Cloud Scheduler `native-5m-backfill-daily` at 16:00 IST |
 | `verify_all_nse_drive_snapshots.yml` | Manual | Independent Drive audit |
 | `nse_fno_sync.yml`, `nse_news_events_sync.yml` | Daily | F&O and news/event layers |
+
+GitHub-hosted cron is throttled in this repository: scheduled workflows have
+fired hours late (the compiler ran once daily near 18:10 UTC despite its
+15:29 IST cron, and the backfill trigger fired at 17:57 UTC instead of 10:30
+UTC). Production data acquisition therefore relies on Cloud Scheduler; the
+retrain job consolidates and checks freshness itself rather than depending on
+the order or promptness of two GitHub cron jobs.
 
 Important compiler properties:
 
@@ -299,8 +309,8 @@ The service explicitly delegates prediction to GitHub Actions:
 
 ### 5.3 Stage 1 — pre-capture history refresh
 
-Before the slow full-universe quote fetch, Cloud Run starts refreshing
-current-session five-minute bars for the universe:
+Before the selected-roster quote fetch, Cloud Run starts refreshing
+current-session five-minute bars for the same fixed 500 symbols:
 
 - reads the seed archive and live archive from Drive;
 - requests missing recent bars from INDstocks through the same request gate;
@@ -315,11 +325,12 @@ Doing the refresh first reduces prediction latency and feature staleness.
 
 `capture_all_universe_minute_snapshot_sharded()`:
 
-1. Resolve the official NSE equity universe
-   (`delivery_training_universe.official_nse_symbols`), strip `.NS`, uppercase,
-   sort and deduplicate.
+1. Load `backfill_universe.json`, normalize and deduplicate its symbols, and
+   fail closed unless it contains exactly 500 unique entries. This file alone
+   selects live capture/prediction symbols; the official NSE master is not a
+   selection source.
 2. Resolve the INDstocks instrument master (`symbol → instrument_code`).
-3. Split the universe deterministically:
+3. Split the selected 500-symbol roster deterministically:
    `symbols[worker_id::worker_count]`.
 4. Run `worker_count` threads (default 8) through a `ThreadPoolExecutor`.
 5. Each thread captures its assigned slice in batches of **500** instrument
@@ -354,7 +365,7 @@ production_data/all_universe_minute_snapshots/YYYY/MM/DD/shards/
 Every shard manifest records:
 
 - `worker_id`, `worker_count`;
-- `shard_symbols`, `shard_symbol_count`, `universe_symbol_count`;
+- `shard_symbols`, `shard_symbol_count`, `selected_symbol_count`;
 - `expected_symbol_count`, `quoted_symbol_count`, `missing_quote_count`;
 - `row_count`, `shard_row_count`;
 - `status = SHARD_STORED`, `snapshot_persisted`, `snapshot_drive_path`;
@@ -390,7 +401,7 @@ publishing anything:
 | Manifest `row_count` equals actual Parquet rows | `SHARD_ROW_COUNT_MISMATCH` |
 | Every row's `cycle_minute_ist` equals the slot | `SHARD_TIMESTAMP_MISMATCH` |
 | Quote observation times fall in the slot window | `SHARD_OBSERVED_AT_OUT_OF_WINDOW` |
-| All shards agree on universe size | `UNIVERSE_COUNT_MISMATCH` |
+| All shards agree on selected-roster size | `UNIVERSE_COUNT_MISMATCH` |
 | Duplicate symbols across shards | `DUPLICATE_SYMBOL` |
 | Assembled frame is non-empty and has a `symbol` column | `EMPTY_ASSEMBLY` |
 
@@ -434,7 +445,7 @@ production_data/all_universe_minute_snapshots/YYYY/MM/DD/
   latest_manifest.json
 ```
 
-Canonical snapshot row shape (one row per universe symbol, including failures):
+Canonical snapshot row shape (one row per selected symbol, including quote failures):
 
 | Field | Meaning |
 |---|---|
@@ -820,15 +831,24 @@ skipped or data-limited.
 |---|---|---|---|
 | Cloud Scheduler | 09:15–15:25 IST, every 5 min | 540 s attempt deadline | 2 attempts, 60 s window |
 | Cloud Run `/tick` | One request per slot | 900 s | Scheduler retry only |
-| GitHub compiler | Every 5 min, 09:15–15:25 IST | 15 min job cap | Next scheduled run; concurrency group queues |
+| GitHub compiler | 15:29 IST weekdays (single safety run) | 15 min job cap | Manual dispatch; GitHub cron is throttled |
 | Delivery production | 21:45 / 01:45 / 06:45 IST | 60 min | Three daily checkpoints |
-| Learning | 16:30 IST weekdays | 180 min | Manual dispatch |
+| Learning | Manual dispatch only | 180 min | Manual dispatch |
+| Native 5m backfill | 16:00 IST via Cloud Scheduler `native-5m-backfill-daily` | Multi-hour Cloud Run job | Cloud Scheduler retry |
+| Live consolidation | 16:15 IST (convenience) + inside retrain | 30 min | Fail-closed on missing 5m slots |
+| To-close retrain | 20:15 IST weekdays | 360 min workflow / 86400 s job | Manual dispatch fallback if cron is late |
 | EOD sync | 20:15 / 23:45 / 05:15 IST | 60 min | Three attempts |
 
 The 15:25 end is intentional: 15:30 is the cash-market close, so the 15:25
 snapshot is the last actionable decision point. The compiler guard itself is
 09:15–15:30, which is why a post-close smoke run can still reach the compile
 step and then select the last fresh slot.
+
+The training chain is explicit: Cloud Scheduler backfills the completed
+session at 16:00 IST, consolidation folds live snapshots into the archive at
+16:15 IST (and again inside the retrain job), and the 20:15 IST retrain fails
+closed unless the archive's newest session is the latest completed NSE session
+and every 09:20–15:25 five-minute slot has data across the selected universe.
 
 ---
 
