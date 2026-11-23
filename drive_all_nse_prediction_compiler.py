@@ -35,6 +35,16 @@ MAX_MINUTE_MANIFEST_CANDIDATES = 100
 HISTORY_DOWNLOAD_WORKERS = max(1, int(os.getenv("ALL_NSE_COMPILER_HISTORY_WORKERS", "12") or 12))
 
 
+def _selected_roster() -> set[str]:
+    """Load the fixed owner-selected roster; never infer symbols from NSE."""
+    from prediction_universe import authoritative_roster
+
+    symbols = set(authoritative_roster())
+    if not symbols:
+        raise RuntimeError("backfill_universe.json is missing or has no selected symbols")
+    return symbols
+
+
 def _find_remote(store, remote: str):
     parent = store.root_id
     parts = [part for part in remote.strip("/").split("/") if part]
@@ -725,6 +735,19 @@ def main() -> int:
         age_minutes = (now - minute).total_seconds() / 60.0
         if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
             raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
+    allowed_symbols = _selected_roster()
+    quotes = quotes.copy()
+    quotes["symbol"] = quotes["symbol"].astype(str).str.strip().str.upper().str.replace(r"\\.NS$", "", regex=True)
+    outside_roster = sorted(set(quotes["symbol"]) - allowed_symbols)
+    if outside_roster:
+        print(json.dumps({
+            "event": "NON_SELECTED_SYMBOLS_EXCLUDED",
+            "excluded_symbol_count": len(outside_roster),
+            "excluded_symbol_samples": outside_roster[:20],
+        }, sort_keys=True), flush=True)
+    quotes = quotes.loc[quotes["symbol"].isin(allowed_symbols)].copy()
+    if quotes.empty:
+        raise RuntimeError("Selected snapshot contains no symbols from the pinned 500-symbol roster")
     symbols = set(quotes["symbol"].astype(str).str.strip().str.upper())
     prediction_manifest_remote = (
         "production_data/all_nse_minute_predictions/"
