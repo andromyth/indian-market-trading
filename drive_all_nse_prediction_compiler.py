@@ -29,9 +29,8 @@ MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 MAX_CAPTURE_AGE_SECONDS = 12 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
-# Each seed symbol costs one list + one download Drive call; the full universe
-# therefore needs thousands of calls per fresh compile and must not pay for
-# them sequentially (run 43394173212 died at the 15-minute job cap doing this).
+# Each selected symbol costs one list + one download Drive call; fetch history
+# concurrently so the fixed 500-symbol roster stays inside the compiler time cap.
 HISTORY_DOWNLOAD_WORKERS = max(1, int(os.getenv("ALL_NSE_COMPILER_HISTORY_WORKERS", "12") or 12))
 
 
