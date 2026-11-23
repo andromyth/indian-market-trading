@@ -609,7 +609,7 @@ def capture_all_universe_minute_snapshot(
     instruments: dict[str, str] | None = None,
     return_frame: bool = False,
 ) -> dict[str, Any]:
-    """Collect one slice of the official NSE universe and persist it for a slot.
+    """Collect one slice of the pinned selected roster and persist it for a slot.
 
     With ``worker_count > 1`` the universe is split into disjoint shards and
     this worker collects only ``symbols[worker_id::worker_count]``, writing a
