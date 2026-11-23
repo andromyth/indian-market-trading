@@ -118,8 +118,8 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
     )
     monkeypatch.setitem(__import__("sys").modules, "indstocks_client", fake_indstocks)
     monkeypatch.setattr(
-        "delivery_training_universe.official_nse_symbols",
-        lambda force_refresh=False: ["AAA", "BBB"],
+        "prediction_universe.authoritative_roster",
+        lambda: ["AAA", "BBB"],
     )
     monkeypatch.setattr("persistent_store.GoogleDriveStore", lambda: fake_store)
 
@@ -160,6 +160,13 @@ def test_full_universe_snapshot_persists_quote_and_missing_symbol_rows(
     assert frame.loc["AAA", "quote_status"] == "PASS"
     assert frame.loc["BBB", "quote_status"] == "MISSING_QUOTE"
     assert frame.loc["BBB", "actual_observed_price"] != frame.loc["BBB", "actual_observed_price"]
+
+
+def test_capture_roster_excludes_symbols_outside_pinned_list(monkeypatch):
+    monkeypatch.setattr("prediction_universe.authoritative_roster", lambda: ["AAA", "BBB"])
+    assert capture._selected_roster(["AAA", "OUTSIDE"]) == ["AAA"]
+    with pytest.raises(RuntimeError, match="do not intersect"):
+        capture._selected_roster(["OUTSIDE"])
 
 
 
