@@ -1239,10 +1239,8 @@ class AllNSEMinutePredictor:
 
                 if not configured():
                     raise RuntimeError("INDstocks credentials are not configured")
-                # Load the validated provider instrument master first. If the NSE
-                # archive roster is blocked (for example HTTP 403 on EQUITY_L.csv),
-                # use the mapped NSE equity symbols for model warm-up instead of
-                # leaving this revision with a zero-symbol predictor.
+                # The pinned file chooses the 500 symbols. The provider master
+                # is used only to map those selected symbols to instrument codes.
                 codes = _instrument_map()
                 symbols = authoritative_roster()
                 if len(symbols) != 500:
