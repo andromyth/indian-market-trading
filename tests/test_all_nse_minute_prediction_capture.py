@@ -140,6 +140,11 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
 
     from all_nse_minute_prediction_capture import AllNSEMinutePredictor
 
+    monkeypatch.setattr(
+        "prediction_universe.authoritative_roster",
+        lambda: ["AAA", "BBB"] + [f"EXTRA{i:03d}" for i in range(498)],
+    )
+
     # Pin the decision clock to mid-session: a bare now() fails after 15:30 IST.
     minute = pd.Timestamp.now(tz=IST).normalize() + pd.Timedelta(hours=11, minutes=30)
     predictor = AllNSEMinutePredictor(tmp_path)
@@ -223,8 +228,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
             "cycle_minute_ist": minute.isoformat(),
             "status": "PERSISTENCE_ERROR",
             "snapshot_persisted": True,
-            "expected_symbol_count": 3,
-            "row_count": 3,
+            "expected_symbol_count": 500,
+            "row_count": 2,
             "snapshot_drive_path": (
                 "production_data/all_universe_minute_snapshots/"
                 f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
@@ -236,7 +241,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
 
     assert result["status"] == "STORED"
     assert result["row_count"] == 2
-    assert result["expected_symbol_count"] == 3
+    assert result["expected_symbol_count"] == 500
     assert result["eligible_symbol_count"] == 2
     assert result["prediction_count"] == 1
     assert result["prediction_status_counts"] == {
@@ -889,7 +894,6 @@ def test_history_refresh_stops_on_auth_failure_and_queues_unprocessed_symbols(
 
 def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypatch):
     import all_universe_minute_capture
-    import delivery_training_universe
     import indstocks_client
 
     symbols = [f"STOCK{i}" for i in range(15)]
@@ -898,9 +902,8 @@ def test_initial_history_seed_stops_after_shared_auth_failure(tmp_path, monkeypa
 
     monkeypatch.setattr(all_universe_minute_capture, "_instrument_map", lambda: codes)
     monkeypatch.setattr(
-        delivery_training_universe,
-        "official_nse_symbols",
-        lambda force_refresh=False: symbols,
+        "prediction_universe.authoritative_roster",
+        lambda: symbols + [f"EXTRA{i:03d}" for i in range(485)],
     )
     monkeypatch.setattr(indstocks_client, "configured", lambda: True)
 
