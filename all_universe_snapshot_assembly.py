@@ -1,6 +1,6 @@
 """Explicit assembly and validation for sharded five-minute NSE snapshots.
 
-The capture path collects the official NSE universe in non-overlapping shards.
+The capture path collects the fixed owner-selected roster in non-overlapping shards.
 Each shard writes its own persisted Parquet file plus a shard manifest. This
 module is the single, explicit assembly step:
 
@@ -62,8 +62,8 @@ FATAL_ISSUE_CODES = {
     "EMPTY_ASSEMBLY",
 }
 WARNING_ISSUE_CODES = {
-    "UNIVERSE_DRIFT_MISSING",
-    "UNIVERSE_DRIFT_EXTRA",
+    "ROSTER_DRIFT_MISSING",
+    "ROSTER_DRIFT_EXTRA",
 }
 
 
@@ -413,7 +413,7 @@ def assemble_shards(
         if absent:
             issues.append(_issue(
                 "UNIVERSE_DRIFT_MISSING",
-                f"{len(absent)} official universe symbols are absent from the assembly",
+                f"{len(absent)} selected-roster symbols are absent from the assembly",
                 symbols=absent[:50],
             ))
             if strict_universe:
