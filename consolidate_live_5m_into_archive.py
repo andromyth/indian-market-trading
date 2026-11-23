@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -40,6 +40,76 @@ MAX_SESSIONS = 500
 MIN_BARS_PER_SESSION = 50
 PARQUET_MIME = "application/vnd.apache.parquet"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+MIN_SLOT_COVERAGE = 0.90
+
+
+def expected_session_slots(first: time | None = None, last: time | None = None) -> list[time]:
+    """Five-minute decision slots between ``first`` and ``last`` (inclusive)."""
+    first = first or time(9, 20)
+    last = last or time(15, 25)
+    slots: list[time] = []
+    current = datetime(2000, 1, 1, first.hour, first.minute)
+    end = datetime(2000, 1, 1, last.hour, last.minute)
+    while current <= end:
+        slots.append(current.time())
+        current += timedelta(minutes=5)
+    return slots
+
+
+def session_coverage_report(
+    latest_session_frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    *,
+    slots: list[time] | None = None,
+    min_coverage: float = MIN_SLOT_COVERAGE,
+) -> dict[str, Any]:
+    """Verify that no five-minute decision slot is missing across the universe."""
+    if not latest_session_frames:
+        return {
+            "complete": False,
+            "reason": "no consolidated session rows",
+            "symbols": len(symbols),
+        }
+    session = str(max(pd.Timestamp(frame.index.max()).date() for frame in latest_session_frames.values()))
+    observed = sorted({
+        stamp.time()
+        for frame in latest_session_frames.values()
+        for stamp in frame.index
+        if str(stamp.date()) == session
+    })
+    if slots is None:
+        slots = expected_session_slots(observed[0], observed[-1]) if observed else []
+    slot_set = set(slots)
+    counts = {slot: 0 for slot in slots}
+    per_symbol: dict[str, int] = {}
+    for symbol, frame in latest_session_frames.items():
+        day_frame = frame.loc[pd.Index(frame.index.date).astype(str) == session]
+        seen = {stamp.time() for stamp in day_frame.index if stamp.time() in slot_set}
+        per_symbol[symbol] = len(seen)
+        for slot in seen:
+            counts[slot] += 1
+    missing = [slot.strftime("%H:%M") for slot in slots if counts[slot] == 0]
+    min_count = min(counts.values()) if counts else 0
+    threshold = min_coverage * len(symbols)
+    complete = not missing and min_count >= threshold
+    report: dict[str, Any] = {
+        "complete": bool(complete),
+        "session": session,
+        "expected_slots": len(slots),
+        "slots_with_data": sum(count > 0 for count in counts.values()),
+        "missing_slots": missing,
+        "min_slot_coverage": min_count,
+        "min_slot_coverage_ratio": round(min_count / len(symbols), 6) if symbols else 0.0,
+        "required_slot_coverage": round(threshold, 3),
+        "symbols_with_full_grid": sum(value == len(slots) for value in per_symbol.values()),
+        "symbols_below_min_bars": sum(value < MIN_BARS_PER_SESSION for value in per_symbol.values()),
+    }
+    if not complete:
+        report["reason"] = (
+            f"missing slots={missing} or slot coverage {min_count}/{len(symbols)} "
+            f"below required {threshold:.0f}"
+        )
+    return report
 
 
 def _day_snapshots(
@@ -152,6 +222,7 @@ def consolidate(
     unchanged = 0
     missing_archive = 0
     coverage: list[dict[str, Any]] = []
+    latest_session_frames: dict[str, pd.DataFrame] = {}
     for index, symbol in enumerate(symbols, start=1):
         parts = live_by_symbol.get(symbol) or []
         if not parts:
@@ -175,6 +246,10 @@ def consolidate(
         if merged.empty:
             unchanged += 1
             continue
+        latest_day = str(merged.index.max().date())
+        latest_session_frames[symbol] = merged.loc[
+            pd.Index(merged.index.date).astype(str) == latest_day, OHLCV
+        ]
         if not dry_run:
             out = work_root / "archive" / f"symbol={symbol}" / f"{symbol}.parquet"
             merged.to_parquet(out, index=True, compression="zstd")
@@ -204,6 +279,7 @@ def consolidate(
         "rows_added": rows_added,
         "dry_run": bool(dry_run),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "latest_session_coverage": session_coverage_report(latest_session_frames, symbols),
         "samples": coverage[:10],
     }
 
@@ -213,6 +289,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--end-date", default="")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-incomplete-session",
+        action="store_true",
+        help="Report missing five-minute slots without failing the job",
+    )
     parser.add_argument("--work-root", default="")
     args = parser.parse_args(argv)
     if args.days < 1 or args.days > 30:
@@ -236,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
             work_root=Path(tmp),
         )
     print("CONSOLIDATE_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
+    coverage = report.get("latest_session_coverage") or {}
+    if not coverage.get("complete") and not args.allow_incomplete_session:
+        print(
+            "CONSOLIDATE_INCOMPLETE_SESSION=" + json.dumps(coverage, sort_keys=True),
+            flush=True,
+        )
+        return 2
     return 0
 
 

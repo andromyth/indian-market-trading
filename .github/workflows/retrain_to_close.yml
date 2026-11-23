@@ -25,6 +25,10 @@ on:
         description: "3 = first decision 09:35"
         required: false
         default: "3"
+      consolidate_live_days:
+        description: "Trading-day lookback for the pre-training live-snapshot consolidation (0 disables)"
+        required: false
+        default: "5"
   # Nightly retrain at 20:15 IST (14:45 UTC), after the 19:15 IST F&O sync. Enabled after the
   # first two manual runs passed. Set the repo variable RETRAIN_SCHEDULE=off to pause it.
   schedule:
@@ -54,6 +58,7 @@ jobs:
       MAX_SYMBOLS: ${{ inputs.max_symbols || '500' }}
       COST: ${{ inputs.cost || '0.0011' }}
       WARMUP_BARS: ${{ inputs.warmup_bars || '3' }}
+      CONSOLIDATE_LIVE_DAYS: ${{ inputs.consolidate_live_days || '5' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -93,7 +98,7 @@ jobs:
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --cpu 8 --memory 32Gi --task-timeout 86400 --max-retries 0 \
             --command python \
-            --args="-u,retrain_to_close_job.py,--universe=$UNIVERSE,--sessions=$SESSIONS,--max-symbols=$MAX_SYMBOLS,--cost=$COST,--warmup-bars=$WARMUP_BARS" \
+            --args="-u,retrain_to_close_job.py,--universe=$UNIVERSE,--sessions=$SESSIONS,--max-symbols=$MAX_SYMBOLS,--cost=$COST,--warmup-bars=$WARMUP_BARS,--consolidate-live-days=$CONSOLIDATE_LIVE_DAYS" \
             --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
           gcloud run jobs describe "$JOB" \
             --project="$PROJECT_ID" --region="$REGION" \
@@ -121,4 +126,4 @@ jobs:
             "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\"" \
             --project="$PROJECT_ID" --limit=120 --order=desc \
             --format='value(timestamp,textPayload)' 2>/dev/null \
-            | grep -aE "RETRAIN_STATUS|TRAIN_UNIVERSE|DATA_NOT_READY|TRAIN_FAILED|Traceback|COMPLETED_|UPLOAD_FAILED" || true
+            | grep -aE "RETRAIN_STATUS|RETRAIN_CONSOLIDATION|CONSOLIDATE_INCOMPLETE_SESSION|TRAIN_UNIVERSE|DATA_NOT_READY|TRAIN_FAILED|Traceback|COMPLETED_|UPLOAD_FAILED" || true

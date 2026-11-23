@@ -23,6 +23,13 @@ def test_training_window_tiers_and_floor():
         job.training_window(44)
 
 
+def test_archive_freshness_compares_sessions():
+    assert job.archive_freshness("2026-11-23", "2026-11-23")[0] is True
+    assert job.archive_freshness("2026-11-24", "2026-11-23")[0] is True
+    assert job.archive_freshness("2026-11-20", "2026-11-23")[0] is False
+    assert job.archive_freshness(None, "2026-11-23")[0] is False
+
+
 def test_choose_universe_prefers_fno_liquidity_and_drops_index():
     fno = pd.DataFrame(
         {

@@ -29,6 +29,30 @@ class _Store:
         return {"status": "OK"}
 
 
+def test_session_coverage_flags_missing_five_minute_slot():
+    index = pd.date_range("2026-11-23 09:20", periods=74, freq="5min", tz=mod.IST)
+    index = index[index != pd.Timestamp("2026-11-23 10:30", tz=mod.IST)]
+    frame = pd.DataFrame({"Close": [100.0] * len(index)}, index=index)
+
+    report = mod.session_coverage_report({"RELIANCE": frame}, ["RELIANCE", "HDFCBANK"])
+
+    assert report["complete"] is False
+    assert report["session"] == "2026-11-23"
+    assert "10:30" in report["missing_slots"]
+
+
+def test_session_coverage_accepts_full_grid():
+    index = pd.date_range("2026-11-23 09:20", periods=74, freq="5min", tz=mod.IST)
+    frame = pd.DataFrame({"Close": [100.0] * len(index)}, index=index)
+
+    report = mod.session_coverage_report({"RELIANCE": frame, "HDFCBANK": frame},
+                                         ["RELIANCE", "HDFCBANK"])
+
+    assert report["complete"] is True
+    assert report["missing_slots"] == []
+    assert report["min_slot_coverage"] == 2
+
+
 def test_consolidate_appends_live_sessions(monkeypatch, tmp_path):
     archive = _frame("2026-11-18")
     live = _frame("2026-11-19")
