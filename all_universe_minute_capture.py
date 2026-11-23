@@ -649,7 +649,7 @@ def capture_all_universe_minute_snapshot(
         "worker_id": worker_id,
         "worker_count": worker_count,
         "expected_symbol_count": 0,
-        "universe_symbol_count": 0,
+        "selected_symbol_count": 0,
         "shard_symbol_count": 0,
         "quoted_symbol_count": 0,
         "missing_quote_count": 0,
@@ -700,7 +700,7 @@ def capture_all_universe_minute_snapshot(
     forecast_rows = _load_forecast_rows(daily_ledger)
     manifest["universe_filter"] = universe_filter
     manifest["expected_symbol_count"] = len(universe_symbols)
-    manifest["universe_symbol_count"] = len(universe_symbols)
+    manifest["selected_symbol_count"] = len(universe_symbols)
     manifest["shard_symbol_count"] = len(assigned_symbols)
     manifest["shard_symbols"] = assigned_symbols
     manifest["unmapped_symbol_count"] = sum(
