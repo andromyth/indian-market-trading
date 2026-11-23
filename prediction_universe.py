@@ -482,17 +482,6 @@ def active_symbols(store=None, plan: dict[str, Any] | None = None,
 _SHARED: dict[str, Any] = {}
 
 
-def _shared_store():
-    """One Drive client per process; failures are cached so ticks stay cheap."""
-    if "store" not in _SHARED:
-        try:
-            from persistent_store import GoogleDriveStore
-            _SHARED["store"] = GoogleDriveStore()
-        except Exception:
-            _SHARED["store"] = None
-    return _SHARED["store"]
-
-
 def active_symbols_cached(plan: dict[str, Any] | None = None, ttl_seconds: float = 900.0,
                           now: datetime | None = None) -> tuple[list[str] | None, dict[str, Any]]:
     """Process-cached ``active_symbols`` for the per-tick capture path."""
@@ -500,7 +489,7 @@ def active_symbols_cached(plan: dict[str, Any] | None = None, ttl_seconds: float
     fetched = _SHARED.get("fetched_at")
     if fetched is not None and (now - fetched).total_seconds() < ttl_seconds:
         return _SHARED.get("symbols"), _SHARED.get("meta") or {}
-    symbols, meta = active_symbols(store=_shared_store(), plan=plan, now=now)
+    symbols, meta = active_symbols()
     _SHARED.update({"symbols": symbols, "meta": meta, "fetched_at": now})
     return symbols, meta
 
