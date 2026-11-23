@@ -347,7 +347,7 @@ def assemble_shards(
         )
         issues.extend(shard_issues)
         if manifest:
-            universe_count = manifest.get("universe_symbol_count")
+            universe_count = manifest.get("selected_symbol_count", manifest.get("universe_symbol_count"))
             if universe_count is not None:
                 try:
                     universe_counts.add(int(universe_count))
@@ -474,6 +474,7 @@ def assemble_shards(
         "shards": shard_summaries,
         "missing_shards": missing_ids,
         "expected_symbol_count": int(expected_symbol_count),
+        "selected_symbol_count": int(expected_symbol_count),
         "row_count": int(len(frame)) if frame is not None else 0,
         "quoted_symbol_count": quoted_symbol_count,
         "missing_quote_count": missing_quote_count,
