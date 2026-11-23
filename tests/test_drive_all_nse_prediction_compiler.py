@@ -479,6 +479,18 @@ def test_prediction_already_stored_checks_per_slot_manifest(monkeypatch, tmp_pat
     monkeypatch.setattr(compiler, "_download", download_empty)
     assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False
 
+    def download_warmup(store, file_id, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps({
+            "status": "STORED",
+            "prediction_count": 0,
+            "prediction_status_counts": {"WARMING_HISTORY": 500},
+            "model_failure_count": 0,
+        }), encoding="utf-8")
+
+    monkeypatch.setattr(compiler, "_download", download_warmup)
+    assert compiler._prediction_already_stored(SimpleNamespace(), minute) is True
+
     monkeypatch.setattr(compiler, "_find_remote", lambda store, remote: None)
     assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False
 

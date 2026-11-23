@@ -119,6 +119,11 @@ def _manifest_has_predictions(manifest: dict[str, Any]) -> bool:
         return False
 
 
+BENIGN_EMPTY_STATES = {
+    "WARMING_HISTORY", "MISSING_CURRENT_QUOTE", "NO_ELIGIBLE_SYMBOLS",
+}
+
+
 def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
     remote = (
         "production_data/all_nse_minute_predictions/"
@@ -133,7 +138,15 @@ def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
         manifest = json.loads(local.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return _manifest_has_predictions(manifest)
+    if _manifest_has_predictions(manifest):
+        return True
+    states = {str(key).upper() for key in (manifest.get("prediction_status_counts") or {})}
+    if not states or not states <= BENIGN_EMPTY_STATES:
+        return False
+    try:
+        return int(manifest.get("model_failure_count") or 0) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
@@ -830,7 +843,17 @@ def main() -> int:
         "manifest_drive_path": result.get("manifest_drive_path"),
         "error": result.get("error"),
     }, sort_keys=True, default=str))
-    if str(result.get("status") or "").upper() != "STORED" or int(result.get("prediction_count") or 0) < 1:
+    if str(result.get("status") or "").upper() != "STORED":
+        raise RuntimeError("Drive-only ALL-NSE prediction compiler did not store prediction rows")
+    if int(result.get("prediction_count") or 0) < 1:
+        states = {str(key).upper() for key in (result.get("prediction_status_counts") or {})}
+        if states and states <= BENIGN_EMPTY_STATES:
+            print(json.dumps({
+                "status": "NO_PREDICTIONS_EXPECTED",
+                "cycle_minute_ist": minute.isoformat(),
+                "prediction_status_counts": result.get("prediction_status_counts"),
+            }, sort_keys=True))
+            return 0
         raise RuntimeError("Drive-only ALL-NSE prediction compiler did not store prediction rows")
     return 0
 

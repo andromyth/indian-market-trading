@@ -95,7 +95,7 @@ jobs:
               echo "No unprocessed slots remain."
               break
             fi
-            if ! grep -q '"status": "STORED"' "/tmp/recover_$i.log"; then
+            if ! grep -Eq '"status": "(STORED|NO_PREDICTIONS_EXPECTED)"' "/tmp/recover_$i.log"; then
               echo "Recovery stopped without storing a prediction."
               exit 1
             fi
