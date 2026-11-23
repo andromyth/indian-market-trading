@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Read-only live-session health check for the five-minute NSE pipeline.
 
-Reports the latest canonical quote snapshot, the latest ALL-NSE prediction
-manifest, and today's live five-minute OHLCV captures. It never writes to
+Reports the latest selected-roster quote snapshot, its prediction manifest,
+and today's live five-minute OHLCV captures. It never writes to
 Drive, never retrains, and never places orders.
 """
 from __future__ import annotations
