@@ -70,19 +70,21 @@ def session_coverage_report(
             "reason": "no consolidated session rows",
             "symbols": len(symbols),
         }
+    session = str(max(pd.Timestamp(frame.index.max()).date() for frame in latest_session_frames.values()))
     observed = sorted({
         stamp.time()
         for frame in latest_session_frames.values()
         for stamp in frame.index
+        if str(stamp.date()) == session
     })
     if slots is None:
         slots = expected_session_slots(observed[0], observed[-1]) if observed else []
-    session = str(max(pd.Timestamp(frame.index.max()).date() for frame in latest_session_frames.values()))
     slot_set = set(slots)
     counts = {slot: 0 for slot in slots}
     per_symbol: dict[str, int] = {}
     for symbol, frame in latest_session_frames.items():
-        seen = {stamp.time() for stamp in frame.index if stamp.time() in slot_set}
+        day_frame = frame.loc[pd.Index(frame.index.date).astype(str) == session]
+        seen = {stamp.time() for stamp in day_frame.index if stamp.time() in slot_set}
         per_symbol[symbol] = len(seen)
         for slot in seen:
             counts[slot] += 1
