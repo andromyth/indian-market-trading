@@ -210,6 +210,15 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
             "quote_observed_at_ist": (minute + pd.Timedelta(seconds=3)).isoformat(),
             "day_volume": 20000,
         },
+        {
+            "symbol": "OUTSIDE",
+            "instrument_code": "NSE_4",
+            "cycle_minute_ist": minute.isoformat(),
+            "quote_status": "PASS",
+            "actual_observed_price": 150.25,
+            "quote_observed_at_ist": (minute + pd.Timedelta(seconds=4)).isoformat(),
+            "day_volume": 15000,
+        },
     ]).to_parquet(quote_path, index=False)
 
     class FakeDriveStore:
@@ -229,7 +238,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
             "status": "PERSISTENCE_ERROR",
             "snapshot_persisted": True,
             "expected_symbol_count": 500,
-            "row_count": 2,
+            "row_count": 3,
             "snapshot_drive_path": (
                 "production_data/all_universe_minute_snapshots/"
                 f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
@@ -242,6 +251,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     assert result["status"] == "STORED"
     assert result["row_count"] == 2
     assert result["expected_symbol_count"] == 500
+    assert result["snapshot_symbol_count"] == 2
     assert result["eligible_symbol_count"] == 2
     assert result["prediction_count"] == 1
     assert result["prediction_status_counts"] == {
