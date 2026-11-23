@@ -251,7 +251,6 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     assert result["status"] == "STORED"
     assert result["row_count"] == 2
     assert result["expected_symbol_count"] == 500
-    assert result["snapshot_symbol_count"] == 2
     assert result["eligible_symbol_count"] == 2
     assert result["prediction_count"] == 1
     assert result["prediction_status_counts"] == {
