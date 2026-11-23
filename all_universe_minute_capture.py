@@ -47,8 +47,8 @@ def _selected_roster(universe: Iterable[str] | None = None) -> list[str]:
     from prediction_universe import authoritative_roster
 
     pinned = authoritative_roster()
-    if not pinned:
-        raise RuntimeError("backfill_universe.json is missing or has no selected symbols")
+    if len(pinned) != 500:
+        raise RuntimeError(f"backfill_universe.json must contain exactly 500 unique symbols; found {len(pinned)}")
     if universe is None:
         return pinned
     requested = {
@@ -698,7 +698,7 @@ def capture_all_universe_minute_snapshot(
     assigned_symbols = shard_universe(universe_symbols, worker_count)[worker_id]
     prediction_map = _prediction_map(prediction_snapshots, cycle_minute)
     forecast_rows = _load_forecast_rows(daily_ledger)
-    manifest["universe_filter"] = universe_filter
+    manifest["roster_selection"] = universe_filter
     manifest["expected_symbol_count"] = len(universe_symbols)
     manifest["selected_symbol_count"] = len(universe_symbols)
     manifest["shard_symbol_count"] = len(assigned_symbols)
