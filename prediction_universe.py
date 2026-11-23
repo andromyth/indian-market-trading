@@ -474,29 +474,16 @@ def build_manifest(store=None, plan: dict[str, Any] | None = None,
 
 
 def active_symbols(store=None, plan: dict[str, Any] | None = None,
-                   now: datetime | None = None) -> tuple[list[str] | None, dict[str, Any]]:
-    """Symbols the capture/predict stage should use, or None to keep the roster."""
-    plan = plan or load_capital_plan()
-    if store is None:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": "no store"}
-    try:
-        payload = _download_bytes(store, UNIVERSE_CURRENT)
-        manifest = json.loads(payload) if payload else {}
-    except Exception as exc:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": f"{type(exc).__name__}"}
-    symbols = [str(s) for s in manifest.get("symbols") or []]
-    if len(symbols) < 150:
-        return None, {"status": "FALLBACK_FULL_ROSTER", "reason": "manifest missing or too small"}
-    now = now or datetime.now(IST)
-    try:
-        age_days = (now - datetime.fromisoformat(manifest["generated_at"])).total_seconds() / 86400
-    except Exception:
-        age_days = 0.0
-    status = "OK" if age_days <= float(plan["manifest_max_age_days"]) else "STALE"
+                   now: datetime | None = None) -> tuple[list[str], dict[str, Any]]:
+    """Return the fixed owner-selected roster; Drive manifests never reselect it."""
+    symbols = authoritative_roster()
+    if not symbols:
+        return [], {"status": "BLOCKED", "reason": "pinned roster unavailable"}
+    version = hashlib.sha1("|".join(symbols).encode("utf-8")).hexdigest()[:12]
     return symbols, {
-        "status": status,
-        "universe_version": manifest.get("universe_version"),
-        "age_days": round(age_days, 1),
+        "status": "PINNED_500_ROSTER",
+        "universe_version": version,
+        "selected_symbol_count": len(symbols),
     }
 
 
@@ -527,8 +514,8 @@ def active_symbols_cached(plan: dict[str, Any] | None = None, ttl_seconds: float
 
 
 def restrict_universe(symbols: Iterable[str], allowed: Iterable[str] | None) -> list[str]:
-    """Keep only allowed symbols; an empty/absent allow-list keeps everything."""
-    if not allowed:
+    """Keep only allowed symbols; an empty allow-list denies all symbols."""
+    if allowed is None:
         return list(symbols)
     keep = {str(s).strip().upper().replace(".NS", "") for s in allowed}
     return [s for s in symbols if str(s).strip().upper().replace(".NS", "") in keep]
