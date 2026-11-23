@@ -250,8 +250,8 @@ def test_sharded_capture_publishes_only_assembled_canonical_snapshot(tmp_path, m
     )
     monkeypatch.setitem(sys.modules, "indstocks_client", fake_indstocks)
     monkeypatch.setattr(
-        "delivery_training_universe.official_nse_symbols",
-        lambda force_refresh=False: ["AAA", "BBB", "CCC", "DDD"],
+        "prediction_universe.authoritative_roster",
+        lambda: ["AAA", "BBB", "CCC", "DDD"] + [f"EXTRA{i:03d}" for i in range(496)],
     )
     monkeypatch.setattr("persistent_store.GoogleDriveStore", lambda: fake_store)
 
@@ -263,6 +263,7 @@ def test_sharded_capture_publishes_only_assembled_canonical_snapshot(tmp_path, m
         worker_root=tmp_path,
         daily_ledger=None,
         prediction_snapshots=[],
+        universe=["AAA", "BBB", "CCC", "DDD"],
         worker_count=2,
         retry_failed_shards=0,
     )
@@ -320,8 +321,8 @@ def test_sharded_capture_does_not_publish_when_a_shard_fails(tmp_path, monkeypat
     )
     monkeypatch.setitem(sys.modules, "indstocks_client", fake_indstocks)
     monkeypatch.setattr(
-        "delivery_training_universe.official_nse_symbols",
-        lambda force_refresh=False: ["AAA", "BBB", "CCC", "DDD"],
+        "prediction_universe.authoritative_roster",
+        lambda: ["AAA", "BBB", "CCC", "DDD"] + [f"EXTRA{i:03d}" for i in range(496)],
     )
     monkeypatch.setattr("persistent_store.GoogleDriveStore", lambda: fake_store)
 
@@ -331,6 +332,7 @@ def test_sharded_capture_does_not_publish_when_a_shard_fails(tmp_path, monkeypat
         worker_root=tmp_path,
         daily_ledger=None,
         prediction_snapshots=[],
+        universe=["AAA", "BBB", "CCC", "DDD"],
         worker_count=2,
         retry_failed_shards=0,
     )

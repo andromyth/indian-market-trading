@@ -166,7 +166,19 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
         "Drive-only inference must not call INDstocks history endpoints"
     )
     predictor._load_completed_fno_context = lambda _minute: ({}, "UNAVAILABLE", None)
-    predictor._history = {}
+    predictor._history = {
+        symbol: pd.DataFrame(
+            {
+                "Open": [price - 1.0],
+                "High": [price + 1.0],
+                "Low": [price - 2.0],
+                "Close": [price],
+                "Volume": [1000.0],
+            },
+            index=pd.DatetimeIndex([minute], tz=IST, name="Datetime"),
+        )
+        for symbol, price in (("AAA", 101.25), ("BBB", 202.25))
+    }
     predictor._market_history = pd.DataFrame(
         columns=["Open", "High", "Low", "Close", "Volume"],
         index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
@@ -276,7 +288,8 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     assert written.loc["AAA", "probability_up_session_close"] == pytest.approx(0.8)
     assert written.loc["AAA", "prediction_horizon"] == "session_close"
     assert written.loc["AAA", "signal"] == "BUY"
-    assert written.loc["AAA", "history_input_mode"] == "CURRENT_QUOTE_ONLY"
+    assert written.loc["AAA", "history_input_mode"] == "CLOSED_5M_HISTORY_ONLY"
+    assert written.loc["AAA", "decision_bar_ist"] == minute.isoformat()
     assert written.loc["BBB", "prediction_status"] == "MODEL_INFERENCE_ERROR"
 
     import json
@@ -1402,3 +1415,117 @@ def test_drive_only_market_context_never_refreshes_from_yahoo(monkeypatch):
 
     assert result.empty
     assert isinstance(result.index, pd.DatetimeIndex)
+
+
+def _drive_only_slot_result(tmp_path, monkeypatch, minute, history, seen):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "prediction_universe.authoritative_roster",
+        lambda: ["AAA"] + [f"X{i:03d}" for i in range(499)],
+    )
+    monkeypatch.setattr(
+        "persistent_store.GoogleDriveStore",
+        lambda: SimpleNamespace(
+            upload_or_update=lambda local_path, remote, mime_type="application/octet-stream": {
+                "status": "OK", "remote_path": remote,
+            }
+        ),
+    )
+
+    predictor = capture.AllNSEMinutePredictor(tmp_path)
+    predictor.start = lambda: pytest.fail("drive-only inference must not seed INDstocks history")
+    predictor._schedule_current_session_history_refresh = lambda _minute: pytest.fail(
+        "drive-only inference must not refresh live history"
+    )
+    predictor._load_completed_fno_context = lambda _minute: ({}, "UNAVAILABLE", None)
+    predictor._fetch_current_nifty_quote = lambda: pytest.fail(
+        "drive-only inference must not fetch a live index quote"
+    )
+    predictor._trained_symbols = {"AAA"}
+    predictor._model_status = {"manifest_sha256_match": True}
+    predictor._history = history
+    predictor._market_history = pd.DataFrame(
+        columns=["Open", "High", "Low", "Close", "Volume"],
+        index=pd.DatetimeIndex([], tz=IST, name="Datetime"),
+    )
+
+    def latest_features(price_df, market_df=None, fno=None, decision_timestamp=None,
+                        feature_names=None):
+        seen["decision_timestamp"] = decision_timestamp
+        seen["stamps"] = list(price_df.index)
+        return {"f1": float(price_df["Close"].iloc[-1])}
+
+    predictor._model_api = SimpleNamespace(
+        FEATURES=["f1"],
+        active_feature_names=lambda: ["f1"],
+        _latest_features=latest_features,
+    )
+    predictor._classifier = SimpleNamespace(
+        predict_proba=lambda frame: np.array([[0.3, 0.7]])
+    )
+    predictor._regressor = SimpleNamespace(predict=lambda frame: np.array([0.01]))
+
+    snapshot_dir = tmp_path / "all_universe_minute_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{
+        "symbol": "AAA",
+        "instrument_code": "NSE_1",
+        "cycle_minute_ist": minute.isoformat(),
+        "quote_status": "PASS",
+        "actual_observed_price": 101.25,
+        "quote_observed_at_ist": (minute + pd.Timedelta(seconds=37)).isoformat(),
+        "day_volume": 10000,
+    }]).to_parquet(
+        snapshot_dir / f"snapshot_{minute:%Y%m%d_%H%M}.parquet", index=False
+    )
+
+    return predictor.run_for_capture(
+        {
+            "cycle_minute_ist": minute.isoformat(),
+            "status": "STORED",
+            "snapshot_persisted": True,
+            "expected_symbol_count": 500,
+            "row_count": 1,
+            "snapshot_drive_path": (
+                "production_data/all_universe_minute_snapshots/"
+                f"{minute:%Y/%m/%d}/snapshot_{minute:%Y%m%d_%H%M}.parquet"
+            ),
+        },
+        worker_root=tmp_path,
+        drive_only=True,
+    )
+
+
+def test_off_grid_quote_uses_closed_decision_bar_without_feature_error(tmp_path, monkeypatch):
+    minute = pd.Timestamp("2026-10-21 10:20:00", tz=IST)
+    idx = pd.date_range(end=minute, periods=13, freq="5min", tz=IST, name="Datetime")
+    history = {
+        "AAA": pd.DataFrame(
+            {
+                "Open": 100.0, "High": 102.0, "Low": 99.0,
+                "Close": 101.0, "Volume": 1000.0,
+            },
+            index=idx,
+        )
+    }
+    seen = {}
+    result = _drive_only_slot_result(tmp_path, monkeypatch, minute, history, seen)
+
+    assert result["status"] == "STORED"
+    assert result["prediction_count"] == 1
+    assert result["prediction_status_counts"].get("FEATURE_BUILD_ERROR", 0) == 0
+    assert pd.Timestamp(seen["decision_timestamp"]) == minute
+    assert seen["stamps"][-1] == minute
+
+
+def test_no_closed_decision_bar_is_warmup_not_feature_error(tmp_path, monkeypatch):
+    minute = pd.Timestamp("2026-10-21 10:25:00", tz=IST)
+    seen = {}
+    result = _drive_only_slot_result(tmp_path, monkeypatch, minute, {}, seen)
+
+    assert result["status"] == "STORED"
+    assert result["prediction_count"] == 0
+    assert result["prediction_status_counts"].get("FEATURE_BUILD_ERROR", 0) == 0
+    assert result["prediction_status_counts"].get("WARMING_HISTORY") == 1
+    assert "decision_timestamp" not in seen

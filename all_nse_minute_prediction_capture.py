@@ -347,6 +347,32 @@ def _model_serving_mode(model_api: Any) -> str | None:
     return None
 
 
+def _feature_group_coverage(frame: pd.DataFrame) -> dict[str, float | None]:
+    """Coverage per feature family, derived from the served feature contract."""
+    fno_names = {
+        "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi",
+        "fno_basis", "fno_available",
+    }
+    market_prefixes = ("mkt_", "rel_", "market_", "relative_")
+    groups: dict[str, list[str]] = {
+        "price_technical": [], "market_context": [], "fno_context": [],
+    }
+    for name in frame.columns:
+        if name in fno_names:
+            groups["fno_context"].append(name)
+        elif str(name).startswith(market_prefixes):
+            groups["market_context"].append(name)
+        else:
+            groups["price_technical"].append(name)
+    return {
+        group: (
+            round(float(frame[names].notna().mean(axis=1).mean() * 100.0), 3)
+            if names else None
+        )
+        for group, names in groups.items()
+    }
+
+
 def _apply_edge_rule(
     signal: str,
     expected_return: float | None,
@@ -2686,7 +2712,7 @@ class AllNSEMinutePredictor:
                 history_age_minutes = max(
                     0.0, (minute - latest_history_at).total_seconds() / 60.0
                 )
-            quote_info, price_row, raw_day_volume = _current_minute_row(
+            quote_info, _price_row, raw_day_volume = _current_minute_row(
                 symbol=symbol,
                 snapshot_minute=minute,
                 quote=quote,
@@ -2703,12 +2729,6 @@ class AllNSEMinutePredictor:
                 ),
                 snapshot_date=minute.date(),
             )
-            actual_price = quote_info.get("actual_market_value")
-            actual_ts = _as_ist_timestamp(
-                quote_info.get("actual_observed_at_ist"),
-                fallback=minute,
-            )
-            quote_age = quote_info.get("actual_quote_age_seconds")
             quote_good = _snapshot_quote_error(quote, minute) is None
             if quote_good and raw_day_volume is not None:
                 quote_actuals[symbol] = {"day_volume": raw_day_volume, "date": minute.date()}
@@ -2717,36 +2737,37 @@ class AllNSEMinutePredictor:
                 quote_info["error"] = model_error
                 model_failures += 1
                 current_rows.append(quote_info)
-            elif price_row is not None:
+            elif _price_row is not None:
                 try:
-                    current_quote_frame = pd.DataFrame(
-                        [price_row],
-                        index=pd.DatetimeIndex([actual_ts], name="Datetime"),
-                    )
+                    decision_ts = None
                     if (
-                        hist.empty
-                        or history_age_minutes is None
-                        or history_age_minutes > MAX_HISTORY_CANDLE_AGE_MINUTES
+                        not hist.empty
+                        and isinstance(hist.index, pd.DatetimeIndex)
+                        and history_age_minutes is not None
+                        and history_age_minutes <= MAX_HISTORY_CANDLE_AGE_MINUTES
                     ):
-                        feature_history = current_quote_frame
-                        quote_info["history_input_mode"] = "CURRENT_QUOTE_ONLY"
-                    elif _is_closed_5m_bar(actual_ts):
-                        feature_history = pd.concat([hist, current_quote_frame]).sort_index()
-                        feature_history = feature_history.loc[
-                            ~feature_history.index.duplicated(keep="last")
-                        ].tail(HISTORY_LOOKBACK_BARS)
-                        quote_info["history_input_mode"] = "FRESH_5M_HISTORY_PLUS_CLOSED_QUOTE"
-                    else:
-                        # Off-grid quote: train/serve parity requires candles only.
-                        feature_history = hist.tail(HISTORY_LOOKBACK_BARS)
-                        quote_info["history_input_mode"] = "CLOSED_5M_HISTORY_ONLY"
+                        candidate = _as_ist_timestamp(hist.index.max())
+                        if _is_closed_5m_bar(candidate) and candidate <= minute:
+                            decision_ts = candidate
+                    if decision_ts is None:
+                        # A live quote is an observation, not a training-parity
+                        # feature bar. Without a closed grid candle for this slot
+                        # keep the row warming instead of forcing a synthetic bar.
+                        quote_info["prediction_status"] = "WARMING_HISTORY"
+                        quote_info["history_input_mode"] = "NO_CLOSED_DECISION_BAR"
+                        quote_info["decision_bar_ist"] = None
+                        current_rows.append(quote_info)
+                        continue
+                    feature_history = hist.tail(HISTORY_LOOKBACK_BARS)
+                    quote_info["history_input_mode"] = "CLOSED_5M_HISTORY_ONLY"
+                    quote_info["decision_bar_ist"] = decision_ts.isoformat()
                     feature_names = _model_feature_names(self._model_api)
                     try:
                         model_feature_row = self._model_api._latest_features(
                             feature_history,
                             market_df=market_history_before_minute,
                             fno=fno_context_by_symbol.get(symbol),
-                            decision_timestamp=actual_ts,
+                            decision_timestamp=decision_ts,
                             feature_names=feature_names,
                         )
                     except TypeError:
@@ -2756,15 +2777,23 @@ class AllNSEMinutePredictor:
                             feature_history,
                             market_df=market_history_before_minute,
                             fno=fno_context_by_symbol.get(symbol),
-                            decision_timestamp=actual_ts,
+                            decision_timestamp=decision_ts,
                         )
                     feature_rows.append(model_feature_row)
                     feature_symbols.append(symbol)
                     current_rows.append(quote_info)
                 except Exception as exc:
-                    quote_info["prediction_status"] = "FEATURE_BUILD_ERROR"
-                    quote_info["error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
-                    model_failures += 1
+                    message = str(exc)
+                    if isinstance(exc, ValueError) and message.startswith("Feature row unavailable"):
+                        # The decision bar has no training-parity feature row yet
+                        # (pre-warmup, short session history, or off-grid stamp).
+                        quote_info["prediction_status"] = "WARMING_HISTORY"
+                        quote_info["history_input_mode"] = "NO_VALID_DECISION_BAR"
+                        quote_info["error"] = message[:240]
+                    else:
+                        quote_info["prediction_status"] = "FEATURE_BUILD_ERROR"
+                        quote_info["error"] = f"{type(exc).__name__}: {message[:240]}"
+                        model_failures += 1
                     current_rows.append(quote_info)
             else:
                 # The symbol had no individually usable stored quote and was
@@ -2787,41 +2816,7 @@ class AllNSEMinutePredictor:
             feature_quality_diagnostics.update({
                 "mean_feature_coverage_pct": round(float(row_coverage.mean()), 3),
                 "p10_feature_coverage_pct": round(float(np.quantile(row_coverage, 0.10)), 3),
-                "feature_group_coverage_pct": {
-                    "price_technical": round(float(
-                        inference_frame[[name for name in inference_frame.columns if name in {
-                            "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
-                            "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
-                            "ma50_ratio", "range_pct", "body_pct", "volume_ratio",
-                            "volume_z20", "tod_sin", "tod_cos",
-                        }]].notna().mean(axis=1).mean() * 100.0
-                    ), 3) if any(name in inference_frame.columns for name in (
-                        "ret_1", "ret_3", "ret_5", "ret_10", "ret_15", "ret_30",
-                        "rsi14", "atr14_pct", "ma5_ratio", "ma10_ratio", "ma20_ratio",
-                        "ma50_ratio", "range_pct", "body_pct", "volume_ratio", "volume_z20",
-                        "tod_sin", "tod_cos",
-                    )) else None,
-                    "market_context": round(float(
-                        inference_frame[[name for name in inference_frame.columns if name in {
-                            "market_ret_1", "market_ret_3", "market_ret_5", "market_ret_10",
-                            "market_ret_15", "market_ret_30", "market_rsi14",
-                            "relative_ret_1", "relative_ret_5", "relative_ret_15",
-                        }]].notna().mean(axis=1).mean() * 100.0
-                    ), 3) if any(name in inference_frame.columns for name in (
-                        "market_ret_1", "market_ret_3", "market_ret_5", "market_ret_10",
-                        "market_ret_15", "market_ret_30", "market_rsi14",
-                        "relative_ret_1", "relative_ret_5", "relative_ret_15",
-                    )) else None,
-                    "fno_context": round(float(
-                        inference_frame[[name for name in inference_frame.columns if name in {
-                            "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi",
-                            "fno_basis", "fno_available",
-                        }]].notna().mean(axis=1).mean() * 100.0
-                    ), 3) if any(name in inference_frame.columns for name in (
-                        "fno_pcr", "fno_oi_change", "fno_fut_return", "fno_fut_oi",
-                        "fno_basis", "fno_available",
-                    )) else None,
-                },
+                "feature_group_coverage_pct": _feature_group_coverage(inference_frame),
                 "missing_count_by_feature": {
                     str(name): int(inference_frame[name].isna().sum())
                     for name in inference_frame.columns

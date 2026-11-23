@@ -117,11 +117,12 @@ def test_restrict_universe_empty_allowlist_denies_all():
     assert pu.restrict_universe(["AAA", "BBB"], []) == []
 
 
-def test_build_manifest_aborts_without_closes(monkeypatch):
+def test_build_manifest_publishes_pinned_roster_without_closes(monkeypatch):
     monkeypatch.setattr(pu, "_download_bytes", lambda store, remote: None)
     manifest = pu.build_manifest(store=object(), plan=PLAN, sync=False)
-    assert manifest["status"] == "ABORTED"
-    assert "closes" in manifest["sources"]
+    assert manifest["status"] == "OK"
+    assert manifest["symbols"] == pu.authoritative_roster()
+    assert manifest["sources"]["closes"] == "OK:0"
 
 
 def test_build_manifest_selects_from_fake_sources(monkeypatch):
@@ -141,7 +142,8 @@ def test_build_manifest_selects_from_fake_sources(monkeypatch):
     plan = dict(PLAN, universe_size=50)
     manifest = pu.build_manifest(store=object(), plan=plan, sync=False,
                                  now=datetime(2026, 11, 16, 16, 0))
-    assert manifest["status"] == "ABORTED"
+    assert manifest["status"] == "OK"
+    assert manifest["symbols"] == pu.authoritative_roster()
     assert manifest["stats"]["selected"] == 3
 
 
