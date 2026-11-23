@@ -40,8 +40,8 @@ def _selected_roster() -> set[str]:
     from prediction_universe import authoritative_roster
 
     symbols = set(authoritative_roster())
-    if not symbols:
-        raise RuntimeError("backfill_universe.json is missing or has no selected symbols")
+    if len(symbols) != 500:
+        raise RuntimeError(f"backfill_universe.json must contain exactly 500 unique symbols; found {len(symbols)}")
     return symbols
 
 
