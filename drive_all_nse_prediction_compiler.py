@@ -45,6 +45,18 @@ def _selected_roster() -> set[str]:
     return symbols
 
 
+def _restrict_to_selected_roster(quotes: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Exclude any snapshot rows outside the pinned roster before inference."""
+    allowed = _selected_roster()
+    frame = quotes.copy()
+    frame["symbol"] = (
+        frame["symbol"].astype(str).str.strip().str.upper()
+        .str.replace(r"\.NS$", "", regex=True)
+    )
+    excluded = sorted(set(frame["symbol"]) - allowed)
+    return frame.loc[frame["symbol"].isin(allowed)].copy(), excluded
+
+
 def _find_remote(store, remote: str):
     parent = store.root_id
     parts = [part for part in remote.strip("/").split("/") if part]
@@ -735,17 +747,13 @@ def main() -> int:
         age_minutes = (now - minute).total_seconds() / 60.0
         if age_minutes < -1 or age_minutes > MAX_CAPTURE_AGE_SECONDS / 60:
             raise RuntimeError(f"Selected quote snapshot is stale: age_minutes={age_minutes:.1f}")
-    allowed_symbols = _selected_roster()
-    quotes = quotes.copy()
-    quotes["symbol"] = quotes["symbol"].astype(str).str.strip().str.upper().str.replace(r"\\.NS$", "", regex=True)
-    outside_roster = sorted(set(quotes["symbol"]) - allowed_symbols)
+    quotes, outside_roster = _restrict_to_selected_roster(quotes)
     if outside_roster:
         print(json.dumps({
             "event": "NON_SELECTED_SYMBOLS_EXCLUDED",
             "excluded_symbol_count": len(outside_roster),
             "excluded_symbol_samples": outside_roster[:20],
         }, sort_keys=True), flush=True)
-    quotes = quotes.loc[quotes["symbol"].isin(allowed_symbols)].copy()
     if quotes.empty:
         raise RuntimeError("Selected snapshot contains no symbols from the pinned 500-symbol roster")
     symbols = set(quotes["symbol"].astype(str).str.strip().str.upper())
