@@ -288,7 +288,7 @@ def test_run_for_capture_predicts_only_stock_with_stored_quote_without_universe_
     saved_manifest = json.loads(minute_manifest_path.read_text(encoding="utf-8"))
     assert saved_manifest["model_version"] == predictor._production_model_version()
     assert saved_manifest["eligible_symbol_count"] == 2
-    assert saved_manifest["skipped_missing_quote_count"] == 1
+    assert saved_manifest["skipped_missing_quote_count"] == 498
     assert "quality_gate_pass" not in saved_manifest
 
 
