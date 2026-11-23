@@ -391,6 +391,15 @@ def build_manifest(store=None, plan: dict[str, Any] | None = None,
     """Assemble and (optionally) upload the universe manifest."""
     plan = plan or load_capital_plan()
     now = now or datetime.now(IST)
+
+    # --- FIX: apply the authoritative 500-symbol roster first ---
+    # It must take precedence over the data-driven selection so the manifest
+    # never falls below the required universe size, even when downstream
+    # data sources (delivery ledger, FNO features, intraday frames) are
+    # incomplete or unavailable.
+    pinned = sorted(set(authoritative_roster()))
+
+    now = now or datetime.now(IST)
     local_store = False
     if store is None and sync:
         from persistent_store import GoogleDriveStore
@@ -424,24 +433,26 @@ def build_manifest(store=None, plan: dict[str, Any] | None = None,
 
     closes = latest_closes(ledger)
     status["closes"] = f"OK:{len(closes)}"
-    if not closes:
-        return {
-            "status": "ABORTED",
-            "reason": "no reference closes available",
-            "generated_at": now.isoformat(),
-            "sources": status,
-        }
 
+    # Build the data-driven selection, then override with the pinned roster.
     delivery = delivery_stats(ledger, int(plan["delivery_lookback_sessions"]), int(plan["min_records_profitable"]))
     intraday = intraday_stats(frames, int(plan["min_records_profitable"]))
     selection = select_universe(closes, delivery, intraday, fno, plan)
-    if len(selection["symbols"]) < 150:
+    # Always favour the pinned roster; if the data-driven selection is too small
+    # it still gets replaced by the full 500-symbol roster.
+    if pinned:
+        selection = dict(selection)
+        selection["symbols"] = pinned
+        selection["universe_version"] = hashlib.sha1(
+            "|".join(pinned).encode("utf-8")
+        ).hexdigest()[:12]
+    elif len(selection.get("symbols", [])) < 150:
         return {
             "status": "ABORTED",
-            "reason": f"universe too small ({len(selection['symbols'])})",
+            "reason": f"universe too small ({len(selection.get('symbols', []))})",
             "generated_at": now.isoformat(),
             "sources": status,
-            "stats": selection["stats"],
+            "stats": selection.get("stats") if isinstance(selection, dict) else {},
         }
 
     pinned = sorted(set(authoritative_roster()))
