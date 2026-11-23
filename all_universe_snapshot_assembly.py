@@ -102,7 +102,7 @@ def shard_universe(symbols: Iterable[str], worker_count: int) -> list[list[str]]
 
     Round-robin assignment (``symbols[i::worker_count]``) keeps shard sizes
     balanced even when the universe is not a multiple of the worker count. Every
-    symbol is assigned to exactly one shard, so the union is the full universe
+    symbol is assigned to exactly one shard, so the union is the selected roster
     and no provider request is duplicated.
     """
     count = max(1, int(worker_count))
