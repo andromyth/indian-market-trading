@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -108,6 +109,16 @@ def _download(store, file_id: str, destination: Path) -> None:
     )
 
 
+def _manifest_has_predictions(manifest: dict[str, Any]) -> bool:
+    """A STORED slot with zero forecasts is a failed compile, not a completed slot."""
+    if str(manifest.get("status") or "").upper() != "STORED":
+        return False
+    try:
+        return int(manifest.get("prediction_count") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
     remote = (
         "production_data/all_nse_minute_predictions/"
@@ -122,7 +133,7 @@ def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
         manifest = json.loads(local.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return str(manifest.get("status") or "").upper() == "STORED"
+    return _manifest_has_predictions(manifest)
 
 
 def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
@@ -765,7 +776,7 @@ def main() -> int:
         existing_path = Path("/tmp/drive_all_nse/existing_prediction_manifest.json")
         _download(store, existing["id"], existing_path)
         prior = json.loads(existing_path.read_text(encoding="utf-8"))
-        if str(prior.get("status") or "").upper() == "STORED":
+        if _manifest_has_predictions(prior):
             print(json.dumps({
                 "status": "SKIPPED_ALREADY_PREDICTED",
                 "cycle_minute_ist": minute.isoformat(),
