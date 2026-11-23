@@ -1,11 +1,11 @@
-# ALL-NSE Five-Minute Prediction + Actual-Price Capture
+# Pinned 500-Symbol Five-Minute Prediction + Actual-Price Capture
 
 ## Acquisition → assembly → prediction
 
-The five-minute cycle is a single coordinated pipeline:
+The five-minute cycle is a single coordinated pipeline for the fixed 500 symbols in `backfill_universe.json`. That file is the sole live snapshot/prediction roster; dynamic selection manifests and the full NSE symbol master do not expand or replace it.
 
 1. **Sharded acquisition.** One coordinated Cloud Run tick fans the official NSE
-   universe out to `ALL_NSE_CAPTURE_WORKERS` shard collectors (default 8). Every
+   selected roster out to `ALL_NSE_CAPTURE_WORKERS` shard collectors (default 8). Every
    shard owns a disjoint slice (`symbols[worker_id::worker_count]`) and all
    shards share the process-wide INDstocks request gate. Shards are worker
    threads inside the one acquisition process; they are not independent
@@ -95,8 +95,8 @@ The prediction folder also receives `manifest_YYYYMMDD_HHMM.json` and the `lates
 - A stock is sent to prediction only if its quote exists in that slot's persisted snapshot and has a valid symbol, slot timestamp, quote status, and positive price.
 - If a particular stock's quote is missing or invalid, that stock is skipped. Missing data for other stocks does not block forecasts for eligible stocks.
 - Historical five-minute bars enrich the features when available. If stock history is absent, the model can use the stored current quote with missing OHLC fields left as null; lower feature readiness may keep the manual signal at `HOLD`.
-- A usable model artifact is required for inference. Prediction and manifest files must be successfully written to Drive. These are actual execution/storage requirements, not universe-wide coverage thresholds.
-- `STORED` means the relevant artifact was persisted. It does not mean that every NSE symbol produced a prediction. Quote coverage, missing-quote counts, and history-seed counts are informational metrics, not global pass/fail gates.
+- A usable model artifact is required for inference. Prediction and manifest files must be successfully written to Drive. These are actual execution/storage requirements, not selected-roster quote-coverage thresholds.
+- `STORED` means the relevant artifact was persisted. It does not mean that every NSE symbol produced a prediction. Quote coverage, missing-quote counts, and history-seed counts within the selected 500 are informational metrics, not global pass/fail gates.
 - If no valid stock quote exists in a slot, the predictor records `NO_ELIGIBLE_SYMBOLS` and generates no prediction rows for that slot.
 
 ## Row contents and safeguards
@@ -116,7 +116,7 @@ Canonical (assembled) snapshot manifest: `cycle_minute_ist`, `status`,
 `snapshot_drive_path`.
 
 Shard manifest: `worker_id`, `worker_count`, `shard_symbols`,
-`shard_symbol_count`, `universe_symbol_count`, `row_count`, `status`
+`shard_symbol_count`, `selected_symbol_count`, `row_count`, `status`
 (`SHARD_STORED`), `snapshot_drive_path`.
 
 Per-stock prediction manifest: `cycle_minute_ist`, `expected_symbol_count`,
