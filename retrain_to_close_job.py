@@ -17,12 +17,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from market_session_guard import latest_completed_nse_session
 
 ARCHIVE_REL = "production_data/nse_official/intraday_seed/olo_5m_archive/symbols"
 FNO_REL = "production_data/nse_official/fno"
@@ -47,10 +51,22 @@ INDEX_SYMBOLS = {
 }
 REMOTE_MODELS = "models/to_close"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def archive_freshness(last_session: object, expected_session: object) -> tuple[bool, str]:
+    """Compare the archive's newest session with the latest completed NSE session."""
+    last = str(last_session or "")[:10]
+    expected = str(expected_session or "")[:10]
+    if not last or not expected:
+        return False, f"archive session missing (last={last!r}, expected={expected!r})"
+    if last < expected:
+        return False, f"archive is stale: last session {last}, expected {expected}"
+    return True, ""
 
 
 def _norm_symbol(value: object) -> str:
@@ -214,6 +230,33 @@ def _download_inputs(root: Path, args: argparse.Namespace) -> tuple[Path, Path, 
         raise RuntimeError("Google Drive read/write preflight failed")
 
     store = GoogleDriveStore()
+    if args.consolidate_live_days > 0:
+        import consolidate_live_5m_into_archive as consolidation
+
+        with tempfile.TemporaryDirectory(prefix="retrain_consolidate_", dir=root) as tmp:
+            consolidation_report = consolidation.consolidate(
+                store=store,
+                symbols=consolidation.authoritative_roster(),
+                days=args.consolidate_live_days,
+                end_date=pd.Timestamp.now(tz=IST),
+                dry_run=False,
+                work_root=Path(tmp),
+            )
+        print(
+            "RETRAIN_CONSOLIDATION=" + json.dumps(consolidation_report, sort_keys=True),
+            flush=True,
+        )
+        if consolidation_report.get("symbols_without_archive"):
+            raise RuntimeError(
+                "consolidation found symbols without an archive: "
+                f"{consolidation_report['symbols_without_archive']}"
+            )
+        session_coverage = consolidation_report.get("latest_session_coverage") or {}
+        if not session_coverage.get("complete") and not args.allow_stale_archive:
+            raise RuntimeError(
+                "incomplete five-minute session coverage: "
+                + json.dumps(session_coverage, sort_keys=True)
+            )
     store.local_root = root  # used only by the download helpers below
     import rebuild_all_nse_intraday_5m_model_from_drive as bridge
 
@@ -331,6 +374,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-symbols", type=int, default=300)
     parser.add_argument("--cost", type=float, default=0.0011)
     parser.add_argument("--warmup-bars", type=int, default=3)
+    parser.add_argument(
+        "--consolidate-live-days",
+        type=int,
+        default=5,
+        help="Trading-day lookback for the pre-training live-snapshot consolidation (0 disables)",
+    )
+    parser.add_argument(
+        "--allow-stale-archive",
+        action="store_true",
+        help="Continue even when the archive is stale or a five-minute slot is missing",
+    )
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--n-splits", type=int, default=4)
     parser.add_argument("--max-train-rows", type=int, default=2_500_000)
@@ -339,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--drive-root", type=Path, default=None, help="Local mounted Drive for debugging")
     parser.add_argument("--no-upload", action="store_true")
     args = parser.parse_args(argv)
+    if args.consolidate_live_days < 0 or args.consolidate_live_days > 30:
+        raise ValueError("--consolidate-live-days must be between 0 and 30")
 
     work = args.work_root.resolve()
     data_root = args.drive_root.resolve() if args.drive_root else work / "drive"
@@ -472,6 +528,24 @@ def main(argv: list[str] | None = None) -> int:
                 "covered_end": ready.get("end"),
             }
         )
+        if not args.drive_root:
+            expected = latest_completed_nse_session(datetime.now(IST)).isoformat()
+            equity_last = (report.get("equity") or {}).get("last_session")
+            fresh, freshness_reason = archive_freshness(equity_last, expected)
+            status.update(
+                {
+                    "expected_latest_session": expected,
+                    "archive_last_session": equity_last,
+                    "archive_fresh": fresh,
+                }
+            )
+            if not fresh and not args.allow_stale_archive:
+                write_status(
+                    status="DATA_NOT_READY",
+                    reason=freshness_reason,
+                    stale_archive=True,
+                )
+                return finish(2)
         try:
             min_train, holdout = training_window(sessions)
         except ValueError as exc:

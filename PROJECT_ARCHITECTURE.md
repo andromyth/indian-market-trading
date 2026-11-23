@@ -198,12 +198,22 @@ Actions runs the Drive-consumer half of the system:
 
 | Workflow | Cadence | Purpose |
 |---|---|---|
-| `compile_all_nse_predictions_from_drive.yml` | Every 5 min, 09:15–15:25 IST | Compile canonical snapshot → predictions |
+| `compile_all_nse_predictions_from_drive.yml` | 15:29 IST weekdays (single safety run) | Compile canonical snapshot → predictions |
 | `nse_eod_sync.yml` | 3 attempts after close | Official EOD/delivery archive sync |
 | `nse_delivery_production_cycle.yml` | 21:45, 01:45, 06:45 IST | Delivery PIT refresh + validation + policy |
-| `autonomous_prediction_learning.yml` | 16:30 IST weekdays | Calibration/learning diagnostics |
+| `autonomous_prediction_learning.yml` | Manual dispatch only | Calibration/learning diagnostics |
+| `consolidate_live_5m_into_archive.yml` | 16:15 IST (convenience) | Fold live 5m snapshots into the training archive; fails if a decision slot is missing |
+| `retrain_to_close.yml` | 20:15 IST weekdays | Self-sufficient retrain: consolidates live snapshots, audits freshness, then trains |
+| `start_cloud_run_5m_backfill.yml` | Manual / staged preflight only | Production backfill is Cloud Scheduler `native-5m-backfill-daily` at 16:00 IST |
 | `verify_all_nse_drive_snapshots.yml` | Manual | Independent Drive audit |
 | `nse_fno_sync.yml`, `nse_news_events_sync.yml` | Daily | F&O and news/event layers |
+
+GitHub-hosted cron is throttled in this repository: scheduled workflows have
+fired hours late (the compiler ran once daily near 18:10 UTC despite its
+15:29 IST cron, and the backfill trigger fired at 17:57 UTC instead of 10:30
+UTC). Production data acquisition therefore relies on Cloud Scheduler; the
+retrain job consolidates and checks freshness itself rather than depending on
+the order or promptness of two GitHub cron jobs.
 
 Important compiler properties:
 
@@ -821,15 +831,24 @@ skipped or data-limited.
 |---|---|---|---|
 | Cloud Scheduler | 09:15–15:25 IST, every 5 min | 540 s attempt deadline | 2 attempts, 60 s window |
 | Cloud Run `/tick` | One request per slot | 900 s | Scheduler retry only |
-| GitHub compiler | Every 5 min, 09:15–15:25 IST | 15 min job cap | Next scheduled run; concurrency group queues |
+| GitHub compiler | 15:29 IST weekdays (single safety run) | 15 min job cap | Manual dispatch; GitHub cron is throttled |
 | Delivery production | 21:45 / 01:45 / 06:45 IST | 60 min | Three daily checkpoints |
-| Learning | 16:30 IST weekdays | 180 min | Manual dispatch |
+| Learning | Manual dispatch only | 180 min | Manual dispatch |
+| Native 5m backfill | 16:00 IST via Cloud Scheduler `native-5m-backfill-daily` | Multi-hour Cloud Run job | Cloud Scheduler retry |
+| Live consolidation | 16:15 IST (convenience) + inside retrain | 30 min | Fail-closed on missing 5m slots |
+| To-close retrain | 20:15 IST weekdays | 360 min workflow / 86400 s job | Manual dispatch fallback if cron is late |
 | EOD sync | 20:15 / 23:45 / 05:15 IST | 60 min | Three attempts |
 
 The 15:25 end is intentional: 15:30 is the cash-market close, so the 15:25
 snapshot is the last actionable decision point. The compiler guard itself is
 09:15–15:30, which is why a post-close smoke run can still reach the compile
 step and then select the last fresh slot.
+
+The training chain is explicit: Cloud Scheduler backfills the completed
+session at 16:00 IST, consolidation folds live snapshots into the archive at
+16:15 IST (and again inside the retrain job), and the 20:15 IST retrain fails
+closed unless the archive's newest session is the latest completed NSE session
+and every 09:20–15:25 five-minute slot has data across the selected universe.
 
 ---
 
