@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""Build the focused prediction universe and tradable picks.
+"""Maintain the owner-pinned 500-symbol roster and affordable tradable picks.
 
-The live pipeline used to capture and predict every NSE symbol (~3,600).  At a
-Rs 7,000/month trading capital that is wasted compute: most symbols can never be
-bought (price cap) and most have no realised edge.  This module selects the few
-hundred symbols worth paying for and turns the newest predictions into an
-affordable, ranked pick list.
+The live five-minute capture and prediction pipeline uses only
+backfill_universe.json. Dynamic selection statistics may be reported for
+research, but they cannot replace or expand that live roster.
 
-Selection rule (all inputs already live in Drive):
-
-    eligible = affordable(close <= price_cap)
-               AND (profitable OR liquid OR top-ranked activity)
-    rank     = 4*delivery-profit + 3*intraday-profit + 2*fno + activity
-
-Pure selection functions take plain frames so they are unit-testable without
-Drive; ``build_manifest``/``active_symbols``/``tradable_picks`` add the IO.
+Pure selection functions remain independently testable; active_symbols
+always returns the pinned roster.
 """
 from __future__ import annotations
 
