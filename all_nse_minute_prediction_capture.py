@@ -1222,8 +1222,8 @@ class AllNSEMinutePredictor:
         while True:
             try:
                 from all_universe_minute_capture import _instrument_map
-                from delivery_training_universe import official_nse_symbols
                 from indstocks_client import _request, configured
+                from prediction_universe import authoritative_roster
 
                 # NIFTY is independent of the INDstocks equity instrument master.
                 # Fetch benchmark history first so an INDstocks token failure cannot
@@ -1275,54 +1275,17 @@ class AllNSEMinutePredictor:
                 # use the mapped NSE equity symbols for model warm-up instead of
                 # leaving this revision with a zero-symbol predictor.
                 codes = _instrument_map()
-                official_universe_error = None
-                try:
-                    official_symbols = official_nse_symbols(force_refresh=False)
-                except Exception as exc:
-                    official_symbols = []
-                    official_universe_error = exc
-                symbols, universe_source = _history_seed_universe(
-                    official_symbols,
-                    codes,
+                symbols = authoritative_roster()
+                if len(symbols) != 500:
+                    raise RuntimeError(
+                        f"backfill_universe.json must contain exactly 500 unique symbols; found {len(symbols)}"
+                    )
+                universe_source = "PINNED_500_ROSTER"
+                self._log(
+                    "all_nse_history_roster_selected",
+                    source=universe_source,
+                    symbol_count=len(symbols),
                 )
-                try:
-                    from prediction_universe import active_symbols_cached, restrict_universe
-
-                    restricted, universe_meta = active_symbols_cached()
-                    if restricted:
-                        filtered = restrict_universe(symbols, restricted)
-                        if len(filtered) >= 150:
-                            self._log(
-                                "all_nse_history_universe_filtered",
-                                before=len(symbols),
-                                after=len(filtered),
-                                universe_version=universe_meta.get("universe_version"),
-                                universe_status=universe_meta.get("status"),
-                            )
-                            symbols = filtered
-                        else:
-                            self._log(
-                                "all_nse_history_universe_filter_skipped",
-                                reason="filtered pool too small",
-                                before=len(symbols),
-                                after=len(filtered),
-                                universe_status=universe_meta.get("status"),
-                            )
-                except Exception as exc:
-                    self._log(
-                        "all_nse_history_universe_filter_failed",
-                        error_type=type(exc).__name__,
-                    )
-                if official_universe_error is not None or universe_source != "NSE_OFFICIAL_EQUITY_L":
-                    self._log(
-                        "all_nse_history_universe_fallback",
-                        source=universe_source,
-                        symbol_count=len(symbols),
-                        official_error_type=(
-                            type(official_universe_error).__name__
-                            if official_universe_error is not None else None
-                        ),
-                    )
                 try:
                     nifty_code = self._nifty_instrument_code()
                 except Exception as exc:
@@ -2581,6 +2544,25 @@ class AllNSEMinutePredictor:
             }
 
         quote_frame["symbol"] = quote_frame["symbol"].astype(str).str.strip().str.upper()
+        from prediction_universe import authoritative_roster
+
+        selected_roster = set(authoritative_roster())
+        if len(selected_roster) != 500:
+            return {
+                "status": "BLOCKED_ROSTER_CONFIG",
+                "cycle_minute_ist": minute_key,
+                "prediction_count": 0,
+                "error": f"backfill_universe.json must contain exactly 500 unique symbols; found {len(selected_roster)}",
+            }
+        non_selected_symbols = sorted(set(quote_frame["symbol"]) - selected_roster)
+        if non_selected_symbols:
+            quote_frame = quote_frame.loc[quote_frame["symbol"].isin(selected_roster)].copy()
+            self._log(
+                "all_nse_prediction_non_selected_symbols_excluded",
+                cycle_minute_ist=minute_key,
+                excluded_symbol_count=len(non_selected_symbols),
+                excluded_symbol_samples=non_selected_symbols[:20],
+            )
         snapshot_rows = quote_frame.to_dict(orient="records")
         snapshot_symbols = sorted({
             str(row.get("symbol") or "").strip().upper()
@@ -2594,9 +2576,7 @@ class AllNSEMinutePredictor:
                 continue
             quote_by_symbol[symbol] = row
         skipped_quote_symbols = sorted(set(snapshot_symbols) - set(quote_by_symbol))
-        expected_universe_count = max(
-            0, int(capture_manifest.get("expected_symbol_count") or len(snapshot_symbols))
-        )
+        expected_universe_count = len(selected_roster)
         missing_quotes = max(0, expected_universe_count - len(quote_by_symbol))
 
         if not quote_by_symbol:
