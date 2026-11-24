@@ -216,7 +216,7 @@ def _fit_probability_calibrator(train: pd.DataFrame, test: pd.DataFrame, split_t
     return {
         "status": "ELIGIBLE_FOR_REVIEW" if eligible else "REJECTED_BY_HOLDOUT_GATE",
         "candidate_type": "logistic_probability_calibration",
-        "target": "P(actual 30-minute-or-recorded-horizon return > 0)",
+        "target": "P(actual same-session 15:30 IST close return > 0)",
         "split_method": "chronological unique target timestamps; train precedes untouched holdout",
         "split_timestamp_utc": split_time,
         "training_rows": int(len(tr)),
@@ -662,7 +662,7 @@ def _build_outcomes(store: Any, records: list[tuple[str, dict[str, Any]]]) -> tu
             "ledger_date": ledger_date,
             "decision_time_ist": decision_ts.tz_convert(IST).isoformat() if not pd.isna(decision_ts) else None,
             "target_time_ist": target_ts.tz_convert(IST).isoformat() if not pd.isna(target_ts) else None,
-            "decision_time_bucket_30m": _time_bucket(evaluated.get("decision_timestamp_utc")),
+            "decision_time_bucket_session_close": _time_bucket(evaluated.get("decision_timestamp_utc")),
             "model_version": str(record.get("model_version") or "UNKNOWN"),
             "model_family": str(record.get("model_family") or "UNKNOWN"),
             "source": str(record.get("source") or "UNKNOWN"),
@@ -861,7 +861,7 @@ def build_learning_report(
     group_rows: list[dict[str, Any]] = []
     for dimension in [
         "horizon_min", "symbol", "signal", "source", "model_version",
-        "decision_time_bucket_30m", "feature_coverage_band", "confidence",
+        "decision_time_bucket_session_close", "feature_coverage_band", "confidence",
     ]:
         group_rows.extend(_group_metrics(x, dimension))
     groups_frame = pd.DataFrame(group_rows)
@@ -874,8 +874,9 @@ def build_learning_report(
         ),
     )
     cal_bins = pd.DataFrame(_calibration_bins(validated))
-    # Fit a distinct challenger for each horizon and model version. Mixing, for
-    # example, 5-minute and 30-minute outcomes in one calibrator can hide horizon
+    # Fit a distinct challenger for each horizon and model version. The live
+    # intraday contract is a same-session 15:30 IST close; mixing horizons in one
+    # calibrator can hide horizon
     # differences and produce a misleading improvement.
     candidates: dict[str, Any] = {}
     if not validated.empty:

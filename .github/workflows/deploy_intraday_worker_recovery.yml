@@ -236,7 +236,7 @@ jobs:
               code=="200"
               and data.get("status")=="ok"
               and checks.get("bar_interval_minutes")==5
-              and checks.get("target")=="target_30m"
+              and checks.get("target")=="target_session_close"
               and checks.get("feature_count_manifest")==checks.get("feature_count_runtime")
               and checks.get("feature_list_matches_runtime") is True
               and checks.get("artifact_hashes_match") is True

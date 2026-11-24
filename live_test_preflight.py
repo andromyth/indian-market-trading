@@ -18,8 +18,7 @@ import pandas as pd
 from all_nse_delivery_model import model_status as delivery_model_status
 from persistent_store import drive_status
 from prediction_ledger import load_records, load_validation_records
-from production_model import model_status as intraday_model_status
-from all_nse_intraday_5m_model import model_status as intraday_5m_model_status
+from champion_model_api import model_status as intraday_model_status
 from data_fetcher import market_is_open
 from nse_data_layer import fetch_intraday_1m_current
 
@@ -134,37 +133,19 @@ def main() -> int:
     try:
         intraday = intraday_model_status()
         print(
-            "intraday_30m_model:",
+            "intraday_session_close_model:",
             {
+                "status": intraday.get("status"),
                 "target": intraday.get("target"),
                 "feature_count": intraday.get("feature_count"),
                 "manifest_sha256_match": intraday.get("manifest_sha256_match"),
             },
         )
-        if intraday.get("feature_count") != 137 or not intraday.get("manifest_sha256_match"):
-            failures.append("Certified 30-minute Intraday model is not verified.")
+        if intraday.get("status") != "CHAMPION" or intraday.get("target") != "target_session_close":
+            failures.append("Champion same-session-close Intraday model is not verified.")
     except Exception as exc:
-        print("intraday_30m_model: ERROR", type(exc).__name__, str(exc))
-        failures.append("Certified 30-minute Intraday model status check failed.")
-
-    try:
-        intraday_5m = intraday_5m_model_status()
-        print(
-            "intraday_5m_model:",
-            {
-                "status": intraday_5m.get("status"),
-                "horizons": intraday_5m.get("target_horizons"),
-                "feature_count": intraday_5m.get("feature_count"),
-                "bundle_sha256_match": intraday_5m.get("bundle_sha256_match"),
-                "training_symbol_count": intraday_5m.get("training_symbol_count"),
-                "universe_size": intraday_5m.get("universe_size"),
-            },
-        )
-        if intraday_5m.get("status") != "READY":
-            failures.append("5-minute-step Intraday model bundle is not READY/VERIFIED.")
-    except Exception as exc:
-        print("intraday_5m_model: ERROR", type(exc).__name__, str(exc))
-        failures.append("5-minute-step Intraday model status check failed.")
+        print("intraday_session_close_model: ERROR", type(exc).__name__, str(exc))
+        failures.append("Champion same-session-close Intraday model status check failed.")
 
     snapshot_path, snapshot_date = _latest_snapshot()
     print("latest_delivery_snapshot:", snapshot_path)

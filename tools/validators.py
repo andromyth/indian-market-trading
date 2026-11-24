@@ -18,7 +18,7 @@ _COMMANDS = {
     "validate_canonical_cash_research_view": "validate_canonical_cash_research_view.py",
     "validate_delivery_prediction_ledger": "validate_delivery_prediction_ledger.py",
     "validate_identity_preserved_cash_master": "validate_identity_preserved_cash_master.py",
-    "validate_intraday_30m_predictions": "validate_intraday_30m_predictions.py",
+    "validate_intraday_session_close_predictions": "validate_intraday_session_close_predictions.py",
     "validate_multifactor_candidate": "validate_multifactor_candidate.py",
     "validate_prediction_ledger": "validate_prediction_ledger.py",
     "verify_minute_prediction_persistence": "verify_minute_prediction_persistence.py",

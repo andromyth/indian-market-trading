@@ -121,7 +121,7 @@ jobs:
                           "trained_for_symbol", "data_limited",
                           "data_readiness_score", "feature_count",
                           "non_missing_feature_count", "actual_quote_age_seconds",
-                          "actual_market_value", "probability_up_30m",
+                          "actual_market_value", "probability_up_session_close",
                           "forecast_target_timestamp_utc",
                       ) if name in frame.columns
                   ],
@@ -148,7 +148,7 @@ jobs:
                   "non_missing_feature_count": numeric_summary("non_missing_feature_count"),
                   "feature_count": numeric_summary("feature_count"),
                   "actual_quote_age_seconds": numeric_summary("actual_quote_age_seconds"),
-                  "probability_up_30m": numeric_summary("probability_up_30m"),
+                  "probability_up_session_close": numeric_summary("probability_up_session_close"),
                   "target_timestamp_non_null": (
                       int(pd.to_datetime(frame["forecast_target_timestamp_utc"], errors="coerce", utc=True).notna().sum())
                       if "forecast_target_timestamp_utc" in frame.columns else 0

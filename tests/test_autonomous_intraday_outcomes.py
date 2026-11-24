@@ -8,18 +8,17 @@ from audit_autonomous_intraday_outcomes import evaluate_record, _metrics
 
 def _bars(values):
     idx = pd.DatetimeIndex(pd.to_datetime([
-        "2026-10-14T03:45:00Z",
-        "2026-10-14T03:50:00Z",
-        "2026-10-14T03:51:00Z",
+        "2026-10-14T09:59:00Z",
+        "2026-10-14T10:00:00Z",
+        "2026-10-14T10:01:00Z",
     ], utc=True))
     return pd.DataFrame({"close": values}, index=idx)
 
 
-def test_evaluate_buy_at_or_after_horizon_target():
+def test_evaluate_buy_at_or_after_session_close_target():
     record = {
         "symbol": "DMART.NS",
         "decision_timestamp": "2026-10-14T03:45:00Z",
-        "horizon_min": 5,
         "signal": "BUY",
         "probability_up": 0.7,
         "reference_close": 100.0,
@@ -37,7 +36,6 @@ def test_never_use_a_pre_target_bar():
     record = {
         "symbol": "DMART",
         "decision_timestamp": "2026-10-14T03:45:00Z",
-        "horizon_min": 5,
         "signal": "BUY",
         "probability_up": 0.7,
         "reference_close": 100.0,
@@ -45,7 +43,7 @@ def test_never_use_a_pre_target_bar():
     }
     bars = pd.DataFrame(
         {"close": [100.0]},
-        index=pd.DatetimeIndex(pd.to_datetime(["2026-10-14T03:49:00Z"], utc=True)),
+        index=pd.DatetimeIndex(pd.to_datetime(["2026-10-14T09:59:00Z"], utc=True)),
     )
     row = evaluate_record(record, bars)
     assert row["validation_status"] == "WAITING_FOR_TARGET_BAR"

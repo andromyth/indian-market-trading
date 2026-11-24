@@ -264,7 +264,7 @@ def select_row_level_clean_predictions(
         errors="coerce",
     )
     probability = pd.to_numeric(
-        pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)),
+        pred.get("probability_up_session_close", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
     )
     quote_age = pd.to_numeric(
@@ -327,7 +327,7 @@ def select_row_level_clean_predictions(
         index=merged.index,
     )
     merged_probability = pd.to_numeric(
-        merged.get("probability_up_30m", pd.Series(np.nan, index=merged.index)),
+        merged.get("probability_up_session_close", pd.Series(np.nan, index=merged.index)),
         errors="coerce",
     )
     merged_quote_age = pd.to_numeric(
@@ -464,32 +464,20 @@ def match_matured_outcomes(
     probability_raw = pd.to_numeric(
         pred.get("probability_up_session_close_raw", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(pred.get("probability_up_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     probability_legacy = pd.to_numeric(
         pred.get("probability_up_session_close", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(pred.get("probability_up_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     pred["_probability"] = probability_raw.where(probability_raw.notna(), probability_legacy)
 
     return_raw = pd.to_numeric(
         pred.get("expected_return_session_close_raw", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(pred.get("expected_return_30m_raw", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     return_legacy = pd.to_numeric(
         pred.get("expected_return_session_close", pd.Series(np.nan, index=pred.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(pred.get("expected_return_30m", pd.Series(np.nan, index=pred.index)), errors="coerce"),
     )
     pred["_expected_return"] = return_raw.where(return_raw.notna(), return_legacy)
     if "model_version" not in pred:
@@ -503,7 +491,6 @@ def match_matured_outcomes(
             pred.get("data_readiness_score", pd.Series(np.nan, index=pred.index)), errors="coerce"
         ).map(readiness_segment)
     for col in ("probability_up_session_close_calibrated", "expected_return_session_close_calibrated",
-                "probability_up_30m_calibrated", "expected_return_30m_calibrated",
                 "actual_quote_age_seconds", "data_readiness_score"):
         if col not in pred:
             pred[col] = np.nan
@@ -573,18 +560,12 @@ def match_matured_outcomes(
     calibrated_probability = pd.to_numeric(
         merged.get("probability_up_session_close_calibrated", pd.Series(np.nan, index=merged.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(merged.get("probability_up_30m_calibrated", pd.Series(np.nan, index=merged.index)), errors="coerce"),
     )
     merged["probability_up_calibrated"] = calibrated_probability
     merged["expected_return"] = merged["_expected_return"]
     calibrated_return = pd.to_numeric(
         merged.get("expected_return_session_close_calibrated", pd.Series(np.nan, index=merged.index)),
         errors="coerce",
-    ).where(
-        lambda value: value.notna(),
-        pd.to_numeric(merged.get("expected_return_30m_calibrated", pd.Series(np.nan, index=merged.index)), errors="coerce"),
     )
     merged["expected_return_calibrated"] = calibrated_return
     signal = merged["signal_raw"].fillna("").astype(str).str.strip()
@@ -664,10 +645,8 @@ def load_clean_session_data(
         "prediction_status", "trained_for_symbol", "data_limited", "base_model_version",
         "readiness_segment", "probability_up_session_close", "probability_up_session_close_raw",
         "expected_return_session_close", "expected_return_session_close_raw",
-        "probability_up_30m", "probability_up_30m_raw", "expected_return_30m",
-        "expected_return_30m_raw", "signal", "signal_raw", "raw_model_signal",
+        "signal", "signal_raw", "raw_model_signal",
         "probability_up_session_close_calibrated", "expected_return_session_close_calibrated",
-        "probability_up_30m_calibrated", "expected_return_30m_calibrated",
         "signal_calibrated", "calibrated_signal_advisory", "calibration_profile_id",
         "model_version", "model_version_source", "model_family",
         "data_readiness_score", "prediction_slot_status", "quote_slot_status",

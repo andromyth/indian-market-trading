@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Rolling simulation of one symbol's stored 5-minute signals.
 
-Every prediction has a 30-minute horizon, so a signal issued at 12:30 is scored
-against the price at 13:00. This replays the whole session: long on BUY, short
-on SELL, held for the model horizon, with the capital plan's position limit and
-real NSE intraday charges.
+Every prediction targets the same-session 15:30 IST close, so a signal is
+scored against the close unless a fixed exit slot is supplied. This replays the
+whole session: long on BUY, short on SELL, held to the target, with the capital
+plan's position limit and real NSE intraday charges.
 
 Read-only. It never writes to Drive, never retrains and never places orders.
 """
@@ -64,14 +64,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Simulate one symbol's session")
     parser.add_argument("--symbol", default="SBIN")
     parser.add_argument("--date", default="")
-    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--horizon", type=int, default=0,
+                        help="holding horizon in minutes; 0 = hold to the same-session 15:30 IST close")
     parser.add_argument("--max-positions", type=int, default=0, help="0 = use capital plan")
     parser.add_argument("--gate", type=float, default=None,
-                        help="only trade signals whose expected 30m move clears this magnitude (e.g. 0.015); "
+                        help="only trade signals whose expected move to the 15:30 close clears this magnitude (e.g. 0.015); "
                              "applied to BUY as expected>=gate and to SELL as expected<=-gate. "
                              "Default: take every BUY/SELL")
     parser.add_argument("--target-slot", default="",
-                        help="fixed exit HH:MM; every signal issued from target-30m through target is held to it")
+                        help="fixed exit HH:MM; every signal issued from window start through target is held to it")
     parser.add_argument("--window-minutes", type=int, default=0,
                         help="how far back from the fixed exit a signal stays usable (0 = horizon)")
     args = parser.parse_args(argv)
@@ -104,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     out("SESSION_DATE", day.strftime("%Y-%m-%d"))
     out("PREDICTION_SLOTS", len(pred_slots))
     out("SNAPSHOT_SLOTS", len(snap_slots))
-    out("HORIZON_MINUTES", args.horizon)
+    out("HORIZON_MINUTES", args.horizon or "SESSION_CLOSE")
     out("PER_TRADE", round(per_trade, 2))
     out("PRICE_CAP", round(price_cap, 2))
     out("MAX_POSITIONS", max_positions)
@@ -112,12 +113,11 @@ def main(argv: list[str] | None = None) -> int:
 
     fixed_exit = ""
     if args.target_slot:
-        # A 30-minute model refreshed every 5 minutes gives exactly one strict
-        # horizon match per exit slot. But a signal issued at 13:35 is still
-        # usable for a 13:45 exit -- you just hold it for 10 minutes instead of
-        # 30. So the window is every slot from exit-window through exit.
+        # A session-close model refreshed every 5 minutes gives several usable
+        # decision slots per close. So the window is every slot from
+        # exit-window through exit.
         fixed_exit = args.target_slot.replace(":", "")
-        window = args.window_minutes or args.horizon
+        window = args.window_minutes or (args.horizon or 390)
         earliest = shift(fixed_exit, -window)
         pred_slots = [s for s in pred_slots if earliest <= s <= fixed_exit]
         out("TARGET_WINDOW_EXIT", fixed_exit)
@@ -155,11 +155,11 @@ def main(argv: list[str] | None = None) -> int:
         row = rows.iloc[0]
         action = str(row.get("signal", "")).strip().upper() or "HOLD"
         try:
-            probability = float(row.get("probability_up_30m"))
+            probability = float(row.get("probability_up_session_close"))
         except (TypeError, ValueError):
             probability = float("nan")
         try:
-            expected = float(row.get("expected_return_30m"))
+            expected = float(row.get("expected_return_session_close"))
         except (TypeError, ValueError):
             expected = float("nan")
         try:
@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError):
             readiness = float("nan")
 
-        target_slot = fixed_exit or shift(slot, args.horizon)
+        target_slot = fixed_exit or (shift(slot, args.horizon) if args.horizon else "1530")
         entry = slot_price(slot)
 
         if action == "HOLD":

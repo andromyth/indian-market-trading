@@ -8,7 +8,6 @@ modifies a prediction model.
 from __future__ import annotations
 
 import argparse
-import re
 
 import numpy as np
 import pandas as pd
@@ -55,13 +54,8 @@ def _norm(frame: pd.DataFrame | None) -> pd.DataFrame:
     return x[~x.index.duplicated(keep="last")]
 
 
-def _horizon(record: dict) -> int:
-    value = record.get("horizon_minutes")
-    if value is not None:
-        return int(value)
-    raw = str(record.get("prediction_horizon", "30m"))
-    match = re.search(r"(\d+)", raw)
-    return int(match.group(1)) if match else 30
+def _session_close_target(decision: pd.Timestamp) -> pd.Timestamp:
+    return decision.normalize() + pd.Timedelta(hours=15, minutes=30)
 
 
 def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
@@ -72,8 +66,7 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
     else:
         ts = ts.tz_convert("Asia/Kolkata")
 
-    horizon = _horizon(record)
-    target_ts = ts + pd.Timedelta(minutes=horizon)
+    target_ts = _session_close_target(ts)
     frame = _norm(load_persistent_1m(symbol))
     base_price = pd.to_numeric(
         record.get("current_price", record.get("prediction_price_reference")),
@@ -84,13 +77,13 @@ def validate_one(record: dict, tolerance_seconds: int = 60) -> dict:
         "prediction_id": record.get("prediction_id"),
         "symbol": symbol,
         "mode": "Intraday",
-        "prediction_horizon": f"{horizon}m",
+        "prediction_horizon": "session_close",
         "decision_timestamp": str(ts),
         "target_timestamp": str(target_ts),
         "signal": str(record.get("signal", "HOLD")).upper(),
         "predicted_price": pd.to_numeric(record.get("predicted_price"), errors="coerce"),
         "probability_up": pd.to_numeric(
-            record.get("probability_up", record.get("probability_up_30m")),
+            record.get("probability_up_session_close", record.get("probability_up")),
             errors="coerce",
         ),
         "validation_status": "WAITING",

@@ -70,7 +70,7 @@ jobs:
           prediction_validation.py
           prediction_ledger.py
           validate_delivery_prediction_ledger.py
-          validate_intraday_30m_predictions.py
+          validate_intraday_session_close_predictions.py
           intraday_5m_multihorizon_validation.py
           self_evolving_intelligence.py
           delivery_prediction_csv_ledger.py

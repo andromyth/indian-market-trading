@@ -83,8 +83,8 @@ def test_tradable_picks_filter_price_and_rank():
     predictions = pd.DataFrame({
         "symbol": ["AAA", "BBB", "CCC", "DDD"],
         "signal": ["BUY", "BUY", "BUY", "SELL"],
-        "probability_up_30m": [0.7, 0.6, 0.9, 0.9],
-        "expected_return_30m": [0.02, 0.018, 0.03, 0.05],
+        "probability_up_session_close": [0.7, 0.6, 0.9, 0.9],
+        "expected_return_session_close": [0.02, 0.018, 0.03, 0.05],
         "prediction_status": ["PREDICTED"] * 4,
     })
     prices = {"AAA": 500.0, "BBB": 2400.0, "CCC": 5000.0, "DDD": 100.0}
@@ -99,8 +99,8 @@ def test_tradable_picks_ignores_sub_threshold_moves():
     predictions = pd.DataFrame({
         "symbol": ["AAA"],
         "signal": ["BUY"],
-        "probability_up_30m": [0.9],
-        "expected_return_30m": [0.004],
+        "probability_up_session_close": [0.9],
+        "expected_return_session_close": [0.004],
         "prediction_status": ["PREDICTED"],
     })
     assert pu.tradable_picks(predictions, PLAN, prices={"AAA": 100.0})["picks"] == []

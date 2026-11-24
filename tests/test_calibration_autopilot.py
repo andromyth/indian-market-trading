@@ -426,15 +426,15 @@ class _FakeStore:
 
 def test_build_outcomes_scores_the_raw_forecast_when_a_profile_was_applied(monkeypatch):
     import io
-    bars = pd.DataFrame({"timestamp": pd.date_range("2026-10-14 04:30", "2026-10-14 06:00", freq="1min", tz="UTC")})
+    bars = pd.DataFrame({"timestamp": pd.date_range("2026-10-14 09:30", "2026-10-14 10:01", freq="1min", tz="UTC")})
     bars["Close"] = 100.0
-    bars.loc[bars["timestamp"] >= pd.Timestamp("2026-10-14 05:30", tz="UTC"), "Close"] = 101.0
+    bars.loc[bars["timestamp"] >= pd.Timestamp("2026-10-14 10:00", tz="UTC"), "Close"] = 101.0
     buffer = io.BytesIO()
     bars.to_parquet(buffer, index=False)
     monkeypatch.setattr(engine, "_download_drive_bytes", lambda store, remote: buffer.getvalue())
     record = {
-        "symbol": "SBIN.NS", "horizon_min": 30, "model_version": "v1", "decision_timestamp": "2026-10-14T05:00:00+00:00",
-        "reference_close": 100.0, "forecast_key": "SBIN|2026-10-14T05:00:00+00:00|30|v1",
+        "symbol": "SBIN.NS", "model_version": "v1", "decision_timestamp": "2026-10-14T09:30:00+00:00",
+        "reference_close": 100.0, "forecast_key": "SBIN|2026-10-14T09:30:00+00:00|close|v1",
         "probability_up": 0.55, "probability_up_raw": 0.90, "signal": "BUY", "signal_raw": "HOLD",
         "expected_return": 0.001, "expected_return_raw": 0.004, "predicted_price": 100.1, "predicted_price_raw": 100.4,
         "probability_up_calibrated": 0.55, "calibration_profile_id": "pid", "calibration_stage": "ACTIVE",

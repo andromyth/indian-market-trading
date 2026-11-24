@@ -164,8 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         "prediction_status",
         "signal",
         "signal_raw",
-        "probability_up_30m",
-        "expected_return_30m",
+        "probability_up_session_close",
+        "expected_return_session_close",
         "data_readiness_score",
         "data_limited",
         "readiness_segment",
@@ -179,11 +179,11 @@ def main(argv: list[str] | None = None) -> int:
 
     action = str(row.get("signal", "")).strip().upper() or "HOLD"
     try:
-        probability = float(row.get("probability_up_30m"))
+        probability = float(row.get("probability_up_session_close"))
     except (TypeError, ValueError):
         probability = None
     try:
-        expected_return = float(row.get("expected_return_30m"))
+        expected_return = float(row.get("expected_return_session_close"))
     except (TypeError, ValueError):
         expected_return = None
 

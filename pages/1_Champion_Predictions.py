@@ -210,7 +210,7 @@ if serving_filter != "All" and "model_serving_mode" in view:
 
 columns = [
     "symbol", "signal", "probability_up_session_close", "expected_return_session_close",
-    "expected_return_30m", "confidence", "prediction_status", "model_serving_mode",
+    "expected_return_session_close", "confidence", "prediction_status", "model_serving_mode",
     "model_target", "model_coverage_symbols", "data_readiness_score", "signal_min_edge",
     "forecast_target_timestamp_utc", "model_version",
 ]

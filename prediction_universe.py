@@ -542,18 +542,9 @@ def tradable_picks(predictions: pd.DataFrame, plan: dict[str, Any] | None = None
         frame = frame[good]
     if "signal" in frame.columns:
         frame = frame[frame["signal"].astype(str).str.upper() == "BUY"]
-    # Session-close predictions are the live contract. Legacy 30-minute
-    # snapshots remain readable so archived days can still be inspected.
-    probability_column = (
-        "probability_up_session_close"
-        if "probability_up_session_close" in frame.columns
-        else "probability_up_30m"
-    )
-    expected_return_column = (
-        "expected_return_session_close"
-        if "expected_return_session_close" in frame.columns
-        else "expected_return_30m"
-    )
+    # The live intraday contract is the same-session 15:30 IST close.
+    probability_column = "probability_up_session_close"
+    expected_return_column = "expected_return_session_close"
     for column in (probability_column, expected_return_column):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")

@@ -131,21 +131,21 @@ jobs:
             exit "$rc"
           fi
 
-      - name: Validate matured 30-minute predictions against exact target bars
-        id: validate-30m
+      - name: Validate matured intraday predictions against same-session close bars
+        id: validate-session-close
         continue-on-error: true
         run: |
           mkdir -p accuracy-audit
           set +e
-          python -u validate_intraday_30m_predictions.py --lookback-calendar-days 14 \
-            > accuracy-audit/30m_validation.json \
-            2> accuracy-audit/30m_validation_stderr.txt
+          python -u validate_intraday_session_close_predictions.py --lookback-calendar-days 14 \
+            > accuracy-audit/session_close_validation.json \
+            2> accuracy-audit/session_close_validation_stderr.txt
           rc=$?
-          printf '{"audit":"intraday_30m_target_validation","exit_code":%s}\n' "$rc" \
-            > accuracy-audit/30m_validation_exit.json
-          cat accuracy-audit/30m_validation.json
+          printf '{"audit":"intraday_session_close_target_validation","exit_code":%s}\n' "$rc" \
+            > accuracy-audit/session_close_validation_exit.json
+          cat accuracy-audit/session_close_validation.json
           if [ "$rc" -ne 0 ]; then
-            echo "30-minute target validator returned exit code $rc; inspect the stderr artifact."
+            echo "Session-close target validator returned exit code $rc; inspect the stderr artifact."
             exit "$rc"
           fi
 
@@ -209,7 +209,7 @@ jobs:
           reports = [
               ("Official EOD hydration", Path("accuracy-audit/eod_hydration_exit.json")),
               ("Delivery target validator", Path("accuracy-audit/delivery_validation_exit.json")),
-              ("30-minute target validator", Path("accuracy-audit/30m_validation_exit.json")),
+              ("Session-close target validator", Path("accuracy-audit/session_close_validation_exit.json")),
               ("Delivery live health", Path("accuracy-audit/delivery_audit_exit.json")),
               ("Autonomous Intraday outcomes", Path("accuracy-audit/intraday_audit_exit.json")),
           ]

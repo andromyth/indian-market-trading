@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Validate persisted intraday predictions against persisted NSE 1-minute bars.
 
-The live contract is a same-session 15:30 IST close target whose remaining
-horizon shrinks on every five-minute cycle. Legacy fixed 30-minute records are
-still accepted so historical ledgers remain auditable. Only observations at or
-after the stored target timestamp qualify as actuals. No model artifacts,
-prediction signals, or policy thresholds are changed.
+The live contract is a same-session 15:30 IST close target. There is no
+fixed 30-minute horizon: every five-minute cycle predicts whether the symbol
+will finish the same session above the decision reference. Only observations
+at or after the stored 15:30 target timestamp qualify as actuals. No model
+artifacts, prediction signals, or policy thresholds are changed.
 """
 from __future__ import annotations
 
@@ -22,11 +22,12 @@ import pandas as pd
 from persistent_store import INTRADAY_ROOT, normalize_symbol
 from prediction_ledger import (
     IST_TZ,
-    is_within_nse_session,
     load_records,
     load_validation_records,
     save_validation_results,
 )
+
+SESSION_CLOSE = (15, 30)
 
 
 def _root(symbol: Any) -> str:
@@ -67,7 +68,6 @@ def _normalise_bars(frame: pd.DataFrame | None) -> pd.DataFrame:
 def _drive_partition(symbol: str, session_date: date) -> pd.DataFrame:
     """Read the target-session bar partition from Drive when the local runner lacks it."""
     from googleapiclient.http import MediaIoBaseDownload
-    from persistent_store import GoogleDriveStore
 
     root = normalize_symbol(symbol)
     day_path = f"{session_date:%Y/%m/%d}"
@@ -148,13 +148,20 @@ def _timestamp(value: Any) -> pd.Timestamp | None:
     return ts.tz_convert(IST_TZ)
 
 
-
-
 def _close_timestamp(decision: pd.Timestamp) -> pd.Timestamp:
-    return decision.normalize() + pd.Timedelta(hours=15, minutes=30)
+    return decision.normalize() + pd.Timedelta(hours=SESSION_CLOSE[0], minutes=SESSION_CLOSE[1])
 
 
-def _horizon_key(record: dict[str, Any]) -> str:
+def _stored_target(record: dict[str, Any]) -> pd.Timestamp | None:
+    return _timestamp(
+        record.get("signal_horizon_end")
+        or record.get("target_timestamp")
+        or record.get("forecast_target_timestamp_utc")
+    )
+
+
+def _is_session_close(record: dict[str, Any]) -> bool:
+    """True only for the same-session 15:30 IST close contract."""
     raw = (
         str(record.get("prediction_horizon") or "")
         .strip()
@@ -163,22 +170,14 @@ def _horizon_key(record: dict[str, Any]) -> str:
         .replace("-", "_")
     )
     if raw in {"session_close", "sessionclose", "close", "eod", "15:30"}:
-        return "session_close"
-    if raw in {"30m", "30min", "30minutes"}:
-        return "30m"
+        return True
+    if raw:
+        return False
     decision = _timestamp(record.get("decision_timestamp"))
-    target = _timestamp(
-        record.get("signal_horizon_end")
-        or record.get("target_timestamp")
-        or record.get("forecast_target_timestamp_utc")
-    )
+    target = _stored_target(record)
     if decision is not None and target is not None:
-        expected_close = _close_timestamp(decision)
-        if abs((target - expected_close).total_seconds()) <= 1:
-            return "session_close"
-        if abs((target - decision).total_seconds() - 1800) <= 1:
-            return "30m"
-    return "30m"
+        return abs((target - _close_timestamp(decision)).total_seconds()) <= 1
+    return False
 
 
 def _decision_in_session(decision: pd.Timestamp) -> bool:
@@ -186,6 +185,7 @@ def _decision_in_session(decision: pd.Timestamp) -> bool:
         decision.weekday() < 5
         and pd.Timestamp("09:15").time() <= decision.time() < pd.Timestamp("15:30").time()
     )
+
 
 def validate_one(
     record: dict[str, Any],
@@ -195,56 +195,43 @@ def validate_one(
     symbol = _root(record.get("symbol"))
     decision = _timestamp(record.get("decision_timestamp"))
     pred_id = str(record.get("prediction_id") or "")
-    target = _timestamp(
-        record.get("signal_horizon_end")
-        or record.get("target_timestamp")
-        or record.get("forecast_target_timestamp_utc")
-    )
-    horizon_key = _horizon_key(record)
+    target = _stored_target(record)
     if decision is None:
         return {
             "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
-            "prediction_horizon": horizon_key, "validation_status": "INVALID_PREDICTION",
+            "prediction_horizon": "session_close", "validation_status": "INVALID_PREDICTION",
             "validation_reason": "Missing or invalid decision timestamp.",
         }
-    if target is None:
-        target = (
-            _close_timestamp(decision)
-            if horizon_key == "session_close"
-            else decision + pd.Timedelta(minutes=30)
-        )
-    horizon_minutes = int(round((target - decision).total_seconds() / 60.0))
-    # Guard against mislabeled/corrupt horizons rather than silently shifting target.
-    if horizon_key == "session_close":
-        expected_target = _close_timestamp(decision)
-        if abs((target - expected_target).total_seconds()) > 1:
-            return {
-                "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
-                "prediction_horizon": horizon_key, "decision_timestamp": decision.isoformat(),
-                "target_timestamp": target.isoformat(), "validation_status": "INVALID_PREDICTION",
-                "validation_reason": "Stored target is not the same-session 15:30 IST close.",
-            }
-        if not _decision_in_session(decision):
-            return {
-                "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
-                "prediction_horizon": horizon_key, "decision_timestamp": decision.isoformat(),
-                "target_timestamp": target.isoformat(), "validation_status": "OUT_OF_SESSION",
-                "validation_reason": "Session-close decision timestamp is outside the regular NSE cash session.",
-            }
-    elif abs((target - decision).total_seconds() - 1800) > 1:
+    if not _is_session_close(record):
         return {
             "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
-            "prediction_horizon": horizon_key, "decision_timestamp": decision.isoformat(),
+            "prediction_horizon": "session_close", "decision_timestamp": decision.isoformat(),
+            "validation_status": "UNSUPPORTED_HORIZON",
+            "validation_reason": "Only the same-session 15:30 IST close target is supported.",
+        }
+    expected_target = _close_timestamp(decision)
+    if target is None:
+        target = expected_target
+    elif abs((target - expected_target).total_seconds()) > 1:
+        return {
+            "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
+            "prediction_horizon": "session_close", "decision_timestamp": decision.isoformat(),
             "target_timestamp": target.isoformat(), "validation_status": "INVALID_PREDICTION",
-            "validation_reason": "Stored horizon endpoint is not exactly 30 minutes after decision.",
+            "validation_reason": "Stored target is not the same-session 15:30 IST close.",
+        }
+    if not _decision_in_session(decision):
+        return {
+            "prediction_id": pred_id, "symbol": symbol, "mode": "Intraday",
+            "prediction_horizon": "session_close", "decision_timestamp": decision.isoformat(),
+            "target_timestamp": target.isoformat(), "validation_status": "OUT_OF_SESSION",
+            "validation_reason": "Session-close decision timestamp is outside the regular NSE cash session.",
         }
     base_price = pd.to_numeric(
         record.get("signal_price_reference", record.get("reference_close", record.get("current_price"))),
         errors="coerce",
     )
     p_up = pd.to_numeric(
-        record.get("probability_up_session_close",
-                   record.get("probability_up_30m", record.get("probability_up"))),
+        record.get("probability_up_session_close", record.get("probability_up")),
         errors="coerce",
     )
     signal = str(record.get("signal", "HOLD")).strip().upper()
@@ -252,22 +239,18 @@ def validate_one(
         "prediction_id": pred_id,
         "symbol": symbol,
         "mode": "Intraday",
-        "prediction_horizon": horizon_key,
-        "horizon_minutes": horizon_minutes,
+        "prediction_horizon": "session_close",
+        "horizon_minutes": int(round((target - decision).total_seconds() / 60.0)),
         "model_version": record.get("model_version"),
         "decision_timestamp": decision.isoformat(),
         "target_timestamp": target.isoformat(),
         "target_timestamp_utc": target.tz_convert("UTC").isoformat(),
         "signal": signal,
         "probability_up": float(p_up) if np.isfinite(p_up) else np.nan,
-        "probability_up_30m": float(p_up) if np.isfinite(p_up) else np.nan,
         "validation_status": "WAITING",
     }
     if not pred_id:
         out.update(validation_status="INVALID_PREDICTION", validation_reason="Missing prediction_id.")
-        return out
-    if horizon_key == "30m" and not is_within_nse_session(decision, 30):
-        out.update(validation_status="OUT_OF_SESSION", validation_reason="30-minute target falls outside the regular NSE cash session.")
         return out
     if bars.empty:
         out["validation_reason"] = "No persisted NSE 1-minute history available."
@@ -295,13 +278,12 @@ def validate_one(
     actual_up = bool(actual_return > 0)
     predicted_up = bool(float(p_up) >= 0.5) if np.isfinite(p_up) else None
     predicted_price_value = pd.to_numeric(
-        record.get("predicted_price_session_close",
-                   record.get("predicted_price_30m", record.get("predicted_price"))),
+        record.get("predicted_price_session_close", record.get("predicted_price")),
         errors="coerce",
     )
     if not np.isfinite(predicted_price_value):
         expected_return = pd.to_numeric(
-            record.get("expected_return_session_close", record.get("expected_return_30m")),
+            record.get("expected_return_session_close"),
             errors="coerce",
         )
         if np.isfinite(expected_return):
@@ -325,16 +307,6 @@ def validate_one(
         "brier_score": (float(p_up) - float(actual_up)) ** 2 if np.isfinite(p_up) else np.nan,
         "predicted_price": float(predicted_price_value) if np.isfinite(predicted_price_value) else np.nan,
         "abs_price_error": abs(float(predicted_price_value) - actual_price) if np.isfinite(predicted_price_value) else np.nan,
-        # Legacy aliases keep existing dashboards and exported ledgers readable.
-        "actual_price_30m": actual_price,
-        "actual_return_30m": float(actual_return),
-        "actual_direction_30m": "UP" if actual_up else "DOWN",
-        "predicted_direction_30m": "UP" if predicted_up is True else ("DOWN" if predicted_up is False else None),
-        "direction_match_30m": (predicted_up == actual_up) if predicted_up is not None else None,
-        "signal_direction_match_30m": signal_match,
-        "brier_score_30m": (float(p_up) - float(actual_up)) ** 2 if np.isfinite(p_up) else np.nan,
-        "predicted_price_30m": float(predicted_price_value) if np.isfinite(predicted_price_value) else np.nan,
-        "abs_price_error_30m": abs(float(predicted_price_value) - actual_price) if np.isfinite(predicted_price_value) else np.nan,
         "validation_status": "VALIDATED",
     })
     return out
@@ -353,11 +325,11 @@ def main() -> int:
     predictions = [
         row for row in all_records
         if str(row.get("mode", "")).strip().lower() == "intraday"
-        and _horizon_key(row) in {"session_close", "30m"}
+        and _is_session_close(row)
         and row.get("prediction_id")
     ]
     if not predictions:
-        print(json.dumps({"status": "NO_30M_PREDICTIONS", "predictions_seen": 0}, indent=2))
+        print(json.dumps({"status": "NO_SESSION_CLOSE_PREDICTIONS", "predictions_seen": 0}, indent=2))
         return 0
 
     existing: dict[str, dict[str, Any]] = {}
@@ -367,8 +339,8 @@ def main() -> int:
     completed_ids = {
         pid for pid, row in existing.items()
         if str(row.get("validation_status", "")).upper() == "VALIDATED"
-        and pd.notna(pd.to_numeric(row.get("actual_return", row.get("actual_return_30m")), errors="coerce"))
-        and str(row.get("actual_direction", row.get("actual_direction_30m", ""))).upper() in {"UP", "DOWN"}
+        and pd.notna(pd.to_numeric(row.get("actual_return"), errors="coerce"))
+        and str(row.get("actual_direction", "")).upper() in {"UP", "DOWN"}
     }
     now = pd.Timestamp.now(tz=IST_TZ)
     cutoff_date = now.date() - timedelta(days=args.lookback_calendar_days)
@@ -377,17 +349,9 @@ def main() -> int:
         if str(row["prediction_id"]) in completed_ids:
             continue
         decision = _timestamp(row.get("decision_timestamp"))
-        target = _timestamp(
-            row.get("signal_horizon_end")
-            or row.get("target_timestamp")
-            or row.get("forecast_target_timestamp_utc")
-        )
+        target = _stored_target(row)
         if target is None and decision is not None:
-            target = (
-                _close_timestamp(decision)
-                if _horizon_key(row) == "session_close"
-                else decision + pd.Timedelta(minutes=30)
-            )
+            target = _close_timestamp(decision)
         # Only query actuals for recently matured targets. Future predictions
         # remain unscored, and older unresolved rows can be audited separately.
         if target is not None and (target > now or target.date() < cutoff_date):
@@ -397,7 +361,7 @@ def main() -> int:
         pending.append(row)
     if not pending:
         print(json.dumps({
-            "status": "NO_UNRESOLVED_30M_PREDICTIONS",
+            "status": "NO_UNRESOLVED_SESSION_CLOSE_PREDICTIONS",
             "predictions_seen": len(predictions),
             "already_validated": len(completed_ids),
             "lookback_start_date": cutoff_date.isoformat(),
@@ -412,17 +376,9 @@ def main() -> int:
     for record in pending:
         symbol = _root(record.get("symbol"))
         decision = _timestamp(record.get("decision_timestamp"))
-        target = _timestamp(
-            record.get("signal_horizon_end")
-            or record.get("target_timestamp")
-            or record.get("forecast_target_timestamp_utc")
-        )
+        target = _stored_target(record)
         if target is None and decision is not None:
-            target = (
-                _close_timestamp(decision)
-                if _horizon_key(record) == "session_close"
-                else decision + pd.Timedelta(minutes=30)
-            )
+            target = _close_timestamp(decision)
         if target is None:
             results.append(validate_one(record, pd.DataFrame(columns=["close"]), args.tolerance_seconds))
             continue
@@ -456,16 +412,16 @@ def main() -> int:
             continue
         if str(row.get("mode", "")).strip().lower() != "intraday":
             continue
-        if _horizon_key(row) not in {"session_close", "30m"}:
+        if not _is_session_close(row):
             continue
-        target_ts = _timestamp(row.get("target_timestamp") or row.get("signal_horizon_end"))
+        target_ts = _stored_target(row)
         if target_ts is None or target_ts > now or target_ts.date() < cutoff_date:
             continue
         validated_in_window.append(row)
     action_matches = [
-        bool(row.get("signal_direction_match", row.get("signal_direction_match_30m")))
+        bool(row.get("signal_direction_match"))
         for row in validated_in_window
-        if row.get("signal") in {"BUY", "SELL"} and row.get("signal_direction_match_30m") is not None
+        if row.get("signal") in {"BUY", "SELL"} and row.get("signal_direction_match") is not None
     ]
     error_count = int(counts.get("INVALID_PREDICTION", 0))
     report = {
@@ -485,7 +441,7 @@ def main() -> int:
         "action_predictions_scored": len(action_matches),
         "saved_validation_rows": saved.get("rows"),
         "drive_synced": saved.get("synced"),
-        "warning": "Minute-level targets overlap. These are descriptive out-of-sample outcomes, not a portfolio backtest or net-of-cost results.",
+        "warning": "Targets are same-session 15:30 IST closes. These are descriptive out-of-sample outcomes, not a portfolio backtest or net-of-cost results.",
     }
     print(json.dumps(report, indent=2, default=str))
     return 0 if (args.no_sync_drive or saved.get("synced") is True) and error_count == 0 else 2

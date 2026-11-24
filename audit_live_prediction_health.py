@@ -202,7 +202,7 @@ def _realised_delivery_diagnostics(
 
 
 def _intraday_target_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
-    """Resolve the same 30-minute endpoint used by the target-bar validator."""
+    """Resolve the same-session 15:30 IST close used by the target-bar validator."""
     raw = row.get("signal_horizon_end")
     if raw is None or str(raw).strip().lower() in {"", "nan", "none", "<na>", "nat"}:
         raw = row.get("target_timestamp")
@@ -211,7 +211,11 @@ def _intraday_target_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
         parsed = pd.to_datetime(row.get("decision_timestamp"), errors="coerce")
         if pd.isna(parsed):
             return None
-        parsed = parsed + pd.Timedelta(minutes=30)
+        parsed = pd.Timestamp(parsed)
+        if parsed.tzinfo is None:
+            parsed = parsed.tz_localize(ZoneInfo("Asia/Kolkata"))
+        parsed = parsed.tz_convert(ZoneInfo("Asia/Kolkata"))
+        return parsed.normalize() + pd.Timedelta(hours=15, minutes=30)
     stamp = pd.Timestamp(parsed)
     if stamp.tzinfo is None:
         return stamp.tz_localize(ZoneInfo("Asia/Kolkata"))
@@ -224,14 +228,14 @@ def _normalise_outcome_prediction_ids(values: pd.Series) -> pd.Series:
 
 
 def _intraday_outcome_coverage() -> dict[str, Any]:
-    """Audit recent matured 30-minute predictions, not every intraday horizon."""
+    """Audit recent matured same-session-close predictions."""
     try:
         from prediction_ledger import load_records, load_validation_records
         preds = pd.DataFrame(load_records())
         vals = pd.DataFrame(load_validation_records())
         if preds.empty:
             return {
-                "status": "NO_30M_INTRADAY_PREDICTIONS",
+                "status": "NO_SESSION_CLOSE_INTRADAY_PREDICTIONS",
                 "intraday_prediction_count": 0,
                 "accuracy_claim_allowed": False,
             }
@@ -239,17 +243,18 @@ def _intraday_outcome_coverage() -> dict[str, Any]:
         mode = preds.get("mode", pd.Series("", index=preds.index)).astype(str).str.strip().str.lower()
         horizon = (
             preds.get("prediction_horizon", pd.Series("", index=preds.index))
-            .astype(str).str.strip().str.lower().str.replace(r"\s+", "", regex=True)
+            .astype(str).str.strip().str.lower().str.replace(r"[\s\-]+", "_", regex=True)
         )
-        is_30m = mode.eq("intraday") & horizon.isin({"30m", "30min", "30minutes"})
-        intraday = preds.loc[is_30m].copy()
+        close_horizon = horizon.isin({"session_close", "sessionclose", "close", "eod", "15:30"})
+        is_session_close = mode.eq("intraday") & (close_horizon | horizon.eq(""))
+        intraday = preds.loc[is_session_close].copy()
         if intraday.empty:
             return {
-                "status": "NO_30M_INTRADAY_PREDICTIONS",
+                "status": "NO_SESSION_CLOSE_INTRADAY_PREDICTIONS",
                 "intraday_prediction_count": 0,
-                "other_intraday_rows_excluded": int((mode.eq("intraday")).sum()),
+                "other_intraday_rows_excluded": int((mode.eq("intraday") & ~is_session_close).sum()),
                 "accuracy_claim_allowed": False,
-                "note": "Only mode=Intraday records with a 30-minute horizon are eligible for this coverage check.",
+                "note": "Only mode=Intraday records with a same-session 15:30 IST close target are eligible for this coverage check.",
             }
 
         now_ist = pd.Timestamp.now(tz=ZoneInfo("Asia/Kolkata"))
@@ -288,22 +293,22 @@ def _intraday_outcome_coverage() -> dict[str, Any]:
         if not recent_matured:
             return {
                 **summary,
-                "status": "NO_RECENT_MATURED_30M_PREDICTIONS",
+                "status": "NO_RECENT_MATURED_SESSION_CLOSE_PREDICTIONS",
                 "validation_rows_matched_by_prediction_id": 0,
                 "matched_validated_rows": 0,
                 "validation_rows_with_target_aligned_outcomes": 0,
-                "realised_30m_fields_found_in_validation_ledger": [],
+                "realised_fields_found_in_validation_ledger": [],
                 "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
                 "note": (
-                    "No 30-minute target in the current 14-calendar-day validation window has both "
+                    "No same-session close target in the current 14-calendar-day validation window has both "
                     "matured and become eligible for outcome scoring. Future targets are waiting, "
                     "and older targets are outside this live-coverage check; no accuracy score is inferred."
                 ),
             }
 
         fields = {
-            "realised_return": ["actual_return_30m", "actual_30m_return", "realized_return_30m", "realised_return_30m"],
-            "realised_direction": ["actual_direction_30m", "actual_30m_direction", "realized_direction_30m", "realised_direction_30m"],
+            "realised_return": ["actual_return"],
+            "realised_direction": ["actual_direction"],
         }
         available = {kind: [name for name in names if name in vals.columns] for kind, names in fields.items()}
         if "prediction_id" not in intraday.columns:
@@ -331,16 +336,16 @@ def _intraday_outcome_coverage() -> dict[str, Any]:
         target_outcome_available = not matured.empty
         return {
             **summary,
-            "status": "TARGET_ALIGNED_OUTCOMES_AVAILABLE" if target_outcome_available else "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR",
+            "status": "TARGET_ALIGNED_OUTCOMES_AVAILABLE" if target_outcome_available else "NO_TARGET_ALIGNED_SESSION_CLOSE_OUTCOME_VALIDATOR",
             "validation_rows_matched_by_prediction_id": int(len(matched)),
             "matched_validated_rows": int(len(validated)),
             "validation_rows_with_target_aligned_outcomes": int(len(matured)),
-            "realised_30m_fields_found_in_validation_ledger": available["realised_return"] + available["realised_direction"],
+            "realised_fields_found_in_validation_ledger": available["realised_return"] + available["realised_direction"],
             "validation_ledger_fields": list(vals.columns) if not vals.empty else [],
             "note": (
-                "Only recent matured 30-minute predictions are checked. A scored outcome requires "
-                "a matching prediction ID, VALIDATED status, and a populated 30-minute realised return "
-                "or direction. This coverage check does not itself prove predictive accuracy."
+                "Only recent matured same-session-close predictions are checked. A scored outcome requires "
+                "a matching prediction ID, VALIDATED status, and a populated realised return "
+                "or direction at the 15:30 IST close. This coverage check does not itself prove predictive accuracy."
             ),
         }
     except Exception as exc:
@@ -353,7 +358,7 @@ def _intraday_outcome_coverage() -> dict[str, Any]:
 
 def _intraday_model_audit() -> dict[str, Any]:
     try:
-        from production_model import model_status, model_target_contract
+        from champion_model_api import model_status, model_target_contract
         return {"model_status": model_status(), "target_contract": model_target_contract()}
     except Exception as exc:
         return {"status": "AUDIT_FAILED", "error": f"{type(exc).__name__}: {exc}"}

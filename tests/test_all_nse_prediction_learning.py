@@ -203,10 +203,10 @@ def _prediction(target="2026-10-01T04:30:00Z"):
         "actual_quote_age_seconds": 5.0,
         "forecast_target_timestamp_utc": target,
         "forecast_key": "ABC|2026-10-01T04:00:00Z|30|model-v1",
-        "probability_up_30m": 0.62,
-        "probability_up_30m_raw": 0.62,
-        "expected_return_30m": 0.01,
-        "expected_return_30m_raw": 0.01,
+        "probability_up_session_close": 0.62,
+        "probability_up_session_close_raw": 0.62,
+        "expected_return_session_close": 0.01,
+        "expected_return_session_close_raw": 0.01,
         "raw_model_signal": "BUY",
         "signal_raw": "BUY",
         "prediction_status": "PASS",
@@ -468,7 +468,7 @@ def test_run_learning_reports_prediction_count_after_releasing_source_frames(tmp
             }
 
     source_predictions = pd.DataFrame([
-        {"symbol": "AAA", "probability_up_30m": 0.6}
+        {"symbol": "AAA", "probability_up_session_close": 0.6}
     ])
     monkeypatch.setattr(learning, "GoogleDriveStore", FakeDriveStore)
     monkeypatch.setattr(
@@ -565,10 +565,10 @@ def test_matcher_falls_back_to_model_values_when_raw_columns_exist_but_are_null(
     pred = _prediction(target="2026-10-01T04:30:00Z")
     # This is what older Drive Parquets look like after the loader has
     # materialized newer schema columns with null values.
-    pred["probability_up_30m_raw"] = None
-    pred["expected_return_30m_raw"] = None
-    pred["probability_up_30m"] = 0.62
-    pred["expected_return_30m"] = 0.01
+    pred["probability_up_session_close_raw"] = None
+    pred["expected_return_session_close_raw"] = None
+    pred["probability_up_session_close"] = 0.62
+    pred["expected_return_session_close"] = 0.01
     predictions = pd.DataFrame([pred])
     quotes = pd.DataFrame([
         {

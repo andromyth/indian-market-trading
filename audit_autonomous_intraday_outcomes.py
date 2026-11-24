@@ -3,8 +3,9 @@
 
 Reads the worker-owned prediction ledger and 1-minute bar partitions from the
 Indian_Market_Research Google Drive tree. It joins each prediction to the first
-persisted close at or after decision_timestamp + horizon_min, within a strict
-time tolerance. It does not update ledgers, retrain models, change signals, or
+persisted close at or after the same-session 15:30 IST close, within a strict
+time tolerance. Any non-session-close target is reported as unsupported and is
+never scored. It does not update ledgers, retrain models, change signals, or
 place orders.
 
 Example:
@@ -241,13 +242,6 @@ def evaluate_record(
             out["validation_reason"] = "missing_or_invalid_decision_timestamp"
             return out
         decision = pd.Timestamp(parsed_decision)
-        horizon_raw = record.get("horizon_min")
-        if horizon_raw in (None, ""):
-            horizon_raw = record.get("horizon_minutes")
-        horizon = int(horizon_raw)
-        if horizon <= 0 or horizon > 390:
-            out["validation_reason"] = "horizon_min_outside_supported_range"
-            return out
         stored_target_raw = (
             record.get("signal_horizon_end")
             or record.get("target_timestamp")
@@ -260,20 +254,23 @@ def evaluate_record(
         else:
             stored_target = pd.Timestamp(stored_target)
     except Exception as exc:
-        out["validation_reason"] = f"invalid_decision_timestamp_or_horizon:{type(exc).__name__}"
+        out["validation_reason"] = f"invalid_decision_timestamp:{type(exc).__name__}"
         return out
 
-    # Session-close rows store the exact 15:30 target. Prefer it over the
-    # canonical 390-minute bucket so the outcome is scored at the real close
-    # instead of a synthetic decision+390 timestamp.
-    target = (
-        stored_target
-        if stored_target is not None
-        else decision + pd.Timedelta(minutes=horizon)
-    )
+    # The only supported intraday target is the same-session 15:30 IST close.
+    decision_ist = decision.tz_convert(IST)
+    expected_close_ist = decision_ist.normalize() + pd.Timedelta(hours=15, minutes=30)
+    if stored_target is not None:
+        target = stored_target
+        if abs((target.tz_convert(IST) - expected_close_ist).total_seconds()) > 1:
+            out["validation_status"] = "UNSUPPORTED_HORIZON"
+            out["validation_reason"] = "stored target is not the same-session 15:30 IST close"
+            return out
+    else:
+        target = expected_close_ist.tz_convert("UTC")
     horizon = int(round((target - decision).total_seconds() / 60.0))
     if horizon <= 0:
-        out["validation_reason"] = "stored_target_is_not_after_decision"
+        out["validation_reason"] = "session_close_target_is_not_after_decision"
         return out
     out["horizon_min"] = horizon
     out["decision_timestamp_utc"] = decision.isoformat()

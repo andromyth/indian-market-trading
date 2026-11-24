@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from prediction_validation import validate_delivery_prediction
-import validate_intraday_30m_predictions as intraday
+import validate_intraday_session_close_predictions as intraday
 
 
 def _delivery_record(**updates):
@@ -58,13 +58,12 @@ def test_delivery_validation_scores_the_exact_prediction_target_session():
     assert result["actual_direction_d1"] == "UP"
 
 
-def _intraday_record(**updates):
+def _legacy_30m_record(**updates):
     row = {
-        "prediction_id": "intraday-1",
+        "prediction_id": "intraday-legacy-1",
         "symbol": "RELIANCE",
         "mode": "Intraday",
         "prediction_horizon": "30m",
-        "model_version": "2026-all-nse-intraday-multifactor-replacement",
         "decision_timestamp": "2026-10-08T10:00:00+05:30",
         "signal_horizon_end": "2026-10-08T10:30:00+05:30",
         "signal_price_reference": 100.0,
@@ -75,48 +74,16 @@ def _intraday_record(**updates):
     return row
 
 
-def test_30m_validation_uses_the_first_actual_bar_at_or_after_target():
-    idx = pd.DatetimeIndex(
-        ["2026-10-08T10:29:00+05:30", "2026-10-08T10:30:00+05:30", "2026-10-08T10:31:00+05:30"]
-    )
-    bars = pd.DataFrame({"close": [99.0, 102.0, 103.0]}, index=idx)
-
-    result = intraday.validate_one(_intraday_record(), bars)
-
-    assert result["validation_status"] == "VALIDATED"
-    assert result["actual_timestamp"] == "2026-10-08T10:30:00+05:30"
-    assert abs(result["actual_return_30m"] - 0.02) < 1e-9
-    assert result["actual_direction_30m"] == "UP"
-    assert result["direction_match_30m"] is True
-    assert result["signal_direction_match_30m"] is True
-
-
-def test_30m_validation_never_scores_a_pre_target_bar():
+def test_legacy_30m_horizon_is_rejected_as_unsupported():
     bars = pd.DataFrame(
-        {"close": [99.0]},
-        index=pd.DatetimeIndex(["2026-10-08T10:29:00+05:30"]),
+        {"close": [102.0]},
+        index=pd.DatetimeIndex(["2026-10-08T10:30:00+05:30"]),
     )
 
-    result = intraday.validate_one(_intraday_record(), bars)
+    result = intraday.validate_one(_legacy_30m_record(), bars)
 
-    assert result["validation_status"] == "WAITING"
-    assert "not persisted yet" in result["validation_reason"]
-
-
-def test_30m_validation_rejects_targets_outside_the_cash_session():
-    record = _intraday_record(
-        decision_timestamp="2026-10-08T15:00:00+05:30",
-        signal_horizon_end="2026-10-08T15:30:00+05:30",
-    )
-    bars = pd.DataFrame(
-        {"close": [100.0]},
-        index=pd.DatetimeIndex(["2026-10-08T15:00:00+05:30"]),
-    )
-
-    result = intraday.validate_one(record, bars)
-
-    assert result["validation_status"] == "OUT_OF_SESSION"
-    assert "outside the regular NSE cash session" in result["validation_reason"]
+    assert result["validation_status"] == "UNSUPPORTED_HORIZON"
+    assert "15:30" in result["validation_reason"]
 
 
 def test_minute_partition_naive_index_is_interpreted_as_ist():

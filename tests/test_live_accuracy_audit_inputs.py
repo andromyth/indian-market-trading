@@ -45,21 +45,21 @@ def test_intraday_coverage_requires_populated_target_aligned_outcome(monkeypatch
         "prediction_id": "intraday-1",
         "symbol": "SBIN",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat(),
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-1",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "validation_status": "WAITING",
-        "actual_return_30m": None,
-        "actual_direction_30m": None,
+        "actual_return": None,
+        "actual_direction": None,
     }])
 
     result = audit._intraday_outcome_coverage()
 
-    assert result["status"] == "NO_TARGET_ALIGNED_30M_OUTCOME_VALIDATOR"
+    assert result["status"] == "NO_TARGET_ALIGNED_SESSION_CLOSE_OUTCOME_VALIDATOR"
     assert result["validation_rows_matched_by_prediction_id"] == 1
     assert result["matched_validated_rows"] == 0
     assert result["validation_rows_with_target_aligned_outcomes"] == 0
@@ -74,16 +74,16 @@ def test_intraday_coverage_accepts_a_matched_validated_actual(monkeypatch):
         "prediction_id": "intraday-2",
         "symbol": "SBIN",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat(),
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [{
         "prediction_id": "intraday-2",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "validation_status": "VALIDATED",
-        "actual_return_30m": 0.01,
-        "actual_direction_30m": "UP",
+        "actual_return": 0.01,
+        "actual_direction": "UP",
     }])
 
     result = audit._intraday_outcome_coverage()
@@ -188,10 +188,10 @@ def test_intraday_coverage_ignores_other_horizons(monkeypatch):
             "decision_timestamp": "2026-10-20T10:00:00+05:30",
         },
         {
-            "prediction_id": "delivery-30m",
+            "prediction_id": "delivery-other",
             "symbol": "SBIN",
             "mode": "Delivery",
-            "prediction_horizon": "30m",
+            "prediction_horizon": "session_close",
             "decision_timestamp": "2026-10-20T10:00:00+05:30",
         },
     ])
@@ -199,7 +199,7 @@ def test_intraday_coverage_ignores_other_horizons(monkeypatch):
 
     result = audit._intraday_outcome_coverage()
 
-    assert result["status"] == "NO_30M_INTRADAY_PREDICTIONS"
+    assert result["status"] == "NO_SESSION_CLOSE_INTRADAY_PREDICTIONS"
     assert result["intraday_prediction_count"] == 0
     assert result["other_intraday_rows_excluded"] == 1
     assert result["accuracy_claim_allowed"] is False
@@ -210,17 +210,17 @@ def test_intraday_coverage_does_not_block_on_stale_targets_outside_lookback(monk
     import audit_live_prediction_health as audit
 
     monkeypatch.setattr(prediction_ledger, "load_records", lambda: [{
-        "prediction_id": "intraday-old-30m",
+        "prediction_id": "intraday-old-close",
         "symbol": "SBIN",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "decision_timestamp": "2026-09-01T10:00:00+05:30",
     }])
     monkeypatch.setattr(prediction_ledger, "load_validation_records", lambda: [])
 
     result = audit._intraday_outcome_coverage()
 
-    assert result["status"] == "NO_RECENT_MATURED_30M_PREDICTIONS"
+    assert result["status"] == "NO_RECENT_MATURED_SESSION_CLOSE_PREDICTIONS"
     assert result["recent_matured_target_count"] == 0
     assert result["historical_outside_lookback_count"] == 1
     assert result["accuracy_claim_allowed"] is False
@@ -231,10 +231,10 @@ def test_intraday_coverage_does_not_block_on_future_targets(monkeypatch):
     import audit_live_prediction_health as audit
 
     monkeypatch.setattr(prediction_ledger, "load_records", lambda: [{
-        "prediction_id": "intraday-future-30m",
+        "prediction_id": "intraday-future-close",
         "symbol": "SBIN",
         "mode": "Intraday",
-        "prediction_horizon": "30m",
+        "prediction_horizon": "session_close",
         "decision_timestamp": (pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(hours=1)).isoformat(),
         "signal_horizon_end": (pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(hours=1, minutes=30)).isoformat(),
     }])
@@ -242,7 +242,7 @@ def test_intraday_coverage_does_not_block_on_future_targets(monkeypatch):
 
     result = audit._intraday_outcome_coverage()
 
-    assert result["status"] == "NO_RECENT_MATURED_30M_PREDICTIONS"
+    assert result["status"] == "NO_RECENT_MATURED_SESSION_CLOSE_PREDICTIONS"
     assert result["recent_matured_target_count"] == 0
     assert result["future_target_count"] == 1
     assert result["accuracy_claim_allowed"] is False
