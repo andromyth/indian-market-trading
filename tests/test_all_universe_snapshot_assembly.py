@@ -361,3 +361,38 @@ def test_historical_repair_does_not_move_the_latest_manifest_pointer(tmp_path):
     assert canonical["snapshot_remote"] in store.uploads
     assert canonical["manifest_remote"] in store.uploads
     assert canonical["latest_manifest_remote"] not in store.uploads
+
+
+def test_duplicate_repair_dedupes_and_restricts_to_pinned_roster():
+    expected = ["AAA", "BBB", "CCC"]
+    shards = [
+        {
+            "worker_id": 0,
+            "manifest": _manifest(SLOT, 0, 2, ["AAA", "BBB", "AAA"], _frame(["AAA", "BBB", "AAA"])),
+            "frame": _frame(["AAA", "BBB", "AAA"]),
+        },
+        {
+            "worker_id": 1,
+            "manifest": _manifest(SLOT, 1, 2, ["AAA", "CCC", "OUTSIDE"], _frame(["AAA", "CCC", "OUTSIDE"])),
+            "frame": _frame(["AAA", "CCC", "OUTSIDE"]),
+        },
+    ]
+    strict = assembly.assemble_shards(
+        cycle_minute=SLOT, worker_count=2, shards=shards, expected_universe=expected
+    )
+    assert strict["status"] == "INCOMPLETE"
+
+    repaired = assembly.assemble_shards(
+        cycle_minute=SLOT,
+        worker_count=2,
+        shards=shards,
+        expected_universe=expected,
+        allow_duplicate_repair=True,
+    )
+
+    assert repaired["status"] == "VALIDATED"
+    assert sorted(repaired["frame"]["symbol"].tolist()) == expected
+    assert repaired["manifest"]["row_count"] == 3
+    assert repaired["manifest"]["assembly_mode"] == "REPAIR"
+    assert repaired["manifest"]["validation"]["fatal_issue_count"] == 0
+    assert any("duplicate symbol rows" in action for action in repaired["manifest"]["repair_actions"])

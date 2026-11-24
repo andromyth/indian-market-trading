@@ -873,3 +873,68 @@ def test_load_live_history_state_keeps_seed_rows_when_capture_is_late(tmp_path, 
     compiler._load_live_history_state(object(), {"AAA"}, t0, tmp_path / "work", 120, history)
 
     assert history["AAA"]["Close"].tolist() == [1.0]
+
+
+def test_recover_skip_minutes_parses_env(monkeypatch):
+    import drive_all_nse_prediction_compiler as compiler
+
+    monkeypatch.setenv(compiler.RECOVER_SKIP_MINUTES_ENV, "20261123_1210, 20261123_1215 ,,")
+    assert compiler._recover_skip_minutes() == {"20261123_1210", "20261123_1215"}
+
+
+def test_recover_zero_prediction_status_flags_unrecoverable_warming():
+    import drive_all_nse_prediction_compiler as compiler
+
+    result = {
+        "prediction_count": 0,
+        "prediction_status_counts": {"WARMING_HISTORY": 500},
+    }
+    mid_session = pd.Timestamp("2026-11-23 12:10:00", tz=IST)
+    warmup = pd.Timestamp("2026-11-23 09:20:00", tz=IST)
+
+    assert compiler._recover_zero_prediction_status(result, mid_session) == "UNRECOVERABLE_WARMING_HISTORY"
+    assert compiler._recover_zero_prediction_status(result, warmup) is None
+    assert compiler._recover_zero_prediction_status(
+        {"prediction_status_counts": {"MODEL_ERROR": 500}}, mid_session
+    ) is None
+
+
+def test_recovery_capture_honors_skip_minutes(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import drive_all_nse_prediction_compiler as compiler
+
+    target = pd.Timestamp("2026-11-23 12:00:00", tz=IST)
+    day_path = "production_data/all_universe_minute_snapshots/2026/11/23"
+    manifest = {
+        "cycle_minute_ist": "2026-11-23T12:10:00+05:30",
+        "status": "STORED",
+        "snapshot_persisted": True,
+        "worker_count": 1,
+    }
+
+    monkeypatch.setattr(
+        compiler, "_find_remote",
+        lambda store, remote: {"id": "day"} if remote == day_path else None,
+    )
+    monkeypatch.setattr(
+        compiler, "_list_children",
+        lambda store, parent: (
+            [{"id": "manifest", "name": "manifest_20261123_1210.json"}]
+            if parent == "day" else []
+        ),
+    )
+    monkeypatch.setattr(
+        compiler, "_download",
+        lambda store, file_id, destination: (
+            destination.parent.mkdir(parents=True, exist_ok=True),
+            destination.write_text(json.dumps(manifest), encoding="utf-8"),
+        ),
+    )
+    monkeypatch.setattr(compiler, "_recover_skip_minutes", lambda: {"20261123_1210"})
+    monkeypatch.setattr(
+        compiler, "_prediction_already_stored",
+        lambda store, minute: (_ for _ in ()).throw(AssertionError("should skip before prediction check")),
+    )
+
+    assert compiler._recovery_capture(SimpleNamespace(), target) is None

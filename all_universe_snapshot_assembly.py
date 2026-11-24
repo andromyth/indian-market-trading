@@ -297,6 +297,7 @@ def assemble_shards(
     shards: Sequence[dict[str, Any]],
     expected_universe: Iterable[str] | None = None,
     strict_universe: bool = False,
+    allow_duplicate_repair: bool = False,
 ) -> dict[str, Any]:
     """Validate all shards and return the canonical assembly result.
 
@@ -372,7 +373,7 @@ def assemble_shards(
         if frame is not None and not frame.empty:
             frames.append(frame)
 
-    if len(universe_counts) > 1:
+    if len(universe_counts) > 1 and not allow_duplicate_repair:
         issues.append(_issue(
             "UNIVERSE_COUNT_MISMATCH",
             f"Shards disagree about the universe size: {sorted(universe_counts)}",
@@ -381,6 +382,7 @@ def assemble_shards(
     frame = pd.concat(frames, ignore_index=True) if frames else None
     duplicate_symbols: list[str] = []
     missing_symbols: list[str] = []
+    repair_actions: list[str] = []
     if frame is not None and not frame.empty:
         if "symbol" not in frame.columns:
             issues.append(_issue("EMPTY_ASSEMBLY", "Assembled rows have no symbol column"))
@@ -390,26 +392,51 @@ def assemble_shards(
             counts = frame["symbol"].value_counts()
             duplicate_symbols = sorted(counts[counts > 1].index.tolist())
             if duplicate_symbols:
-                issues.append(_issue(
-                    "DUPLICATE_SYMBOL",
-                    f"{len(duplicate_symbols)} symbols appear in more than one shard",
-                    symbols=duplicate_symbols[:50],
-                ))
+                if allow_duplicate_repair:
+                    redundant_rows = int((counts[counts > 1] - 1).sum())
+                    repair_actions.append(
+                        f"Dropped {redundant_rows} duplicate symbol rows "
+                        f"across {len(duplicate_symbols)} symbols"
+                    )
+                    frame = frame.drop_duplicates(subset=["symbol"], keep="last")
+                    duplicate_symbols = []
+                else:
+                    issues.append(_issue(
+                        "DUPLICATE_SYMBOL",
+                        f"{len(duplicate_symbols)} symbols appear in more than one shard",
+                        symbols=duplicate_symbols[:50],
+                    ))
     else:
         issues.append(_issue("EMPTY_ASSEMBLY", "No shard rows were available to assemble"))
+
+    expected_set: set[str] | None = None
+    if expected_universe is not None:
+        expected_set = {
+            str(symbol).strip().upper()
+            for symbol in expected_universe
+            if str(symbol).strip()
+        }
+    if (
+        allow_duplicate_repair
+        and expected_set is not None
+        and frame is not None
+        and not frame.empty
+        and "symbol" in frame.columns
+    ):
+        extra_rows = int((~frame["symbol"].isin(expected_set)).sum())
+        if extra_rows:
+            repair_actions.append(
+                f"Dropped {extra_rows} rows outside the pinned 500-symbol roster"
+            )
+            frame = frame.loc[frame["symbol"].isin(expected_set)].copy()
 
     union_symbols: set[str] = set()
     if frame is not None and not frame.empty and "symbol" in frame.columns:
         union_symbols = set(frame["symbol"].unique().tolist())
 
-    if expected_universe is not None:
-        expected = {
-            str(symbol).strip().upper()
-            for symbol in expected_universe
-            if str(symbol).strip()
-        }
-        absent = sorted(expected - union_symbols)
-        extra = sorted(union_symbols - expected)
+    if expected_set is not None:
+        absent = sorted(expected_set - union_symbols)
+        extra = sorted(union_symbols - expected_set)
         if absent:
             issues.append(_issue(
                 "UNIVERSE_DRIFT_MISSING",
@@ -429,6 +456,11 @@ def assemble_shards(
                 symbols=extra[:50],
             ))
 
+    if allow_duplicate_repair:
+        issues = [
+            issue for issue in issues
+            if issue.get("code") not in {"UNIVERSE_COUNT_MISMATCH", "DUPLICATE_SYMBOL"}
+        ]
     fatal = [issue for issue in issues if issue.get("code") in FATAL_ISSUE_CODES]
     if not missing_symbols:
         missing_symbols = sorted({
@@ -445,7 +477,9 @@ def assemble_shards(
         frame = frame.sort_values("symbol", kind="stable").reset_index(drop=True)
 
     expected_symbol_count = (
-        max(universe_counts) if universe_counts else len(union_symbols)
+        len(expected_set)
+        if allow_duplicate_repair and expected_set is not None
+        else max(universe_counts) if universe_counts else len(union_symbols)
     )
     quoted_symbol_count = 0
     missing_quote_count = 0
@@ -483,6 +517,8 @@ def assemble_shards(
         "coverage_is_informational": True,
         "duplicate_symbol_count": len(duplicate_symbols),
         "missing_symbol_count": len(missing_symbols),
+        "assembly_mode": "REPAIR" if allow_duplicate_repair else "STRICT",
+        "repair_actions": repair_actions,
         "validation": {
             "duplicate_symbols": duplicate_symbols[:200],
             "missing_symbols": missing_symbols[:200],
@@ -592,6 +628,7 @@ def assemble_from_drive(
     strict_universe: bool = False,
     write_canonical: bool = True,
     write_latest: bool = True,
+    allow_duplicate_repair: bool = False,
 ) -> dict[str, Any]:
     """Load shards from Drive, validate them, and optionally publish canonical output."""
     minute = normalized_cycle_minute(cycle_minute)
@@ -602,6 +639,7 @@ def assemble_from_drive(
         shards=payloads,
         expected_universe=expected_universe,
         strict_universe=strict_universe,
+        allow_duplicate_repair=allow_duplicate_repair,
     )
     if result["status"] == "VALIDATED" and write_canonical:
         write_result = write_canonical_snapshot(

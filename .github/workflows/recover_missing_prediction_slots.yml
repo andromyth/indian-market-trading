@@ -101,9 +101,11 @@ jobs:
           set -uo pipefail
           max="${MAX_SLOTS:-75}"
           recovered=0
+          skipped=""
           for i in $(seq 1 "$max"); do
             echo "::group::recovery attempt $i"
             if ! ALL_NSE_COMPILER_MODE=recover ALL_NSE_RECOVER_DATE="$RECOVER_DATE" \
+              ALL_NSE_RECOVER_SKIP_MINUTES="$skipped" \
               python -u drive_all_nse_prediction_compiler.py 2>&1 | tee "/tmp/recover_$i.log"; then
               echo "recovery attempt $i failed"
               echo "::endgroup::"
@@ -114,6 +116,14 @@ jobs:
               echo "No unprocessed slots remain."
               break
             fi
+            if grep -q '"status": "UNRECOVERABLE_WARMING_HISTORY"' "/tmp/recover_$i.log"; then
+              minute_key=$(grep '"status": "UNRECOVERABLE_WARMING_HISTORY"' "/tmp/recover_$i.log" | grep -o '"cycle_minute_key": "[^"]*"' | tail -1 | cut -d'"' -f4)
+              if [ -n "$minute_key" ]; then
+                skipped="${skipped:+$skipped,}$minute_key"
+                echo "Skipped unrecoverable slot $minute_key (missing contiguous 5m history)"
+              fi
+              continue
+            fi
             if ! grep -Eq '"status": "(STORED|NO_PREDICTIONS_EXPECTED)"' "/tmp/recover_$i.log"; then
               echo "Recovery stopped without storing a prediction."
               exit 1
@@ -121,6 +131,7 @@ jobs:
             recovered=$((recovered + 1))
           done
           echo "Recovered slots in this run: $recovered"
+          echo "Skipped unrecoverable slots in this run: $skipped"
 
       - name: Save updated Drive history cache
         if: always()

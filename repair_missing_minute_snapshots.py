@@ -101,6 +101,7 @@ def repair_slot(
         strict_universe=False,
         write_canonical=True,
         write_latest=False,
+        allow_duplicate_repair=True,
     )
     manifest = result.get("manifest") or {}
     return {
@@ -112,6 +113,7 @@ def repair_slot(
         "quoted_symbol_count": manifest.get("quoted_symbol_count"),
         "missing_quote_count": manifest.get("missing_quote_count"),
         "missing_shards": manifest.get("missing_shards") or [],
+        "repair_actions": manifest.get("repair_actions") or [],
         "fatal_issue_codes": [
             str(issue.get("code"))
             for issue in ((manifest.get("validation") or {}).get("issues") or [])
@@ -164,6 +166,11 @@ def run_repair(
         }
     shard_files = _list_shard_files(store, session_date)
     day_names = {str(item.get("name") or "") for item in day_files}
+    if not expected_universe:
+        from prediction_universe import authoritative_roster
+        roster = authoritative_roster()
+        if len(roster) == 500:
+            expected_universe = sorted(roster)
     work_root = Path(tempfile.mkdtemp(prefix="repair_minute_snapshots_"))
     repaired: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []

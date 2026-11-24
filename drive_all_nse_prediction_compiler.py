@@ -30,6 +30,7 @@ MARKET_CONTEXT_SYMBOL = "__NIFTY50__"
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 MAX_CAPTURE_AGE_SECONDS = 12 * 60
 MAX_MINUTE_MANIFEST_CANDIDATES = 100
+RECOVER_SKIP_MINUTES_ENV = "ALL_NSE_RECOVER_SKIP_MINUTES"
 # Each selected symbol costs one list + one download Drive call; fetch history
 # concurrently so the fixed 500-symbol roster stays inside the compiler time cap.
 HISTORY_DOWNLOAD_WORKERS = max(1, int(os.getenv("ALL_NSE_COMPILER_HISTORY_WORKERS", "12") or 12))
@@ -133,6 +134,35 @@ def _is_prediction_warmup(minute: pd.Timestamp) -> bool:
     if stamp.tzinfo is not None:
         stamp = stamp.tz_convert(IST)
     return (int(stamp.hour), int(stamp.minute)) < PREDICTION_WARMUP_END
+
+
+def _recover_skip_minutes() -> set[str]:
+    """Slots the recovery workflow already found unrecoverable in this run."""
+    raw = os.getenv(RECOVER_SKIP_MINUTES_ENV, "")
+    return {
+        part.strip()
+        for part in str(raw or "").split(",")
+        if part.strip()
+    }
+
+
+def _recover_zero_prediction_status(
+    result: dict[str, Any], minute: pd.Timestamp
+) -> str | None:
+    """Return a non-failing recovery status when a slot cannot be rebuilt."""
+    states = {
+        str(key).upper()
+        for key in (result.get("prediction_status_counts") or {})
+        if str(key).strip()
+    }
+    if (
+        states
+        and states <= BENIGN_EMPTY_STATES
+        and "WARMING_HISTORY" in states
+        and not _is_prediction_warmup(minute)
+    ):
+        return "UNRECOVERABLE_WARMING_HISTORY"
+    return None
 
 
 def _has_benign_empty_prediction(
@@ -516,6 +546,7 @@ def _recovery_capture(store, target: pd.Timestamp):
         if re.fullmatch(r"manifest_\d{8}_\d{4}\.json", str(item.get("name") or ""))
     ]
     items.sort(key=lambda item: str(item.get("name") or ""))
+    skip_keys = _recover_skip_minutes()
     skipped: list[str] = []
     for index, item in enumerate(items):
         local = Path("/tmp/drive_all_nse") / f"recovery_manifest_{index}.json"
@@ -526,6 +557,9 @@ def _recovery_capture(store, target: pd.Timestamp):
             minute = minute.tz_localize(IST) if minute.tzinfo is None else minute.tz_convert(IST)
         except Exception as exc:
             skipped.append(f"{item.get('name')}: invalid manifest ({type(exc).__name__})")
+            continue
+        if minute.strftime("%Y%m%d_%H%M") in skip_keys:
+            skipped.append(f"{item.get('name')}: unrecoverable in this run")
             continue
         if minute.strftime("%Y-%m-%d") != target.strftime("%Y-%m-%d"):
             skipped.append(f"{item.get('name')}: cycle date mismatch")
@@ -877,10 +911,25 @@ def main() -> int:
     if str(result.get("status") or "").upper() != "STORED":
         raise RuntimeError("Drive-only ALL-NSE prediction compiler did not store prediction rows")
     if int(result.get("prediction_count") or 0) < 1:
+        if mode == "recover":
+            unrecoverable = _recover_zero_prediction_status(result, minute)
+            if unrecoverable:
+                print(json.dumps({
+                    "status": unrecoverable,
+                    "cycle_minute_ist": minute.isoformat(),
+                    "cycle_minute_key": minute.strftime("%Y%m%d_%H%M"),
+                    "prediction_status_counts": result.get("prediction_status_counts"),
+                    "reason": (
+                        "No contiguous five-minute history is available for this "
+                        "slot; the persisted live captures are missing bars."
+                    ),
+                }, sort_keys=True))
+                return 0
         if _has_benign_empty_prediction(result, minute):
             print(json.dumps({
                 "status": "NO_PREDICTIONS_EXPECTED",
                 "cycle_minute_ist": minute.isoformat(),
+                "cycle_minute_key": minute.strftime("%Y%m%d_%H%M"),
                 "prediction_status_counts": result.get("prediction_status_counts"),
             }, sort_keys=True))
             return 0
