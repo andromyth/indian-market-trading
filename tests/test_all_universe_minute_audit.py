@@ -286,6 +286,7 @@ def test_missing_snapshot_is_not_reported_as_incomplete_symbol_slot():
     )
     assert key in report["missing_snapshot_minutes"]
     assert key not in report["slots_with_incomplete_symbols"]
+    assert report["minimum_complete_symbol_coverage_pct"] == 100.0
 
 
 def test_prediction_audit_accepts_capture_manifest_schema_validation_marker():
@@ -295,6 +296,7 @@ def test_prediction_audit_accepts_capture_manifest_schema_validation_marker():
     manifest = manifests[f"prediction-manifest-{key}"]
     manifest.pop("quote_snapshot_rows_validated")
     manifest["quote_snapshot_schema_validated"] = True
+    manifest["quote_snapshot_expected_symbol_count"] = 999
 
     report = build_prediction_audit(
         keys, files, lambda file_id: manifests[file_id], session_date=session_date

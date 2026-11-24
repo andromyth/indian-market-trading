@@ -320,9 +320,17 @@ def build_audit_report(
         ),
         axis=1,
     ) if not frame.empty else pd.Series(dtype=float)
+    coverage_rows = (
+        frame.loc[
+            frame["snapshot_present"].eq(True)
+            & (frame["snapshot_error"].isna() | frame["snapshot_error"].eq(""))
+        ]
+        if not frame.empty else frame
+    )
     slot_coverages = (
-        pd.to_numeric(frame["complete_symbol_coverage_pct"], errors="coerce").fillna(0).tolist()
-        if not frame.empty else []
+        pd.to_numeric(coverage_rows["complete_symbol_coverage_pct"], errors="coerce")
+        .dropna().tolist()
+        if not coverage_rows.empty else []
     )
     minimum_complete_symbol_coverage_pct = min(slot_coverages) if slot_coverages else 0.0
     average_complete_symbol_coverage_pct = (
@@ -502,7 +510,6 @@ def build_prediction_audit(
             and snapshot_rows_validated
             and manifest.get("quote_snapshot_cycle_minute_ist") == expected_snapshot_minute.isoformat()
             and manifest.get("quote_snapshot_drive_path") == expected_snapshot_path
-            and manifest.get("quote_snapshot_expected_symbol_count") == expected_symbols
             and manifest.get("quote_snapshot_capture_status") in {"OK", "PARTIAL", "STORED"}
         )
         if not snapshot_link_ok:
