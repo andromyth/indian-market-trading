@@ -175,6 +175,11 @@ def test_core_quote_fields_are_validated_per_symbol_without_a_coverage_threshold
     row = rows.loc[rows["minute_key_ist"].eq(key)].iloc[0]
     assert row["complete_symbol_count"] == 7
     assert row["incomplete_symbol_count"] == 3
+    assert report["incomplete_symbol_reason_counts"] == {
+        "INVALID_OR_MISSING_PRICE": 1,
+        "INVALID_OR_MISSING_QUOTE_TIMESTAMP": 1,
+        "MISSING_INSTRUMENT_CODE": 1,
+    }
     assert report["audit_status"] == "RECORDED"
     assert "quality_gate_pass" not in report
 
@@ -267,3 +272,50 @@ def test_expected_minutes_before_open_is_empty_for_same_day():
         as_of=datetime(2026, 10, 16, 8, 59, tzinfo=ZoneInfo("Asia/Kolkata")),
     )
     assert keys == []
+
+
+def test_missing_snapshot_is_not_reported_as_incomplete_symbol_slot():
+    session_date = date(2026, 10, 16)
+    files, manifests, snapshots = _complete_day_files(session_date)
+    key = "20261016_1005"
+    files = [item for item in files if item["name"] != f"snapshot_{key}.parquet"]
+
+    report, _ = build_audit_report(
+        session_date, files, lambda file_id: manifests[file_id],
+        snapshot_loader=lambda file_id: snapshots[file_id],
+    )
+    assert key in report["missing_snapshot_minutes"]
+    assert key not in report["slots_with_incomplete_symbols"]
+
+
+def test_prediction_audit_accepts_capture_manifest_schema_validation_marker():
+    session_date = date(2026, 10, 16)
+    keys, files, manifests = _prediction_files(session_date)
+    key = "20261016_1005"
+    manifest = manifests[f"prediction-manifest-{key}"]
+    manifest.pop("quote_snapshot_rows_validated")
+    manifest["quote_snapshot_schema_validated"] = True
+
+    report = build_prediction_audit(
+        keys, files, lambda file_id: manifests[file_id], session_date=session_date
+    )
+    assert key not in report["prediction_snapshot_link_diagnostics"]
+
+
+def test_prediction_audit_separates_data_limited_from_fully_supported_rows():
+    session_date = date(2026, 10, 16)
+    keys, files, manifests = _prediction_files(session_date)
+    key = "20261016_1005"
+    manifests[f"prediction-manifest-{key}"]["prediction_status_counts"] = {
+        "PREDICTED": 2,
+        "PREDICTED_DATA_LIMITED": 3,
+        "PREDICTED_UNTRAINED_SYMBOL": 1,
+    }
+    manifests[f"prediction-manifest-{key}"]["prediction_count"] = 6
+
+    report = build_prediction_audit(
+        keys, files, lambda file_id: manifests[file_id], session_date=session_date
+    )
+    assert report["total_fully_supported_prediction_count"] == 76
+    assert report["total_data_limited_prediction_count"] == 3
+    assert report["total_untrained_symbol_prediction_count"] == 1

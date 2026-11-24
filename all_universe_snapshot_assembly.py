@@ -591,6 +591,7 @@ def assemble_from_drive(
     expected_universe: Iterable[str] | None = None,
     strict_universe: bool = False,
     write_canonical: bool = True,
+    write_latest: bool = True,
 ) -> dict[str, Any]:
     """Load shards from Drive, validate them, and optionally publish canonical output."""
     minute = normalized_cycle_minute(cycle_minute)
@@ -609,6 +610,7 @@ def assemble_from_drive(
             result["frame"],
             result["manifest"],
             work_dir,
+            write_latest=write_latest,
         )
         result["manifest"].update(write_result)
     result["manifest"]["work_dir"] = str(work_dir)
@@ -621,6 +623,8 @@ def write_canonical_snapshot(
     frame: pd.DataFrame,
     manifest: dict[str, Any],
     work_dir: Path,
+    *,
+    write_latest: bool = True,
 ) -> dict[str, Any]:
     """Persist the assembled canonical snapshot, then its manifest.
 
@@ -674,13 +678,15 @@ def write_canonical_snapshot(
         raise RuntimeError(
             f"Canonical manifest upload was not confirmed: {minute_upload}"
         )
-    latest_upload = store.upload_or_update(
-        latest_path, names["latest_manifest_remote"], mime_type="application/json"
-    )
-    if latest_upload.get("status") != "OK":
-        raise RuntimeError(
-            f"Canonical latest-manifest upload was not confirmed: {latest_upload}"
+    latest_upload = None
+    if write_latest:
+        latest_upload = store.upload_or_update(
+            latest_path, names["latest_manifest_remote"], mime_type="application/json"
         )
+        if latest_upload.get("status") != "OK":
+            raise RuntimeError(
+                f"Canonical latest-manifest upload was not confirmed: {latest_upload}"
+            )
     snapshot_path.with_suffix(".uploaded.json").write_text(
         json.dumps({
             "status": "OK",

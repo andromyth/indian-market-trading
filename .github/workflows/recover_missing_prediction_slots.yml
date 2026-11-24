@@ -1,13 +1,19 @@
 name: Recover missing ALL-NSE prediction slots
 
-# Opt-in, read-mostly repair for slots the live compiler never revisited.
+# Post-close repair for slots the live compiler never revisited.
 # The live compiler intentionally processes only the newest fresh snapshot, so
-# a missed slot stays missing forever. This workflow walks a trading day
-# oldest-first and compiles every snapshot whose prediction manifest is not
-# STORED yet. Run it after the cash session; it never touches the Cloud Run
-# worker and never rewrites an existing STORED prediction.
+# a missed slot stays missing forever. This workflow first re-assembles
+# canonical snapshots whose shard uploads succeeded but whose final assembly
+# failed, then walks the trading day oldest-first and compiles every snapshot
+# whose prediction manifest is not fully supported yet. It runs after the cash
+# session, never touches the Cloud Run worker, and never rewrites a slot that
+# already has model predictions.
 
 on:
+  # 15:50 IST (10:20 UTC) on weekdays, after the 15:30 cash close and before
+  # the 16:15 IST persistence audit.
+  schedule:
+    - cron: "20 10 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
@@ -17,10 +23,14 @@ on:
       max_slots:
         description: "Maximum snapshots to compile in this run"
         required: false
-        default: "40"
+        default: "75"
 
 permissions:
   contents: read
+
+concurrency:
+  group: recover-missing-prediction-slots
+  cancel-in-progress: false
 
 jobs:
   recover-slots:
@@ -74,6 +84,14 @@ jobs:
             nse-live-${{ steps.market_date.outputs.value }}-
             nse-live-
 
+      - name: Re-assemble canonical snapshots from persisted shards
+        env:
+          RECOVER_DATE: ${{ github.event.inputs.date }}
+        run: |
+          set -euo pipefail
+          python -u repair_missing_minute_snapshots.py --date "$RECOVER_DATE" \
+            | tee /tmp/repair_missing_snapshots.log
+
       - name: Compile every unprocessed slot oldest-first
         env:
           RECOVER_DATE: ${{ github.event.inputs.date }}
@@ -81,7 +99,7 @@ jobs:
           ALL_NSE_COMPILER_HISTORY_WORKERS: "24"
         run: |
           set -uo pipefail
-          max="${MAX_SLOTS:-40}"
+          max="${MAX_SLOTS:-75}"
           recovered=0
           for i in $(seq 1 "$max"); do
             echo "::group::recovery attempt $i"

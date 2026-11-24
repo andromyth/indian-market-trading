@@ -457,7 +457,11 @@ def test_prediction_already_stored_checks_per_slot_manifest(monkeypatch, tmp_pat
     monkeypatch.setattr(
         compiler,
         "_find_remote",
-        lambda store, remote: {"id": "prediction"} if remote == requested else None,
+        lambda store, remote: (
+            {"id": "prediction"}
+            if remote.endswith(("manifest_20261111_1400.json", "manifest_20261111_0920.json"))
+            else None
+        ),
     )
 
     def download(store, file_id, destination):
@@ -489,7 +493,12 @@ def test_prediction_already_stored_checks_per_slot_manifest(monkeypatch, tmp_pat
         }), encoding="utf-8")
 
     monkeypatch.setattr(compiler, "_download", download_warmup)
-    assert compiler._prediction_already_stored(SimpleNamespace(), minute) is True
+    # Mid-session WARMING_HISTORY means the live history refresh failed; the
+    # post-close compiler must revisit the slot instead of treating it as done.
+    assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False
+
+    warmup_minute = pd.Timestamp("2026-11-11 09:20:00", tz=IST)
+    assert compiler._prediction_already_stored(SimpleNamespace(), warmup_minute) is True
 
     monkeypatch.setattr(compiler, "_find_remote", lambda store, remote: None)
     assert compiler._prediction_already_stored(SimpleNamespace(), minute) is False

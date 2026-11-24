@@ -343,3 +343,21 @@ def test_sharded_capture_does_not_publish_when_a_shard_fails(tmp_path, monkeypat
         path.endswith(f"/{slot:%Y/%m/%d}/snapshot_{slot:%Y%m%d_%H%M}.parquet")
         for path in fake_store.uploads
     )
+
+
+def test_historical_repair_does_not_move_the_latest_manifest_pointer(tmp_path):
+    store = FakeStore()
+    frame = _frame(["AAA", "BBB"])
+    manifest = assembly.assemble_shards(
+        cycle_minute=SLOT, worker_count=1,
+        shards=[{"worker_id": 0, "manifest": _manifest(SLOT, 0, 1, ["AAA", "BBB"], frame), "frame": frame}],
+    )["manifest"]
+
+    assembly.write_canonical_snapshot(
+        store, SLOT, frame, manifest, tmp_path, write_latest=False
+    )
+
+    canonical = assembly.canonical_artifact_names(SLOT)
+    assert canonical["snapshot_remote"] in store.uploads
+    assert canonical["manifest_remote"] in store.uploads
+    assert canonical["latest_manifest_remote"] not in store.uploads

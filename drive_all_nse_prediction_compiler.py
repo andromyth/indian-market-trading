@@ -122,6 +122,43 @@ def _manifest_has_predictions(manifest: dict[str, Any]) -> bool:
 BENIGN_EMPTY_STATES = {
     "WARMING_HISTORY", "MISSING_CURRENT_QUOTE", "NO_ELIGIBLE_SYMBOLS",
 }
+# WARMING_HISTORY is only expected during the opening warmup. After this slot,
+# zero predictions mean the live history refresh failed and the slot must be
+# recompiled from the persisted archive instead of being treated as complete.
+PREDICTION_WARMUP_END = (9, 35)
+
+
+def _is_prediction_warmup(minute: pd.Timestamp) -> bool:
+    stamp = pd.Timestamp(minute)
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert(IST)
+    return (int(stamp.hour), int(stamp.minute)) < PREDICTION_WARMUP_END
+
+
+def _has_benign_empty_prediction(
+    manifest: dict[str, Any], minute: pd.Timestamp
+) -> bool:
+    """Return True only for empty outcomes that another compile cannot repair.
+
+    A mid-session WARMING_HISTORY slot is a transient live-history failure: the
+    post-close compiler can rebuild it from persisted OHLCV. Treating it as
+    benign (the previous behavior) permanently dropped every affected slot.
+    """
+    states = {
+        str(key).upper()
+        for key in (manifest.get("prediction_status_counts") or {})
+        if str(key).strip()
+    }
+    if not states or not states <= BENIGN_EMPTY_STATES:
+        return False
+    try:
+        if int(manifest.get("model_failure_count") or 0) != 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if _is_prediction_warmup(minute):
+        return True
+    return states <= {"MISSING_CURRENT_QUOTE", "NO_ELIGIBLE_SYMBOLS"}
 
 
 def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
@@ -140,13 +177,7 @@ def _prediction_already_stored(store, minute: pd.Timestamp) -> bool:
         return False
     if _manifest_has_predictions(manifest):
         return True
-    states = {str(key).upper() for key in (manifest.get("prediction_status_counts") or {})}
-    if not states or not states <= BENIGN_EMPTY_STATES:
-        return False
-    try:
-        return int(manifest.get("model_failure_count") or 0) == 0
-    except (TypeError, ValueError):
-        return False
+    return _has_benign_empty_prediction(manifest, minute)
 
 
 def _read_history(path: Path, symbol: str | None = None) -> pd.DataFrame:
@@ -846,15 +877,17 @@ def main() -> int:
     if str(result.get("status") or "").upper() != "STORED":
         raise RuntimeError("Drive-only ALL-NSE prediction compiler did not store prediction rows")
     if int(result.get("prediction_count") or 0) < 1:
-        states = {str(key).upper() for key in (result.get("prediction_status_counts") or {})}
-        if states and states <= BENIGN_EMPTY_STATES:
+        if _has_benign_empty_prediction(result, minute):
             print(json.dumps({
                 "status": "NO_PREDICTIONS_EXPECTED",
                 "cycle_minute_ist": minute.isoformat(),
                 "prediction_status_counts": result.get("prediction_status_counts"),
             }, sort_keys=True))
             return 0
-        raise RuntimeError("Drive-only ALL-NSE prediction compiler did not store prediction rows")
+        raise RuntimeError(
+            "Drive-only ALL-NSE prediction compiler produced zero predictions for "
+            f"a non-warmup slot: {result.get('prediction_status_counts')}"
+        )
     return 0
 
 

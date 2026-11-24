@@ -121,6 +121,7 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
         "incomplete_symbol_count": 0,
         "snapshot_duplicate_symbol_count": 0,
         "symbol_capture_status_counts": {},
+        "incomplete_symbol_reason_counts": {},
         "incomplete_symbol_samples": [],
         "missing_required_snapshot_columns": [],
         "snapshot_error": None,
@@ -169,6 +170,7 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
     )
 
     incomplete_samples = []
+    reason_counts: dict[str, int] = {}
     for index in frame.index[~complete]:
         reasons = []
         symbol = str(symbols.loc[index] or "")
@@ -184,6 +186,8 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
             reasons.append("INVALID_OR_MISSING_PRICE")
         if pd.isna(timestamps.loc[index]):
             reasons.append("INVALID_OR_MISSING_QUOTE_TIMESTAMP")
+        for reason in reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
         if len(incomplete_samples) < 100:
             incomplete_samples.append({
                 "symbol": symbol or None,
@@ -199,6 +203,7 @@ def _snapshot_completeness(frame: pd.DataFrame) -> dict[str, Any]:
             str(key): int(value)
             for key, value in statuses.value_counts(dropna=False).items()
         },
+        "incomplete_symbol_reason_counts": dict(sorted(reason_counts.items())),
         "incomplete_symbol_samples": incomplete_samples,
         "missing_required_snapshot_columns": [],
         "snapshot_error": None,
@@ -242,6 +247,7 @@ def build_audit_report(
             "incomplete_symbol_count": 0,
             "snapshot_duplicate_symbol_count": 0,
             "symbol_capture_status_counts": {},
+            "incomplete_symbol_reason_counts": {},
             "incomplete_symbol_samples": [],
             "missing_required_snapshot_columns": [],
             "snapshot_error": "Snapshot file is missing",
@@ -325,11 +331,21 @@ def build_audit_report(
     total_complete_symbols = int(
         pd.to_numeric(frame["complete_symbol_count"], errors="coerce").fillna(0).sum()
     ) if not frame.empty else 0
+    incomplete_reason_counts: dict[str, int] = {}
+    for _, row in frame.iterrows():
+        if not bool(row.get("snapshot_present")) or row.get("snapshot_error"):
+            continue
+        for reason, count in (row.get("incomplete_symbol_reason_counts") or {}).items():
+            incomplete_reason_counts[str(reason)] = (
+                incomplete_reason_counts.get(str(reason), 0) + int(count or 0)
+            )
     slots_with_incomplete_symbols = [
         str(row["minute_key_ist"])
         for _, row in frame.iterrows()
         if (
-            pd.notna(row.get("expected_symbol_count"))
+            bool(row.get("snapshot_present"))
+            and not row.get("snapshot_error")
+            and pd.notna(row.get("expected_symbol_count"))
             and int(row.get("complete_symbol_count") or 0)
                 < int(row.get("expected_symbol_count") or 0)
         )
@@ -364,6 +380,7 @@ def build_audit_report(
         "corrupt_manifest_minutes": corrupt_manifests,
         "corrupt_snapshot_minutes": corrupt_snapshots,
         "slots_with_incomplete_symbols": slots_with_incomplete_symbols,
+        "incomplete_symbol_reason_counts": dict(sorted(incomplete_reason_counts.items())),
         "recovered_persistence_issue_minutes": recovered_persistence_issue_minutes,
         "duplicate_snapshot_files": duplicate_snapshot_files,
         "duplicate_manifest_files": duplicate_manifest_files,
@@ -476,9 +493,13 @@ def build_prediction_audit(
             "production_data/all_universe_minute_snapshots/"
             f"{session_date:%Y/%m/%d}/snapshot_{key}.parquet"
         )
+        snapshot_rows_validated = (
+            manifest.get("quote_snapshot_rows_validated") is True
+            or manifest.get("quote_snapshot_schema_validated") is True
+        )
         snapshot_link_ok = (
             bool(snapshots)
-            and manifest.get("quote_snapshot_rows_validated") is True
+            and snapshot_rows_validated
             and manifest.get("quote_snapshot_cycle_minute_ist") == expected_snapshot_minute.isoformat()
             and manifest.get("quote_snapshot_drive_path") == expected_snapshot_path
             and manifest.get("quote_snapshot_expected_symbol_count") == expected_symbols
@@ -505,6 +526,13 @@ def build_prediction_audit(
                 "prediction_status_counts": manifest.get("prediction_status_counts") or {},
             })
 
+    fully_supported_predictions = int(prediction_status_counts.get("PREDICTED", 0))
+    data_limited_predictions = int(
+        prediction_status_counts.get("PREDICTED_DATA_LIMITED", 0)
+    )
+    untrained_symbol_predictions = int(
+        prediction_status_counts.get("PREDICTED_UNTRAINED_SYMBOL", 0)
+    )
     return {
         "prediction_expected_slots": len(expected),
         "prediction_files_present": len(expected) - len(missing_files),
@@ -521,6 +549,14 @@ def build_prediction_audit(
         "prediction_slot_status_counts": status_counts,
         "total_declared_prediction_rows": total_declared_rows,
         "total_model_prediction_count": total_predictions,
+        "total_fully_supported_prediction_count": fully_supported_predictions,
+        "total_data_limited_prediction_count": data_limited_predictions,
+        "total_untrained_symbol_prediction_count": untrained_symbol_predictions,
+        "prediction_count_semantics": (
+            "total_model_prediction_count includes data-limited and untrained-symbol "
+            "rows; only total_fully_supported_prediction_count meets the readiness "
+            "threshold and has a trained symbol."
+        ),
         "prediction_warmup_until": first_prediction_key,
         "prediction_coverage_is_informational": True,
     }

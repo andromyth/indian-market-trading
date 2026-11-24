@@ -132,6 +132,7 @@ jobs:
               "minute_manifests_present", "missing_manifest_minutes",
               "capture_status_counts", "corrupt_snapshot_minutes",
               "corrupt_manifest_minutes", "slots_with_incomplete_symbols",
+              "incomplete_symbol_reason_counts",
               "total_expected_symbol_minutes", "total_quoted_symbol_minutes",
               "total_missing_quote_rows", "observed_quote_coverage_pct",
               "total_complete_symbol_rows", "average_complete_symbol_coverage_pct",
@@ -142,6 +143,10 @@ jobs:
               "prediction_snapshot_link_diagnostics", "prediction_model_diagnostics",
               "prediction_status_counts", "prediction_slot_status_counts",
               "total_declared_prediction_rows", "total_model_prediction_count",
+              "total_fully_supported_prediction_count",
+              "total_data_limited_prediction_count",
+              "total_untrained_symbol_prediction_count",
+              "prediction_count_semantics",
               "audit_status", "drive_json_write", "drive_csv_write",
           )
           summary = {k: report.get(k) for k in keys}
