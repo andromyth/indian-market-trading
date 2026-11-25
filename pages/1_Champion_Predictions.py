@@ -7,13 +7,19 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from typing import Any
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from persistent_store import GoogleDriveStore
 from prediction_universe import authoritative_roster
+
+GITHUB_REPO = os.getenv("GITHUB_REPO", "andromyth/indian-market-trading")
+RETRAIN_WORKFLOW = "retrain_to_close.yml"
+PROMOTE_WORKFLOW = "promote_to_close_champion.yml"
 
 PREDICTION_ROOT = ["production_data", "all_nse_minute_predictions"]
 CHAMPION_ROOT = "production_data/all_nse_champion"
@@ -143,6 +149,38 @@ def _load_champion(refresh_revision: int = 0) -> dict:
         return {}
 
 
+def _github_token() -> str | None:
+    """GitHub PAT with ``repo`` and ``workflow`` scope, from env or Streamlit secrets."""
+    token = os.getenv("GITHUB_PAT") or os.getenv("GH_TOKEN")
+    if token:
+        return token
+    try:
+        return st.secrets.get("GITHUB_PAT") or st.secrets.get("GH_TOKEN")  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def _dispatch_github_workflow(workflow_file: str, inputs: dict[str, str]) -> tuple[bool, str | None]:
+    """Trigger a GitHub Actions workflow_dispatch. Returns (ok, run_url_or_error)."""
+    token = _github_token()
+    if not token:
+        return False, "GitHub PAT not configured (set GITHUB_PAT env var or [secrets] GITHUB_PAT)."
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{workflow_file}/dispatches"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"ref": "main", "inputs": inputs}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - surface the error to the user
+        return False, f"Request failed: {type(exc).__name__}: {exc}"
+    if resp.status_code == 204:
+        return True, f"https://github.com/{GITHUB_REPO}/actions"
+    return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+
+
 st.set_page_config(page_title="Champion predictions", layout="wide")
 st.title("To-close champion · predictions")
 st.caption(
@@ -158,6 +196,42 @@ with refresh_col:
         st.rerun()
 with slots_col:
     slots = st.slider("Five-minute slots to load", 1, 24, 6)
+
+st.divider()
+with st.expander("Manual model operations", expanded=False):
+    st.caption(
+        "Nightly retraining runs on a schedule (20:15 IST weekdays) and promotion is manual. "
+        "Use these buttons to trigger them on demand. Retraining builds a Docker image and runs "
+        "on Cloud Run; it can take 20–60 minutes."
+    )
+    op_col1, op_col2, op_col3 = st.columns([1, 1, 3])
+    with op_col1:
+        retrain_pressed = st.button("Run manual retrain", key="champion_manual_retrain")
+    with op_col2:
+        promote_pressed = st.button("Promote latest candidate", key="champion_manual_promote")
+    with op_col3:
+        st.caption("Retrain publishes a candidate; promotion moves it to the live champion.")
+
+    if retrain_pressed or promote_pressed:
+        workflow = PROMOTE_WORKFLOW if promote_pressed else RETRAIN_WORKFLOW
+        label = "Promote" if promote_pressed else "Retrain"
+        inputs = (
+            {"dry_run": "false", "force": "false"}
+            if promote_pressed
+            else {
+                "universe": "all",
+                "sessions": "500",
+                "max_symbols": "500",
+                "cost": "0.0011",
+                "warmup_bars": "3",
+                "consolidate_live_days": "5",
+            }
+        )
+        ok, info = _dispatch_github_workflow(workflow, inputs)
+        if ok:
+            st.success(f"{label} workflow dispatched. Watch progress at: {info}")
+        else:
+            st.error(f"{label} failed: {info}")
 
 champion = _load_champion()
 if champion:
