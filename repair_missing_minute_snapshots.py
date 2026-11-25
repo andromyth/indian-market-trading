@@ -192,6 +192,50 @@ def load_archive_histories(
     return history
 
 
+def archive_diagnostics(
+    history: dict[str, pd.DataFrame],
+    session_date: date,
+) -> dict[str, Any]:
+    """Summarise which session bars the archive actually contains."""
+    latest = None
+    first_session = None
+    last_session = None
+    session_symbols = 0
+    session_bars = 0
+    for frame in history.values():
+        if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            continue
+        index = frame.index
+        index = (
+            index.tz_convert(IST) if index.tz is not None else index.tz_localize(IST)
+        )
+        if latest is None or index.max() > latest:
+            latest = index.max()
+        mask = index.date == session_date
+        count = int(mask.sum())
+        if count:
+            session_symbols += 1
+            session_bars += count
+            day = index[mask]
+            if first_session is None or day.min() < first_session:
+                first_session = day.min()
+            if last_session is None or day.max() > last_session:
+                last_session = day.max()
+    return {
+        "archive_latest_timestamp_ist": latest.isoformat() if latest is not None else None,
+        "archive_session_symbol_count": session_symbols,
+        "archive_session_bar_count": session_bars,
+        "archive_session_first_bar_ist": (
+            first_session.isoformat() if first_session is not None else None
+        ),
+        "archive_session_last_bar_ist": (
+            last_session.isoformat() if last_session is not None else None
+        ),
+    }
+
+
 def build_archive_snapshot_frame(
     history: dict[str, pd.DataFrame],
     minute: pd.Timestamp,
@@ -371,12 +415,13 @@ def run_repair(
     work_root = Path(tempfile.mkdtemp(prefix="repair_minute_snapshots_"))
     archive_history: dict[str, pd.DataFrame] | None = None
     archive_status = "NOT_LOADED"
+    archive_stats: dict[str, Any] = {}
     repaired: list[dict[str, Any]] = []
     archive_repaired: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
     def _archive_frame(minute: pd.Timestamp) -> pd.DataFrame | None:
-        nonlocal archive_history, archive_status
+        nonlocal archive_history, archive_status, archive_stats
         if archive_history is None:
             if not roster:
                 archive_status = "NO_ROSTER"
@@ -393,6 +438,8 @@ def run_repair(
                 archive_history = {}
                 return None
             archive_status = "AVAILABLE" if archive_history else "EMPTY_ARCHIVE"
+            if archive_history:
+                archive_stats = archive_diagnostics(archive_history, session_date)
         frame = build_archive_snapshot_frame(archive_history, minute, roster)
         return frame if not frame.empty else None
 
@@ -464,6 +511,7 @@ def run_repair(
         "archive_repaired_count": len(archive_repaired),
         "skipped_count": len(skipped),
         "archive_status": archive_status,
+        **archive_stats,
         "repair_status": "COMPLETED",
     }
 

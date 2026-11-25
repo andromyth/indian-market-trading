@@ -142,3 +142,25 @@ def test_run_repair_falls_back_to_archive_when_no_shard_exists(monkeypatch):
     assert report["repaired_count"] == 1
     assert report["skipped_count"] == 0
     assert report["repair_status"] == "COMPLETED"
+
+
+def test_archive_diagnostics_reports_session_coverage():
+    stats = repair.archive_diagnostics(
+        {"AAA": _archive_frame()}, date(2026, 10, 16)
+    )
+
+    assert stats["archive_session_symbol_count"] == 1
+    assert stats["archive_session_bar_count"] == 2
+    assert stats["archive_session_first_bar_ist"].startswith("2026-10-16T09:20")
+    assert stats["archive_session_last_bar_ist"].startswith("2026-10-16T09:25")
+    assert stats["archive_latest_timestamp_ist"].startswith("2026-10-16T09:25")
+
+
+def test_archive_diagnostics_empty_when_only_prior_session_bars():
+    stats = repair.archive_diagnostics(
+        {"AAA": _archive_frame()}, date(2026, 10, 17)
+    )
+
+    assert stats["archive_session_symbol_count"] == 0
+    assert stats["archive_session_bar_count"] == 0
+    assert stats["archive_session_first_bar_ist"] is None

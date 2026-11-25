@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -147,3 +147,46 @@ def test_start_backfill_accepts_already_running(monkeypatch):
     )
 
     assert result["status"] == "BACKFILL_ALREADY_RUNNING"
+
+
+def _backfill_state(status: str, started: str, updated: str) -> dict:
+    return {
+        "status": status,
+        "state": {"started_at_utc": started, "updated_at_utc": updated},
+    }
+
+
+def test_should_skip_existing_backfill_only_for_clean_current_session():
+    now = datetime(2026, 11, 25, 13, 0, tzinfo=timezone.utc)
+    current = _backfill_state(
+        "COMPLETED",
+        "2026-11-25T10:35:00+00:00",
+        "2026-11-25T10:40:00+00:00",
+    )
+
+    assert gap.should_skip_existing_backfill(current, date(2026, 11, 25), now=now)
+    assert not gap.should_skip_existing_backfill(
+        current, date(2026, 11, 25), now=now, force=True
+    )
+    assert not gap.should_skip_existing_backfill(current, date(2026, 11, 24), now=now)
+
+
+def test_should_retry_gapped_session_only_after_cooldown():
+    now = datetime(2026, 11, 25, 13, 0, tzinfo=timezone.utc)
+    recent = _backfill_state(
+        "COMPLETED_WITH_GAPS",
+        "2026-11-25T10:35:00+00:00",
+        "2026-11-25T12:45:00+00:00",
+    )
+    stale = _backfill_state(
+        "COMPLETED_WITH_GAPS",
+        "2026-11-25T10:35:00+00:00",
+        "2026-11-25T11:30:00+00:00",
+    )
+
+    assert gap.should_skip_existing_backfill(
+        recent, date(2026, 11, 25), now=now, retry_minutes=30
+    )
+    assert not gap.should_skip_existing_backfill(
+        stale, date(2026, 11, 25), now=now, retry_minutes=30
+    )

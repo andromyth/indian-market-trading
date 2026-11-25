@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, time as clock_time, timedelta
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -236,6 +236,35 @@ def _belongs_to_session(current: dict[str, Any], session_date: date) -> bool:
     return bool(started) and started[:10] == session_date.isoformat()
 
 
+def should_skip_existing_backfill(
+    current: dict[str, Any],
+    session_date: date,
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+    retry_minutes: int = 30,
+) -> bool:
+    """Skip only a clean session run, or a gapped run still inside its cooldown."""
+    if force or not _belongs_to_session(current, session_date):
+        return False
+    status = str(current.get("status") or "").upper()
+    if status == "COMPLETED":
+        return True
+    if status != "COMPLETED_WITH_GAPS":
+        return False
+    updated_raw = str((current.get("state") or {}).get("updated_at_utc") or "")
+    if not updated_raw:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    return (reference - updated_at) < timedelta(minutes=max(0, int(retry_minutes)))
+
+
 def wait_for_backfill(
     url: str,
     token: str,
@@ -403,10 +432,17 @@ def main() -> int:
         "1", "true", "yes",
     }
     existing = backfill_state(url, token)
-    already_completed = (
-        not force
-        and classify_backfill_status(str(existing.get("status") or "")) == "DONE"
-        and _belongs_to_session(existing, session_date)
+    try:
+        retry_minutes = max(
+            0, int(os.getenv("SAME_DAY_BACKFILL_GAP_RETRY_MINUTES", "30") or 30)
+        )
+    except ValueError:
+        retry_minutes = 30
+    # A clean COMPLETED session never needs another fetch. COMPLETED_WITH_GAPS is
+    # retried by the later fallback runs once the cooldown expires, because the
+    # provider can publish the last candles a little after the 16:05 attempt.
+    already_completed = should_skip_existing_backfill(
+        existing, session_date, force=force, retry_minutes=retry_minutes
     )
     if already_completed:
         started = {
