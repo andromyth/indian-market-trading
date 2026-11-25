@@ -22,7 +22,7 @@ Do not put INDstocks credentials or tokens in GitHub repository secrets, Streaml
 
 1. **Cloud Run** owns the INDstocks token and collects five-minute full-universe quote snapshots. It runs the resumable 5-minute historical backfill only through the authenticated private Cloud Run endpoint, sharing the same process-local token cache.
 2. Cloud Run persists quote snapshots and symbol-wise five-minute history Parquet files to Google Drive.
-3. **GitHub Actions** reads those Drive artifacts, compiles the existing 30-minute ALL-NSE model features, loads the existing model/F&O context from Drive, and writes prediction Parquet files and manifests back to Drive. It does not import or call INDstocks.
+3. **Cloud Run** normally runs the ALL-NSE prediction inside the same tick (`ALL_NSE_IN_WORKER_PREDICTION=1`), using the champion `target_session_close` model, and writes prediction Parquet files and manifests to Drive. When in-worker prediction is disabled, **GitHub Actions** reads the same Drive artifacts and compiles the same session-close predictions as a fallback. Neither path imports or calls INDstocks outside Cloud Run.
 4. The news collector is a separate GitHub Actions workflow. It reads publisher RSS and writes the point-in-time news archive to Drive. News is optional context; absence of a matching news headline must not block the independent ALL-NSE prediction pipeline.
 5. Streamlit is a read-only dashboard and uses other configured market-data fallbacks. INDstocks access is disabled in the dashboard.
 

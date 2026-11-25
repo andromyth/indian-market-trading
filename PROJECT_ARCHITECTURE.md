@@ -20,8 +20,8 @@ An NSE cash-equity decision-support and prediction system. It:
 - captures only the fixed 500-symbol owner-selected roster during market hours;
 - builds point-in-time features from official EOD, delivery, F&O, news and
   five-minute intraday data;
-- runs pooled machine-learning models for **30-minute intraday** and
-  **next-session Delivery** horizons;
+- runs pooled machine-learning models for **same-session close (15:30 IST)**
+  and **next-session Delivery** horizons;
 - persists every prediction together with the actual observed price so it can
   be evaluated later;
 - continuously validates predictions, learns calibration overlays, and audits
@@ -592,14 +592,18 @@ Prediction row fields include:
 - model: `model_family`, `model_target`, `model_version`,
   `base_model_version`, `readiness_segment`, `feature_count`,
   `non_missing_feature_count`, `data_readiness_score`;
-- output: `probability_up_30m`, `expected_return_30m`, `confidence`,
-  `raw_model_signal`, `signal`, `prediction_status`;
-- horizon: `forecast_target_timestamp_utc`, `forecast_key`;
+- output: `probability_up_session_close`, `expected_return_session_close`,
+  `confidence`, `raw_model_signal`, `signal`, `prediction_status`;
+- horizon: `target_timestamp`, `horizon_minutes`, `minutes_to_close`,
+  `forecast_target_timestamp_utc`, `forecast_key`;
 - ownership: `trained_for_symbol`, `model_coverage_symbols`;
-- calibration: `probability_up_30m_calibrated`,
-  `expected_return_30m_calibrated`, `predicted_price_30m_calibrated`,
+- calibration: `probability_up_session_close_calibrated`,
+  `expected_return_session_close_calibrated`,
   `calibrated_signal_advisory`, `signal_calibrated`,
   `calibration_profile_id`, `calibration_stage`, `calibration_applied`.
+
+The legacy `probability_up_30m` / `expected_return_30m` columns remain readable
+for archived rows but are not written or used by the live path.
 
 ### 5.10 Idempotency and retry semantics
 
@@ -683,12 +687,12 @@ A mismatch raises; it never silently serves an unverified model.
 
 ### 6.4 Auxiliary multihorizon model
 
-`all_nse_intraday_5m_model.py` is a **separate model family**, not the
-production 30-minute compiler model. It estimates direct prices at +5, +10,
-+15, +20, +25 and +30 minutes with per-horizon classifiers and return
-regressors. It has its own 49-feature contract and artifact root
-(`models/all_nse_intraday_5m_multifactor_replacement_2026`). The repository
-explicitly states it does not replace the certified 30-minute artifact.
+`all_nse_intraday_5m_model.py` is a **legacy research model family**. It
+estimates direct prices at +5, +10, +15, +20, +25 and +30 minutes with
+per-horizon classifiers and return regressors. It has its own 49-feature
+contract and artifact root
+(`models/all_nse_intraday_5m_multifactor_replacement_2026`). It is not used by
+the live session-close path or the dashboard's Intraday panel.
 
 ### 6.5 Calibration overlay
 
@@ -802,7 +806,7 @@ Key fields:
   "status": "STORED",
   "cycle_minute_ist": "2026-11-13T15:15:00+05:30",
   "model_version": "...",
-  "model_target": "target_30m",
+  "model_target": "target_session_close",
   "expected_symbol_count": 2635,
   "snapshot_symbol_count": 2635,
   "eligible_symbol_count": 2635,
@@ -963,9 +967,11 @@ and `NSE_DATA_LAYER_ARCHITECTURE.md`.
 `app.py` is the human-facing decision-support layer:
 
 - **Delivery mode** routes to the live ALL-NSE 59-feature candidate;
-- **Intraday mode** routes to the certified `target_30m` production model;
+- **Intraday mode** reads the stored ALL-NSE `target_session_close` prediction
+  row and never runs a second on-demand model;
 - historical replay reconstructs point-in-time inputs and compares the
-  prediction with the subsequent actual move;
+  prediction with the subsequent actual move; Intraday replay currently reports
+  that no point-in-time inference adapter is connected;
 - one-year audit reports causal direction hit rates, per-stock results,
   score-to-return correlation and threshold sensitivity;
 - paper trading simulates decisions and never submits orders;
@@ -1084,8 +1090,8 @@ Add `--no-write` to validate without publishing.
 | `all_universe_snapshot_assembly.py` | Assembly + validation + canonical publish |
 | `drive_all_nse_prediction_compiler.py` | Actions Drive consumer and compile entry point |
 | `all_nse_minute_prediction_capture.py` | Feature build, inference, signal policy, persistence |
-| `all_nse_intraday_model.py` | 30-minute model adapter and feature contract |
-| `all_nse_intraday_5m_model.py` | Auxiliary multihorizon model family |
+| `all_nse_intraday_model.py` | Session-close adapter; legacy 30-minute fallback |
+| `all_nse_intraday_5m_model.py` | Legacy multihorizon research model |
 | `indstocks_client.py` | INDstocks auth, quotes, historical bars |
 | `persistent_store.py` | Google Drive store and retry logic |
 | `market_session_guard.py` | Session/holiday guards |
@@ -1094,7 +1100,7 @@ Add `--no-write` to validate without publishing.
 
 | File | Role |
 |---|---|
-| `colab_build_all_nse_intraday_multifactor.py` | Train 30-minute pooled model |
+| `colab_build_all_nse_intraday_multifactor.py` | Train session-close pooled model |
 | `colab_build_all_nse_intraday_5m_multifactor.py` | Train multihorizon model |
 | `rebuild_all_nse_intraday_5m_model_from_drive.py` | Rebuild model bundle from Drive |
 | `colab_build_all_nse_delivery_multifactor_candidate.py` | Train Delivery candidate |
@@ -1193,7 +1199,7 @@ Add `--no-write` to validate without publishing.
 | **Calibration overlay** | Optional validated probability/return adjustment; never replaces weights |
 | **PIT** | Point-in-time; only information available at the decision timestamp |
 | **Delivery** | Next-session cash-equity prediction lane |
-| **Intraday** | 30-minute forward-return prediction lane |
+| **Intraday** | Same-session 15:30 IST close prediction lane |
 | **Drive-only** | Compiler mode that reads persisted artifacts and never calls INDstocks |
 
 ---

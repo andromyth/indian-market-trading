@@ -1,8 +1,8 @@
 # beta_version2 — self-driving prediction challenger
 
 This branch is isolated from the current production paths. It does not replace
-the current ALL-NSE Delivery model, the certified 30-minute Intraday model, or
-the current 5-minute Intraday production model.
+the current ALL-NSE Delivery model, the live session-close Intraday capture
+(`target_session_close`), or the legacy 30-minute replay artifact.
 
 ## Delivery fixes
 - Causal next-observed-session return labels.
@@ -21,8 +21,9 @@ the current 5-minute Intraday production model.
 - No raw price-level feature is required for the new contract.
 - Labels never cross the NSE regular-session boundary.
 - Targets are market-neutral by decision timestamp and horizon.
-- Independent +5/+10/+15/+20/+25/+30 minute models.
-- Separate per-horizon registries.
+- Legacy challenger: independent +5/+10/+15/+20/+25/+30 minute models.
+- Separate per-horizon registries. These are not used by the live
+  session-close dashboard or Paper Trading path.
 
 ## Data honesty controls
 - Missing historical information remains unknown; it is not replaced with synthetic values.

@@ -1,8 +1,21 @@
 # Production data-model contract
 
-The certified deployment artifact is a binary Logistic Regression model with target `target_30m` and 137 named input features.
+## Live capture contract: `target_session_close`
 
-## Direction semantics
+The live ALL-NSE capture predicts whether the **same-session 15:30 IST close** will be above the decision price. Rows carry:
+
+- `model_target = target_session_close`
+- `target_timestamp` = the same trading day at 15:30 IST
+- `horizon_minutes` / `minutes_to_close` = minutes remaining in the session
+- `probability_up_session_close`, `expected_return_session_close`
+
+The dashboard, Paper Trading and Live Test read these stored rows. They do not run a second on-demand model. The legacy `probability_up_30m` / `expected_return_30m` columns are read only as a fallback for archived rows written before the session-close migration.
+
+## Legacy certified artifact: `target_30m`
+
+The older certified deployment artifact is a binary Logistic Regression model with target `target_30m` and 137 named input features. It remains available for historical replay and audit, but it is **not** the live capture contract.
+
+### Direction semantics
 
 `target_30m = 1` means the future 30-minute return is **positive (UP)**.
 `target_30m = 0` means the future 30-minute return is **non-positive (DOWN/FLAT)**.

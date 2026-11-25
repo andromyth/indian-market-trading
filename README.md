@@ -29,8 +29,10 @@ All values can be changed from the sidebar.
 ### 3. Production ML delivery + intraday routing
 
 The dashboard now routes Delivery mode to the live ALL-NSE 59-feature
-classifier/regressor candidate and Intraday mode to the certified `target_30m`
-production model. Delivery now consumes a daily persisted PIT snapshot assembled
+classifier/regressor candidate. Intraday mode uses the stored ALL-NSE
+`target_session_close` capture: the probability that the same-session 15:30 IST
+close is above the decision price. The legacy `target_30m` artifact is retained
+only for replay/audit. Delivery now consumes a daily persisted PIT snapshot assembled
 from official NSE EOD/delivery plus available F&O, news/events and fundamentals.
 Current NSE equities are eligible automatically once they have 60 clean sessions;
 the build-time roster no longer permanently freezes IPO eligibility.
@@ -157,7 +159,7 @@ Run it from the sidebar with **Run 1-Year Prediction Audit**. You can download t
 
 The dashboard now has a **Historical Replay** view. Pick a past date, a stock, a mode and a prediction/holding horizon. The engine reconstructs the selected point-in-time input set, produces a prediction, then compares it with the subsequent **actual market move**.
 
-For Intraday replay, the certified `target_30m` production model is run on the historical 1-minute price history through the selected timestamp. The live capture path uses a separate session-close target (`target_session_close`, 15:30 IST) refreshed every five minutes; the replay artifact is unchanged. The result includes the ML signal, probability, confidence, data-readiness, reference price, ATR-based target/stop and the actual outcome after the selected minute horizon.
+For Intraday replay, the view currently reports that a point-in-time historical inference adapter is not connected; it no longer runs a 30-minute model. Live Intraday uses the stored session-close target (`target_session_close`, 15:30 IST) refreshed by the ALL-NSE five-minute capture.
 
 For Delivery replay, the existing causal rule engine is evaluated at the selected EOD date, with a configurable 1/3/5/10/20-trading-day forward horizon. The comparison uses the next trading day's open as the historical entry reference and reports subsequent return, target/stop touches and directional match.
 
@@ -165,9 +167,9 @@ The replay never substitutes **today's** news, F&O chain or corporate-event stat
 
 Each replay can be appended to a session ledger and exported as CSV for later analysis. The replay is designed to become the foundation for a larger prediction-vs-actual ledger and repeated daily audit without rebuilding the production ML model.
 
-The Historical Replay view also includes a **Batch Historical Prediction Audit**. It can replay the certified 30-minute Intraday model across a selected stock universe, date range, and decision interval. Cross-sectional features are built across the selected universe at each historical timestamp, and each prediction is joined to the next 30-minute actual outcome. Rows with incomplete optional information remain in the ledger and are flagged as data-limited rather than being silently discarded.
+The former **Batch Historical Prediction Audit** (30-minute Intraday replay) has been removed from the dashboard.
 
-The file `MODEL_DATA_MODEL_CONTRACT.md` documents the production target semantics: class 1 is UP (future 30-minute return > 0), class 0 is DOWN/FLAT, and `predict_proba()[:,1]` is therefore the UP probability. A BUY followed by a DOWN actual is a model miss; the dashboard does not invert the labels to make the prediction appear correct.
+The file `MODEL_DATA_MODEL_CONTRACT.md` documents the live `target_session_close` semantics and the legacy `target_30m` replay contract. A BUY followed by a DOWN actual is a model miss; the dashboard does not invert the labels to make the prediction appear correct.
 
 ## Free Historical Data Manager
 

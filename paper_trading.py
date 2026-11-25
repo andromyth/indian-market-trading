@@ -810,69 +810,16 @@ def _int_or_none(value):
         return None
 
 
-def _select_prediction_for_horizon(
-    predictions: list[dict],
-    horizon_min: int,
-    preferred: dict | None = None,
-) -> dict:
-    """Select only a prediction that explicitly matches the requested minute horizon."""
-    candidates = ([preferred] if isinstance(preferred, dict) and preferred else []) + list(predictions or [])
-    for item in candidates:
-        if _int_or_none(item.get("horizon_min")) == int(horizon_min):
-            return dict(item)
-    return {}
-
-
-def _intraday_horizon_table_rows(
-    predictions: list[dict] | None,
-    unavailable_reason: str = "",
-) -> list[dict]:
-    """Build a stable six-row table; missing horizons remain explicitly unavailable."""
-    by_horizon = {}
-    for item in predictions or []:
-        horizon = _int_or_none(item.get("horizon_min"))
-        if horizon in (5, 10, 15, 20, 25, 30):
-            by_horizon[horizon] = dict(item)
-
-    rows = []
-    for horizon in (5, 10, 15, 20, 25, 30):
-        item = by_horizon.get(horizon)
-        if item is None:
-            rows.append({
-                "Horizon": f"+{horizon} min",
-                "Signal": "UNAVAILABLE",
-                "P(up)": "—",
-                "Expected return": "—",
-                "Forecast price": "—",
-                "Feature coverage": "—",
-                "Model status": "NOT RUN",
-                "Reason": unavailable_reason or "No output returned for this horizon.",
-            })
-            continue
-
-        probability = _finite_or_none(item.get("probability_up"))
-        expected_return = _finite_or_none(item.get("expected_return"))
-        predicted_price = _finite_or_none(item.get("predicted_price"))
-        coverage = _finite_or_none(item.get("feature_coverage"))
-        signal = str(item.get("signal") or "ABSTAIN").upper()
-        reason = str(item.get("reason") or item.get("signal_reason") or "")
-        if signal == "ABSTAIN":
-            model_status = "ABSTAIN"
-        elif predicted_price is None:
-            model_status = str(item.get("price_forecast_status") or "SIGNAL ONLY")
-        else:
-            model_status = "OUTPUT"
-        rows.append({
-            "Horizon": f"+{horizon} min",
-            "Signal": signal,
-            "P(up)": f"{probability:.1%}" if probability is not None else "—",
-            "Expected return": f"{expected_return:+.2%}" if expected_return is not None else "—",
-            "Forecast price": f"₹{predicted_price:,.2f}" if predicted_price is not None else "—",
-            "Feature coverage": f"{coverage:.1%}" if coverage is not None else "—",
-            "Model status": model_status,
-            "Reason": reason,
-        })
-    return rows
+def _session_close_prediction(snapshot: dict) -> tuple[dict, str, str]:
+    """Read the stored same-session 15:30 prediction; never run a second model."""
+    snapshot = snapshot or {}
+    prediction = dict(snapshot.get("prediction") or {})
+    status = "READY" if snapshot.get("prediction_ready") else "NOT READY"
+    reason = snapshot.get("prediction_freshness_reason") or (
+        "A fresh completed stock bar and fresh benchmark context are required "
+        "for the session-close model."
+    )
+    return prediction, status, reason
 
 
 def _format_timestamp(value: str):
@@ -1156,7 +1103,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         ["INTRADAY", "DELIVERY"],
         horizontal=True,
         key="paper_trading_segment",
-        format_func=lambda value: "Intraday · 30-minute forecast" if value == "INTRADAY" else "Delivery · 7-session OHLC forecast",
+        format_func=lambda value: "Intraday · session-close forecast" if value == "INTRADAY" else "Delivery · 7-session OHLC forecast",
     )
     st.caption(
         "Intraday, Delivery and Legacy use separately allocated cash and margin. "
@@ -1200,19 +1147,9 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             )
 
     price = _finite_or_none(snapshot.get("price"))
-    predictions = snapshot.get("predictions") or []
-    intraday_horizons_returned = {
-        int(item.get("horizon_min", 0) or 0)
-        for item in predictions
-        if int(item.get("horizon_min", 0) or 0) in (5, 10, 15, 20, 25, 30)
-    }
     if segment == "INTRADAY":
-        selected_prediction = _select_prediction_for_horizon(
-            predictions, 30, snapshot.get("prediction")
-        )
-        prediction_status = "READY" if selected_prediction and snapshot.get("prediction_ready") else "NOT READY"
-        prediction_unavailable_reason = snapshot.get("prediction_freshness_reason") or (
-            "A fresh completed stock bar and fresh benchmark context are required for the 30-minute model."
+        selected_prediction, prediction_status, prediction_unavailable_reason = (
+            _session_close_prediction(snapshot)
         )
     else:
         delivery_rows = delivery_forecast.get("forecasts", []) or []
@@ -1238,12 +1175,8 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         c1.metric("Live market price", f"₹{price:,.2f}")
         c2.metric("Quote status", "FRESH BAR" if fresh else "QUOTE ONLY / STALE")
         c3.metric(
-            "Intraday horizons" if segment == "INTRADAY" else "7-session forecast",
-            (
-                f"{len(intraday_horizons_returned)}/6 returned"
-                if segment == "INTRADAY" else
-                str(selected_prediction.get("signal") or "UNAVAILABLE")
-            ),
+            "Session-close prediction" if segment == "INTRADAY" else "7-session forecast",
+            str(selected_prediction.get("signal") or "UNAVAILABLE"),
         )
         st.caption(
             f"Quote source: {price_source} · Last update: {_format_timestamp(quote_timestamp)}"
@@ -1252,7 +1185,7 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
             if segment == "INTRADAY":
                 st.warning(
                     f"Quote is available, but it is not verified as a fresh completed current-session OHLC bar. "
-                    f"{snapshot.get('price_freshness_reason') or 'The 30-minute intraday model requires fresh stock and benchmark inputs.'}"
+                    f"{snapshot.get('price_freshness_reason') or 'The session-close model requires fresh stock and benchmark inputs.'}"
                 )
             else:
                 st.caption(
@@ -1264,40 +1197,39 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
     else:
         st.info(
             "Enter an NSE symbol and refresh to load its current market value and "
-            + ("30-minute Intraday prediction." if segment == "INTRADAY" else "seven-session Delivery OHLC forecast.")
+            + ("session-close prediction." if segment == "INTRADAY" else "seven-session Delivery OHLC forecast.")
         )
 
     if segment == "INTRADAY":
-        st.subheader("Intraday predictions · 5, 10, 15, 20, 25 and 30 minutes")
-        intraday_rows = _intraday_horizon_table_rows(
-            predictions,
-            unavailable_reason=prediction_unavailable_reason,
-        )
-        returned_horizons = intraday_horizons_returned
-        st.caption(
-            f"Model outputs received: {len(returned_horizons)}/6 · "
-            "Each horizon is evaluated independently from the same latest eligible decision anchor."
-        )
-        st.dataframe(
-            pd.DataFrame(intraday_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-        if not returned_horizons:
-            st.warning(
-                "No intraday horizon could be calculated. All six horizons are shown as unavailable; "
-                + (prediction_unavailable_reason or "fresh stock and benchmark OHLC bars are required.")
-            )
-        elif len(returned_horizons) < 6:
-            missing = sorted(set((5, 10, 15, 20, 25, 30)) - returned_horizons)
-            st.warning(f"Missing model outputs for: {', '.join(f'{value} min' for value in missing)}.")
+        st.subheader("To-close prediction · session close (15:30 IST)")
+        minutes_to_close = _finite_or_none(selected_prediction.get("minutes_to_close"))
+        probability = _finite_or_none(selected_prediction.get("probability_up"))
+        expected_return = _finite_or_none(selected_prediction.get("expected_return"))
+        horizon_label = f"+{int(minutes_to_close)} min to close" if minutes_to_close is not None else "session close"
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Signal", str(selected_prediction.get("signal") or "HOLD"))
+        c2.metric("P(up to close)", f"{probability:.1%}" if probability is not None else "—")
+        c3.metric("Expected return", f"{expected_return:+.2%}" if expected_return is not None else "—")
+        c4.metric("Horizon", horizon_label)
         if selected_prediction:
-            prediction_caption = (
-                f"Order annotation default: +30 min · "
-                f"Model: {selected_prediction.get('model_version') or 'unknown'} · "
-                f"Decision time: {_format_timestamp(str(selected_prediction.get('decision_timestamp') or ''))}"
+            data_readiness = _finite_or_none(selected_prediction.get("data_readiness_score"))
+            model_version = selected_prediction.get("model_version") or "unknown"
+            decision_ts = selected_prediction.get("decision_timestamp") or ""
+            readiness_text = (
+                f"Data readiness: {float(data_readiness):.0%}"
+                if data_readiness is not None
+                else "Data readiness: —"
             )
-            st.caption(prediction_caption)
+            st.caption(
+                f"Order annotation default: exit at session close · "
+                f"Model: {model_version} · {readiness_text} · "
+                f"Decision: {_format_timestamp(decision_ts)}"
+            )
+        if prediction_status != "READY":
+            st.warning(
+                prediction_unavailable_reason
+                or "No stored ALL-NSE session-close prediction is available for this symbol."
+            )
     else:
         st.subheader("Delivery forecast · next 7 NSE sessions")
         forecasts = delivery_forecast.get("forecasts", []) or []

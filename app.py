@@ -59,19 +59,16 @@ from free_data import (
 )
 from selfdriving.sd_v2_runtime import (
     beta_delivery_predict,
-    beta_intraday_predict,
     beta_status,
 )
 from selfdriving.stepwise_forecast import stepwise_horizon_path
 from live_signal_guards import (
-    assess_horizon_completeness,
     latest_completed_bar_status,
     target_session_is_underway,
 )
 
 from prediction_validation import validate_ledger, rolling_7day_scorecard
 from model_health import assess_delivery_health
-from historical_audit import run_batch_intraday_audit
 from historical_replay import (
     historical_price, historical_benchmark, historical_news, historical_announcements,
     actual_outcome, replay_rule_delivery, _entry_exit_metrics,
@@ -252,9 +249,13 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                 if not prediction_frame.empty and "symbol" in prediction_frame.columns:
                     prediction_frame = normalize_symbols(prediction_frame)
                     keep = [
-                        "symbol", "prediction_status", "signal", "probability_up_30m",
-                        "expected_return_30m", "confidence", "data_readiness_score",
-                        "model_version", "forecast_target_timestamp_utc",
+                        "symbol", "prediction_status", "signal",
+                        "probability_up_session_close", "probability_up_30m",
+                        "expected_return_session_close", "expected_return_30m",
+                        "horizon_minutes", "minutes_to_close", "target_timestamp",
+                        "snapshot_minute_ist", "confidence", "data_readiness_score",
+                        "model_version", "model_target", "prediction_horizon",
+                        "forecast_target_timestamp_utc",
                         "actual_market_value", "actual_observed_at_utc",
                         "actual_quote_status", "actual_quote_age_seconds",
                         "source_snapshot_drive_path", "error",
@@ -1245,23 +1246,32 @@ def _auto_watch_intraday(symbol: str) -> dict:
         ):
             return cached
 
-        predictions = beta_intraday_predict(symbol, completed, market_frame)
-        by_horizon = {
-            int(item.get("horizon_min", 0)): item
-            for item in predictions
-            if int(item.get("horizon_min", 0)) in {5, 15, 30}
-        }
-        completeness = assess_horizon_completeness(by_horizon, (5, 15, 30))
-        out = {
-            "status": completeness["status"],
-            "reason": completeness.get("reason"),
-            "latest_candle_ist": latest_ts.isoformat(),
-            "market_latest_candle_ist": market_latest_ts,
-            "source": source,
-            "age_seconds": age_seconds,
-            "refresh_revision": refresh_revision,
-            "horizons": by_horizon,
-        }
+        row = _latest_stored_prediction_for_symbol(symbol)
+        if row is None:
+            out = {
+                "status": "NO_STORED_PREDICTION",
+                "reason": "No stored ALL-NSE session-close prediction is available for this symbol.",
+                "latest_candle_ist": latest_ts.isoformat(),
+                "market_latest_candle_ist": market_latest_ts,
+                "source": source,
+                "age_seconds": age_seconds,
+                "refresh_revision": refresh_revision,
+                "horizons": {},
+                "session_close_prediction": None,
+            }
+        else:
+            horizon_min = row.get("horizon_minutes")
+            out = {
+                "status": "OK" if _stored_prediction_is_ready(row) else "PREDICTION_NOT_READY",
+                "reason": row.get("error") or "",
+                "latest_candle_ist": latest_ts.isoformat(),
+                "market_latest_candle_ist": market_latest_ts,
+                "source": source,
+                "age_seconds": age_seconds,
+                "refresh_revision": refresh_revision,
+                "horizons": {int(horizon_min): row} if horizon_min is not None else {},
+                "session_close_prediction": row,
+            }
         st.session_state[state_key] = out
         return out
     except Exception as exc:
@@ -1271,6 +1281,50 @@ def _auto_watch_intraday(symbol: str) -> dict:
             "latest_candle_ist": latest_ts.isoformat(),
             "source": source,
         }
+
+
+def _stored_prediction_is_ready(row: dict[str, Any] | None) -> bool:
+    """True only for a persisted, snapshot-linked, successfully predicted row."""
+    if not isinstance(row, dict) or not row:
+        return False
+    if not bool(row.get("_prediction_row_stored")):
+        return False
+    if str(row.get("prediction_snapshot_link_status") or "") != "MATCHED_TO_SNAPSHOT_QUOTE":
+        return False
+    if not str(row.get("prediction_status") or "").upper().startswith("PREDICTED"):
+        return False
+    probability = pd.to_numeric(
+        pd.Series([row.get("probability_up_session_close")]), errors="coerce"
+    ).iloc[0]
+    return bool(pd.notna(probability) and np.isfinite(float(probability)))
+
+
+def _latest_stored_prediction_for_symbol(symbol: str) -> dict[str, Any] | None:
+    """Read the latest stored ALL-NSE session-close prediction for one symbol.
+
+    Returns the raw Drive row dict, or None when the latest snapshot has no
+    stored prediction row for that symbol.
+    """
+    try:
+        snapshot = _cached_latest_all_nse_5m_snapshot()
+    except Exception:
+        return None
+    if snapshot.get("status") != "OK":
+        return None
+    rows = snapshot.get("rows")
+    if rows is None or getattr(rows, "empty", True):
+        return None
+    root = str(symbol).strip().upper().replace(".NS", "").replace(".BO", "")
+    match = rows.loc[rows["symbol"].astype(str).str.upper() == root]
+    if match.empty:
+        return None
+    if "_prediction_row_stored" in match.columns:
+        match = match.loc[match["_prediction_row_stored"].astype(bool)]
+    if match.empty:
+        return None
+    row = match.iloc[0].to_dict()
+    row["_snapshot_cycle_minute_ist"] = snapshot.get("cycle_minute_ist")
+    return row
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -1391,46 +1445,64 @@ def _cached_paper_trading_snapshot(
             require_current_session=True,
         )
         output["market_context_freshness_status"] = str(market_guard.get("status") or "UNKNOWN")
-        if price is None or not price_guard.get("ok"):
-            output["prediction_freshness_reason"] = str(
-                price_guard.get("reason") or "No usable fresh stock-price input is available."
-            )
-        elif not market_guard.get("ok"):
-            output["prediction_freshness_reason"] = (
-                f"{benchmark} market context is not fresh: "
-                f"{market_guard.get('reason') or market_guard.get('status')}"
-            )
-        else:
-            output["prediction_freshness_reason"] = ""
-        if not price_guard.get("ok") or not market_guard.get("ok") or price is None:
-            return output
+        output["prediction_freshness_reason"] = ""
 
-        predictions = beta_intraday_predict(
-            canonical,
-            completed,
-            market_frame,
-            decision_interval_minutes=5,
-        )
-        requested_horizons = (5, 10, 15, 20, 25, 30)
-        intraday_horizons = {
-            int(item.get("horizon_min", 0) or 0): dict(item)
-            for item in (predictions or [])
-            if int(item.get("horizon_min", 0) or 0) in requested_horizons
-        }
-        output["predictions"] = [
-            intraday_horizons[horizon]
-            for horizon in requested_horizons
-            if horizon in intraday_horizons
-        ]
-        thirty_minute = intraday_horizons.get(30, {})
-        output["prediction"] = thirty_minute
-        output["prediction_ready"] = bool(thirty_minute)
-        output["prediction_horizon_min"] = 30
-        output["prediction_horizons_returned"] = sorted(intraday_horizons)
-        if not thirty_minute:
-            output["prediction_freshness_reason"] = (
-                "The runtime returned no eligible 30-minute prediction."
-            )
+        # The session-close prediction is a stored artifact from the ALL-NSE
+        # capture. Reading it must not depend on local quote freshness and must
+        # never trigger a second on-demand inference.
+        row = _latest_stored_prediction_for_symbol(canonical)
+        prediction_row = {}
+        if row is not None:
+            horizon_min = row.get("horizon_minutes")
+            prediction_row = {
+                "horizon_min": int(horizon_min) if horizon_min is not None else None,
+                "signal": str(row.get("signal") or "HOLD"),
+                "probability_up": row.get("probability_up_session_close"),
+                "expected_return": row.get("expected_return_session_close"),
+                "confidence": row.get("confidence"),
+                "data_readiness_score": row.get("data_readiness_score"),
+                "model_version": row.get("model_version"),
+                "decision_timestamp": row.get("snapshot_minute_ist") or row.get("forecast_target_timestamp_utc"),
+                "reason": row.get("error") or "",
+                "prediction_status": row.get("prediction_status"),
+                "model_target": row.get("model_target"),
+                "prediction_horizon": row.get("prediction_horizon"),
+                "minutes_to_close": row.get("minutes_to_close"),
+                "target_timestamp": row.get("target_timestamp"),
+                "snapshot_link_status": row.get("prediction_snapshot_link_status"),
+            }
+        cycle_age_seconds = None
+        if row is not None:
+            cycle_ts = pd.to_datetime(row.get("_snapshot_cycle_minute_ist"), errors="coerce")
+            if pd.notna(cycle_ts):
+                cycle_ts = (
+                    cycle_ts.tz_localize("Asia/Kolkata")
+                    if cycle_ts.tzinfo is None else cycle_ts.tz_convert("Asia/Kolkata")
+                )
+                cycle_age_seconds = max(0.0, (now - cycle_ts).total_seconds())
+
+        stored_ready = _stored_prediction_is_ready(row)
+        stale_cycle = cycle_age_seconds is not None and cycle_age_seconds > 12 * 60
+        output["predictions"] = [prediction_row] if prediction_row else []
+        output["prediction"] = prediction_row
+        output["prediction_ready"] = bool(stored_ready and not stale_cycle)
+        output["prediction_horizon_min"] = prediction_row.get("horizon_min")
+        output["prediction_horizons_returned"] = ([prediction_row.get("horizon_min")] if prediction_row.get("horizon_min") is not None else [])
+        output["prediction_cycle_age_seconds"] = cycle_age_seconds
+        if not output["prediction_ready"]:
+            status = str(prediction_row.get("prediction_status") or "").upper()
+            if stale_cycle:
+                reason = (
+                    f"The stored prediction cycle is {cycle_age_seconds / 60:.1f} minutes old "
+                    "(maximum 12 minutes)."
+                )
+            elif prediction_row:
+                reason = prediction_row.get("reason") or (
+                    f"Stored session-close prediction is not live-ready (status {status})."
+                )
+            else:
+                reason = "No stored ALL-NSE session-close prediction is available for this symbol."
+            output["prediction_freshness_reason"] = reason
         return output
     except Exception as exc:
         return {
@@ -1677,8 +1749,13 @@ if interface_mode == "Live Test":
             cycle_minute = str(stored_view.get("cycle_minute_ist") or "Unknown")
             captured_count = int(rows_5m["capture_complete"].sum()) if "capture_complete" in rows_5m else 0
             prediction_count = int(
-                pd.to_numeric(rows_5m.get("probability_up_30m"), errors="coerce").notna().sum()
-            ) if "probability_up_30m" in rows_5m else 0
+                pd.to_numeric(
+                    rows_5m.get("probability_up_session_close")
+                    if "probability_up_session_close" in rows_5m
+                    else rows_5m.get("probability_up_30m"),
+                    errors="coerce",
+                ).notna().sum()
+            ) if ("probability_up_session_close" in rows_5m or "probability_up_30m" in rows_5m) else 0
             prediction_rows_stored = int(rows_5m["prediction_stored"].sum()) if "prediction_stored" in rows_5m else 0
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Stored symbol rows", f"{len(rows_5m):,}")
@@ -1704,16 +1781,26 @@ if interface_mode == "Live Test":
             if view_filter == "Complete quote captured":
                 filtered = filtered.loc[filtered["capture_complete"]]
             elif view_filter == "Prediction emitted":
-                if "probability_up_30m" in filtered:
+                prob_col = (
+                    "probability_up_session_close"
+                    if "probability_up_session_close" in filtered
+                    else ("probability_up_30m" if "probability_up_30m" in filtered else None)
+                )
+                if prob_col is not None:
                     filtered = filtered.loc[
-                        pd.to_numeric(filtered["probability_up_30m"], errors="coerce").notna()
+                        pd.to_numeric(filtered[prob_col], errors="coerce").notna()
                     ]
                 else:
                     filtered = filtered.iloc[0:0]
             elif view_filter == "Needs attention":
+                prob_col = (
+                    "probability_up_session_close"
+                    if "probability_up_session_close" in filtered
+                    else ("probability_up_30m" if "probability_up_30m" in filtered else None)
+                )
                 has_prediction = (
-                    pd.to_numeric(filtered["probability_up_30m"], errors="coerce").notna()
-                    if "probability_up_30m" in filtered
+                    pd.to_numeric(filtered[prob_col], errors="coerce").notna()
+                    if prob_col is not None
                     else pd.Series(False, index=filtered.index)
                 )
                 filtered = filtered.loc[~filtered["capture_complete"] | ~has_prediction]
@@ -1722,8 +1809,10 @@ if interface_mode == "Live Test":
                 "symbol", "quote_status", "capture_complete", "actual_observed_price",
                 "quote_observed_at_ist", "snapshot_stored", "prediction_stored",
                 "prediction_status", "prediction_snapshot_link_status", "signal",
-                "actual_market_value", "actual_observed_at_utc", "probability_up_30m",
-                "expected_return_30m", "confidence", "data_readiness_score",
+                "actual_market_value", "actual_observed_at_utc",
+                "probability_up_session_close", "probability_up_30m",
+                "expected_return_session_close", "expected_return_30m",
+                "confidence", "data_readiness_score",
                 "forecast_target_timestamp_utc", "model_version", "error",
             ]
             display_columns = [column for column in display_columns if column in filtered.columns]
@@ -2099,8 +2188,18 @@ if interface_mode == "Live Test":
                 )
                 return
             signal = str(row.get("signal") or "HOLD").upper()
-            probability = pd.to_numeric(row.get("probability_up_30m"), errors="coerce")
-            expected_return = pd.to_numeric(row.get("expected_return_30m"), errors="coerce")
+            probability = pd.to_numeric(
+                row.get("probability_up_session_close")
+                if row.get("probability_up_session_close") is not None
+                else row.get("probability_up_30m"),
+                errors="coerce",
+            )
+            expected_return = pd.to_numeric(
+                row.get("expected_return_session_close")
+                if row.get("expected_return_session_close") is not None
+                else row.get("expected_return_30m"),
+                errors="coerce",
+            )
             reference_price = pd.to_numeric(row.get("actual_market_value"), errors="coerce")
             predicted_price = (
                 float(reference_price) * (1.0 + float(expected_return))
@@ -2108,9 +2207,9 @@ if interface_mode == "Live Test":
             )
             p1, p2, p3, p4 = st.columns(4)
             p1.metric("Snapshot price", f"₹{float(reference_price):,.2f}" if pd.notna(reference_price) else "—")
-            p2.metric("GitHub signal · 30m", signal)
-            p3.metric("P(up) · 30m", f"{float(probability):.1%}" if pd.notna(probability) else "—")
-            p4.metric("Forecast price · 30m", f"₹{predicted_price:,.2f}" if pd.notna(predicted_price) else "Unavailable")
+            p2.metric("Signal · session close", signal)
+            p3.metric("P(up) · close", f"{float(probability):.1%}" if pd.notna(probability) else "—")
+            p4.metric("Forecast price · close", f"₹{predicted_price:,.2f}" if pd.notna(predicted_price) else "Unavailable")
             target_ts = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
             details = {
                 "Prediction cycle (IST)": cycle_ts.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2175,49 +2274,8 @@ if analysis_view == "Historical Replay":
         except Exception as exc:
             st.error(f"Beta V2 status check failed: {type(exc).__name__}: {exc}")
 
-    batch_audit = st.sidebar.checkbox("Batch historical audit", value=False, help="Run many historical 30-minute predictions and compare each with the subsequent actual move.")
-    if batch_audit:
-        st.sidebar.subheader("Batch audit settings")
-        batch_start = st.sidebar.date_input("Audit start date", value=pd.Timestamp("2026-09-01").date(), min_value=pd.Timestamp("2018-01-01").date(), max_value=pd.Timestamp.now().date(), key="batch_start")
-        batch_end = st.sidebar.date_input("Audit end date", value=pd.Timestamp("2026-09-25").date(), min_value=pd.Timestamp("2018-01-01").date(), max_value=pd.Timestamp.now().date(), key="batch_end")
-        batch_start_time = st.sidebar.time_input("First decision time (IST)", value=pd.Timestamp("10:00").time(), step=60, key="batch_start_time")
-        batch_end_time = st.sidebar.time_input("Last decision time (IST)", value=pd.Timestamp("14:00").time(), step=60, key="batch_end_time")
-        batch_step = st.sidebar.selectbox("Decision interval", [30, 60], index=0, format_func=lambda x: f"Every {x} minutes", key="batch_step")
-        batch_symbols = [normalize_symbol(x) for x in st.sidebar.text_area("Batch symbols", ", ".join(symbols[:10]), key="batch_symbols").split(",") if x.strip()]
-        run_batch = st.sidebar.button("Run Batch Audit", type="primary", key="run_batch_audit")
-        st.markdown("## Batch Historical Prediction Audit")
-        st.caption("Each 30-minute prediction is reconstructed point-in-time across the selected universe. The production target is UP when the next 30-minute return is positive. Predictions with less than 70% information-group readiness are retained but excluded from the headline eligible accuracy.")
-        if run_batch:
-            with st.spinner("Running point-in-time batch audit…"):
-                try:
-                    audit_df, audit_summary = run_batch_intraday_audit(batch_symbols, batch_start, batch_end, batch_start_time, batch_end_time, batch_step)
-                    st.success(f"Batch audit completed: {audit_summary['total_predictions']:,} prediction rows.")
-                    q1,q2,q3,q4 = st.columns(4)
-                    q1.metric("Predictions", f"{audit_summary['total_predictions']:,}")
-                    q2.metric("Actuals available", f"{audit_summary['eligible_predictions']:,}")
-                    q3.metric("Directional accuracy", "N/A" if audit_summary['directional_accuracy'] is None else f"{audit_summary['directional_accuracy']:.1%}")
-                    q4.metric("Data-limited", f"{audit_summary['data_limited_predictions']:,}")
-                    st.write({
-                        "full_data_eligible_predictions": audit_summary.get("full_data_eligible_predictions", 0),
-                        "full_data_directional_accuracy": audit_summary.get("full_data_directional_accuracy"),
-                        "mean_brier_error": audit_summary.get("mean_brier_error"),
-                        "average_actual_move_pct": audit_summary.get("average_actual_move_pct"),
-                        "average_signed_move_pct": audit_summary.get("average_signed_move_pct"),
-                    })
-                    if audit_summary['directional_accuracy'] is not None:
-                        st.write({k:v for k,v in audit_summary.items() if k not in {"symbols_requested","symbols_scored"}})
-                    if not audit_df.empty:
-                        st.markdown("### Prediction vs actual ledger")
-                        st.dataframe(audit_df.sort_values("timestamp", ascending=False), width="stretch", hide_index=True)
-                        csv = audit_df.to_csv(index=False).encode("utf-8")
-                        st.download_button("Download batch audit CSV", csv, file_name="historical_prediction_audit.csv", mime="text/csv")
-                        mistakes = audit_df[(audit_df["direction_match"] == False) & (audit_df["audit_eligible"])]
-                        if not mistakes.empty:
-                            with st.expander("Eligible wrong-direction predictions", expanded=False):
-                                st.dataframe(mistakes.sort_values("timestamp", ascending=False), width="stretch", hide_index=True)
-                except Exception as exc:
-                    st.error(f"Batch historical audit failed: {type(exc).__name__}: {exc}")
-        st.stop()
+    # The 30-minute batch audit was removed. Live and replay predictions now
+    # use the same-session 15:30 close contract only.
 
     replay_mode = st.sidebar.radio("Replay mode", ["Delivery", "Intraday", "F&O (underlying replay)"], index=1)
     replay_symbol = normalize_symbol(st.sidebar.text_input("Replay stock", symbols[0] if symbols else "BHARTIARTL.NS"))
@@ -2227,7 +2285,8 @@ if analysis_view == "Historical Replay":
     )
     if replay_mode == "Intraday" or replay_mode.startswith("F&O"):
         replay_time = st.sidebar.time_input("Historical time (IST)", value=pd.Timestamp("10:30").time(), step=60)
-        replay_horizon = st.sidebar.selectbox("Production ML horizon", [30], index=0, format_func=lambda x: f"{x} minutes")
+        replay_horizon = 30  # internal price-fetch window; target is the same-session 15:30 close
+        st.sidebar.caption("Target: same-session 15:30 close")
     else:
         replay_time = pd.Timestamp("15:30").time()
         replay_horizon = st.sidebar.selectbox("Holding horizon", [1, 3, 5, 10, 20], index=2, format_func=lambda x: f"{x} trading day(s)")
@@ -2330,7 +2389,7 @@ if analysis_view == "Historical Replay":
                     st.error(f"Historical Delivery replay failed: {type(exc).__name__}: {exc}")
 
         else:
-            with st.spinner("Reconstructing minute-level history and running the production 30-minute model…"):
+            with st.spinner("Reconstructing minute-level history and running the session-close model…"):
                 start = decision_ts - pd.Timedelta(days=20)
                 end = decision_ts + pd.Timedelta(minutes=int(replay_horizon) + 5)
                 price_df = historical_price(replay_symbol, start, end, interval="1m")
@@ -2994,16 +3053,17 @@ for rec in live_records:
 
     ml = production_results.get(symbol)
     if style == "Intraday":
-        st.markdown("### Production ML — next 30-minute direction")
+        st.markdown("### Production ML — session-close direction")
         if ml:
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("ML Signal", ml["signal"])
-            m2.metric("P(up) 30m", f"{ml['probability_up_30m']:.1%}")
-            m3.metric("Confidence", ml["confidence"])
-            m4.metric("Data readiness", f"{ml['data_readiness_score']:.0%}")
+            m1.metric("ML Signal", ml.get("signal", "HOLD"))
+            p_up = ml.get("probability_up_session_close") or ml.get("probability_up_30m")
+            m2.metric("P(up) · close", f"{float(p_up):.1%}" if p_up is not None else "—")
+            m3.metric("Confidence", ml.get("confidence", "—"))
+            m4.metric("Data readiness", f"{float(ml.get('data_readiness_score', 0)):.0%}")
             st.caption(
-                "Certified logistic-regression production model · 137-feature contract · target_30m. "
-                "The probability is the model output, not a guarantee of profit. Missing optional live groups are explicitly represented and handled by the trained imputer."
+                "Session-close model · target_session_close. "
+                "The probability is the model output, not a guarantee of profit."
             )
         else:
             st.warning("Production ML prediction unavailable for this symbol; the rule-based context remains available.")
