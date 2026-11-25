@@ -1,0 +1,89 @@
+name: Probe live worker diagnostics
+
+# Read-only post-deploy verification of the production intraday worker.
+# Prints /readyz, /modelz, /providerz and /capturez so the runbook can confirm
+# which model API is serving, its serving mode and the freshness of the latest
+# persisted ALL-NSE prediction row. It never promotes traffic or places orders.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probe-live-worker-diagnostics
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Probe diagnostics endpoints
+        shell: bash
+        run: |
+          set -uo pipefail
+          URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          echo "SERVICE_URL=$URL"
+          gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" \
+            --format='table(status.traffic[].revisionName,status.traffic[].percent,status.latestReadyRevisionName)'
+          TOKEN="$(gcloud auth print-identity-token --audiences="$URL")"
+          for PATH_NAME in readyz modelz providerz capturez; do
+            OUT="$(mktemp)"
+            CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 240 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+              --output "$OUT" --write-out "%{http_code}" "$URL/$PATH_NAME")"
+            echo "PROBE_${PATH_NAME^^}_HTTP=$CODE"
+            python - "$OUT" "$PATH_NAME" <<'PY'
+          import json, sys
+          path, name = sys.argv[1:]
+          try:
+              data = json.load(open(path, encoding="utf-8"))
+          except Exception as exc:
+              print(f"PROBE_{name.upper()}_JSON=INVALID ({type(exc).__name__})")
+              raise SystemExit(0)
+          checks = data.get("checks") or {}
+          summary = {
+              "status": data.get("status"),
+              "probe": data.get("probe"),
+              "reason": data.get("reason"),
+              "error_type": data.get("error_type"),
+          }
+          for key in (
+              "model_api", "model_status", "model_version", "trained_through",
+              "serving_mode", "serving_reason", "target", "prediction_horizon",
+              "bar_interval_minutes", "feature_count_manifest", "feature_count_runtime",
+              "feature_list_matches_runtime", "artifact_hashes_match",
+              "training_symbol_count", "drive_configured", "drive_reachable",
+              "drive_write_ready", "credentials_configured",
+              "cycle_minute_ist", "age_seconds", "row_count", "prediction_count",
+              "prediction_coverage_pct", "drive_path",
+          ):
+              if key in checks:
+                  summary[key] = checks[key]
+          for key in (
+              "cycle_minute_ist", "age_seconds", "row_count", "prediction_count",
+              "prediction_coverage_pct", "drive_path", "reasons",
+          ):
+              if key in data and key not in summary:
+                  summary[key] = data[key]
+          print(f"PROBE_{name.upper()}_JSON=" + json.dumps(summary, sort_keys=True, default=str))
+          PY
+            rm -f "$OUT"
+          done
