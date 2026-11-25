@@ -44,7 +44,7 @@ jobs:
           gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" \
             --format='table(status.traffic[].revisionName,status.traffic[].percent,status.latestReadyRevisionName)'
           TOKEN="$(gcloud auth print-identity-token --audiences="$URL")"
-          for PATH_NAME in readyz modelz providerz capturez; do
+          for PATH_NAME in readyz modelz providerz capturez backfillz; do
             OUT="$(mktemp)"
             CODE="$(curl --silent --show-error --connect-timeout 10 --max-time 240 \
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
