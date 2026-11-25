@@ -1466,6 +1466,7 @@ def _cached_paper_trading_snapshot(
                 "reason": row.get("error") or "",
                 "prediction_status": row.get("prediction_status"),
                 "model_target": row.get("model_target"),
+                "model_serving_mode": row.get("model_serving_mode"),
                 "prediction_horizon": row.get("prediction_horizon"),
                 "minutes_to_close": row.get("minutes_to_close"),
                 "target_timestamp": row.get("target_timestamp"),

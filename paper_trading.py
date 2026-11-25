@@ -1214,17 +1214,25 @@ def render_paper_trading(snapshot_loader, delivery_prediction_loader=None) -> No
         if selected_prediction:
             data_readiness = _finite_or_none(selected_prediction.get("data_readiness_score"))
             model_version = selected_prediction.get("model_version") or "unknown"
+            serving_mode = str(selected_prediction.get("model_serving_mode") or "").upper()
             decision_ts = selected_prediction.get("decision_timestamp") or ""
             readiness_text = (
                 f"Data readiness: {float(data_readiness):.0%}"
                 if data_readiness is not None
                 else "Data readiness: —"
             )
+            mode_text = f" · Serving: {serving_mode}" if serving_mode else ""
             st.caption(
                 f"Order annotation default: exit at session close · "
-                f"Model: {model_version} · {readiness_text} · "
+                f"Model: {model_version} · {readiness_text}{mode_text} · "
                 f"Decision: {_format_timestamp(decision_ts)}"
             )
+            if serving_mode == "HOLD":
+                st.info(
+                    "The champion is in HOLD (fail-safe). The session-close probability is still "
+                    "stored and shown, but signals stay suppressed until the nightly retrain "
+                    "advances the champion or the gate re-activates."
+                )
         if prediction_status != "READY":
             st.warning(
                 prediction_unavailable_reason

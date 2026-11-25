@@ -95,6 +95,20 @@ Open Google Cloud Console → **Cloud Run** → indian-market-intraday-worker �
 
 A weekend, NSE holiday, pre-open or post-close log should show MARKET_CLOSED/no market data cycle. Stale/missing stock or benchmark candles cause the affected prediction to be withheld rather than guessed.
 
+### Model-serving diagnostics (`/modelz`)
+
+The worker exposes read-only probes that the deploy workflow uses as a promotion gate:
+
+| Probe | What it proves |
+| --- | --- |
+| `/modelz` | The model the capture actually serves loads, matches the `target_session_close` / 5-minute contract, has verified artifact hashes, and Drive is read/write ready |
+| `/providerz` | The worker's own INDstocks credentials can fetch a quote and a 5-minute bar |
+| `/capturez` | The latest persisted ALL-NSE prediction row is fresh and non-empty |
+
+`/modelz` binds the same API as the capture, in the same order: the nightly to-close champion at `production_data/all_nse_champion/champion.json` (target `target_session_close`, features from `features_5m`) and only then the legacy pooled bundle at `models/all_nse_intraday_session_close_multifactor_2026`. The response reports `checks.model_api` (`champion` or `legacy`), `checks.serving_mode` and `checks.trained_through`, so a green probe is also a statement about which artifact is live.
+
+`serving_mode` is `LIVE`, `PAPER` or `HOLD`. `HOLD` is a fail-safe, not a deploy failure: rows are still persisted with `prediction_status=PREDICTED` and a session-close probability, but `signal` is forced to `HOLD`. The champion is put in `HOLD` when it is more than one stored session behind (`max_lag_sessions=1`), when its gate is not active, or when the live circuit breaker has halted it. A frozen champion therefore degrades to HOLD rather than trading a stale model; re-run `retrain_to_close.yml` to advance `trained_through`.
+
 ## Prediction learning and error diagnosis
 
 The separate `prediction_learning_engine.py` module runs at **16:30 IST on weekdays** through `.github/workflows/autonomous_prediction_learning.yml`, after the existing 16:00 IST outcomes audit. It reads persisted forecast ledgers and matching actual one-minute bar partitions, de-duplicates repeated forecast identities, and produces diagnosis slices by symbol, horizon, active model version, signal, input source, feature coverage and time of day.
