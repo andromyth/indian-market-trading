@@ -127,4 +127,37 @@ jobs:
               supportsAllDrives=True,
           ).execute()
           print("SESSION_CLOSE_FOLDERS=" + json.dumps(resp.get("files", []), sort_keys=True))
+
+          # Inspect the to-close champion lane that the capture prefers.
+          def read_text(file_id):
+              return service.files().get_media(fileId=file_id).execute().decode("utf-8", "replace")
+
+          def walk(path_parts):
+              parent = root_id
+              for part in path_parts:
+                  found = find_child(parent, part)
+                  if not found:
+                      return None
+                  parent = found["id"]
+              return parent
+
+          to_close = walk(["models", "to_close"])
+          print("TO_CLOSE_FOLDER_ID=" + json.dumps(to_close))
+          if to_close:
+              print("TO_CLOSE_CHILDREN=" + json.dumps(sorted(k.get("name") for k in children(to_close))))
+              latest = find_child(to_close, "latest.json")
+              if latest:
+                  print("TO_CLOSE_LATEST=" + read_text(latest["id"])[:4000])
+              runs = walk(["models", "to_close", "runs"])
+              if runs:
+                  run_dirs = sorted((k for k in children(runs) if k.get("mimeType") == FOLDER), key=lambda x: x.get("name", ""))
+                  print("TO_CLOSE_RUNS=" + json.dumps([{"name": k.get("name"), "id": k.get("id"), "children": sorted(c.get("name") for c in children(k["id"]))} for k in run_dirs], sort_keys=True))
+
+          champion = walk(["production_data", "all_nse_champion"])
+          print("CHAMPION_FOLDER_ID=" + json.dumps(champion))
+          if champion:
+              print("CHAMPION_CHILDREN=" + json.dumps(sorted(k.get("name") for k in children(champion))))
+              champ_json = find_child(champion, "champion.json")
+              if champ_json:
+                  print("CHAMPION_JSON=" + read_text(champ_json["id"])[:6000])
           PY
