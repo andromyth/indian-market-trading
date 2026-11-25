@@ -210,11 +210,15 @@ if serving_filter != "All" and "model_serving_mode" in view:
 
 columns = [
     "symbol", "signal", "probability_up_session_close", "expected_return_session_close",
-    "expected_return_session_close", "confidence", "prediction_status", "model_serving_mode",
-    "model_target", "model_coverage_symbols", "data_readiness_score", "signal_min_edge",
+    "confidence", "prediction_status", "model_serving_mode", "model_target",
+    "model_coverage_symbols", "data_readiness_score", "signal_min_edge",
     "forecast_target_timestamp_utc", "model_version",
 ]
-columns = [c for c in columns if c in view.columns]
+# Filter to columns that exist in the frame and de-duplicate while preserving
+# order. A duplicated name here used to produce a duplicate-column frame that
+# pyarrow rejected with ``Duplicate column names found`` when rendering the
+# dataframe.
+columns = list(dict.fromkeys(c for c in columns if c in view.columns))
 if "expected_return_session_close" in columns:
     view = view.sort_values("expected_return_session_close", ascending=False)
 st.dataframe(view[columns], width="stretch", hide_index=True, height=640)
