@@ -689,8 +689,33 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
 
 
 
+def _serving_model_api() -> tuple[Any, str]:
+    """The model API the capture actually binds, in the same order it tries them.
+
+    The capture prefers the nightly ``models/to_close`` champion and only falls back to the legacy
+    pooled bundle. Validating the legacy bundle here blocked deploys on an artifact that serving never
+    reads, so mirror the capture: champion first, legacy second.
+    """
+    mode = os.getenv("ALL_NSE_MODEL_API", "champion").strip().lower()
+    if mode not in {"legacy", "pooled", "all_nse"}:
+        try:
+            from persistent_store import gdrive_config
+
+            if gdrive_config().get("configured"):
+                import champion_model_api as champion
+                import daily_cycle
+
+                champion.configure(daily_cycle.make_drive_store())
+                return champion, "champion"
+        except Exception:  # noqa: BLE001 - fall through to the legacy bundle
+            pass
+    import all_nse_intraday_model as legacy
+
+    return legacy, "legacy"
+
+
 def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
-    """Validate the five-minute model and Drive writes using the runtime identity."""
+    """Validate the five-minute model serving uses, plus Drive writes, with the runtime identity."""
     checked_at = datetime.now(timezone.utc).isoformat()
     payload: dict[str, Any] = {
         "probe": "five_minute_model_bundle",
@@ -699,19 +724,38 @@ def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
         "checks": {},
     }
     try:
-        import all_nse_intraday_model as model
         from persistent_store import drive_status
 
+        model, model_api = _serving_model_api()
         status = model.model_status()
-        manifest = model._manifest()
         contract = model.model_target_contract()
         drive = drive_status(require_write=True)
         runtime_features = model.active_feature_names()
-        features_match = manifest.get("features") == runtime_features
+        if model_api == "champion":
+            # champion_model_api reports the contract itself; there is no on-disk manifest document.
+            manifest_features = list(status.get("artifact_features") or status.get("features") or [])
+            manifest = {
+                "bar_interval_minutes": contract["bar_interval_minutes"],
+                "target": status.get("artifact_target") or status.get("target"),
+                "prediction_horizon": status.get("prediction_horizon"),
+                "feature_count": status.get("artifact_feature_count") or len(manifest_features),
+                "features": manifest_features,
+                "training_symbol_count": len(status.get("training_symbols") or []),
+            }
+        else:
+            manifest = model._manifest()
+            manifest_features = list(manifest.get("features") or [])
+        features_match = manifest_features == runtime_features
         checks = {
+            "model_api": model_api,
             "model_status": status.get("status"),
+            "model_version": status.get("model_version"),
+            "trained_through": status.get("trained_through"),
+            "serving_mode": status.get("serving_mode"),
+            "serving_reason": status.get("serving_reason"),
             "bar_interval_minutes": manifest.get("bar_interval_minutes"),
             "target": manifest.get("target"),
+            "prediction_horizon": manifest.get("prediction_horizon"),
             "feature_count_manifest": manifest.get("feature_count"),
             "feature_count_runtime": len(runtime_features),
             "feature_list_matches_runtime": features_match,
@@ -742,7 +786,9 @@ def _model_bundle_diagnostic() -> tuple[int, dict[str, Any]]:
             payload["status"] = "ok"
             return 200, payload
 
-        payload["reason"] = "Five-minute model contract, artifact hashes, or Drive write readiness failed."
+        payload["reason"] = (
+            f"{model_api} five-minute model contract, artifact hashes, or Drive write readiness failed."
+        )
         return 503, payload
     except Exception as exc:
         # Safe diagnostic only: never return tokens, OAuth JSON, root IDs, or full provider responses.

@@ -113,6 +113,10 @@ def model_status() -> dict[str, Any]:
     pol = serving_policy()["horizons"]["close"]
     contract = model_target_contract()
     return {"status": "CHAMPION", "model_family": "hgb_logistic_ensemble", "target": contract["target"],
+            "artifact_target": champ.get("target"),
+            "artifact_feature_module": champ.get("feature_module"),
+            "artifact_feature_count": champ.get("feature_count"),
+            "artifact_features": list(ms.get("features") or []),
             "prediction_horizon": HORIZON_NAME, "model_version": f"{champ['version']}__{champ['bundle_sha256'][:12]}",
             "trained_through": champ["trained_through"], "feature_count": len(FEATURES_5M), "manifest_feature_count": len(FEATURES_5M),
             "features": list(FEATURES_5M), "feature_contract_match": True, "target_contract_match": True,
