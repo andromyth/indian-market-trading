@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import same_day_gap_backfill as gap
+from consolidate_live_5m_into_archive import expected_session_slots
+
+
+def test_missing_live_history_slots_reports_only_absent_captures():
+    session_date = date(2026, 11, 23)
+    slots = expected_session_slots()
+    files = [
+        {"name": f"capture_20261123_{slot:%H%M}.parquet"}
+        for slot in slots
+        if slot.strftime("%H%M") != "1210"
+    ]
+
+    assert gap.missing_live_history_slots(files, session_date) == ["1210"]
+
+
+def test_warming_prediction_slots_ignores_latest_pointer_and_non_warming():
+    manifests = [
+        (
+            "manifest_20261123_1210.json",
+            {"prediction_count": 0, "prediction_status_counts": {"WARMING_HISTORY": 500}},
+        ),
+        (
+            "manifest_20261123_1215.json",
+            {"prediction_count": 12, "prediction_status_counts": {"PREDICTED": 12}},
+        ),
+        ("latest_manifest.json", {"prediction_count": 0}),
+    ]
+
+    assert gap.warming_prediction_slots(manifests) == ["20261123_1210"]
+
+
+def test_discover_gap_state_uses_roster_only_when_a_gap_exists():
+    session_date = date(2026, 11, 23)
+    roster = ["AAA", "BBB", "CCC"]
+
+    no_gap = gap.discover_gap_state(
+        session_date=session_date,
+        live_history_files=[
+            {"name": f"capture_20261123_{slot:%H%M}.parquet"}
+            for slot in expected_session_slots()
+        ],
+        prediction_manifests=[],
+        roster=roster,
+    )
+    assert no_gap["needs_backfill"] is False
+    assert no_gap["gap_symbol_count"] == 0
+    assert no_gap["reason"] == "none"
+
+    with_gap = gap.discover_gap_state(
+        session_date=session_date,
+        live_history_files=[],
+        prediction_manifests=[],
+        roster=roster,
+    )
+    assert with_gap["needs_backfill"] is True
+    assert with_gap["gap_symbol_count"] == len(roster)
+    assert with_gap["reason"] == "missing_live_history_slots"
+
+
+def test_backfill_payload_is_provider_safe():
+    payload = gap.backfill_payload(date(2026, 11, 23), ["AAA", "BBB"])
+
+    assert payload == {
+        "confirm": "START_NATIVE_5M_BACKFILL",
+        "end_date": "2026-11-23",
+        "replace_existing_history": "no",
+        "symbols": "AAA,BBB",
+    }
+
+
+def test_large_symbol_list_falls_back_to_runner_gap_detection():
+    symbols = [f"SYMBOL{index:03d}" for index in range(500)]
+
+    assert gap.backfill_symbol_argument(symbols) == ""
+    assert gap.backfill_payload(date(2026, 11, 23), symbols)["symbols"] == ""
+
+
+def test_classify_backfill_status():
+    assert gap.classify_backfill_status("COMPLETED") == "DONE"
+    assert gap.classify_backfill_status("COMPLETED_WITH_GAPS") == "DONE"
+    assert gap.classify_backfill_status("RUNNING") == "ACTIVE"
+    assert gap.classify_backfill_status("PAUSED_FOR_LIVE_MARKET") == "ACTIVE"
+    assert gap.classify_backfill_status("FAILED") == "FAILED"
+    assert gap.classify_backfill_status("IDLE") == "IDLE"
+
+
+def test_wait_ignores_previous_session_completion(monkeypatch):
+    monkeypatch.setattr(
+        gap,
+        "backfill_state",
+        lambda *args, **kwargs: {
+            "status": "COMPLETED",
+            "http_status": 200,
+            "state": {"started_at_utc": "2026-11-22T10:35:00+00:00"},
+        },
+    )
+
+    result = gap.wait_for_backfill(
+        "https://example.test",
+        "token",
+        session_date=date(2026, 11, 23),
+        max_wait_minutes=1,
+    )
+
+    assert result["status"] == "IDLE"
+
+
+def test_wait_returns_current_session_failure(monkeypatch):
+    monkeypatch.setattr(
+        gap,
+        "backfill_state",
+        lambda *args, **kwargs: {
+            "status": "FAILED",
+            "http_status": 200,
+            "state": {"started_at_utc": "2026-11-23T10:35:00+00:00"},
+        },
+    )
+
+    result = gap.wait_for_backfill(
+        "https://example.test",
+        "token",
+        session_date=date(2026, 11, 23),
+        max_wait_minutes=1,
+    )
+
+    assert result["status"] == "FAILED"
+
+
+def test_start_backfill_accepts_already_running(monkeypatch):
+    monkeypatch.setattr(
+        gap,
+        "_request_json",
+        lambda *args, **kwargs: (409, {"status": "BACKFILL_ALREADY_RUNNING"}),
+    )
+
+    result = gap.start_backfill(
+        "https://example.test", "token", date(2026, 11, 23), ["AAA"]
+    )
+
+    assert result["status"] == "BACKFILL_ALREADY_RUNNING"

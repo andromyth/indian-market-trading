@@ -10,10 +10,10 @@ name: Recover missing ALL-NSE prediction slots
 # already has model predictions.
 
 on:
-  # 15:50 IST (10:20 UTC) on weekdays, after the 15:30 cash close and before
-  # the 16:15 IST persistence audit.
+  # 16:20 IST (10:50 UTC) on weekdays, after the 16:05 provider gap backfill
+  # (bounded to 12 minutes) and before the 16:30 consolidation.
   schedule:
-    - cron: "20 10 * * 1-5"
+    - cron: "50 10 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
@@ -51,6 +51,25 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Wait for same-day provider backfill
+        env:
+          MAX_WAIT_MINUTES: "10"
+        run: |
+          python -u scripts/same_day_gap_backfill.py \
+            --wait-only \
+            --max-wait-minutes "$MAX_WAIT_MINUTES"
 
       - name: Set repository import path
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"

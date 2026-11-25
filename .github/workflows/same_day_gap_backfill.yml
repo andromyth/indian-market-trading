@@ -1,0 +1,102 @@
+name: Backfill same-day missing 5m history
+
+# Runs after the 15:30 cash close and before the 16:10 recovery / 16:30
+# consolidation. It only fills genuine provider 5m bars for symbols affected by
+# missing slots. The existing recovery workflow then re-assembles snapshots and
+# compiles predictions from the refreshed history. It never touches the live
+# Cloud Run worker during market hours.
+on:
+  schedule:
+    # 16:05 IST (10:35 UTC) on weekdays.
+    - cron: "35 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Trading date YYYY-MM-DD (default: latest completed session)"
+        required: false
+        default: ""
+      max_wait_minutes:
+        description: "Maximum minutes to wait for provider backfill"
+        required: false
+        default: "12"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: same-day-gap-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      PROJECT_ID: indian-market-trading
+      REGION: asia-south1
+      SERVICE: indian-market-intraday-worker
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve session date
+        id: session
+        env:
+          INPUT_DATE: ${{ github.event.inputs.date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import date, datetime, time, timedelta
+          from zoneinfo import ZoneInfo
+          from market_session_guard import is_nse_trading_day
+
+          raw = (os.environ.get("INPUT_DATE") or "").strip()
+          if raw:
+              session = date.fromisoformat(raw)
+          else:
+              now = datetime.now(ZoneInfo("Asia/Kolkata"))
+              session = now.date()
+              if now.time() < time(9, 15):
+                  session -= timedelta(days=1)
+              while not is_nse_trading_day(session):
+                  session -= timedelta(days=1)
+          print("date=" + session.isoformat())
+          print("trading_day=" + ("true" if is_nse_trading_day(session) else "false"))
+          PY
+
+      - name: Authenticate to Google Cloud
+        if: steps.session.outputs.trading_day == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        if: steps.session.outputs.trading_day == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
+      - name: Discover gaps and backfill missing provider bars
+        if: steps.session.outputs.trading_day == 'true'
+        env:
+          SESSION_DATE: ${{ steps.session.outputs.date }}
+          MAX_WAIT_MINUTES: ${{ github.event.inputs.max_wait_minutes || '12' }}
+        run: |
+          set -euo pipefail
+          python -u scripts/same_day_gap_backfill.py \
+            --date "$SESSION_DATE" \
+            --max-wait-minutes "$MAX_WAIT_MINUTES" \
+            | tee /tmp/same_day_gap_backfill.log

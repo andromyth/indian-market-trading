@@ -19,8 +19,8 @@ on:
         required: false
         default: false
   schedule:
-    # 10:45 UTC = 16:15 IST, after the close and after the 16:00 backfill trigger.
-    - cron: "45 10 * * *"
+    # 11:00 UTC = 16:30 IST, after the 16:05 same-day gap backfill and recovery.
+    - cron: "0 11 * * 1-5"
 
 permissions:
   contents: read
@@ -53,6 +53,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          project_id: indian-market-trading
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: indian-market-trading
+
       - name: Verify Drive read/write preflight
         run: |
           python - <<'PY'
@@ -62,6 +73,14 @@ jobs:
           if status.get("reachable") is not True or status.get("write_ready") is not True:
               raise SystemExit("Drive read/write preflight failed")
           PY
+
+      - name: Wait for same-day provider backfill
+        env:
+          MAX_WAIT_MINUTES: "10"
+        run: |
+          python -u scripts/same_day_gap_backfill.py \
+            --wait-only \
+            --max-wait-minutes "$MAX_WAIT_MINUTES"
 
       - name: Fold recent live snapshots into the authoritative archive
         shell: bash
