@@ -399,16 +399,33 @@ def main() -> int:
     symbols_mode = (
         "explicit" if backfill_symbol_argument(symbols) else "runner_gap_detection"
     )
-    started = start_backfill(url, token, session_date, symbols)
+    force = str(os.getenv("SAME_DAY_BACKFILL_FORCE") or "").strip().lower() in {
+        "1", "true", "yes",
+    }
+    existing = backfill_state(url, token)
+    already_completed = (
+        not force
+        and classify_backfill_status(str(existing.get("status") or "")) == "DONE"
+        and _belongs_to_session(existing, session_date)
+    )
+    if already_completed:
+        started = {
+            "status": "SKIPPED_ALREADY_COMPLETED",
+            "previous_status": existing.get("status"),
+            "updated_at_utc": (existing.get("state") or {}).get("updated_at_utc"),
+        }
+        current = existing
+    else:
+        started = start_backfill(url, token, session_date, symbols)
+        current = wait_for_backfill(
+            url,
+            token,
+            session_date=session_date,
+            max_wait_minutes=args.max_wait_minutes,
+        )
     print(
         "SAME_DAY_BACKFILL_TRIGGER=" + json.dumps(started, sort_keys=True),
         flush=True,
-    )
-    current = wait_for_backfill(
-        url,
-        token,
-        session_date=session_date,
-        max_wait_minutes=args.max_wait_minutes,
     )
     status = str(current.get("status") or "").upper()
     print(

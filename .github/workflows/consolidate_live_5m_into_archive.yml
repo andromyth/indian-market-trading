@@ -74,12 +74,11 @@ jobs:
               raise SystemExit("Drive read/write preflight failed")
           PY
 
-      - name: Wait for same-day provider backfill
+      - name: Ensure same-day provider backfill
         env:
           MAX_WAIT_MINUTES: "10"
         run: |
           python -u scripts/same_day_gap_backfill.py \
-            --wait-only \
             --max-wait-minutes "$MAX_WAIT_MINUTES"
 
       - name: Fold recent live snapshots into the authoritative archive

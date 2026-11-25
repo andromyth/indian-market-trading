@@ -11,9 +11,16 @@ name: Recover missing ALL-NSE prediction slots
 
 on:
   # 16:20 IST (10:50 UTC) on weekdays, after the 16:05 provider gap backfill
-  # (bounded to 12 minutes) and before the 16:30 consolidation.
+  # (bounded to 12 minutes) and before the 16:30 consolidation. A second slot at
+  # 18:50 IST is a late-start fallback: GitHub cron can throttle this repository
+  # by hours, but a delayed run still lands after the session and repairs gaps.
   schedule:
-    - cron: "50 10 * * 1-5"
+    - cron: "50 10,13 * * 1-5"
+  # Chain immediately after the backfill workflow so snapshot repair never
+  # depends on a second, independently throttled cron entry.
+  workflow_run:
+    workflows: ["Backfill same-day missing 5m history"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       date:
@@ -63,16 +70,44 @@ jobs:
         with:
           project_id: indian-market-trading
 
-      - name: Wait for same-day provider backfill
-        env:
-          MAX_WAIT_MINUTES: "10"
-        run: |
-          python -u scripts/same_day_gap_backfill.py \
-            --wait-only \
-            --max-wait-minutes "$MAX_WAIT_MINUTES"
-
       - name: Set repository import path
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Resolve recovery session date
+        id: session
+        env:
+          INPUT_DATE: ${{ github.event.inputs.date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import date, datetime, time, timedelta
+          from zoneinfo import ZoneInfo
+          from market_session_guard import is_nse_trading_day
+
+          raw = (os.environ.get("INPUT_DATE") or "").strip()
+          if raw:
+              session = date.fromisoformat(raw)
+          else:
+              now = datetime.now(ZoneInfo("Asia/Kolkata"))
+              session = now.date()
+              if now.time() < time(15, 30):
+                  session -= timedelta(days=1)
+              while not is_nse_trading_day(session):
+                  session -= timedelta(days=1)
+          print("date=" + session.isoformat())
+          print("trading_day=" + ("true" if is_nse_trading_day(session) else "false"))
+          PY
+
+      - name: Ensure same-day provider backfill
+        if: steps.session.outputs.trading_day == 'true'
+        env:
+          SESSION_DATE: ${{ steps.session.outputs.date }}
+          MAX_WAIT_MINUTES: "12"
+        run: |
+          set -euo pipefail
+          python -u scripts/same_day_gap_backfill.py \
+            --date "$SESSION_DATE" \
+            --max-wait-minutes "$MAX_WAIT_MINUTES"
 
       - name: Resolve India market date for history cache
         id: market_date
@@ -103,18 +138,22 @@ jobs:
             nse-live-${{ steps.market_date.outputs.value }}-
             nse-live-
 
-      - name: Re-assemble canonical snapshots from persisted shards
+      - name: Re-assemble canonical snapshots from shards or archive
+        if: steps.session.outputs.trading_day == 'true'
         env:
-          RECOVER_DATE: ${{ github.event.inputs.date }}
+          SESSION_DATE: ${{ steps.session.outputs.date }}
         run: |
           set -euo pipefail
-          python -u repair_missing_minute_snapshots.py --date "$RECOVER_DATE" \
+          python -u repair_missing_minute_snapshots.py --date "$SESSION_DATE" \
             | tee /tmp/repair_missing_snapshots.log
+          grep -q '"repair_status": "COMPLETED"' /tmp/repair_missing_snapshots.log
+          echo "::notice::Snapshot repair finished (repair_status=COMPLETED)"
 
       - name: Compile every unprocessed slot oldest-first
+        if: steps.session.outputs.trading_day == 'true'
         env:
-          RECOVER_DATE: ${{ github.event.inputs.date }}
-          MAX_SLOTS: ${{ github.event.inputs.max_slots }}
+          RECOVER_DATE: ${{ steps.session.outputs.date }}
+          MAX_SLOTS: ${{ github.event.inputs.max_slots || '75' }}
           ALL_NSE_COMPILER_HISTORY_WORKERS: "24"
         run: |
           set -uo pipefail
