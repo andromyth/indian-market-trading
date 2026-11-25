@@ -161,3 +161,88 @@ jobs:
               if champ_json:
                   print("CHAMPION_JSON=" + read_text(champ_json["id"])[:6000])
           PY
+
+      - name: Audit live 5m history freshness (read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from datetime import date, timedelta
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+
+          token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+          root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
+          info = json.loads(token_text)
+          creds = Credentials.from_authorized_user_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+          if not creds.valid:
+              creds.refresh(Request())
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+          FOLDER = "application/vnd.google-apps.folder"
+
+          def children(parent_id):
+              out, page = [], None
+              while True:
+                  resp = service.files().list(
+                      q=f"'{parent_id}' in parents and trashed = false",
+                      pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+                      includeItemsFromAllDrives=True, supportsAllDrives=True,
+                  ).execute()
+                  out.extend(resp.get("files", []))
+                  page = resp.get("nextPageToken")
+                  if not page:
+                      break
+              return out
+
+          def find_child(parent_id, name):
+              resp = service.files().list(
+                  q=f"'{parent_id}' in parents and name = '{name}' and trashed = false",
+                  pageSize=10, fields="files(id,name,mimeType,size)",
+                  includeItemsFromAllDrives=True, supportsAllDrives=True,
+              ).execute()
+              files = resp.get("files", [])
+              return files[0] if files else None
+
+          def walk(parts):
+              parent = root_id
+              for part in parts:
+              # Each component must exist as a folder; a missing component means an empty day.
+                  found = find_child(parent, part)
+                  if not found:
+                      return None
+                  parent = found["id"]
+              return parent
+
+          live_root = walk(["production_data", "nse_official", "intraday_5m_live"])
+          print("LIVE_5M_ROOT=" + json.dumps(live_root))
+          today = date.today()
+          for back in range(0, 8):
+              day = today - timedelta(days=back)
+              folder = walk(["production_data", "nse_official", "intraday_5m_live", f"{day:%Y}", f"{day:%m}", f"{day:%d}"])
+              if not folder:
+                  print("LIVE_5M_DAY=" + json.dumps({"date": day.isoformat(), "exists": False}))
+                  continue
+              files = children(folder)
+              sizes = sum(int(f.get("size") or 0) for f in files)
+              print("LIVE_5M_DAY=" + json.dumps({
+                  "date": day.isoformat(), "exists": True, "files": len(files),
+                  "size_mib": round(sizes / (1024 * 1024), 2),
+                  "newest_modified": max((f.get("modifiedTime") or "" for f in files), default=""),
+                  "sample": sorted(f.get("name") for f in files)[:5],
+              }, sort_keys=True))
+
+          archive = walk(["production_data", "nse_official", "intraday_seed", "olo_5m_archive", "symbols"])
+          if archive:
+              dirs = [d for d in children(archive) if d.get("mimeType") == FOLDER]
+              print("ARCHIVE_SYMBOL_FOLDERS=" + str(len(dirs)))
+              for sample in sorted(dirs, key=lambda x: x.get("name", ""))[:3]:
+                  files = [f for f in children(sample["id"]) if f.get("mimeType") != FOLDER]
+                  print("ARCHIVE_SAMPLE=" + json.dumps({
+                      "folder": sample.get("name"),
+                      "files": sorted(f.get("name") for f in files)[:3],
+                      "newest_modified": max((f.get("modifiedTime") or "" for f in files), default=""),
+                  }, sort_keys=True))
+          PY
