@@ -252,3 +252,21 @@ def test_should_retry_gapped_session_only_after_cooldown():
     assert not gap.should_skip_existing_backfill(
         stale, date(2026, 11, 25), now=now, retry_minutes=30
     )
+
+
+def test_backfill_session_ownership_uses_target_end_date_before_start_time():
+    current = {
+        "status": "COMPLETED",
+        "state": {
+            "target_end_date": "2026-11-25",
+            "started_at_utc": "2026-11-26T10:35:00+00:00",
+        },
+    }
+    assert gap._belongs_to_session(current, date(2026, 11, 25))
+    assert not gap._belongs_to_session(current, date(2026, 11, 26))
+
+
+def test_backfill_session_ownership_falls_back_to_started_at_when_target_missing():
+    current = {"state": {"started_at_utc": "2026-11-25T10:35:00+00:00"}}
+    assert gap._belongs_to_session(current, date(2026, 11, 25))
+    assert not gap._belongs_to_session(current, date(2026, 11, 26))
