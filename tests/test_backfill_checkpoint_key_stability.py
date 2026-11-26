@@ -201,3 +201,7 @@ def test_checkpoint_key_is_stable_for_the_complete_five_symbol_group():
     full_group = [symbol for symbol, _ in GROUP]
     assert backfill._checkpoint_key(full_group) == _key(full_group)
     assert backfill._checkpoint_key(full_group) != backfill._checkpoint_key(full_group[:1])
+
+
+def test_legacy_batch_progress_loader_is_removed_as_a_skip_authority():
+    assert not hasattr(backfill, "_load_batch_progress")
