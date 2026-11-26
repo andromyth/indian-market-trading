@@ -1,0 +1,57 @@
+name: Consolidation dry-run audit (Drive only, no Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Trading-day lookback used by the consolidation loop"
+        required: false
+        default: "10"
+      end_date:
+        description: "Inclusive end date (YYYY-MM-DD); blank = now"
+        required: false
+        default: "2026-11-25"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: consolidate-dryrun-audit
+  cancel-in-progress: false
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Drive read access
+        run: |
+          python - <<'PY'
+          from persistent_store import drive_status
+          status = drive_status(require_write=False)
+          print("DRIVE_STATUS=" + str({k: status.get(k) for k in ("configured", "reachable", "auth_method")}))
+          if status.get("reachable") is not True:
+              raise SystemExit("Drive read preflight failed")
+          PY
+
+      - name: Dry-run consolidation (no writes)
+        continue-on-error: true
+        run: |
+          python -u consolidate_live_5m_into_archive.py \
+            --days "${{ github.event.inputs.days || '10' }}" \
+            --end-date "${{ github.event.inputs.end_date }}" \
+            --dry-run
