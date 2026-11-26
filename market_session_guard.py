@@ -9,6 +9,7 @@ from production_data_freshness_gate import HOLIDAYS, previous_trading_day
 IST = ZoneInfo("Asia/Kolkata")
 OPEN = time(9, 15)
 CLOSE = time(15, 30)
+AUDIT_READY = time(16, 0)
 EOD_READY = time(18, 0)
 
 
@@ -48,6 +49,21 @@ def latest_completed_nse_session(value: datetime) -> date:
     current = _to_ist(value)
     current_date = current.date()
     if is_nse_trading_day(current_date) and current.time() >= EOD_READY:
+        return current_date
+    return previous_trading_day(current_date)
+
+
+def latest_auditable_nse_session(value: datetime) -> date:
+    """Resolve the session whose intraday outcomes are ready to audit.
+
+    Outcomes are complete after the 16:00 IST final flush.  A scheduled audit
+    delayed past midnight must audit the previous completed session instead of
+    the new date, which has no predictions until the market opens and closes.
+    Weekends and holidays resolve to the most recent preceding NSE session.
+    """
+    current = _to_ist(value)
+    current_date = current.date()
+    if is_nse_trading_day(current_date) and current.time() >= AUDIT_READY:
         return current_date
     return previous_trading_day(current_date)
 

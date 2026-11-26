@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, time as clock_time, timedelta
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -214,6 +214,15 @@ def start_backfill(url: str, token: str, session_date: date, symbols: list[str])
         return {"http_status": code, "status": status}
     if code == 409 and status == "BACKFILL_ALREADY_RUNNING":
         return {"http_status": code, "status": status}
+    if code == 423 and status == "BACKFILL_OUTSIDE_ALLOWED_WINDOW":
+        # A delayed scheduled run can land inside the live-priority window.
+        # Treat it as a benign deferral so consolidation/retraining can still
+        # proceed; the next in-window run will collect the missing bars.
+        return {
+            "http_status": code,
+            "status": status,
+            "next_allowed_time_ist": body.get("next_allowed_time_ist"),
+        }
     raise RuntimeError(
         "BACKFILL_START_FAILED http=" + str(code) + " status=" + status
     )
@@ -234,6 +243,35 @@ def backfill_state(url: str, token: str) -> dict[str, Any]:
 def _belongs_to_session(current: dict[str, Any], session_date: date) -> bool:
     started = str((current.get("state") or {}).get("started_at_utc") or "")
     return bool(started) and started[:10] == session_date.isoformat()
+
+
+def should_skip_existing_backfill(
+    current: dict[str, Any],
+    session_date: date,
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+    retry_minutes: int = 30,
+) -> bool:
+    """Skip only a clean session run, or a gapped run still inside its cooldown."""
+    if force or not _belongs_to_session(current, session_date):
+        return False
+    status = str(current.get("status") or "").upper()
+    if status == "COMPLETED":
+        return True
+    if status != "COMPLETED_WITH_GAPS":
+        return False
+    updated_raw = str((current.get("state") or {}).get("updated_at_utc") or "")
+    if not updated_raw:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    return (reference - updated_at) < timedelta(minutes=max(0, int(retry_minutes)))
 
 
 def wait_for_backfill(
@@ -399,16 +437,60 @@ def main() -> int:
     symbols_mode = (
         "explicit" if backfill_symbol_argument(symbols) else "runner_gap_detection"
     )
-    started = start_backfill(url, token, session_date, symbols)
+    force = str(os.getenv("SAME_DAY_BACKFILL_FORCE") or "").strip().lower() in {
+        "1", "true", "yes",
+    }
+    existing = backfill_state(url, token)
+    try:
+        retry_minutes = max(
+            0, int(os.getenv("SAME_DAY_BACKFILL_GAP_RETRY_MINUTES", "30") or 30)
+        )
+    except ValueError:
+        retry_minutes = 30
+    # A clean COMPLETED session never needs another fetch. COMPLETED_WITH_GAPS is
+    # retried by the later fallback runs once the cooldown expires, because the
+    # provider can publish the last candles a little after the 16:05 attempt.
+    already_completed = should_skip_existing_backfill(
+        existing, session_date, force=force, retry_minutes=retry_minutes
+    )
+    if already_completed:
+        started = {
+            "status": "SKIPPED_ALREADY_COMPLETED",
+            "previous_status": existing.get("status"),
+            "updated_at_utc": (existing.get("state") or {}).get("updated_at_utc"),
+        }
+        current = existing
+    else:
+        started = start_backfill(url, token, session_date, symbols)
+        if str(started.get("status") or "").upper() == "BACKFILL_OUTSIDE_ALLOWED_WINDOW":
+            print(
+                "SAME_DAY_BACKFILL_TRIGGER=" + json.dumps(started, sort_keys=True),
+                flush=True,
+            )
+            print(
+                "SAME_DAY_BACKFILL_JSON="
+                + json.dumps(
+                    {
+                        "status": "SKIPPED_OUTSIDE_WINDOW",
+                        "trigger": started,
+                        "symbols": len(symbols),
+                        "symbols_mode": symbols_mode,
+                        **state,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 0
+        current = wait_for_backfill(
+            url,
+            token,
+            session_date=session_date,
+            max_wait_minutes=args.max_wait_minutes,
+        )
     print(
         "SAME_DAY_BACKFILL_TRIGGER=" + json.dumps(started, sort_keys=True),
         flush=True,
-    )
-    current = wait_for_backfill(
-        url,
-        token,
-        session_date=session_date,
-        max_wait_minutes=args.max_wait_minutes,
     )
     status = str(current.get("status") or "").upper()
     print(
