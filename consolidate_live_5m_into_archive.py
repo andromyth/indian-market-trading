@@ -198,6 +198,14 @@ def _day_snapshots(
     return result
 
 
+def _latest_session_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the most recent session present in a symbol's archive frame."""
+    if frame.empty:
+        return frame
+    latest_day = str(frame.index.max().date())
+    return frame.loc[pd.Index(frame.index.date).astype(str) == latest_day, OHLCV]
+
+
 def consolidate(
     *,
     store: GoogleDriveStore,
@@ -225,10 +233,6 @@ def consolidate(
     latest_session_frames: dict[str, pd.DataFrame] = {}
     for index, symbol in enumerate(symbols, start=1):
         parts = live_by_symbol.get(symbol) or []
-        if not parts:
-            continue
-        live = pd.concat(parts).sort_index()
-        live = live.loc[~live.index.duplicated(keep="last")]
         remote = f"{REMOTE_ROOT}/symbol={symbol}/{symbol}.parquet"
         local = work_root / "archive" / f"symbol={symbol}" / f"{symbol}.existing.parquet"
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -236,20 +240,27 @@ def consolidate(
         if archive.empty:
             missing_archive += 1
             continue
+        if not parts:
+            # No live rows for this symbol: still measure its latest archived
+            # session so coverage spans the whole roster, not just updated names.
+            latest_session_frames[symbol] = _latest_session_frame(archive)
+            unchanged += 1
+            continue
+        live = pd.concat(parts).sort_index()
+        live = live.loc[~live.index.duplicated(keep="last")]
         new_timestamps = live.index.difference(archive.index)
         if len(new_timestamps) == 0:
+            latest_session_frames[symbol] = _latest_session_frame(archive)
             unchanged += 1
             continue
         merged = pd.concat([archive, live]).sort_index()
         merged = merged.loc[~merged.index.duplicated(keep="last")]
         merged = retain_latest_sessions(merged, MAX_SESSIONS, MIN_BARS_PER_SESSION)
         if merged.empty:
+            latest_session_frames[symbol] = _latest_session_frame(archive)
             unchanged += 1
             continue
-        latest_day = str(merged.index.max().date())
-        latest_session_frames[symbol] = merged.loc[
-            pd.Index(merged.index.date).astype(str) == latest_day, OHLCV
-        ]
+        latest_session_frames[symbol] = _latest_session_frame(merged)
         if not dry_run:
             out = work_root / "archive" / f"symbol={symbol}" / f"{symbol}.parquet"
             merged.to_parquet(out, index=True, compression="zstd")

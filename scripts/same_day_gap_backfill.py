@@ -214,6 +214,15 @@ def start_backfill(url: str, token: str, session_date: date, symbols: list[str])
         return {"http_status": code, "status": status}
     if code == 409 and status == "BACKFILL_ALREADY_RUNNING":
         return {"http_status": code, "status": status}
+    if code == 423 and status == "BACKFILL_OUTSIDE_ALLOWED_WINDOW":
+        # A delayed scheduled run can land inside the live-priority window.
+        # Treat it as a benign deferral so consolidation/retraining can still
+        # proceed; the next in-window run will collect the missing bars.
+        return {
+            "http_status": code,
+            "status": status,
+            "next_allowed_time_ist": body.get("next_allowed_time_ist"),
+        }
     raise RuntimeError(
         "BACKFILL_START_FAILED http=" + str(code) + " status=" + status
     )
@@ -453,6 +462,26 @@ def main() -> int:
         current = existing
     else:
         started = start_backfill(url, token, session_date, symbols)
+        if str(started.get("status") or "").upper() == "BACKFILL_OUTSIDE_ALLOWED_WINDOW":
+            print(
+                "SAME_DAY_BACKFILL_TRIGGER=" + json.dumps(started, sort_keys=True),
+                flush=True,
+            )
+            print(
+                "SAME_DAY_BACKFILL_JSON="
+                + json.dumps(
+                    {
+                        "status": "SKIPPED_OUTSIDE_WINDOW",
+                        "trigger": started,
+                        "symbols": len(symbols),
+                        "symbols_mode": symbols_mode,
+                        **state,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 0
         current = wait_for_backfill(
             url,
             token,

@@ -149,6 +149,68 @@ def test_start_backfill_accepts_already_running(monkeypatch):
     assert result["status"] == "BACKFILL_ALREADY_RUNNING"
 
 
+def test_start_backfill_defers_outside_allowed_window(monkeypatch):
+    monkeypatch.setattr(
+        gap,
+        "_request_json",
+        lambda *args, **kwargs: (
+            423,
+            {
+                "status": "BACKFILL_OUTSIDE_ALLOWED_WINDOW",
+                "next_allowed_time_ist": "16:00 IST today",
+            },
+        ),
+    )
+
+    result = gap.start_backfill(
+        "https://example.test", "token", date(2026, 11, 23), ["AAA"]
+    )
+
+    assert result["http_status"] == 423
+    assert result["status"] == "BACKFILL_OUTSIDE_ALLOWED_WINDOW"
+    assert result["next_allowed_time_ist"] == "16:00 IST today"
+
+
+def test_main_exits_zero_when_backfill_is_deferred(monkeypatch, capsys):
+    import market_session_guard
+    import persistent_store
+    import prediction_universe
+
+    monkeypatch.setattr(gap, "resolve_session_date", lambda raw=None: date(2026, 11, 23))
+    monkeypatch.setattr(market_session_guard, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(persistent_store, "GoogleDriveStore", lambda: object())
+    monkeypatch.setattr(prediction_universe, "authoritative_roster", lambda: ["AAA", "BBB"])
+    monkeypatch.setattr(gap, "_load_live_history_files", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_prediction_manifests", lambda store, session: [])
+    monkeypatch.setattr(
+        gap,
+        "discover_gap_state",
+        lambda **kwargs: {
+            "needs_backfill": True,
+            "gap_symbol_count": 2,
+            "reason": "missing_live_history_slots",
+        },
+    )
+    monkeypatch.setattr(gap, "service_url", lambda: "https://example.test")
+    monkeypatch.setattr(gap, "identity_token", lambda url: "token")
+    monkeypatch.setattr(gap, "backfill_state", lambda url, token: {"status": "IDLE"})
+    monkeypatch.setattr(
+        gap,
+        "start_backfill",
+        lambda *args, **kwargs: {
+            "http_status": 423,
+            "status": "BACKFILL_OUTSIDE_ALLOWED_WINDOW",
+            "next_allowed_time_ist": "16:00 IST today",
+        },
+    )
+
+    monkeypatch.setattr(sys, "argv", ["same_day_gap_backfill.py", "--date", "2026-11-23"])
+    code = gap.main()
+
+    assert code == 0
+    assert "SKIPPED_OUTSIDE_WINDOW" in capsys.readouterr().out
+
+
 def _backfill_state(status: str, started: str, updated: str) -> dict:
     return {
         "status": status,

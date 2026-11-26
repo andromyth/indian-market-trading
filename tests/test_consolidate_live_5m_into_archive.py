@@ -96,6 +96,74 @@ def test_consolidate_dry_run_does_not_upload(monkeypatch, tmp_path):
     assert store.uploads == []
 
 
+def test_consolidate_coverage_counts_unchanged_and_live_less_symbols(monkeypatch, tmp_path):
+    archives = {
+        "RELIANCE": _frame("2026-11-18"),
+        "HDFCBANK": _frame("2026-11-19"),
+    }
+    monkeypatch.setattr(
+        mod,
+        "_day_snapshots",
+        lambda *a, **k: {"RELIANCE": _frame("2026-11-19")},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_download_existing",
+        lambda store, remote, local: archives[remote.split("symbol=")[1].split("/")[0]].copy(),
+    )
+    monkeypatch.setattr(mod, "is_nse_trading_day", lambda d: True)
+    store = _Store()
+
+    report = mod.consolidate(
+        store=store,
+        symbols=["RELIANCE", "HDFCBANK"],
+        days=1,
+        end_date=pd.Timestamp("2026-11-19", tz=mod.IST),
+        dry_run=True,
+        work_root=tmp_path,
+    )
+
+    coverage = report["latest_session_coverage"]
+    assert report["symbols_updated"] == 1
+    assert report["symbols_unchanged"] == 1
+    assert coverage["session"] == "2026-11-19"
+    assert coverage["complete"] is True
+    assert coverage["min_slot_coverage"] == 2
+
+
+def test_consolidate_coverage_fails_when_a_symbol_is_stale(monkeypatch, tmp_path):
+    archives = {
+        "RELIANCE": _frame("2026-11-18"),
+        "HDFCBANK": _frame("2026-11-18"),
+    }
+    monkeypatch.setattr(
+        mod,
+        "_day_snapshots",
+        lambda *a, **k: {"RELIANCE": _frame("2026-11-19")},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_download_existing",
+        lambda store, remote, local: archives[remote.split("symbol=")[1].split("/")[0]].copy(),
+    )
+    monkeypatch.setattr(mod, "is_nse_trading_day", lambda d: True)
+    store = _Store()
+
+    report = mod.consolidate(
+        store=store,
+        symbols=["RELIANCE", "HDFCBANK"],
+        days=1,
+        end_date=pd.Timestamp("2026-11-19", tz=mod.IST),
+        dry_run=True,
+        work_root=tmp_path,
+    )
+
+    coverage = report["latest_session_coverage"]
+    assert coverage["session"] == "2026-11-19"
+    assert coverage["complete"] is False
+    assert coverage["min_slot_coverage"] == 1
+
+
 def test_consolidate_dry_run_reports_new_rows_without_upload(monkeypatch, tmp_path):
     archive = _frame("2026-11-18")
     live = _frame("2026-11-19")

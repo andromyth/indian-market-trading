@@ -41,10 +41,13 @@ jobs:
           import os
           from datetime import date, datetime
           from zoneinfo import ZoneInfo
-          from market_session_guard import is_nse_trading_day
+          from market_session_guard import is_nse_trading_day, latest_auditable_nse_session
 
           requested = os.environ.get("MANUAL_AUDIT_DATE", "").strip()
-          target = date.fromisoformat(requested) if requested else datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          if requested:
+              target = date.fromisoformat(requested)
+          else:
+              target = latest_auditable_nse_session(datetime.now(ZoneInfo("Asia/Kolkata")))
           should_run = is_nse_trading_day(target)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"audit_date={target.isoformat()}\n")

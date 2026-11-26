@@ -222,15 +222,17 @@ def test_backfill_pauses_until_1600_on_trading_days(monkeypatch):
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 23, 59, tzinfo=ist))
 
 
-def test_backfill_start_allowed_only_from_1600_on_trading_days(monkeypatch):
+def test_backfill_start_allowed_outside_live_priority_window_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     ist = ZoneInfo("Asia/Kolkata")
-    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 0, 0, tzinfo=ist))
-    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
+    # Delayed overnight runs land before the open and must be accepted.
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 0, 0, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 4, 46, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 9, 14, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 30, tzinfo=ist))

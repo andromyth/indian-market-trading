@@ -29,6 +29,10 @@ on:
         description: "Trading-day lookback for the pre-training live-snapshot consolidation (0 disables)"
         required: false
         default: "5"
+      session_date:
+        description: "Optional NSE session to backfill before training (YYYY-MM-DD)"
+        required: false
+        default: ""
   # Nightly retrain at 20:15 IST (14:45 UTC), after the 19:15 IST F&O sync. Enabled after the
   # first two manual runs passed. Set the repo variable RETRAIN_SCHEDULE=off to pause it.
   schedule:
@@ -73,6 +77,30 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: indian-market-trading
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Collect the same-day provider gaps before consolidation and training.
+      # A deferred run (HTTP 423) exits cleanly; the coverage gate below will
+      # still block training if the archive is genuinely incomplete.
+      - name: Collect same-day missing 5m bars
+        shell: bash
+        env:
+          SESSION_DATE: ${{ inputs.session_date }}
+          MAX_WAIT_MINUTES: "12"
+        run: |
+          set -euo pipefail
+          args=(--max-wait-minutes "$MAX_WAIT_MINUTES")
+          if [ -n "${SESSION_DATE:-}" ]; then
+            args+=(--date "$SESSION_DATE")
+          fi
+          python -u scripts/same_day_gap_backfill.py "${args[@]}"
 
       - name: Build training image
         shell: bash

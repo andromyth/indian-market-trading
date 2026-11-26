@@ -173,10 +173,15 @@ def _is_nse_live_priority_window(now: datetime) -> bool:
 
 
 def _backfill_start_allowed(now: datetime) -> bool:
-    """Allow all day on NSE non-trading days; on trading days only from 16:00 IST."""
-    if not is_nse_trading_day(now.date()):
-        return True
-    return (now.hour, now.minute) >= (16, 0)
+    """Allow starts outside the live-priority window.
+
+    On NSE trading days historical backfill must not compete with the live
+    market, so starts are blocked between 09:15 and 16:00 IST.  Before the
+    open and after the close are safe; the runner itself also pauses during
+    the live window.  This keeps delayed overnight schedules (which often
+    slip past midnight) working instead of rejecting them with HTTP 423.
+    """
+    return not _is_nse_live_priority_window(now)
 
 
 def _parse_backfill_options(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
