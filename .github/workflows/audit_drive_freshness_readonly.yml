@@ -1,0 +1,211 @@
+name: Audit Drive snapshot and archive freshness (read only, no Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Calendar days back to inspect live snapshot folders"
+        required: false
+        default: "12"
+      sample_symbols:
+        description: "Comma-separated symbols whose consolidated parquet is sampled"
+        required: false
+        default: "RELIANCE,HDFCBANK,TCS,INFY,SBIN,ICICIBANK,ITC,LT,AXISBANK,BHARTIARTL"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-drive-freshness-readonly
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      DAYS: ${{ github.event.inputs.days || '12' }}
+      SAMPLE_SYMBOLS: ${{ github.event.inputs.sample_symbols }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Drive client
+        run: python -m pip install --disable-pip-version-check google-api-python-client google-auth pandas pyarrow
+
+      - name: List Drive snapshot folders and sample consolidated parquet timestamps
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, os
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          import pandas as pd
+          from google.auth.transport.requests import Request
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          IST = ZoneInfo("Asia/Kolkata")
+          token_text = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+          root_id = os.environ.get("GOOGLE_DRIVE_ROOT_ID", "").strip()
+          if not token_text or not root_id:
+              raise SystemExit("BLOCKED_MISSING_OAUTH_TOKEN_OR_ROOT_ID")
+          creds = Credentials.from_authorized_user_info(
+              json.loads(token_text), scopes=["https://www.googleapis.com/auth/drive"]
+          )
+          if not creds.valid:
+              creds.refresh(Request())
+          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+          FOLDER = "application/vnd.google-apps.folder"
+
+          def children(parent_id, name=None):
+              q = f"'{parent_id}' in parents and trashed = false"
+              if name is not None:
+                  q += " and name = " + json.dumps(name)
+              rows, page = [], None
+              while True:
+                  res = drive.files().list(
+                      q=q, pageSize=1000, pageToken=page,
+                      fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+                  ).execute()
+                  rows.extend(res.get("files", []))
+                  page = res.get("nextPageToken")
+                  if not page:
+                      return rows
+
+          def descend(parent, parts):
+              current = parent
+              for part in parts:
+                  hits = [x for x in children(current, part) if x["mimeType"] == FOLDER]
+                  if not hits:
+                      return None
+                  current = hits[0]["id"]
+              return current
+
+          print("AUDIT_NOTE=READ_ONLY_DRIVE_ONLY_NO_CLOUD_RUN_NO_BACKFILL")
+
+          # 1) Live five-minute snapshot folders for recent days.
+          days = max(1, min(int(os.environ.get("DAYS", "12")), 31))
+          today = datetime.now(IST).date()
+          for offset in range(days):
+              day = today - timedelta(days=offset)
+              parts = ["production_data", "nse_official", "intraday_5m_live",
+                       f"{day:%Y}", f"{day:%m}", f"{day:%d}"]
+              folder = descend(root_id, parts)
+              rel = "/".join(parts)
+              if not folder:
+                  print("LIVE_DAY=" + json.dumps({"path": rel, "exists": False}))
+                  continue
+              rows = children(folder)
+              files = [r for r in rows if r["mimeType"] != FOLDER]
+              print("LIVE_DAY=" + json.dumps({
+                  "path": rel,
+                  "exists": True,
+                  "file_count": len(files),
+                  "total_bytes": sum(int(r.get("size") or 0) for r in files),
+                  "folder_count": len(rows) - len(files),
+                  "latest_modified": max((str(r.get("modifiedTime") or "") for r in files), default=None),
+                  "first_names": [r.get("name") for r in files[:2]],
+                  "last_names": [r.get("name") for r in files[-2:]],
+              }, sort_keys=True))
+
+          # 2) Canonical minute snapshot folders for recent days (same layout).
+          for offset in range(days):
+              day = today - timedelta(days=offset)
+              for base in ("production_data/intraday_minute_snapshots",
+                           "production_data/all_universe_minute_snapshots"):
+                  parts = base.split("/") + [f"{day:%Y}", f"{day:%m}", f"{day:%d}"]
+                  folder = descend(root_id, parts)
+                  if not folder:
+                      continue
+                  rows = children(folder)
+                  files = [r for r in rows if r["mimeType"] != FOLDER]
+                  print("MINUTE_DAY=" + json.dumps({
+                      "path": "/".join(parts),
+                      "file_count": len(files),
+                      "folder_count": len(rows) - len(files),
+                      "total_bytes": sum(int(r.get("size") or 0) for r in files),
+                      "latest_modified": max((str(r.get("modifiedTime") or "") for r in files), default=None),
+                  }, sort_keys=True))
+
+          # 3) Consolidated archive inventory (metadata only).
+          archive = descend(root_id, ["production_data", "nse_official",
+                                      "intraday_seed", "olo_5m_archive"])
+          if not archive:
+              print("ARCHIVE_FOLDER=MISSING")
+              raise SystemExit(0)
+          archive_meta = {r["name"]: r for r in children(archive) if r["mimeType"] != FOLDER}
+          manifest = archive_meta.get("backfill_manifest.json")
+          if manifest:
+              buf = io.BytesIO()
+              dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=manifest["id"]))
+              done = False
+              while not done:
+                  _, done = dl.next_chunk()
+              try:
+                  doc = json.loads(buf.getvalue().decode("utf-8"))
+                  print("ARCHIVE_MANIFEST=" + json.dumps({
+                      "modified": manifest.get("modifiedTime"),
+                      "overall_status": doc.get("overall_status"),
+                      "symbols_resolved": doc.get("symbols_resolved"),
+                      "symbols_with_200_plus_sessions": doc.get("symbols_with_200_plus_sessions"),
+                      "official_symbols_requested": doc.get("official_symbols_requested"),
+                      "updated_at_utc": doc.get("updated_at_utc"),
+                  }, sort_keys=True))
+              except Exception as exc:
+                  print("ARCHIVE_MANIFEST_READ_ERROR=" + type(exc).__name__)
+          else:
+              print("ARCHIVE_MANIFEST=MISSING")
+
+          symbols_folder = descend(root_id, ["production_data", "nse_official",
+                                            "intraday_seed", "olo_5m_archive", "symbols"])
+          symbol_dirs = [x for x in children(symbols_folder) if x["mimeType"] == FOLDER and x["name"].startswith("symbol=")]
+          print("ARCHIVE_SYMBOL_FOLDER_COUNT=" + str(len(symbol_dirs)))
+          by_name = {x["name"][len("symbol="):].upper(): x for x in symbol_dirs}
+
+          requested = [s.strip().upper() for s in os.environ.get("SAMPLE_SYMBOLS", "").split(",") if s.strip()]
+          for symbol in requested:
+              folder = by_name.get(symbol)
+              if not folder:
+                  print("SAMPLE_SYMBOL=" + json.dumps({"symbol": symbol, "status": "FOLDER_MISSING"}))
+                  continue
+              files = [x for x in children(folder["id"]) if x["name"] == f"{symbol}.parquet"]
+              if not files:
+                  print("SAMPLE_SYMBOL=" + json.dumps({"symbol": symbol, "status": "PARQUET_MISSING"}))
+                  continue
+              item = max(files, key=lambda x: x.get("modifiedTime") or "")
+              buf = io.BytesIO()
+              dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=item["id"]), chunksize=8 * 1024 * 1024)
+              done = False
+              while not done:
+                  _, done = dl.next_chunk()
+              frame = pd.read_parquet(io.BytesIO(buf.getvalue()))
+              if "Timestamp" in frame.columns:
+                  idx = pd.to_datetime(frame.pop("Timestamp"), errors="coerce", utc=True)
+              else:
+                  idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
+              idx = pd.DatetimeIndex(idx)
+              valid = ~idx.isna()
+              idx = idx[valid].tz_convert(IST)
+              dates = pd.Index(idx.date).astype(str)
+              per_day = pd.Series(1, index=dates).groupby(level=0).sum()
+              last_days = {str(k): int(v) for k, v in per_day.sort_index().tail(10).items()}
+              print("SAMPLE_SYMBOL=" + json.dumps({
+                  "symbol": symbol,
+                  "status": "OK",
+                  "rows_total": int(len(frame)),
+                  "modified": item.get("modifiedTime"),
+                  "last_timestamp_ist": idx.max().isoformat() if len(idx) else None,
+                  "bars_per_session_last_10": last_days,
+              }, sort_keys=True))
+          print("AUDIT_COMPLETE=READ_ONLY")
+          PY
+
+      - name: Note
+        if: always()
+        run: echo "READ_ONLY_DRIVE_AUDIT_COMPLETE - no Cloud Run invocation, no Drive writes, no backfill."
