@@ -744,7 +744,7 @@ def fetch_indstocks_5m_batch(
 
 
 def _save_batch_progress(store: Any, completed: set[int]) -> None:
-    """Persist the set of completed batch numbers so restarts skip them."""
+    """Persist/reset legacy progress metadata; it is never a batch skip authority."""
     local = Path("/tmp/nse_5m_batch_progress.json")
     local.write_text(
         json.dumps(
