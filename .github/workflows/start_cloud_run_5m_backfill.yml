@@ -82,7 +82,7 @@ jobs:
           # Manual dispatch with confirm_backfill=yes bypasses the 16:00 IST
           # trading-hours gate: the operator explicitly authorizes the backfill
           # and accepts any rate-limit or contention risk.
-          manual = os.environ.get("GITHUB_EVENT_NAME", "") == "workflow_dispatch" and os.environ.get("INPUT_CONFIRM_BACKFILL", "no") == "yes"
+          manual = os.environ.get("GITHUB_EVENT_NAME", "") == "workflow_dispatch" and os.environ.get("CONFIRM_BACKFILL", "no") == "yes"
           allowed = manual or (not trading_day) or (now.hour, now.minute) >= (16, 0)
           requested = (os.environ.get("REQUESTED_END_DATE") or "").strip()
           if requested:
