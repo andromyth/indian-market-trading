@@ -212,6 +212,17 @@ with st.expander("Manual model operations", expanded=False):
     with op_col3:
         st.caption("Retrain publishes a candidate; promotion moves it to the live champion.")
 
+    drive_only = st.checkbox(
+        "Drive-only retrain (skip same-day provider backfill, keep Cloud Run free)",
+        value=True,
+        key="champion_retrain_drive_only",
+    )
+    allow_stale = st.checkbox(
+        "Train even if a 5-minute slot is missing (use stored archive as-is)",
+        value=True,
+        key="champion_retrain_allow_stale",
+    )
+
     if retrain_pressed or promote_pressed:
         workflow = PROMOTE_WORKFLOW if promote_pressed else RETRAIN_WORKFLOW
         label = "Promote" if promote_pressed else "Retrain"
@@ -225,6 +236,8 @@ with st.expander("Manual model operations", expanded=False):
                 "cost": "0.0011",
                 "warmup_bars": "3",
                 "consolidate_live_days": "5",
+                "skip_gap_backfill": "true" if drive_only else "false",
+                "allow_stale_archive": "true" if allow_stale else "false",
             }
         )
         ok, info = _dispatch_github_workflow(workflow, inputs)
