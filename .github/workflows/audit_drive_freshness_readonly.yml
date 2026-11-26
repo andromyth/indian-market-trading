@@ -10,7 +10,7 @@ on:
       sample_symbols:
         description: "Comma-separated symbols whose consolidated parquet is sampled"
         required: false
-        default: "RELIANCE,HDFCBANK,TCS,INFY,SBIN,ICICIBANK,ITC,LT,AXISBANK,BHARTIARTL"
+        default: "RELIANCE,INFY,SBIN,ITC,BHARTIARTL,ADANIPOWER,AAKASH,ACEINTEG,PKTEA,ABMINTLLTD"
 
 permissions:
   contents: read
@@ -168,6 +168,29 @@ jobs:
           print("ARCHIVE_SYMBOL_FOLDER_COUNT=" + str(len(symbol_dirs)))
           by_name = {x["name"][len("symbol="):].upper(): x for x in symbol_dirs}
 
+          # 3b) Duplicate parquet filenames inside symbol folders. A duplicate
+          # older copy can shadow the newest file because _find_child returns
+          # files[0] with no ordering.
+          duplicate_folders = []
+          multi_parquet_names = {}
+          for folder in symbol_dirs:
+              symbol = folder["name"].split("=", 1)[1].strip().upper()
+              items = [x for x in children(folder["id"]) if x["mimeType"] != FOLDER]
+              matches = [x for x in items if x["name"] == f"{symbol}.parquet"]
+              if len(matches) > 1:
+                  multi_parquet_names[symbol] = matches
+                  duplicate_folders.append({
+                      "symbol": symbol,
+                      "copies": sorted([
+                          {"name": x.get("name"), "modified": x.get("modifiedTime"),
+                           "size": int(x.get("size") or 0)}
+                          for x in matches
+                      ], key=lambda x: x.get("modified") or ""),
+                  })
+          print("ARCHIVE_DUPLICATE_SYMBOL_FOLDERS=" + str(len(duplicate_folders)))
+          for item in duplicate_folders[:60]:
+              print("DUPLICATE_SYMBOL=" + json.dumps(item, sort_keys=True))
+
           requested = [s.strip().upper() for s in os.environ.get("SAMPLE_SYMBOLS", "").split(",") if s.strip()]
           for symbol in requested:
               folder = by_name.get(symbol)
@@ -178,30 +201,37 @@ jobs:
               if not files:
                   print("SAMPLE_SYMBOL=" + json.dumps({"symbol": symbol, "status": "PARQUET_MISSING"}))
                   continue
-              item = max(files, key=lambda x: x.get("modifiedTime") or "")
-              buf = io.BytesIO()
-              dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=item["id"]), chunksize=8 * 1024 * 1024)
-              done = False
-              while not done:
-                  _, done = dl.next_chunk()
-              frame = pd.read_parquet(io.BytesIO(buf.getvalue()))
-              if "Timestamp" in frame.columns:
-                  idx = pd.to_datetime(frame.pop("Timestamp"), errors="coerce", utc=True)
-              else:
-                  idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
-              idx = pd.DatetimeIndex(idx)
-              valid = ~idx.isna()
-              idx = idx[valid].tz_convert(IST)
-              dates = pd.Index(idx.date).astype(str)
-              per_day = pd.Series(1, index=dates).groupby(level=0).sum()
-              last_days = {str(k): int(v) for k, v in per_day.sort_index().tail(10).items()}
+              candidates = []
+              for item in sorted(files, key=lambda x: x.get("modifiedTime") or ""):
+                  buf = io.BytesIO()
+                  dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=item["id"]), chunksize=8 * 1024 * 1024)
+                  done = False
+                  while not done:
+                      _, done = dl.next_chunk()
+                  frame = pd.read_parquet(io.BytesIO(buf.getvalue()))
+                  if "Timestamp" in frame.columns:
+                      idx = pd.to_datetime(frame.pop("Timestamp"), errors="coerce", utc=True)
+                  else:
+                      idx = pd.to_datetime(frame.index, errors="coerce", utc=True)
+                  idx = pd.DatetimeIndex(idx)
+                  valid = ~idx.isna()
+                  idx = idx[valid].tz_convert(IST)
+                  dates = pd.Index(idx.date).astype(str)
+                  per_day = pd.Series(1, index=dates).groupby(level=0).sum()
+                  last_days = {str(k): int(v) for k, v in per_day.sort_index().tail(6).items()}
+                  candidates.append({
+                      "file_id": item["id"],
+                      "rows_total": int(len(frame)),
+                      "modified": item.get("modifiedTime"),
+                      "size": int(item.get("size") or 0),
+                      "last_timestamp_ist": idx.max().isoformat() if len(idx) else None,
+                      "bars_per_session_last_6": last_days,
+                  })
               print("SAMPLE_SYMBOL=" + json.dumps({
                   "symbol": symbol,
                   "status": "OK",
-                  "rows_total": int(len(frame)),
-                  "modified": item.get("modifiedTime"),
-                  "last_timestamp_ist": idx.max().isoformat() if len(idx) else None,
-                  "bars_per_session_last_10": last_days,
+                  "copies": len(candidates),
+                  "candidates": candidates,
               }, sort_keys=True))
           print("AUDIT_COMPLETE=READ_ONLY")
           PY
