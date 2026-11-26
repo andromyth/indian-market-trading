@@ -27,7 +27,9 @@ from autonomous_intraday_worker import (
     all_nse_capture_slot,
 )
 from all_nse_minute_prediction_capture import AllNSEMinutePredictor
+from intraday_prediction_cycle import slots_between
 from market_session_guard import IST, is_nse_trading_day
+from worker_tick_lease import acquire_lease
 
 PORT = int(os.getenv("PORT", "8080"))
 WORKER_ROOT = Path(os.getenv("AUTONOMOUS_INTRADAY_ROOT", "/tmp/autonomous_intraday"))
@@ -88,6 +90,24 @@ ALL_NSE_IN_WORKER_DEADLINE_SECONDS = max(
     30.0,
     float(os.getenv("ALL_NSE_IN_WORKER_PREDICTION_DEADLINE_SECONDS") or 180),
 )
+# Backlog drain: on every tick, predict older same-session slots whose quote
+# snapshot exists but whose prediction was never stored (timeout, error, or a
+# tick skipped by a scheduler collision). This is the in-session "never lose a
+# slot" guarantee; GitHub remains the post-close audit/backstop.
+ALL_NSE_BACKLOG_DRAIN = _env_flag("ALL_NSE_BACKLOG_DRAIN", True)
+ALL_NSE_BACKLOG_MAX_SLOTS = max(0, int(os.getenv("ALL_NSE_BACKLOG_MAX_SLOTS") or 12))
+ALL_NSE_BACKLOG_DEADLINE_SECONDS = max(
+    5.0, float(os.getenv("ALL_NSE_BACKLOG_DEADLINE_SECONDS") or 90)
+)
+# Per-slot lease so a second Cloud Run instance (--max-instances 2) can accept a
+# request without either instance ticking the same slot twice. Opt-in: enabling
+# it also suppresses same-slot Cloud Scheduler retries until the TTL expires.
+ALL_NSE_TICK_LEASE = _env_flag("ALL_NSE_TICK_LEASE", False)
+ALL_NSE_TICK_LEASE_TTL_SECONDS = max(
+    30, int(os.getenv("ALL_NSE_TICK_LEASE_TTL_SECONDS") or 120)
+)
+PREDICTION_PENDING = "PREDICTION_PENDING"
+WORKER_INSTANCE_ID = f"{os.getenv('HOSTNAME', 'worker')}-{os.getpid()}"
 
 
 def _update_backfill_status(**fields: Any) -> None:
@@ -334,11 +354,12 @@ def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]
     """
     slot = capture.get("cycle_minute_ist")
     fallback = {
-        "status": "DELEGATED_TO_GITHUB_ACTIONS",
+        "status": PREDICTION_PENDING,
         "cycle_minute_ist": slot,
         "source_snapshot_drive_path": capture.get("snapshot_drive_path"),
     }
     if not ALL_NSE_IN_WORKER_PREDICTION:
+        fallback["status"] = "DELEGATED_TO_GITHUB_ACTIONS"
         fallback["reason"] = "ALL_NSE_IN_WORKER_PREDICTION is disabled."
         return fallback
     started = datetime.now(timezone.utc)
@@ -374,7 +395,7 @@ def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]
             "reason": (
                 "In-worker prediction exceeded the "
                 f"{ALL_NSE_IN_WORKER_DEADLINE_SECONDS:.0f}s deadline; "
-                "GitHub fallback owns this slot."
+                "queued for the backlog drain (GitHub remains the post-close backstop)."
             ),
         })
         return fallback
@@ -388,7 +409,7 @@ def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]
         fallback.update({
             "prediction_latency_seconds": elapsed,
             "error": outcome["error"],
-            "reason": "In-worker prediction failed; GitHub fallback owns this slot.",
+            "reason": "In-worker prediction failed; queued for the backlog drain (GitHub remains the post-close backstop).",
         })
         return fallback
     result = dict(outcome.get("result") or {})
@@ -402,6 +423,242 @@ def _run_all_nse_prediction_in_worker(capture: dict[str, Any]) -> dict[str, Any]
         elapsed_seconds=elapsed,
     )
     return result
+
+
+def _drive_lease_io() -> Any:
+    """Build a Drive-backed lease adapter, importing Drive helpers lazily."""
+    from drive_all_nse_prediction_compiler import _download, _find_remote
+    from persistent_store import GoogleDriveStore
+
+    store = GoogleDriveStore()
+    scratch = WORKER_ROOT / "tick_lease"
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    class _DriveLeaseIO:
+        def read(self, remote_path: str) -> dict[str, Any] | None:
+            item = _find_remote(store, remote_path)
+            if not item:
+                return None
+            local = scratch / f"read_{os.getpid()}.json"
+            _download(store, item["id"], local)
+            try:
+                return json.loads(local.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+
+        def write(self, remote_path: str, payload: dict[str, Any]) -> None:
+            local = scratch / f"write_{os.getpid()}.json"
+            local.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            store.upload_or_update(local, remote_path, mime_type="application/json")
+
+    return _DriveLeaseIO()
+
+
+def _acquire_tick_lease(slot_key: str) -> dict[str, Any]:
+    """Best-effort per-slot lease; fails open if Drive is unavailable."""
+    if not ALL_NSE_TICK_LEASE:
+        return {"acquired": True, "reason": "lease disabled"}
+    try:
+        decision = acquire_lease(
+            _drive_lease_io(),
+            slot_key,
+            WORKER_INSTANCE_ID,
+            datetime.now(timezone.utc),
+            ALL_NSE_TICK_LEASE_TTL_SECONDS,
+        )
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+        _log("tick_lease_unavailable", slot_key=slot_key, error=detail)
+        return {"acquired": True, "reason": "lease store unavailable; failing open", "error": detail}
+    return {
+        "acquired": decision.acquired,
+        "reason": decision.reason,
+        "existing_owner": decision.existing_owner,
+    }
+
+
+def _slot_key(value: Any) -> str | None:
+    try:
+        stamp = pd.Timestamp(value)
+        stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+        return stamp.strftime("%Y%m%d_%H%M")
+    except Exception:
+        return None
+
+
+def _count_missing_prediction_slots(store: Any, target: pd.Timestamp) -> dict[str, Any]:
+    """Cheap today-level count of quote slots with no prediction manifest."""
+    try:
+        from drive_all_nse_prediction_compiler import _find_remote, _list_children
+
+        quote_folder = _find_remote(
+            store, f"production_data/all_universe_minute_snapshots/{target:%Y/%m/%d}"
+        )
+        prediction_folder = _find_remote(
+            store, f"production_data/all_nse_minute_predictions/{target:%Y/%m/%d}"
+        )
+
+        def _names(folder: Any) -> set[str]:
+            if not folder:
+                return set()
+            return {str(item.get("name") or "") for item in _list_children(store, folder["id"])}
+
+        quote_names = {name for name in _names(quote_folder) if name.startswith("manifest_")}
+        prediction_names = {name for name in _names(prediction_folder) if name.startswith("manifest_")}
+        missing = sorted(quote_names - prediction_names)
+        return {
+            "quote_slots": len(quote_names),
+            "prediction_slots": len(prediction_names),
+            "prediction_slots_missing_today": len(missing),
+            "missing_sample": missing[-6:],
+        }
+    except Exception as exc:
+        return {
+            "quote_slots": None,
+            "prediction_slots": None,
+            "prediction_slots_missing_today": None,
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        }
+
+
+def _drain_missing_prediction_slots(
+    now: pd.Timestamp | datetime | None = None,
+    max_slots: int | None = None,
+    deadline_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Predict older same-session slots whose prediction is not yet stored.
+
+    Reuses ``_recovery_capture`` (the GitHub repair selector) so the worker and
+    the post-close audit share one definition of "missing". Time-boxed so a
+    large backlog can never push the current tick past its five-minute slot.
+    """
+    if not (ALL_NSE_IN_WORKER_PREDICTION and ALL_NSE_BACKLOG_DRAIN):
+        return {"status": "DISABLED", "drained": 0, "attempted": 0, "results": []}
+    stamp = pd.Timestamp.now(tz=IST) if now is None else pd.Timestamp(now)
+    stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+    target = stamp.normalize()
+    limit = ALL_NSE_BACKLOG_MAX_SLOTS if max_slots is None else max(0, int(max_slots))
+    budget = (
+        ALL_NSE_BACKLOG_DEADLINE_SECONDS if deadline_seconds is None else float(deadline_seconds)
+    )
+    started = time.monotonic()
+    results: list[dict[str, Any]] = []
+    drained = 0
+    newest_stored: pd.Timestamp | None = None
+    try:
+        from drive_all_nse_prediction_compiler import _recovery_capture
+        from persistent_store import GoogleDriveStore
+
+        # _recovery_capture stages manifests/snapshots under /tmp/drive_all_nse.
+        Path("/tmp/drive_all_nse").mkdir(parents=True, exist_ok=True)
+        store = GoogleDriveStore()
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+        _log("backlog_drain_unavailable", error=detail)
+        return {"status": "ERROR", "error": detail, "drained": 0, "attempted": 0, "results": []}
+    # Cheap two-folder check first: on a healthy tick there is nothing to drain,
+    # so never pay for the oldest-first manifest scan.
+    counts = _count_missing_prediction_slots(store, target)
+    missing = counts.get("prediction_slots_missing_today")
+    if not isinstance(missing, int) or missing <= 0:
+        report = {
+            "status": "NO_BACKLOG" if counts.get("error") is None else "ERROR",
+            "drained": 0,
+            "attempted": 0,
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+            "newest_stored_cycle_minute_ist": None,
+            "results": [],
+        }
+        report.update(counts)
+        return report
+    while len(results) < limit and (time.monotonic() - started) < budget:
+        try:
+            selection = _recovery_capture(store, target)
+        except RuntimeError as exc:
+            if "No quote snapshot folder" in str(exc):
+                break
+            detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+            _log("backlog_drain_scan_failed", error=detail)
+            return {
+                "status": "ERROR", "error": detail, "drained": drained,
+                "attempted": len(results), "results": results,
+            }
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+            _log("backlog_drain_scan_failed", error=detail)
+            return {
+                "status": "ERROR", "error": detail, "drained": drained,
+                "attempted": len(results), "results": results,
+            }
+        if selection is None:
+            break
+        manifest, _quotes, minute = selection
+        try:
+            # drive_only=True loads the persisted history archive for that slot,
+            # so a backfilled prediction is point-in-time correct instead of
+            # borrowing the warm live predictor's newer bars.
+            result = ALL_NSE_MINUTE_PREDICTOR.run_for_capture(
+                manifest, worker_root=WORKER_ROOT, drive_only=True
+            )
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+            results.append({"cycle_minute_ist": minute.isoformat(), "status": "ERROR", "error": detail})
+            break
+        status = str(result.get("status") or "").upper()
+        results.append({
+            "cycle_minute_ist": minute.isoformat(),
+            "status": status,
+            "prediction_count": result.get("prediction_count"),
+        })
+        if status in {"STORED", "OK", "PARTIAL"}:
+            drained += 1
+            newest_stored = minute
+        else:
+            # A failed slot is not retried in a tight loop; the next tick or the
+            # post-close audit will pick it up again.
+            break
+    report = {
+        "status": "OK" if results else "NO_BACKLOG",
+        "drained": drained,
+        "attempted": len(results),
+        "elapsed_seconds": round(time.monotonic() - started, 1),
+        "newest_stored_cycle_minute_ist": (
+            newest_stored.isoformat() if newest_stored is not None else None
+        ),
+        "results": results[-6:],
+    }
+    report.update(counts)
+    if isinstance(missing, int):
+        report["prediction_slots_missing_today"] = max(0, missing - drained)
+    if results:
+        _log("backlog_drain_result", **report)
+    return report
+
+
+def _prediction_metrics(
+    capture: dict[str, Any],
+    prediction: dict[str, Any],
+    drain: dict[str, Any] | None,
+    timings: dict[str, Any],
+) -> dict[str, Any]:
+    capture_minute = capture.get("cycle_minute_ist")
+    stored_minute = None
+    if str(prediction.get("status") or "").upper() in {"STORED", "OK", "PARTIAL"}:
+        stored_minute = prediction.get("cycle_minute_ist") or capture_minute
+    elif drain and drain.get("newest_stored_cycle_minute_ist"):
+        stored_minute = drain.get("newest_stored_cycle_minute_ist")
+    lag = None
+    capture_key = _slot_key(capture_minute) if capture_minute else None
+    stored_key = _slot_key(stored_minute) if stored_minute else None
+    if capture_key and stored_key:
+        lag = slots_between(capture_key, stored_key)
+    return {
+        "tick_duration_seconds": timings.get("tick_duration_seconds"),
+        "capture_seconds": timings.get("capture_seconds"),
+        "prediction_seconds": timings.get("prediction_seconds"),
+        "prediction_lag_slots": lag,
+        "prediction_slots_missing_today": (drain or {}).get("prediction_slots_missing_today"),
+    }
 
 
 def _prepare_all_nse_history_before_capture(
@@ -487,6 +744,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
         }
         STATE["last_tick_at_utc"] = datetime.now(timezone.utc).isoformat()
         STATE["last_tick_result"] = _clean_json(result)
+        STATE["tick_metrics"] = _clean_json(result.get("metrics") or {})
         STATE["all_universe_capture_status"] = capture_status
         STATE["all_nse_minute_prediction_status"] = all_nse_status
         STATE["all_nse_minute_prediction_last_result"] = _clean_json({
@@ -504,7 +762,7 @@ def _record_tick_result(result: dict[str, Any]) -> None:
             )
             if key in all_nse
         })
-        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}:
+        if all_nse_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS", "PREDICTION_PENDING"}:
             STATE["all_nse_minute_prediction_error"] = str(
                 all_nse_error or f"ALL-NSE minute prediction status is {all_nse_status}"
             )
@@ -639,6 +897,22 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             }
             return 202, payload
 
+        if item_status == "PREDICTION_PENDING":
+            metrics = state.get("tick_metrics") or {}
+            payload = {
+                "status": "pending",
+                "probe": "all_nse_minute_prediction_actual",
+                "checked_at_utc": now_utc.isoformat(),
+                "cycle_minute_ist": minute,
+                "age_seconds": None if age is None else round(age, 1),
+                "source_snapshot_drive_path": item.get("source_snapshot_drive_path"),
+                "prediction_lag_slots": metrics.get("prediction_lag_slots"),
+                "prediction_slots_missing_today": metrics.get("prediction_slots_missing_today"),
+                "reason": "This slot is queued for the in-session backlog drain; GitHub remains the post-close backstop.",
+                "reasons": [],
+            }
+            return 202, payload
+
         # No valid quote is an expected no-op for that slot, not a global
         # coverage failure. The stored source snapshot remains the audit record.
         no_data = item_status == "NO_ELIGIBLE_SYMBOLS" or (
@@ -685,6 +959,8 @@ def _capture_diagnostic(path: str) -> tuple[int, dict[str, Any]]:
             "history_ready": item.get("history_ready"),
             "drive_path": drive_path,
             "manifest_drive_path": manifest_path,
+            "prediction_lag_slots": (state.get("tick_metrics") or {}).get("prediction_lag_slots"),
+            "prediction_slots_missing_today": (state.get("tick_metrics") or {}).get("prediction_slots_missing_today"),
             "reasons": reasons,
         }
         return (200 if stored and has_prediction else 503), payload
@@ -986,13 +1262,24 @@ class WorkerHandler(BaseHTTPRequestHandler):
         capture_status = status.get("all_universe_capture_status", "NOT_RUN")
         capture_warning = status.get("all_universe_capture_warning")
         drive_preflight_status = status.get("drive_preflight_status", "NOT_CHECKED")
+        metrics = status.get("tick_metrics") or {}
+        now_ist = pd.Timestamp.now(tz=IST)
+        in_session = bool(
+            is_nse_trading_day(now_ist.date())
+            and pd.Timestamp("09:15").time() <= now_ist.time() < pd.Timestamp("15:30").time()
+        )
+        lag_slots = metrics.get("prediction_lag_slots")
+        prediction_stalled = bool(
+            in_session and isinstance(lag_slots, (int, float)) and lag_slots > 3
+        )
         payload = {
             "status": "degraded" if (
                 error
                 or capture_status not in {"OK", "STORED", "PARTIAL", "NOT_RUN"}
                 or capture_warning
                 or drive_preflight_status != "OK"
-                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS"}
+                or status.get("all_nse_minute_prediction_status", "NOT_RUN") not in {"OK", "STORED", "PARTIAL", "NOT_RUN", "NO_ELIGIBLE_SYMBOLS", "DELEGATED_TO_GITHUB_ACTIONS", "PREDICTION_PENDING"}
+                or prediction_stalled
             ) else "ok",
             "worker_status": status.get("worker_status", {}).get("run_status"),
             "last_tick_at_utc": status.get("last_tick_at_utc"),
@@ -1007,6 +1294,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
             "all_nse_minute_prediction_error": status.get("all_nse_minute_prediction_error"),
             "nse_time_ist": status.get("nse_time_ist"),
             "tick_interval_seconds": status.get("tick_interval_seconds"),
+            "tick_duration_seconds": metrics.get("tick_duration_seconds"),
+            "capture_seconds": metrics.get("capture_seconds"),
+            "prediction_seconds": metrics.get("prediction_seconds"),
+            "prediction_lag_slots": lag_slots,
+            "prediction_slots_missing_today": metrics.get("prediction_slots_missing_today"),
+            "prediction_stalled": prediction_stalled,
         }
         self._send_json(503 if payload["status"] == "degraded" else 200, payload)
 
@@ -1141,6 +1434,18 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     })
                     return
 
+            slot_key = pd.Timestamp.now(tz=IST).floor("5min").strftime("%Y%m%d_%H%M")
+            lease = _acquire_tick_lease(slot_key)
+            if not lease.get("acquired"):
+                _log("cloud_run_tick_lease_held", slot_key=slot_key, **lease)
+                self._send_json(200, {
+                    "status": "TICK_LEASE_HELD",
+                    "slot_key": slot_key,
+                    "reason": lease.get("reason"),
+                    "existing_owner": lease.get("existing_owner"),
+                })
+                return
+
             # Drain the small scheduler payload, if any.
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1149,11 +1454,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
             if length:
                 self.rfile.read(min(length, 4096))
 
+            tick_started = time.monotonic()
             # Seed and refresh history before the full-universe quote collector
             # starts. This lets fresh one-minute candles arrive during the quote
             # fetch instead of starting refresh only after quote collection ends.
             history_prefetch = _prepare_all_nse_history_before_capture()
+            capture_started = time.monotonic()
             result = WORKER.tick_once()
+            capture_seconds = round(time.monotonic() - capture_started, 3)
             result["all_nse_pre_capture_history_refresh"] = history_prefetch
             # Cloud Run owns INDstocks collection and durable snapshot/history writes.
             # When ALL_NSE_IN_WORKER_PREDICTION is enabled it also owns the
@@ -1161,6 +1469,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             # five-minute boundary; otherwise GitHub Actions compiles the
             # persisted Drive artifacts as before.
             capture_result = result.get("all_universe_capture") or {}
+            prediction_started = time.monotonic()
             if capture_result.get("status") == "NOT_SCHEDULED":
                 result["all_nse_minute_predictions"] = {
                     "status": "NOT_SCHEDULED",
@@ -1170,6 +1479,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 result["all_nse_minute_predictions"] = _run_all_nse_prediction_in_worker(
                     capture_result
                 )
+            prediction_seconds = round(time.monotonic() - prediction_started, 3)
+            # Drain older missed slots (time-boxed) so a timeout, error, or a
+            # scheduler collision can never permanently lose a slot.
+            drain = _drain_missing_prediction_slots()
+            result["backlog_drain"] = drain
+            result["metrics"] = _prediction_metrics(
+                capture_result,
+                result.get("all_nse_minute_predictions") or {},
+                drain,
+                {
+                    "tick_duration_seconds": round(time.monotonic() - tick_started, 3),
+                    "capture_seconds": capture_seconds,
+                    "prediction_seconds": prediction_seconds,
+                },
+            )
             _record_tick_result(result)
             _log("cloud_run_tick_result", **result, **_resource_usage())
             # A tick completed even if one symbol/source failed; errors are

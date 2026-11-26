@@ -21,9 +21,15 @@ os.environ["INDSTOCKS_AUTH_MODE"] = "disabled"
 
 from intraday_prediction_cycle import (
     DEFAULT_MAX_LOOKBACK_SLOTS as PREDICTION_CYCLE_LOOKBACK_SLOTS,
+    LIVE_DELAYED,
+    LIVE_STALE,
+    NO_CYCLE_FOR_SESSION,
+    SESSION_FINAL,
+    classify_cycle_status,
     select_prediction_complete_cycles,
     slots_between,
 )
+from prediction_readiness import stored_prediction_is_ready as _stored_prediction_is_ready
 from data_fetcher import (
     INDEX_TICKER_MAP,
     benchmark_for_symbol,
@@ -1533,20 +1539,23 @@ def _auto_watch_intraday(symbol: str) -> dict:
         }
 
 
-def _stored_prediction_is_ready(row: dict[str, Any] | None) -> bool:
-    """True only for a persisted, snapshot-linked, successfully predicted row."""
-    if not isinstance(row, dict) or not row:
-        return False
-    if not bool(row.get("_prediction_row_stored")):
-        return False
-    if str(row.get("prediction_snapshot_link_status") or "") != "MATCHED_TO_SNAPSHOT_QUOTE":
-        return False
-    if not str(row.get("prediction_status") or "").upper().startswith("PREDICTED"):
-        return False
-    probability = pd.to_numeric(
-        pd.Series([row.get("probability_up_session_close")]), errors="coerce"
-    ).iloc[0]
-    return bool(pd.notna(probability) and np.isfinite(float(probability)))
+def _last_completed_nse_session(now_ist: Any) -> Any:
+    """Return the most recent finished NSE session date for ``now_ist``.
+
+    After the 15:30 IST close on a trading day the completed session is today;
+    otherwise (pre-open, weekend, holiday) it is the previous trading day.
+    """
+    from production_data_freshness_gate import previous_trading_day
+
+    now = pd.Timestamp(now_ist)
+    today = now.date()
+    try:
+        from nse_trading_calendar import is_nse_trading_day
+    except Exception:
+        is_nse_trading_day = lambda value: value.weekday() < 5  # noqa: E731
+    if is_nse_trading_day(today) and now.time() >= pd.Timestamp("15:30").time():
+        return today
+    return previous_trading_day(today)
 
 
 def _latest_stored_prediction_for_symbol(symbol: str) -> dict[str, Any] | None:
@@ -1776,6 +1785,69 @@ if interface_mode == "Paper Trading":
         delivery_prediction_loader=_cached_paper_trading_7day_forecast,
     )
     st.stop()
+
+
+def _render_slot_predictions_table(slot_predictions: dict[str, Any], selected_symbol: str) -> None:
+    """Render per-slot session-close predictions for all remaining 5-min slots."""
+    status = slot_predictions.get("status")
+    if status == "DRIVE_UNAVAILABLE":
+        st.warning(
+            "Per-slot predictions unavailable: "
+            + str(slot_predictions.get("reason") or "Google Drive is not reachable.")
+        )
+        return
+    if status == "SESSION_CLOSED":
+        st.info("NSE session is closed — no remaining five-minute slots today.")
+        return
+    if status != "OK":
+        st.warning(f"Per-slot predictions unavailable ({status}).")
+        return
+
+    slots = slot_predictions.get("slots") or []
+    if not slots:
+        st.info("No five-minute prediction slots found for today's session.")
+        return
+
+    session_date = slot_predictions.get("session_date", "today")
+    st.divider()
+    st.subheader(f"Session-close predictions — {selected_symbol} ({session_date})")
+    st.caption(
+        "One prediction per remaining 5-minute slot until the 15:30 IST close. "
+        "Each slot is a separate persisted cycle; P(up) and expected return are for the session close."
+    )
+
+    table_rows = []
+    for slot in slots:
+        pred = slot.get("prediction") or {}
+        horizon = pred.get("horizon_minutes")
+        prob = pred.get("probability_up")
+        exp_ret = pred.get("expected_return")
+        ref_price = pred.get("actual_market_value")
+        fc_price = (
+            float(ref_price) * (1.0 + float(exp_ret))
+            if pd.notna(ref_price) and pd.notna(exp_ret) else np.nan
+        )
+        table_rows.append({
+            "Slot (IST)": slot.get("slot_label", "—"),
+            "Horizon (min)": int(horizon) if pd.notna(horizon) else "—",
+            "Signal": str(pred.get("signal") or "—"),
+            "P(up)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
+            "Exp. return": f"{float(exp_ret):+.2%}" if pd.notna(exp_ret) else "—",
+            "Forecast close": f"₹{float(fc_price):,.2f}" if pd.notna(fc_price) else "—",
+            "Status": str(pred.get("prediction_status") or ("STORED" if slot.get("prediction_file_stored") else "PENDING")),
+            "Manifest": str(slot.get("manifest_status") or "—"),
+        })
+
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        width="stretch",
+        hide_index=True,
+        height=min(420, 40 + 32 * len(table_rows)),
+    )
+    st.caption(
+        f"{slot_predictions.get('total_slots', 0)} slot(s) for {session_date}. "
+        "PENDING = prediction file not yet persisted for that slot."
+    )
 
 
 if interface_mode == "Live Test":
@@ -2401,7 +2473,7 @@ if interface_mode == "Live Test":
             )
             if snapshot.get("status") != "OK":
                 st.warning(
-                    "No persisted five-minute snapshot is available from GitHub/Drive: "
+                    "No persisted five-minute snapshot is available from Cloud Run/Drive: "
                     + str(snapshot.get("reason") or snapshot.get("status"))
                 )
                 # Still show per-slot predictions if any exist.
@@ -2426,7 +2498,7 @@ if interface_mode == "Live Test":
             cycle_value = snapshot.get("cycle_minute_ist")
             cycle_ts = pd.to_datetime(cycle_value, errors="coerce")
             if pd.isna(cycle_ts):
-                st.warning("The GitHub prediction cycle timestamp is missing or invalid.")
+                st.warning("The prediction cycle timestamp is missing or invalid.")
                 if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
                     _render_slot_predictions_table(slot_predictions, selected_root)
                 return
@@ -2437,28 +2509,55 @@ if interface_mode == "Live Test":
             manifest_status = str(prediction_manifest.get("status") or "").upper()
             link_status = str(row.get("prediction_snapshot_link_status") or "")
             prediction_status = str(row.get("prediction_status") or "").upper()
-            prediction_ready = (
-                prediction_file_stored
-                and manifest_status == "STORED"
-                and bool(row.get("prediction_stored"))
-                and link_status == "MATCHED_TO_SNAPSHOT_QUOTE"
-                and prediction_status.startswith("PREDICTED")
-            )
+            prediction_ready = _stored_prediction_is_ready(row)
             slots_behind = int(snapshot.get("slots_behind") or 0)
+            now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+            freshness = classify_cycle_status(
+                now_ist,
+                cycle_ts,
+                slots_behind,
+                _last_completed_nse_session(now_ist),
+            )
             cycle_caption = (
-                f"GitHub prediction cycle: {cycle_ts.strftime('%d %b %Y %H:%M:%S')} IST · "
-                f"age: {age_seconds / 60:.1f} min · source: Google Drive"
+                "Intraday prediction cycle · Cloud Run → Google Drive "
+                "(GitHub compiles the post-close audit) · "
+                f"{cycle_ts.strftime('%d %b %Y %H:%M:%S')} IST · "
+                f"age: {age_seconds / 60:.1f} min"
             )
             if slots_behind:
                 cycle_caption += (
                     f" · {slots_behind} slot(s) behind the newest quote cycle"
                     f" ({snapshot.get('newest_snapshot_cycle_minute') or 'unknown'})"
                 )
+            if freshness.is_final:
+                cycle_caption += " · Final cycle for the last completed session"
             st.caption(cycle_caption)
-            if age_seconds > 10 * 60:
+            if freshness.status == LIVE_STALE:
+                st.warning(
+                    "The intraday prediction pipeline is stalled: the newest fully persisted cycle is "
+                    f"{slots_behind} slot(s) behind the newest quote snapshot "
+                    f"(limit {PREDICTION_CYCLE_LOOKBACK_SLOTS}). No local inference fallback is used."
+                )
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
+                return
+            if freshness.status == NO_CYCLE_FOR_SESSION:
+                st.warning(
+                    "The last completed NSE session produced no complete prediction cycle "
+                    "(no snapshot with a stored prediction). No local inference fallback is used."
+                )
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
+                return
+            if freshness.status == LIVE_DELAYED:
                 st.caption(
-                    f"Note: cycle is {age_seconds / 60:.1f} minutes old "
-                    "(showing the latest persisted prediction; no local inference fallback)."
+                    f"Note: the prediction pipeline is {slots_behind} slot(s) behind; "
+                    "showing the newest fully persisted prediction. No local inference fallback is used."
+                )
+            if not prediction_ready:
+                st.caption(
+                    "Note: the latest cycle row is not fully stored/linked; "
+                    "the per-slot table below is the authoritative view."
                 )
 
             # ---- Latest cycle signal / P(up) / forecast price ----
@@ -3506,65 +3605,3 @@ for rec in live_records:
             near_atm = fo.get("near_atm_chain")
             if near_atm is not None and not near_atm.empty:
                 st.dataframe(near_atm, width="stretch")
-
-def _render_slot_predictions_table(slot_predictions: dict[str, Any], selected_symbol: str) -> None:
-    """Render per-slot session-close predictions for all remaining 5-min slots."""
-    status = slot_predictions.get("status")
-    if status == "DRIVE_UNAVAILABLE":
-        st.warning(
-            "Per-slot predictions unavailable: "
-            + str(slot_predictions.get("reason") or "Google Drive is not reachable.")
-        )
-        return
-    if status == "SESSION_CLOSED":
-        st.info("NSE session is closed — no remaining five-minute slots today.")
-        return
-    if status != "OK":
-        st.warning(f"Per-slot predictions unavailable ({status}).")
-        return
-
-    slots = slot_predictions.get("slots") or []
-    if not slots:
-        st.info("No five-minute prediction slots found for today's session.")
-        return
-
-    session_date = slot_predictions.get("session_date", "today")
-    st.divider()
-    st.subheader(f"Session-close predictions — {selected_symbol} ({session_date})")
-    st.caption(
-        "One prediction per remaining 5-minute slot until the 15:30 IST close. "
-        "Each slot is a separate persisted cycle; P(up) and expected return are for the session close."
-    )
-
-    table_rows = []
-    for slot in slots:
-        pred = slot.get("prediction") or {}
-        horizon = pred.get("horizon_minutes")
-        prob = pred.get("probability_up")
-        exp_ret = pred.get("expected_return")
-        ref_price = pred.get("actual_market_value")
-        fc_price = (
-            float(ref_price) * (1.0 + float(exp_ret))
-            if pd.notna(ref_price) and pd.notna(exp_ret) else np.nan
-        )
-        table_rows.append({
-            "Slot (IST)": slot.get("slot_label", "—"),
-            "Horizon (min)": int(horizon) if pd.notna(horizon) else "—",
-            "Signal": str(pred.get("signal") or "—"),
-            "P(up)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
-            "Exp. return": f"{float(exp_ret):+.2%}" if pd.notna(exp_ret) else "—",
-            "Forecast close": f"₹{float(fc_price):,.2f}" if pd.notna(fc_price) else "—",
-            "Status": str(pred.get("prediction_status") or ("STORED" if slot.get("prediction_file_stored") else "PENDING")),
-            "Manifest": str(slot.get("manifest_status") or "—"),
-        })
-
-    st.dataframe(
-        pd.DataFrame(table_rows),
-        width="stretch",
-        hide_index=True,
-        height=min(420, 40 + 32 * len(table_rows)),
-    )
-    st.caption(
-        f"{slot_predictions.get('total_slots', 0)} slot(s) for {session_date}. "
-        "PENDING = prediction file not yet persisted for that slot."
-    )

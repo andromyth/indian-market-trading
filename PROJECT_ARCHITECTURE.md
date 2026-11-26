@@ -198,7 +198,9 @@ Actions runs the Drive-consumer half of the system:
 
 | Workflow | Cadence | Purpose |
 |---|---|---|
-| `compile_all_nse_predictions_from_drive.yml` | 15:29 IST weekdays (single safety run) | Compile canonical snapshot → predictions |
+| `compile_all_nse_predictions_from_drive.yml` | 15:29 IST weekdays (safety run) + `mode=recover` dispatch | Compile canonical snapshot → predictions; post-close audit |
+| `session_prediction_dispatcher.yml` | In-session 5-minute dispatch (GitHub-throttled) | Repair missing slots + publish session health |
+| `prediction_schedule_watchdog.yml` | Every 10 minutes in-session (GitHub-throttled) | Read persisted-pointer age; dispatch a `mode=recover` compile when stale or slots are missing |
 | `nse_eod_sync.yml` | 3 attempts after close | Official EOD/delivery archive sync |
 | `nse_delivery_production_cycle.yml` | 21:45, 01:45, 06:45 IST | Delivery PIT refresh + validation + policy |
 | `autonomous_prediction_learning.yml` | Manual dispatch only | Calibration/learning diagnostics |
@@ -213,7 +215,11 @@ fired hours late (the compiler ran once daily near 18:10 UTC despite its
 15:29 IST cron, and the backfill trigger fired at 17:57 UTC instead of 10:30
 UTC). Production data acquisition therefore relies on Cloud Scheduler; the
 retrain job consolidates and checks freshness itself rather than depending on
-the order or promptness of two GitHub cron jobs.
+the order or promptness of two GitHub cron jobs. For the same reason the
+in-session dispatcher and the ten-minute pointer-age watchdog are best-effort
+backstops, not the primary "never lose a slot" guarantee — that guarantee is
+the Cloud Run tick's time-boxed backlog drain, which re-runs any same-session
+slot whose quote snapshot exists but whose prediction is missing.
 
 Important compiler properties:
 
@@ -294,7 +300,25 @@ Examples:
 - daily ledger hydration failure → `PERSISTENCE_ERROR`, no prediction;
 - capture only on a valid five-minute anchor.
 
-The service explicitly delegates prediction to GitHub Actions:
+When `ALL_NSE_IN_WORKER_PREDICTION=1` (the default for manual deploys), Cloud
+Run runs the same-slot champion inference inside the tick. A timeout or error
+does not delegate the slot: it marks it `PREDICTION_PENDING` and the in-session
+backlog drain re-runs it on a later tick, bounded by `ALL_NSE_BACKLOG_MAX_SLOTS`
+and `ALL_NSE_BACKLOG_DEADLINE_SECONDS`:
+
+```json
+{
+  "all_nse_minute_predictions": {
+    "status": "PREDICTION_PENDING",
+    "cycle_minute_ist": "...",
+    "source_snapshot_drive_path": "...",
+    "reason": "In-worker prediction failed; queued for the backlog drain (GitHub remains the post-close backstop)."
+  }
+}
+```
+
+With in-worker prediction disabled, the tick instead reports
+`DELEGATED_TO_GITHUB_ACTIONS` and GitHub compiles the persisted Drive snapshot:
 
 ```json
 {
@@ -302,7 +326,7 @@ The service explicitly delegates prediction to GitHub Actions:
     "status": "DELEGATED_TO_GITHUB_ACTIONS",
     "cycle_minute_ist": "...",
     "source_snapshot_drive_path": "...",
-    "reason": "GitHub Actions compiles the persisted Drive snapshot and history archive."
+    "reason": "ALL_NSE_IN_WORKER_PREDICTION is disabled."
   }
 }
 ```
@@ -835,7 +859,9 @@ skipped or data-limited.
 |---|---|---|---|
 | Cloud Scheduler | 09:15–15:25 IST, every 5 min | 540 s attempt deadline | 2 attempts, 60 s window |
 | Cloud Run `/tick` | One request per slot | 900 s | Scheduler retry only |
-| GitHub compiler | 15:29 IST weekdays (single safety run) | 15 min job cap | Manual dispatch; GitHub cron is throttled |
+| GitHub compiler | 15:29 IST weekdays (safety run) + `mode=recover` dispatch | 15 min job cap | Manual dispatch; GitHub cron is throttled |
+| Session dispatcher | In-session 5-minute dispatch (throttled) | 6 h job cap | Best-effort repair lane |
+| Pointer-age watchdog | Every 10 minutes in-session (throttled) | 12 min job cap | Dispatches `mode=recover` when the pointer is stale |
 | Delivery production | 21:45 / 01:45 / 06:45 IST | 60 min | Three daily checkpoints |
 | Learning | Manual dispatch only | 180 min | Manual dispatch |
 | Native 5m backfill | 16:00 IST via Cloud Scheduler `native-5m-backfill-daily` | Multi-hour Cloud Run job | Cloud Scheduler retry |
@@ -874,6 +900,9 @@ and every 09:20–15:25 five-minute slot has data across the selected universe.
 | No eligible quotes | `NO_ELIGIBLE_SYMBOLS`; zero prediction rows |
 | Model inference error for one symbol | `MODEL_INFERENCE_ERROR` row; other symbols continue |
 | Prediction already stored | `SKIPPED_ALREADY_PREDICTED` |
+| In-worker prediction timeout/error | `PREDICTION_PENDING`; the next tick's backlog drain retries the slot |
+| Slot still missing at close | Post-close compiler `mode=recover` (and the pointer-age watchdog) repairs it |
+| Persisted pointer stale > 15 min in session | Watchdog dispatches a `mode=recover` compile |
 | Capture stale (> 12 min) | Compiler selects nothing and raises |
 
 ### 9.2 Event names to watch
@@ -891,6 +920,17 @@ Cloud Run stdout (JSON text payloads):
 - `drive_flush_completed`
 - `cloud_run_tick_result`
 - `cloud_run_tick_exception`
+- `all_nse_in_worker_prediction_timeout`
+- `backlog_drain_result`
+- `backlog_drain_unavailable`
+- `cloud_run_tick_lease_held`
+- `tick_lease_unavailable`
+
+`/healthz` exposes `prediction_lag_slots`, `prediction_slots_missing_today`,
+`tick_duration_seconds`, `capture_seconds`, `prediction_seconds`, and
+`prediction_stalled` (true when in-session lag exceeds 3 slots); `/predictionz`
+returns `pending` with the same lag/missing fields while a slot is queued for
+the backlog drain.
 
 GitHub Actions compiler:
 

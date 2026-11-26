@@ -755,9 +755,9 @@ def test_all_nse_in_worker_prediction_falls_back_on_error(monkeypatch):
 
     result = service._run_all_nse_prediction_in_worker(capture)
 
-    assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
+    assert result["status"] == "PREDICTION_PENDING"
     assert "simulated drive write failure" in result["error"]
-    assert "GitHub fallback" in result["reason"]
+    assert "backlog drain" in result["reason"]
 
 
 def test_all_nse_in_worker_prediction_falls_back_on_deadline(monkeypatch):
@@ -777,9 +777,113 @@ def test_all_nse_in_worker_prediction_falls_back_on_deadline(monkeypatch):
 
     result = service._run_all_nse_prediction_in_worker(capture)
 
-    assert result["status"] == "DELEGATED_TO_GITHUB_ACTIONS"
+    assert result["status"] == "PREDICTION_PENDING"
     assert "deadline" in result["reason"]
     assert result["prediction_latency_seconds"] >= 0.05
+
+
+def test_backlog_drain_predicts_missing_slots(monkeypatch):
+    import autonomous_intraday_worker_service as service
+    import drive_all_nse_prediction_compiler as compiler
+    import persistent_store
+
+    minute = pd.Timestamp("2026-11-26T09:20:00", tz=IST)
+    selections = [
+        ({"cycle_minute_ist": minute.isoformat(), "snapshot_drive_path": "snap"}, None, minute),
+        None,
+    ]
+    calls = []
+
+    class FakePredictor:
+        def run_for_capture(self, capture, worker_root=None, *, drive_only=True):
+            calls.append((capture, worker_root, drive_only))
+            return {
+                "status": "STORED",
+                "cycle_minute_ist": capture["cycle_minute_ist"],
+                "prediction_count": 10,
+            }
+
+    monkeypatch.setattr(service, "ALL_NSE_MINUTE_PREDICTOR", FakePredictor())
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", True)
+    monkeypatch.setattr(service, "ALL_NSE_BACKLOG_DRAIN", True)
+    monkeypatch.setattr(service, "ALL_NSE_BACKLOG_MAX_SLOTS", 5)
+    monkeypatch.setattr(service, "ALL_NSE_BACKLOG_DEADLINE_SECONDS", 30.0)
+    monkeypatch.setattr(compiler, "_recovery_capture", lambda store, target: selections.pop(0))
+    monkeypatch.setattr(
+        compiler,
+        "_find_remote",
+        lambda store, path: {"id": "pred"} if "all_nse_minute_predictions" in path else {"id": "quote"},
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, folder_id: (
+            [{"name": "manifest_20261126_0920.json"}] if folder_id == "quote" else []
+        ),
+    )
+    monkeypatch.setattr(persistent_store, "GoogleDriveStore", lambda: object())
+
+    report = service._drain_missing_prediction_slots(
+        now=pd.Timestamp("2026-11-26T10:00:00", tz=IST)
+    )
+
+    assert report["drained"] == 1
+    assert report["attempted"] == 1
+    assert report["newest_stored_cycle_minute_ist"] == minute.isoformat()
+    assert report["prediction_slots_missing_today"] == 0
+    assert calls == [
+        (
+            {"cycle_minute_ist": minute.isoformat(), "snapshot_drive_path": "snap"},
+            service.WORKER_ROOT,
+            True,
+        )
+    ]
+
+
+def test_backlog_drain_skips_scan_when_nothing_missing(monkeypatch):
+    import autonomous_intraday_worker_service as service
+    import drive_all_nse_prediction_compiler as compiler
+    import persistent_store
+
+    scans = []
+    monkeypatch.setattr(service, "ALL_NSE_IN_WORKER_PREDICTION", True)
+    monkeypatch.setattr(service, "ALL_NSE_BACKLOG_DRAIN", True)
+    monkeypatch.setattr(compiler, "_recovery_capture", lambda store, target: scans.append(target))
+    monkeypatch.setattr(
+        compiler,
+        "_find_remote",
+        lambda store, path: {"id": "pred"} if "all_nse_minute_predictions" in path else {"id": "quote"},
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_list_children",
+        lambda store, folder_id: (
+            [{"name": "manifest_20261126_0920.json"}] if folder_id == "quote" else [{"name": "manifest_20261126_0920.json"}]
+        ),
+    )
+    monkeypatch.setattr(persistent_store, "GoogleDriveStore", lambda: object())
+
+    report = service._drain_missing_prediction_slots(
+        now=pd.Timestamp("2026-11-26T10:00:00", tz=IST)
+    )
+
+    assert report["status"] == "NO_BACKLOG"
+    assert report["drained"] == 0
+    assert report["prediction_slots_missing_today"] == 0
+    assert scans == []
+
+
+def test_backlog_drain_is_disabled_by_flag(monkeypatch):
+    import autonomous_intraday_worker_service as service
+
+    monkeypatch.setattr(service, "ALL_NSE_BACKLOG_DRAIN", False)
+    report = service._drain_missing_prediction_slots(
+        now=pd.Timestamp("2026-11-26T10:00:00", tz=IST)
+    )
+
+    assert report["status"] == "DISABLED"
+    assert report["drained"] == 0
+    assert report["attempted"] == 0
 
 
 def test_resource_usage_reports_peak_rss_and_cpu():

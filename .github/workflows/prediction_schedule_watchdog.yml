@@ -1,7 +1,17 @@
 name: Prediction schedule watchdog
 
+# In-session backstop for the Cloud Run intraday pipeline. Every ten minutes it
+# reads the newest persisted prediction pointer from Google Drive and, when the
+# pointer is older than 15 minutes or slots are missing, dispatches the
+# Drive-only compiler in recover mode. GitHub cron is throttled in this
+# repository, so this is a best-effort backstop; the Cloud Run tick's in-session
+# backlog drain is the primary guarantee.
 on:
   workflow_dispatch:
+  schedule:
+    # Every 10 minutes; the in-script gate restricts work to 09:15–15:30 IST on
+    # NSE trading days.
+    - cron: "*/10 * * * 1-5"
 
 permissions:
   actions: write
@@ -12,19 +22,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  recover-missed-prediction-run:
+  watchdog:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 12
+    env:
+      GOOGLE_DRIVE_ROOT_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_ROOT_ID }}
+      GOOGLE_OAUTH_TOKEN_JSON: ${{ secrets.GOOGLE_OAUTH_TOKEN_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      WORKFLOW_FILE: compile_all_nse_predictions_from_drive.yml
     steps:
-      - name: Dispatch compiler only when its scheduled run is missing
+      - name: Decide whether this run is in session
+        id: gate
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          in_session = (
+              now.weekday() < 5
+              and (now.hour, now.minute) >= (9, 15)
+              and (now.hour, now.minute) < (15, 30)
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"in_session={'true' if in_session else 'false'}\n")
+              out.write(f"today={now:%Y-%m-%d}\n")
+          print({"in_session": in_session, "now_ist": now.isoformat()})
+          PY
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.in_session == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.in_session == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.in_session == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Check pointer age and dispatch a recovery compile when stale
+        if: steps.gate.outputs.in_session == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: compile_all_nse_predictions_from_drive.yml
+          RECOVER_DATE: ${{ steps.gate.outputs.today }}
         run: |
           python - <<'PY'
           import json
           import os
+          import subprocess
           import sys
           import urllib.error
           import urllib.request
@@ -34,13 +84,8 @@ jobs:
           token = os.environ["GH_TOKEN"]
           repository = os.environ["REPOSITORY"]
           workflow = os.environ["WORKFLOW_FILE"]
+          recover_date = os.environ["RECOVER_DATE"]
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
-
-          if now.weekday() >= 5 or (now.hour, now.minute) < (9, 15) or (now.hour, now.minute) >= (15, 30):
-              print(json.dumps({"status": "OUTSIDE_MARKET_WINDOW", "now_ist": now.isoformat()}))
-              sys.exit(0)
-
-          api = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/runs?per_page=20"
           headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": f"Bearer {token}",
@@ -50,51 +95,77 @@ jobs:
           def request(url, method="GET", body=None):
               data = None if body is None else json.dumps(body).encode()
               req = urllib.request.Request(url, data=data, headers=headers, method=method)
-              with urllib.request.urlopen(req, timeout=20) as response:
+              with urllib.request.urlopen(req, timeout=25) as response:
                   raw = response.read().decode()
                   return json.loads(raw) if raw.strip() else None
 
+          # 1. Read the newest persisted prediction pointer from Drive.
+          health = {}
           try:
-              payload = request(api)
-              runs = payload.get("workflow_runs", [])
-              relevant = [
-                  run for run in runs
-                  if run.get("event") in {"schedule", "workflow_dispatch"}
-                  and run.get("head_branch") == "main"
-              ]
+              proc = subprocess.run(
+                  [sys.executable, "-u", "scripts/session_prediction_health.py"],
+                  capture_output=True, text=True, timeout=240,
+              )
+              for line in proc.stdout.splitlines():
+                  if line.startswith("SESSION_HEALTH_JSON="):
+                      health = json.loads(line.split("=", 1)[1])
+                      break
+              if not health:
+                  print(json.dumps({
+                      "status": "HEALTH_UNAVAILABLE",
+                      "returncode": proc.returncode,
+                      "stderr_tail": (proc.stderr or "")[-400:],
+                  }))
+          except Exception as exc:  # noqa: BLE001 - watchdog must never crash the schedule
+              print(json.dumps({"status": "HEALTH_ERROR", "error": f"{type(exc).__name__}: {exc}"}))
+
+          age = health.get("prediction_age_minutes")
+          missing = health.get("prediction_missing_slots")
+          fresh = bool(health.get("prediction_fresh"))
+          needs_recover = (not fresh) or (isinstance(missing, int) and missing > 0)
+          print(json.dumps({
+              "status": "HEALTH",
+              "prediction_age_minutes": age,
+              "prediction_missing_slots": missing,
+              "prediction_fresh": fresh,
+              "needs_recover": needs_recover,
+          }, sort_keys=True))
+          if not needs_recover:
+              print(json.dumps({"status": "POINTER_FRESH", "now_ist": now.isoformat()}))
+              sys.exit(0)
+
+          # 2. Do not pile up compiles: skip if one is already active or recent.
+          runs_url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/runs?per_page=20"
+          try:
+              runs = request(runs_url).get("workflow_runs", [])
               active = [
-                  run for run in relevant
+                  run for run in runs
                   if run.get("status") in {"queued", "in_progress", "waiting", "pending"}
               ]
               if active:
-                  print(json.dumps({
-                      "status": "COMPILER_ALREADY_ACTIVE",
-                      "runs": [{"id": r.get("id"), "status": r.get("status"), "event": r.get("event")} for r in active[:5]],
-                  }))
+                  print(json.dumps({"status": "COMPILER_ALREADY_ACTIVE", "count": len(active)}))
                   sys.exit(0)
-
               recent = []
-              for run in relevant:
+              for run in runs:
                   created = run.get("created_at")
                   if not created:
                       continue
                   stamp = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                  if datetime.now(timezone.utc) - stamp <= timedelta(minutes=8):
-                      recent.append(run)
-
+                  if datetime.now(timezone.utc) - stamp <= timedelta(minutes=12):
+                      recent.append(run.get("id"))
               if recent:
-                  print(json.dumps({
-                      "status": "RECENT_COMPILER_RUN_EXISTS",
-                      "runs": [{"id": r.get("id"), "status": r.get("status"), "event": r.get("event"), "created_at": r.get("created_at")} for r in recent[:5]],
-                  }))
+                  print(json.dumps({"status": "RECENT_COMPILER_RUN_EXISTS", "run_ids": recent[:5]}))
                   sys.exit(0)
-
-              dispatch_url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/dispatches"
-              request(dispatch_url, method="POST", body={"ref": "main"})
+              request(
+                  f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/dispatches",
+                  method="POST",
+                  body={"ref": "main", "inputs": {"mode": "recover", "recover_date": recover_date}},
+              )
               print(json.dumps({
-                  "status": "MISSED_RUN_RECOVERY_DISPATCHED",
-                  "workflow": workflow,
-                  "ref": "main",
+                  "status": "STALE_POINTER_RECOVERY_DISPATCHED",
+                  "recover_date": recover_date,
+                  "prediction_age_minutes": age,
+                  "prediction_missing_slots": missing,
                   "now_ist": now.isoformat(),
               }))
           except urllib.error.HTTPError as exc:
