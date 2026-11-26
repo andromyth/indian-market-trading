@@ -56,6 +56,7 @@ jobs:
       SERVICE: indian-market-intraday-worker
       INVOKER: indian-market-scheduler@indian-market-trading.iam.gserviceaccount.com
       REQUESTED_END_DATE: ${{ github.event.inputs.end_date }}
+      CONFIRM_BACKFILL: ${{ github.event.inputs.confirm_backfill }}
       BACKFILL_REPLACE_EXISTING: ${{ github.event.inputs.replace_existing_history || 'auto' }}
       BACKFILL_SYMBOLS: ${{ github.event.inputs.symbols }}
       BACKFILL_REVISION_TAG: ${{ github.event.inputs.revision_tag || '' }}
@@ -78,26 +79,32 @@ jobs:
 
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           trading_day = is_nse_trading_day(now.date())
-          allowed = (not trading_day) or (now.hour, now.minute) >= (16, 0)
+          # Manual dispatch with confirm_backfill=yes bypasses the 16:00 IST
+          # trading-hours gate: the operator explicitly authorizes the backfill
+          # and accepts any rate-limit or contention risk.
+          manual = os.environ.get("GITHUB_EVENT_NAME", "") == "workflow_dispatch" and os.environ.get("INPUT_CONFIRM_BACKFILL", "no") == "yes"
+          allowed = manual or (not trading_day) or (now.hour, now.minute) >= (16, 0)
           requested = (os.environ.get("REQUESTED_END_DATE") or "").strip()
           if requested:
               target = requested
           else:
               # Blank input: latest completed session. Today counts only after 16:00 IST.
               day = now.date()
-              if not (is_nse_trading_day(day) and (now.hour, now.minute) >= (16, 0)):
+              if not manual and not (is_nse_trading_day(day) and (now.hour, now.minute) >= (16, 0)):
                   day -= timedelta(days=1)
               while not is_nse_trading_day(day):
                   day -= timedelta(days=1)
               target = day.isoformat()
           reason = (
-              "NSE trading day before 16:00 IST: backfill is not eligible"
+              "Manual dispatch: backfill authorized outside trading hours"
+              if manual
+              else "NSE trading day before 16:00 IST: backfill is not eligible"
               if trading_day and not allowed
               else "NSE non-trading day: backfill is eligible all day"
               if not trading_day
               else "NSE trading day at or after 16:00 IST: backfill is eligible"
           )
-          print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} ALLOWED={allowed} TARGET_END_DATE={target} REASON={reason}")
+          print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} MANUAL={manual} ALLOWED={allowed} TARGET_END_DATE={target} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("should_run=" + ("true" if allowed else "false") + "\n")
               output.write("end_date=" + target + "\n")
