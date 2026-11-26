@@ -77,6 +77,7 @@ jobs:
       - name: Ensure same-day provider backfill
         env:
           MAX_WAIT_MINUTES: "10"
+        continue-on-error: true
         run: |
           python -u scripts/same_day_gap_backfill.py \
             --max-wait-minutes "$MAX_WAIT_MINUTES"

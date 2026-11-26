@@ -91,6 +91,7 @@ jobs:
       # still block training if the archive is genuinely incomplete.
       - name: Collect same-day missing 5m bars
         shell: bash
+        continue-on-error: true
         env:
           SESSION_DATE: ${{ inputs.session_date }}
           MAX_WAIT_MINUTES: "12"
