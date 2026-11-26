@@ -33,6 +33,16 @@ on:
         description: "Optional NSE session to backfill before training (YYYY-MM-DD)"
         required: false
         default: ""
+      skip_gap_backfill:
+        description: "Skip the same-day provider gap backfill step (no Cloud Run invocation)"
+        required: false
+        type: boolean
+        default: false
+      allow_stale_archive:
+        description: "Continue training when a five-minute slot is missing (archive-only run)"
+        required: false
+        type: boolean
+        default: false
   # Nightly retrain at 20:15 IST (14:45 UTC), after the 19:15 IST F&O sync. Enabled after the
   # first two manual runs passed. Set the repo variable RETRAIN_SCHEDULE=off to pause it.
   schedule:
@@ -90,6 +100,7 @@ jobs:
       # A deferred run (HTTP 423) exits cleanly; the coverage gate below will
       # still block training if the archive is genuinely incomplete.
       - name: Collect same-day missing 5m bars
+        if: ${{ !inputs.skip_gap_backfill }}
         shell: bash
         continue-on-error: true
         env:
@@ -117,9 +128,15 @@ jobs:
 
       - name: Deploy Cloud Run training job
         shell: bash
+        env:
+          ALLOW_STALE_ARCHIVE: ${{ inputs.allow_stale_archive }}
         run: |
           set -euo pipefail
           IMAGE="$IMAGE_REPO/to-close-retrain:$GITHUB_SHA"
+          EXTRA_ARGS=""
+          if [ "${ALLOW_STALE_ARCHIVE:-false}" = "true" ]; then
+            EXTRA_ARGS=",--allow-stale-archive"
+          fi
           gcloud run jobs deploy "$JOB" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
@@ -127,7 +144,7 @@ jobs:
             --service-account "indian-market-intraday-runtime@$PROJECT_ID.iam.gserviceaccount.com" \
             --cpu 8 --memory 32Gi --task-timeout 86400 --max-retries 0 \
             --command python \
-            --args="-u,retrain_to_close_job.py,--universe=$UNIVERSE,--sessions=$SESSIONS,--max-symbols=$MAX_SYMBOLS,--cost=$COST,--warmup-bars=$WARMUP_BARS,--consolidate-live-days=$CONSOLIDATE_LIVE_DAYS" \
+            --args="-u,retrain_to_close_job.py,--universe=$UNIVERSE,--sessions=$SESSIONS,--max-symbols=$MAX_SYMBOLS,--cost=$COST,--warmup-bars=$WARMUP_BARS,--consolidate-live-days=$CONSOLIDATE_LIVE_DAYS$EXTRA_ARGS" \
             --set-secrets "GOOGLE_DRIVE_ROOT_ID=google-drive-root-id:latest,GDRIVE_ROOT_FOLDER_ID=google-drive-root-id:latest,GOOGLE_OAUTH_TOKEN_JSON=google-oauth-token-json:latest"
           gcloud run jobs describe "$JOB" \
             --project="$PROJECT_ID" --region="$REGION" \

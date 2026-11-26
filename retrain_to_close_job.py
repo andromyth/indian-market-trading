@@ -233,12 +233,20 @@ def _download_inputs(root: Path, args: argparse.Namespace) -> tuple[Path, Path, 
     if args.consolidate_live_days > 0:
         import consolidate_live_5m_into_archive as consolidation
 
+        # Consolidate only through the latest completed session. Using "now"
+        # folds a partial in-progress session into the archive and then fails
+        # the slot-coverage gate against an incomplete day.
+        consolidate_end = latest_completed_nse_session(datetime.now(IST))
+        print(
+            "RETRAIN_CONSOLIDATE_END_DATE=" + consolidate_end.isoformat(),
+            flush=True,
+        )
         with tempfile.TemporaryDirectory(prefix="retrain_consolidate_", dir=root) as tmp:
             consolidation_report = consolidation.consolidate(
                 store=store,
                 symbols=consolidation.authoritative_roster(),
                 days=args.consolidate_live_days,
-                end_date=pd.Timestamp.now(tz=IST),
+                end_date=pd.Timestamp(consolidate_end, tz=IST),
                 dry_run=False,
                 work_root=Path(tmp),
             )
