@@ -2262,8 +2262,10 @@ if interface_mode == "Live Test":
                 )
             st.caption(cycle_caption)
             if age_seconds > 10 * 60:
-                st.warning("This GitHub prediction cycle is stale (older than 10 minutes). No local inference fallback is used.")
-                return
+                st.caption(
+                    f"Note: cycle is {age_seconds / 60:.1f} minutes old "
+                    "(showing the latest persisted prediction; no local inference fallback)."
+                )
             if not prediction_ready:
                 if not prediction_file_stored:
                     missing = snapshot.get("missing_prediction_minutes") or []
@@ -2339,6 +2341,56 @@ if interface_mode == "Live Test":
                 "Snapshot link": str(row.get("prediction_snapshot_link_status") or "—"),
             }
             st.dataframe(pd.DataFrame([details]), width="stretch", hide_index=True)
+            # ---- Accuracy: compare persisted prediction to actual session close ----
+            target_ts = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
+            now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+            target_reached = pd.notna(target_ts) and target_ts.tz_convert("Asia/Kolkata") < now_ist
+            if target_reached and pd.notna(reference_price) and reference_price > 0:
+                target_date = target_ts.tz_convert("Asia/Kolkata").date()
+                try:
+                    hist = nse_fetch_equity_history(
+                        selected_root,
+                        pd.Timestamp(target_date) - pd.Timedelta(days=2),
+                        pd.Timestamp(target_date) + pd.Timedelta(days=1),
+                        sync_drive=False,
+                    )
+                    if hist is not None and not hist.empty and "close" in hist.columns:
+                        hist = hist.copy()
+                        hist.index = pd.to_datetime(hist.index, errors="coerce")
+                        on_or_before = hist[hist.index.date <= target_date]
+                        if not on_or_before.empty:
+                            actual_close = float(on_or_before["close"].iloc[-1])
+                            actual_return = (actual_close - reference_price) / reference_price
+                            pred_return = float(expected_return) if pd.notna(expected_return) else np.nan
+                            pred_price = float(predicted_price) if pd.notna(predicted_price) else np.nan
+                            abs_error = (actual_return - pred_return) if pd.notna(pred_return) else np.nan
+                            direction_correct = (
+                                (actual_return > 0) == (pred_return > 0)
+                            ) if pd.notna(pred_return) else None
+                            a1, a2, a3, a4 = st.columns(4)
+                            a1.metric("Actual close", f"₹{actual_close:,.2f}")
+                            a2.metric("Actual return", f"{actual_return:+.2%}")
+                            a3.metric("Return error", f"{abs_error:+.2%}" if pd.notna(abs_error) else "—")
+                            a4.metric("Direction", "✓" if direction_correct else ("✗" if direction_correct is False else "—"))
+                            st.caption(
+                                f"Accuracy vs {target_date}: predicted {pred_return:+.2%} → actual {actual_return:+.2%} "
+                                f"(error {abs_error:+.2%}, reference ₹{reference_price:,.2f}, close ₹{actual_close:,.2f})."
+                            )
+                        else:
+                            st.caption(f"Accuracy: no close data on/before {target_date} for {selected_root}.")
+                    else:
+                        st.caption(f"Accuracy: no history returned for {selected_root}.")
+                except Exception as exc:
+                    st.caption(f"Accuracy check unavailable: {type(exc).__name__}: {exc}")
+            elif target_reached:
+                st.caption("Accuracy: reference price unavailable; cannot compute actual return.")
+            else:
+                target_label = (
+                    target_ts.tz_convert("Asia/Kolkata").strftime("%d %b %Y %H:%M IST")
+                    if pd.notna(target_ts)
+                    else "—"
+                )
+                st.caption(f"Accuracy pending — session-close target {target_label} not yet reached.")
             st.caption("Prediction source: GitHub Actions → Google Drive. The displayed timestamp is the persisted five-minute prediction cycle.")
     _render_selected_intraday_panel()
 
