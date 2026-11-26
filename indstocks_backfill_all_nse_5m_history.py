@@ -743,65 +743,6 @@ def fetch_indstocks_5m_batch(
     return result, calls
 
 
-def _load_batch_progress(store: Any, resolvable: list[tuple[str, str]] | None = None) -> set[int]:
-    """Return batch numbers already fully completed and persisted on Drive.
-
-    The small JSON index can be overwritten or lost between restarts, so the
-    authoritative signal is the actual per-symbol parquet folders on Drive: a
-    batch is complete only when every one of its five symbols has a parquet.
-    """
-    from persistent_store import _drive_execute_with_retry
-
-    completed: set[int] = set()
-    local = Path("/tmp/nse_5m_batch_progress.json")
-    try:
-        item = _resolve_remote_file(store, BATCH_PROGRESS_REMOTE)
-        if item:
-            download_drive_file_with_retry(store.service, item["id"], local, operation="batch_progress_download")
-            data = json.loads(local.read_text(encoding="utf-8"))
-            completed = {int(x) for x in data.get("completed_batches", []) if str(x).isdigit()}
-    except Exception:
-        pass
-
-    if store is None or not resolvable:
-        return completed
-    try:
-        folder = _resolve_remote_file(store, REMOTE_ROOT)
-        if not folder:
-            return completed
-        existing: set[str] = set()
-        page_token = None
-        while True:
-            params = {
-                "q": f"'{folder['id']}' in parents and trashed = false",
-                "spaces": "drive",
-                "fields": "nextPageToken,files(id,name,mimeType)",
-                "pageSize": 1000,
-                "includeItemsFromAllDrives": True,
-                "supportsAllDrives": True,
-            }
-            if page_token:
-                params["pageToken"] = page_token
-            resp = _drive_execute_with_retry(
-                "batch_progress_symbol_list",
-                lambda: store.service.files().list(**params).execute(),
-            )
-            for f in resp.get("files", []):
-                name = str(f.get("name") or "")
-                if name.startswith("symbol="):
-                    existing.add(name.split("=", 1)[1].upper().replace(".NS", ""))
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        for batch_no in range(1, math.ceil(len(resolvable) / MAX_CODES_PER_REQUEST) + 1):
-            members = resolvable[(batch_no - 1) * MAX_CODES_PER_REQUEST:batch_no * MAX_CODES_PER_REQUEST]
-            if members and all(sym in existing for sym, _ in members):
-                completed.add(batch_no)
-    except Exception as exc:
-        print("BACKFILL_BATCH_PROGRESS_DRIVE_CHECK_FAILED " + type(exc).__name__, flush=True)
-    return completed
-
-
 def _save_batch_progress(store: Any, completed: set[int]) -> None:
     """Persist the set of completed batch numbers so restarts skip them."""
     local = Path("/tmp/nse_5m_batch_progress.json")
@@ -863,7 +804,8 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(raw_runtime_replace, bool)
         else str(raw_runtime_replace).strip().lower() in {"1", "true", "yes", "on"}
     )
-    replace_history = bool(args.replace_existing_history or runtime_replace)
+    explicit_replace_history = bool(args.replace_existing_history or runtime_replace)
+    replace_history = explicit_replace_history
 
     from indstocks_client import configured
     from delivery_training_universe import official_nse_symbols
@@ -947,28 +889,17 @@ def main(argv: list[str] | None = None) -> int:
     if not replace_history:
         prior_manifest = _download_manifest_json(store, local_root)
         replace_history = str(prior_manifest.get("history_schema") or "") != HISTORY_SCHEMA
+    if explicit_replace_history:
+        # A deliberate rebuild must not leave stale batch-completion metadata
+        # behind, even though symbol-level freshness is now the only skip gate.
+        _save_batch_progress(store, set())
     results: list[dict[str, Any]] = list(resolution_errors)
     total_api_calls = 0
     live_inventory_totals = {"live_capture_files_read": 0, "live_capture_files_failed": 0}
     batches = [resolvable[pos:pos + MAX_CODES_PER_REQUEST] for pos in range(0, len(resolvable), MAX_CODES_PER_REQUEST)]
-    completed_batches = _load_batch_progress(store, resolvable)
     live_file_listing_cache: dict[str, list[dict[str, Any]]] = {}
 
     for batch_no, batch in enumerate(batches, start=1):
-        if batch_no in completed_batches:
-            print("BACKFILL_BATCH_SKIPPED batch=%d completed_symbols=%d" % (
-                batch_no, min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable))
-            ), flush=True)
-            if callable(BACKFILL_PROGRESS_CALLBACK):
-                BACKFILL_PROGRESS_CALLBACK({
-                    "provider": "INDSTOCKS", "batch": batch_no,
-                    "total_batches": len(batches),
-                    "completed_symbols": min(batch_no * MAX_CODES_PER_REQUEST, len(resolvable)),
-                    "resolved_symbols": len(resolvable),
-                    "api_calls": total_api_calls,
-                    "skipped_batch": True,
-                })
-            continue
         if callable(REQUEST_GUARD):
             REQUEST_GUARD()
         # Load recent live captures only for the current <=5-symbol API batch.
@@ -1035,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
                 existing,
                 end,
                 lookback_days=args.recent_session_lookback_days,
-                expected_bars=args.minimum_bars_per_session,
+                expected_bars=FULL_REGULAR_SESSION_BARS,
             )
             is_complete = (not replace_history) and (
                 int(summary.get("usable_sessions") or 0) >= args.minimum_usable_sessions
@@ -1201,11 +1132,6 @@ def main(argv: list[str] | None = None) -> int:
         if callable(BACKFILL_PROGRESS_CALLBACK):
             BACKFILL_PROGRESS_CALLBACK(progress)
 
-        batch_symbols = {symbol for symbol, _ in batch}
-        batch_rows = [row for row in results if row.get("symbol") in batch_symbols]
-        if batch_rows and all(row.get("status") != "ERROR" for row in batch_rows):
-            completed_batches.add(batch_no)
-            _save_batch_progress(store, completed_batches)
 
     results.sort(key=lambda row: row["symbol"])
     ready = [row for row in results if row.get("status") in {"OK", "SKIPPED_EXISTING"} and row.get("fresh_latest_data") is True]
