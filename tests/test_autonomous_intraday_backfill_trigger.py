@@ -336,3 +336,44 @@ def test_dead_worker_with_stale_running_status_can_be_resumed(monkeypatch):
     assert service.BACKFILL_THREAD.started is True
     with service.STATE_LOCK:
         assert service.STATE["five_minute_backfill"]["status"] == "RECOVERING_STALE_WORKER"
+
+
+def test_backfill_persists_requested_target_end_date_in_status(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "_preflight",
+        lambda: {
+            "ready": True,
+            "configured": True,
+            "reachable": True,
+            "write_ready": True,
+        },
+    )
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+
+    class StubThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+    monkeypatch.setattr(service.threading, "Thread", StubThread)
+    body = json.dumps({
+        "confirm": service.BACKFILL_CONFIRMATION,
+        "end_date": "2026-11-25",
+        "replace_existing_history": "no",
+    }).encode("utf-8")
+
+    response = _post_backfill(body)
+
+    assert response["http_status"] == 202
+    with service.STATE_LOCK:
+        assert service.STATE["five_minute_backfill"]["target_end_date"] == "2026-11-25"
+    assert service.BACKFILL_OPTIONS["end_date"] == "2026-11-25"
