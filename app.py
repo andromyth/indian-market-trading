@@ -19,6 +19,11 @@ import sys
 # INDstocks credentials and API access are reserved for the singleton Cloud Run worker.
 os.environ["INDSTOCKS_AUTH_MODE"] = "disabled"
 
+from intraday_prediction_cycle import (
+    DEFAULT_MAX_LOOKBACK_SLOTS as PREDICTION_CYCLE_LOOKBACK_SLOTS,
+    select_prediction_complete_cycles,
+    slots_between,
+)
 from data_fetcher import (
     INDEX_TICKER_MAP,
     benchmark_for_symbol,
@@ -184,8 +189,30 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                 key=lambda item: str(item.get("name") or ""),
                 reverse=True,
             )
+            if not manifests:
+                continue
+            prediction_folder = folder_id([
+                "production_data", "all_nse_minute_predictions",
+                f"{session:%Y}", f"{session:%m}", f"{session:%d}",
+            ])
+            prediction_files = (
+                {item.get("name"): item for item in list_children(prediction_folder)}
+                if prediction_folder
+                else {}
+            )
+
+            # Describe the newest stored snapshot cycles. Prediction persistence
+            # trails quote capture by a slot or two, so a cycle only becomes
+            # displayable once its own prediction file exists and its prediction
+            # manifest reports STORED.
+            candidates: list[dict] = []
             for manifest_file in manifests:
-                capture_manifest = json.loads(read_bytes(manifest_file["id"]).decode("utf-8"))
+                if len(candidates) >= PREDICTION_CYCLE_LOOKBACK_SLOTS:
+                    break
+                try:
+                    capture_manifest = json.loads(read_bytes(manifest_file["id"]).decode("utf-8"))
+                except Exception:
+                    continue
                 snapshot_path = str(
                     capture_manifest.get("snapshot_drive_path")
                     or capture_manifest.get("remote_snapshot_path")
@@ -197,13 +224,50 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                     snapshot_file
                     and (
                         capture_manifest.get("snapshot_persisted") is True
-                        or str(capture_manifest.get("status") or "").upper() in {"STORED", "OK", "PARTIAL"}
+                        or str(capture_manifest.get("status") or "").upper()
+                        in {"STORED", "OK", "PARTIAL"}
                     )
                 )
                 if not snapshot_stored:
                     continue
 
-                quote_frame = pd.read_parquet(io.BytesIO(read_bytes(snapshot_file["id"])))
+                minute_key = str(manifest_file["name"])[9:22]
+                prediction_manifest_file = prediction_files.get(f"manifest_{minute_key}.json")
+                prediction_manifest_status = None
+                if prediction_manifest_file:
+                    try:
+                        prediction_manifest_status = json.loads(
+                            read_bytes(prediction_manifest_file["id"]).decode("utf-8")
+                        ).get("status")
+                    except Exception:
+                        prediction_manifest_status = None
+                candidates.append({
+                    "minute_key": minute_key,
+                    "capture_manifest": capture_manifest,
+                    "snapshot_file": snapshot_file,
+                    "prediction_file": prediction_files.get(f"predictions_{minute_key}.parquet"),
+                    "prediction_manifest_status": prediction_manifest_status,
+                    "snapshot_stored": True,
+                    "prediction_file_stored": (
+                        f"predictions_{minute_key}.parquet" in prediction_files
+                    ),
+                })
+
+            complete_cycles, skipped_prediction_minutes = select_prediction_complete_cycles(
+                candidates, max_lookback_slots=PREDICTION_CYCLE_LOOKBACK_SLOTS
+            )
+            chosen_cycles = complete_cycles + [
+                candidate for candidate in candidates if candidate not in complete_cycles
+            ]
+            for candidate in chosen_cycles:
+                capture_manifest = candidate["capture_manifest"]
+                minute_key = candidate["minute_key"]
+                try:
+                    quote_frame = pd.read_parquet(
+                        io.BytesIO(read_bytes(candidate["snapshot_file"]["id"]))
+                    )
+                except Exception:
+                    continue
                 if quote_frame.empty or "symbol" not in quote_frame.columns:
                     continue
                 quote_frame = normalize_symbols(quote_frame)
@@ -213,38 +277,29 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                 )
                 if pd.isna(cycle_minute):
                     cycle_minute = pd.to_datetime(
-                        str(manifest_file.get("name"))[9:22], format="%Y%m%d_%H%M",
-                        errors="coerce",
+                        minute_key, format="%Y%m%d_%H%M", errors="coerce"
                     )
-                minute_key = str(manifest_file["name"])[9:22]
-                prediction_folder = folder_id([
-                    "production_data", "all_nse_minute_predictions",
-                    f"{session:%Y}", f"{session:%m}", f"{session:%d}",
-                ])
+
                 prediction_manifest = {}
                 prediction_frame = pd.DataFrame()
                 prediction_file_stored = False
-                if prediction_folder:
-                    prediction_files = {
-                        item.get("name"): item for item in list_children(prediction_folder)
-                    }
-                    prediction_file = prediction_files.get(f"predictions_{minute_key}.parquet")
-                    prediction_manifest_file = prediction_files.get(f"manifest_{minute_key}.json")
-                    if prediction_manifest_file:
-                        try:
-                            prediction_manifest = json.loads(
-                                read_bytes(prediction_manifest_file["id"]).decode("utf-8")
-                            )
-                        except Exception:
-                            prediction_manifest = {}
-                    if prediction_file:
-                        try:
-                            prediction_frame = pd.read_parquet(
-                                io.BytesIO(read_bytes(prediction_file["id"]))
-                            )
-                            prediction_file_stored = True
-                        except Exception:
-                            prediction_frame = pd.DataFrame()
+                prediction_manifest_file = prediction_files.get(f"manifest_{minute_key}.json")
+                if prediction_manifest_file:
+                    try:
+                        prediction_manifest = json.loads(
+                            read_bytes(prediction_manifest_file["id"]).decode("utf-8")
+                        )
+                    except Exception:
+                        prediction_manifest = {}
+                prediction_file = candidate["prediction_file"]
+                if prediction_file:
+                    try:
+                        prediction_frame = pd.read_parquet(
+                            io.BytesIO(read_bytes(prediction_file["id"]))
+                        )
+                        prediction_file_stored = True
+                    except Exception:
+                        prediction_frame = pd.DataFrame()
 
                 if not prediction_frame.empty and "symbol" in prediction_frame.columns:
                     prediction_frame = normalize_symbols(prediction_frame)
@@ -331,6 +386,7 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                 view = view.sort_values(
                     ["capture_complete", "symbol"], ascending=[False, True]
                 ).reset_index(drop=True)
+                newest_candidate = candidates[0] if candidates else None
                 return {
                     "status": "OK",
                     "cycle_minute_ist": capture_manifest.get("cycle_minute_ist") or str(cycle_minute),
@@ -338,6 +394,20 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
                     "capture_manifest": capture_manifest,
                     "prediction_manifest": prediction_manifest,
                     "prediction_file_stored": prediction_file_stored,
+                    "prediction_cycle_minute": minute_key,
+                    "newest_snapshot_cycle_minute": (
+                        (
+                            newest_candidate["capture_manifest"].get("cycle_minute_ist")
+                            or newest_candidate["minute_key"]
+                        )
+                        if newest_candidate
+                        else minute_key
+                    ),
+                    "slots_behind": slots_between(
+                        newest_candidate["minute_key"] if newest_candidate else minute_key,
+                        minute_key,
+                    ),
+                    "missing_prediction_minutes": skipped_prediction_minutes,
                     "rows": view,
                 }
 
@@ -2169,24 +2239,70 @@ if interface_mode == "Live Test":
             cycle_ts = cycle_ts.tz_localize("Asia/Kolkata") if cycle_ts.tzinfo is None else cycle_ts.tz_convert("Asia/Kolkata")
             age_seconds = max(0.0, (pd.Timestamp.now(tz="Asia/Kolkata") - cycle_ts).total_seconds())
             prediction_manifest = snapshot.get("prediction_manifest") or {}
+            prediction_file_stored = snapshot.get("prediction_file_stored") is True
+            manifest_status = str(prediction_manifest.get("status") or "").upper()
+            link_status = str(row.get("prediction_snapshot_link_status") or "")
+            prediction_status = str(row.get("prediction_status") or "").upper()
             prediction_ready = (
-                snapshot.get("prediction_file_stored") is True
-                and str(prediction_manifest.get("status") or "").upper() == "STORED"
+                prediction_file_stored
+                and manifest_status == "STORED"
                 and bool(row.get("prediction_stored"))
-                and str(row.get("prediction_snapshot_link_status") or "") == "MATCHED_TO_SNAPSHOT_QUOTE"
+                and link_status == "MATCHED_TO_SNAPSHOT_QUOTE"
+                and prediction_status.startswith("PREDICTED")
             )
-            st.caption(
+            slots_behind = int(snapshot.get("slots_behind") or 0)
+            cycle_caption = (
                 f"GitHub prediction cycle: {cycle_ts.strftime('%d %b %Y %H:%M:%S')} IST · "
                 f"age: {age_seconds / 60:.1f} min · source: Google Drive"
             )
+            if slots_behind:
+                cycle_caption += (
+                    f" · {slots_behind} slot(s) behind the newest quote cycle"
+                    f" ({snapshot.get('newest_snapshot_cycle_minute') or 'unknown'})"
+                )
+            st.caption(cycle_caption)
             if age_seconds > 10 * 60:
                 st.warning("This GitHub prediction cycle is stale (older than 10 minutes). No local inference fallback is used.")
                 return
             if not prediction_ready:
-                st.warning(
-                    "A matching, successfully persisted GitHub prediction is not available for this symbol and snapshot. "
-                    "No local inference fallback is used."
-                )
+                if not prediction_file_stored:
+                    missing = snapshot.get("missing_prediction_minutes") or []
+                    newest = snapshot.get("newest_snapshot_cycle_minute") or "unknown"
+                    st.warning(
+                        "No persisted GitHub prediction file is available for the newest five-minute cycles"
+                        f" (newest quote cycle: {newest}"
+                        + (
+                            f"; cycles without predictions: {', '.join(str(key) for key in missing[:6])}"
+                            if missing else ""
+                        )
+                        + "). No local inference fallback is used."
+                    )
+                elif manifest_status != "STORED":
+                    st.warning(
+                        f"The persisted prediction manifest reports status {manifest_status or 'UNKNOWN'} "
+                        "for this cycle. No local inference fallback is used."
+                    )
+                elif not bool(row.get("prediction_stored")):
+                    st.warning(
+                        f"No persisted prediction row for {selected_root} in cycle "
+                        f"{cycle_ts.strftime('%d %b %Y %H:%M')} IST. No local inference fallback is used."
+                    )
+                elif link_status != "MATCHED_TO_SNAPSHOT_QUOTE":
+                    st.warning(
+                        f"The persisted prediction row for {selected_root} is not linked to the stored snapshot quote"
+                        f" (link status: {link_status or 'UNKNOWN'}). No local inference fallback is used."
+                    )
+                elif not prediction_status.startswith("PREDICTED"):
+                    st.warning(
+                        f"The model is still warming for {selected_root} in this cycle"
+                        f" (status: {prediction_status or 'UNKNOWN'}); no probability was persisted. "
+                        "No local inference fallback is used."
+                    )
+                else:
+                    st.warning(
+                        "A matching, successfully persisted GitHub prediction is not available for this symbol and snapshot. "
+                        "No local inference fallback is used."
+                    )
                 return
             signal = str(row.get("signal") or "HOLD").upper()
             probability = pd.to_numeric(
