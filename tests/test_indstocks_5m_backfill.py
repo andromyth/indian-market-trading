@@ -362,3 +362,27 @@ def test_indstocks_recent_live_history_reads_only_requested_symbols(monkeypatch,
     assert len(history_again["RELIANCE"]) == 1
     assert inventory == {"live_capture_files_read": 2, "live_capture_files_failed": 0}
     assert inventory_again == inventory
+
+
+def test_recent_session_completeness_requires_all_75_regular_bars():
+    import indstocks_backfill_all_nse_5m_history as backfill
+
+    index = pd.date_range("2026-11-25 09:20", periods=74, freq="5min", tz=IST)
+    frame = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5},
+        index=index,
+    )
+    assert backfill._recent_incomplete_session_dates(
+        frame, pd.Timestamp("2026-11-25 15:30", tz=IST).to_pydatetime()
+    ) == ["2026-11-25"]
+
+    complete = pd.concat([
+        frame,
+        pd.DataFrame(
+            {"Open": [100.0], "High": [101.0], "Low": [99.0], "Close": [100.5]},
+            index=[pd.Timestamp("2026-11-25 15:30", tz=IST)],
+        ),
+    ])
+    assert backfill._recent_incomplete_session_dates(
+        complete, pd.Timestamp("2026-11-25 15:30", tz=IST).to_pydatetime()
+    ) == []
