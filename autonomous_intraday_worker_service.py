@@ -99,9 +99,10 @@ ALL_NSE_BACKLOG_MAX_SLOTS = max(0, int(os.getenv("ALL_NSE_BACKLOG_MAX_SLOTS") or
 ALL_NSE_BACKLOG_DEADLINE_SECONDS = max(
     5.0, float(os.getenv("ALL_NSE_BACKLOG_DEADLINE_SECONDS") or 90)
 )
-# Per-slot lease so a second Cloud Run instance (--max-instances 2) can accept a
-# request without either instance ticking the same slot twice. Opt-in: enabling
-# it also suppresses same-slot Cloud Scheduler retries until the TTL expires.
+# Optional per-slot lease (module worker_tick_lease.py). It only prevents two
+# instances from double-ticking the same Drive slot. It does NOT make a second
+# instance safe: the INDstocks API permits one active token/session per account,
+# so --max-instances must stay at 1 and this flag must stay disabled (0).
 ALL_NSE_TICK_LEASE = _env_flag("ALL_NSE_TICK_LEASE", False)
 ALL_NSE_TICK_LEASE_TTL_SECONDS = max(
     30, int(os.getenv("ALL_NSE_TICK_LEASE_TTL_SECONDS") or 120)
