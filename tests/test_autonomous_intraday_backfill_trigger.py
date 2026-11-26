@@ -14,6 +14,7 @@ import indstocks_client
 def reset_backfill_state(monkeypatch):
     monkeypatch.setattr(service, "BACKFILL_START_LOCK", threading.Lock())
     monkeypatch.setattr(service, "BACKFILL_THREAD", None)
+    monkeypatch.setattr(service, "BACKFILL_OPTIONS", {})
     monkeypatch.setattr(service, "BACKFILL_MARKET_PAUSED", False)
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: False)
     with service.STATE_LOCK:
