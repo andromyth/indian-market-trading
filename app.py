@@ -422,6 +422,186 @@ def _cached_latest_all_nse_5m_snapshot(refresh_revision: int = 0) -> dict:
         }
 
 
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_all_nse_session_close_predictions(
+    selected_symbol: str, refresh_revision: int = 0
+) -> dict[str, Any]:
+    """Return per-slot session-close predictions for the selected symbol
+    across all remaining 5-minute slots of today's NSE session.
+
+    Each slot is a separate persisted prediction cycle (e.g. 14:45, 14:50,
+    � 15:30). The desk shows every slot so the user can track how the
+    forecast evolves as the session close approaches.
+    """
+    drive = persistent_drive_status()
+    if not drive.get("configured") or drive.get("reachable") is False:
+        return {
+            "status": "DRIVE_UNAVAILABLE",
+            "reason": drive.get("reason") or "Google Drive is not configured or reachable.",
+        }
+
+    from persistent_store import GoogleDriveStore
+
+    store = GoogleDriveStore()
+
+    def folder_id(parts: list[str]) -> str | None:
+        parent = store.root_id
+        for part in parts:
+            hit = store._find_child(
+                parent, part, "application/vnd.google-apps.folder"
+            )
+            if not hit:
+                return None
+            parent = hit["id"]
+        return parent
+
+    def list_children(parent: str) -> list[dict]:
+        items = []
+        page_token = None
+        while True:
+            params = {
+                "q": f"'{parent}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken,files(id,name,mimeType,modifiedTime)",
+                "pageSize": 1000,
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives": True,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            response = store.service.files().list(**params).execute()
+            items.extend(response.get("files") or [])
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                return items
+
+    def read_bytes(file_id: str) -> bytes:
+        raw = store.service.files().get_media(fileId=file_id).execute()
+        return raw.read() if hasattr(raw, "read") else bytes(raw)
+
+    def normalize_symbols(frame: pd.DataFrame) -> pd.DataFrame:
+        x = frame.copy()
+        x["symbol"] = (
+            x["symbol"].astype(str).str.strip().str.upper()
+            .str.replace(".NS", "", regex=False)
+            .str.replace(".BO", "", regex=False)
+        )
+        return x
+
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+
+    market_open_time = pd.Timestamp("09:15").time()
+    market_close_time = pd.Timestamp("15:30").time()
+
+    if now_ist.time() >= market_close_time:
+        return {
+            "status": "SESSION_CLOSED",
+            "session_date": today.isoformat(),
+            "slots": [],
+            "reason": "NSE session is closed.",
+        }
+
+    # Start from the current 5-minute slot (or 09:15 if before market open).
+    current = now_ist.floor("5min")
+    if current.time() < market_open_time:
+        current = pd.Timestamp.combine(today, market_open_time)
+    close_ts = pd.Timestamp.combine(today, market_close_time)
+
+    prediction_folder = folder_id([
+        "production_data", "all_nse_minute_predictions",
+        f"{today:%Y}", f"{today:%m}", f"{today:%d}",
+    ])
+    prediction_files: dict[str, Any] = {}
+    if prediction_folder:
+        prediction_files = {
+            item.get("name"): item for item in list_children(prediction_folder)
+        }
+
+    canonical = str(selected_symbol or "").strip().upper()
+    canonical = canonical.replace(".NS", "").replace(".BO", "")
+
+    slots: list[dict[str, Any]] = []
+    slot = current
+    while slot <= close_ts:
+        minute_key = slot.strftime("%Y%m%d_%H%M")
+        prediction_file = prediction_files.get(f"predictions_{minute_key}.parquet")
+        prediction_manifest_file = prediction_files.get(f"manifest_{minute_key}.json")
+
+        manifest_status = None
+        if prediction_manifest_file:
+            try:
+                manifest_status = json.loads(
+                    read_bytes(prediction_manifest_file["id"]).decode("utf-8")
+                ).get("status")
+            except Exception:
+                manifest_status = None
+
+        row_data: dict[str, Any] | None = None
+        file_stored = bool(prediction_file)
+        if prediction_file:
+            try:
+                frame = pd.read_parquet(
+                    io.BytesIO(read_bytes(prediction_file["id"]))
+                )
+                if not frame.empty and "symbol" in frame.columns:
+                    frame = normalize_symbols(frame)
+                    sym_rows = frame.loc[frame["symbol"].eq(canonical)]
+                    if not sym_rows.empty:
+                        r = sym_rows.iloc[0]
+                        row_data = {
+                            "symbol": str(r.get("symbol") or canonical),
+                            "prediction_status": str(r.get("prediction_status") or ""),
+                            "signal": str(r.get("signal") or "HOLD"),
+                            "probability_up": pd.to_numeric(
+                                r.get("probability_up_session_close")
+                                if r.get("probability_up_session_close") is not None
+                                else r.get("probability_up_30m"),
+                                errors="coerce",
+                            ),
+                            "expected_return": pd.to_numeric(
+                                r.get("expected_return_session_close")
+                                if r.get("expected_return_session_close") is not None
+                                else r.get("expected_return_30m"),
+                                errors="coerce",
+                            ),
+                            "horizon_minutes": pd.to_numeric(
+                                r.get("horizon_minutes"), errors="coerce"
+                            ),
+                            "minutes_to_close": pd.to_numeric(
+                                r.get("minutes_to_close"), errors="coerce"
+                            ),
+                            "target_timestamp": str(r.get("target_timestamp") or ""),
+                            "model_version": str(r.get("model_version") or ""),
+                            "data_readiness_score": r.get("data_readiness_score"),
+                            "actual_market_value": pd.to_numeric(
+                                r.get("actual_market_value"), errors="coerce"
+                            ),
+                        }
+            except Exception:
+                pass
+
+        slots.append({
+            "slot_ist": slot.isoformat(),
+            "minute_key": minute_key,
+            "slot_label": slot.strftime("%H:%M IST"),
+            "horizon_minutes": int((close_ts - slot).total_seconds() // 60),
+            "prediction": row_data,
+            "manifest_status": manifest_status,
+            "prediction_file_stored": file_stored,
+        })
+        slot += pd.Timedelta(minutes=5)
+
+    return {
+        "status": "OK",
+        "session_date": today.isoformat(),
+        "slots": slots,
+        "total_slots": len(slots),
+    }
+
+
 try:
     from indstocks_client import (
         configured as _indstocks_configured,
@@ -1809,7 +1989,7 @@ if interface_mode == "Live Test":
         with refresh_col:
             if st.button("Refresh stored data", key="refresh_all_nse_5m"):
                 _cached_latest_all_nse_5m_snapshot.clear()
-        with st.spinner("Reading the latest persisted five-minute snapshot and matching predictions from Google Drive…"):
+        with st.spinner("Reading the latest persisted five-minute snapshot and matching predictions from Google Drive..."):
             stored_view = _cached_latest_all_nse_5m_snapshot(refresh_revision)
         if stored_view.get("status") != "OK":
             st.info(stored_view.get("reason") or "No five-minute persisted records are available.")
@@ -1925,7 +2105,7 @@ if interface_mode == "Live Test":
         if not selected_symbol:
             st.stop()
 
-        with st.spinner(f"Loading daily history and evaluating the seven-session OHLC model for {selected_root}…"):
+        with st.spinner(f"Loading daily history and evaluating the seven-session OHLC model for {selected_root}..."):
             try:
                 ohlc_forecast = _cached_7day_ohlc_forecast(selected_symbol, refresh_revision)
             except Exception as exc:
@@ -2100,7 +2280,7 @@ if interface_mode == "Live Test":
                 "how often the OHLC correction forces High to equal Close. This audit does not change production."
             )
             if st.button("Run rolling-origin OHLC audit", key=f"run_rolling_ohlc_audit::{selected_root}"):
-                with st.spinner(f"Running rolling-origin audit for {selected_root} across historical NSE sessions…"):
+                with st.spinner(f"Running rolling-origin audit for {selected_root} across historical NSE sessions..."):
                     try:
                         audit_history = _cached_daily_ohlc_history(selected_symbol, refresh_revision)
                         from cross_sectional_daily_ohlc_audit import load_daily_history
@@ -2196,17 +2376,8 @@ if interface_mode == "Live Test":
                 )
 
     else:
-        st.subheader(f"{selected_root} · Intraday signal desk" if selected_root else "Intraday signal desk")
-        st.caption(
-            "Predictions are generated by the scheduled GitHub five-minute workflow and read from Google Drive. "
-            "This dashboard does not run intraday model inference. Delivery forecasting is unchanged."
-        )
-        auto_refresh = st.checkbox(
-            "Auto-refresh this stock every 60 seconds",
-            value=True,
-            key=f"intraday_auto_refresh::{selected_root or 'none'}",
-            help="Refreshes the persisted GitHub prediction record during regular NSE market hours.",
-        )
+
+
         if not selected_symbol:
             st.stop()
         if not market_open:
@@ -2214,27 +2385,39 @@ if interface_mode == "Live Test":
         @st.fragment(run_every="60s" if auto_refresh and market_open else None, key="selected_intraday_prediction_panel")
         def _render_selected_intraday_panel():
             snapshot = _cached_latest_all_nse_5m_snapshot(refresh_revision)
+            slot_predictions = _cached_all_nse_session_close_predictions(
+                selected_root, refresh_revision
+            )
             if snapshot.get("status") != "OK":
                 st.warning(
                     "No persisted five-minute snapshot is available from GitHub/Drive: "
                     + str(snapshot.get("reason") or snapshot.get("status"))
                 )
+                # Still show per-slot predictions if any exist.
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
                 return
             rows = snapshot.get("rows")
             if not isinstance(rows, pd.DataFrame) or rows.empty:
                 st.warning("The latest persisted snapshot contains no symbol rows.")
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
                 return
             symbol_rows = rows.loc[
                 rows["symbol"].astype(str).str.upper().eq(selected_root.upper())
             ]
             if symbol_rows.empty:
                 st.warning(f"{selected_root} is not present in the latest persisted five-minute snapshot.")
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
                 return
             row = symbol_rows.iloc[0]
             cycle_value = snapshot.get("cycle_minute_ist")
             cycle_ts = pd.to_datetime(cycle_value, errors="coerce")
             if pd.isna(cycle_ts):
                 st.warning("The GitHub prediction cycle timestamp is missing or invalid.")
+                if slot_predictions.get("status") == "OK" and slot_predictions.get("slots"):
+                    _render_slot_predictions_table(slot_predictions, selected_root)
                 return
             cycle_ts = cycle_ts.tz_localize("Asia/Kolkata") if cycle_ts.tzinfo is None else cycle_ts.tz_convert("Asia/Kolkata")
             age_seconds = max(0.0, (pd.Timestamp.now(tz="Asia/Kolkata") - cycle_ts).total_seconds())
@@ -2266,46 +2449,8 @@ if interface_mode == "Live Test":
                     f"Note: cycle is {age_seconds / 60:.1f} minutes old "
                     "(showing the latest persisted prediction; no local inference fallback)."
                 )
-            if not prediction_ready:
-                if not prediction_file_stored:
-                    missing = snapshot.get("missing_prediction_minutes") or []
-                    newest = snapshot.get("newest_snapshot_cycle_minute") or "unknown"
-                    st.warning(
-                        "No persisted GitHub prediction file is available for the newest five-minute cycles"
-                        f" (newest quote cycle: {newest}"
-                        + (
-                            f"; cycles without predictions: {', '.join(str(key) for key in missing[:6])}"
-                            if missing else ""
-                        )
-                        + "). No local inference fallback is used."
-                    )
-                elif manifest_status != "STORED":
-                    st.warning(
-                        f"The persisted prediction manifest reports status {manifest_status or 'UNKNOWN'} "
-                        "for this cycle. No local inference fallback is used."
-                    )
-                elif not bool(row.get("prediction_stored")):
-                    st.warning(
-                        f"No persisted prediction row for {selected_root} in cycle "
-                        f"{cycle_ts.strftime('%d %b %Y %H:%M')} IST. No local inference fallback is used."
-                    )
-                elif link_status != "MATCHED_TO_SNAPSHOT_QUOTE":
-                    st.warning(
-                        f"The persisted prediction row for {selected_root} is not linked to the stored snapshot quote"
-                        f" (link status: {link_status or 'UNKNOWN'}). No local inference fallback is used."
-                    )
-                elif not prediction_status.startswith("PREDICTED"):
-                    st.warning(
-                        f"The model is still warming for {selected_root} in this cycle"
-                        f" (status: {prediction_status or 'UNKNOWN'}); no probability was persisted. "
-                        "No local inference fallback is used."
-                    )
-                else:
-                    st.warning(
-                        "A matching, successfully persisted GitHub prediction is not available for this symbol and snapshot. "
-                        "No local inference fallback is used."
-                    )
-                return
+
+            # ---- Latest cycle signal / P(up) / forecast price ----
             signal = str(row.get("signal") or "HOLD").upper()
             probability = pd.to_numeric(
                 row.get("probability_up_session_close")
@@ -2341,7 +2486,8 @@ if interface_mode == "Live Test":
                 "Snapshot link": str(row.get("prediction_snapshot_link_status") or "—"),
             }
             st.dataframe(pd.DataFrame([details]), width="stretch", hide_index=True)
-            # ---- Accuracy: compare persisted prediction to actual session close ----
+
+            # ---- Accuracy: compare latest persisted prediction to actual session close ----
             target_ts = pd.to_datetime(row.get("forecast_target_timestamp_utc"), errors="coerce", utc=True)
             now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
             target_reached = pd.notna(target_ts) and target_ts.tz_convert("Asia/Kolkata") < now_ist
@@ -2391,7 +2537,10 @@ if interface_mode == "Live Test":
                     else "—"
                 )
                 st.caption(f"Accuracy pending — session-close target {target_label} not yet reached.")
-            st.caption("Prediction source: GitHub Actions → Google Drive. The displayed timestamp is the persisted five-minute prediction cycle.")
+
+            # ---- Per-slot session-close predictions (all remaining 5-min slots) ----
+            _render_slot_predictions_table(slot_predictions, selected_root)
+
     _render_selected_intraday_panel()
 
     st.caption(
@@ -2466,7 +2615,7 @@ if analysis_view == "Historical Replay":
         from datetime import time as _time
         decision_ts = pd.Timestamp.combine(pd.Timestamp(replay_date).date(), replay_time)
         if replay_mode == "Delivery":
-            with st.spinner("Reconstructing the historical daily information set and checking forward actuals…"):
+            with st.spinner("Reconstructing the historical daily information set and checking forward actuals..."):
                 # Pull several calendar years around the target date; local 1-minute archives are preferred.
                 price_df = historical_price(replay_symbol, decision_ts - pd.Timedelta(days=420), decision_ts + pd.Timedelta(days=45), interval="1m")
                 benchmark_symbol = benchmark_for_symbol(replay_symbol)
@@ -2558,7 +2707,7 @@ if analysis_view == "Historical Replay":
                     st.error(f"Historical Delivery replay failed: {type(exc).__name__}: {exc}")
 
         else:
-            with st.spinner("Reconstructing minute-level history and running the session-close model…"):
+            with st.spinner("Reconstructing minute-level history and running the session-close model..."):
                 start = decision_ts - pd.Timedelta(days=20)
                 end = decision_ts + pd.Timedelta(minutes=int(replay_horizon) + 5)
                 price_df = historical_price(replay_symbol, start, end, interval="1m")
@@ -2655,7 +2804,7 @@ st.sidebar.caption(f"Local persistent 1m: {pstore.get('local_files', 0)} partiti
 
 if st.sidebar.button("Capture current 1-minute data", help="Fetch the latest official NSE 1-minute chart data for the current watchlist and persist it. Reported volume is never fabricated."):
     capture_results = []
-    with st.spinner("Capturing latest official NSE 1-minute bars…"):
+    with st.spinner("Capturing latest official NSE 1-minute bars..."):
         for symbol in symbols:
             try:
                 company_root = symbol.replace(".NS", "").replace(".BO", "").upper()
@@ -2667,7 +2816,7 @@ if st.sidebar.button("Capture current 1-minute data", help="Fetch the latest off
     cached_persistent_storage_summary.clear()
 
 if st.sidebar.button("Sync local 1-minute archive to Google Drive"):
-    with st.spinner("Syncing persistent 1-minute partitions to Google Drive…"):
+    with st.spinner("Syncing persistent 1-minute partitions to Google Drive..."):
         st.session_state["persistent_sync_result"] = persistent_sync_pending(max_files=500)
     cached_persistent_storage_summary.clear()
 
@@ -2707,7 +2856,7 @@ except Exception as exc:
 nse_col1, nse_col2 = st.sidebar.columns(2)
 if nse_col1.button("Pull NSE EOD"):
     nse_rows = []
-    with st.spinner("Pulling official NSE EOD data…"):
+    with st.spinner("Pulling official NSE EOD data..."):
         for sym in symbols:
             try:
                 root = sym.replace(".NS", "").replace(".BO", "")
@@ -2721,7 +2870,7 @@ if nse_col1.button("Pull NSE EOD"):
 
 if nse_col2.button("Capture NSE 1-minute"):
     nse_rows = []
-    with st.spinner("Capturing current NSE quote-chart data…"):
+    with st.spinner("Capturing current NSE quote-chart data..."):
         for sym in symbols:
             try:
                 root = sym.replace(".NS", "").replace(".BO", "")
@@ -2779,7 +2928,7 @@ if st.sidebar.button("Download selected history from Dhan"):
         start_dt = end_dt - timedelta(days=int(dhan_days))
         selected_roots = [normalize_symbol(x).replace(".NS", "") for x in raw_symbols.split(",") if x.strip()]
         results = []
-        with st.spinner(f"Downloading Dhan {dhan_interval} history for {len(selected_roots)} symbols…"):
+        with st.spinner(f"Downloading Dhan {dhan_interval} history for {len(selected_roots)} symbols..."):
             for root in selected_roots:
                 try:
                     results.append(dhan_download_symbol(root, start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S"), dhan_interval, overwrite=False, oi=dhan_oi))
@@ -2821,7 +2970,7 @@ def cached_universe_audit(symbol_text, audit_days, tech_w, news_w, market_w, thr
     return run_universe_audit(symbols=symbols_for_audit, config=cfg, fetcher=local_history_provider)
 
 if audit_run:
-    with st.spinner("Downloading roughly two years of daily history and replaying the model causally…"):
+    with st.spinner("Downloading roughly two years of daily history and replaying the model causally..."):
         st.session_state["audit_result"] = cached_universe_audit(
             audit_text, 365, 0.60, 0.20, 0.20, 0.25
         )
@@ -2937,13 +3086,13 @@ if col_dl1.button("Download equity"):
         if not sources:
             st.sidebar.warning("Select at least one archive.")
         elif selected_syms:
-            with st.spinner(f"Downloading {len(selected_syms)} symbol file(s)…"):
+            with st.spinner(f"Downloading {len(selected_syms)} symbol file(s)..."):
                 result_rows = download_equity_universe(selected_syms, sources=sources, workers=4)
             ok_count = sum(1 for r in result_rows if r.get("status") == "ok")
             st.sidebar.success(f"Equity downloads complete: {ok_count}/{len(result_rows)} files ready.")
 
 if col_dl2.button("Download F&O"):
-    with st.spinner("Downloading and extracting the free F&O 1-minute archive (~464 MB compressed)…"):
+    with st.spinner("Downloading and extracting the free F&O 1-minute archive (~464 MB compressed)..."):
         fo_result = download_fno_archive()
     if fo_result.get("status") == "ok":
         st.sidebar.success(f"F&O archive ready: {fo_result.get('extracted_files', 0)} files extracted.")
@@ -2956,17 +3105,17 @@ if st.sidebar.button("Scan local archive"):
     st.session_state["storage"] = storage_summary()
 
 if st.sidebar.button("Check source availability"):
-    with st.spinner("Checking public source/repository availability…"):
+    with st.spinner("Checking public source/repository availability..."):
         st.session_state["source_check"] = online_source_check()
 
 if st.sidebar.button("Validate local data"):
     ensure_data_dirs()
-    with st.spinner("Checking OHLCV integrity of local archives…"):
+    with st.spinner("Checking OHLCV integrity of local archives..."):
         st.session_state["quality"] = scan_quality()
 
 if st.sidebar.button("Reconcile to NSE (recent window)"):
     ensure_data_dirs()
-    with st.spinner("Comparing local daily aggregates with official NSE history…"):
+    with st.spinner("Comparing local daily aggregates with official NSE history..."):
         st.session_state["quality"] = scan_quality(symbols=CORE_SYMBOLS, reconcile=True, sample_days=30)
 
 if "storage" in st.session_state:
@@ -3347,3 +3496,64 @@ for rec in live_records:
             if near_atm is not None and not near_atm.empty:
                 st.dataframe(near_atm, width="stretch")
 
+def _render_slot_predictions_table(slot_predictions: dict[str, Any], selected_symbol: str) -> None:
+    """Render per-slot session-close predictions for all remaining 5-min slots."""
+    status = slot_predictions.get("status")
+    if status == "DRIVE_UNAVAILABLE":
+        st.warning(
+            "Per-slot predictions unavailable: "
+            + str(slot_predictions.get("reason") or "Google Drive is not reachable.")
+        )
+        return
+    if status == "SESSION_CLOSED":
+        st.info("NSE session is closed — no remaining five-minute slots today.")
+        return
+    if status != "OK":
+        st.warning(f"Per-slot predictions unavailable ({status}).")
+        return
+
+    slots = slot_predictions.get("slots") or []
+    if not slots:
+        st.info("No five-minute prediction slots found for today's session.")
+        return
+
+    session_date = slot_predictions.get("session_date", "today")
+    st.divider()
+    st.subheader(f"Session-close predictions — {selected_symbol} ({session_date})")
+    st.caption(
+        "One prediction per remaining 5-minute slot until the 15:30 IST close. "
+        "Each slot is a separate persisted cycle; P(up) and expected return are for the session close."
+    )
+
+    table_rows = []
+    for slot in slots:
+        pred = slot.get("prediction") or {}
+        horizon = pred.get("horizon_minutes")
+        prob = pred.get("probability_up")
+        exp_ret = pred.get("expected_return")
+        ref_price = pred.get("actual_market_value")
+        fc_price = (
+            float(ref_price) * (1.0 + float(exp_ret))
+            if pd.notna(ref_price) and pd.notna(exp_ret) else np.nan
+        )
+        table_rows.append({
+            "Slot (IST)": slot.get("slot_label", "—"),
+            "Horizon (min)": int(horizon) if pd.notna(horizon) else "—",
+            "Signal": str(pred.get("signal") or "—"),
+            "P(up)": f"{float(prob):.1%}" if pd.notna(prob) else "—",
+            "Exp. return": f"{float(exp_ret):+.2%}" if pd.notna(exp_ret) else "—",
+            "Forecast close": f"₹{float(fc_price):,.2f}" if pd.notna(fc_price) else "—",
+            "Status": str(pred.get("prediction_status") or ("STORED" if slot.get("prediction_file_stored") else "PENDING")),
+            "Manifest": str(slot.get("manifest_status") or "—"),
+        })
+
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        width="stretch",
+        hide_index=True,
+        height=min(420, 40 + 32 * len(table_rows)),
+    )
+    st.caption(
+        f"{slot_predictions.get('total_slots', 0)} slot(s) for {session_date}. "
+        "PENDING = prediction file not yet persisted for that slot."
+    )
