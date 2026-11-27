@@ -43,13 +43,13 @@ on:
           - "4Gi"
           - "2Gi"
       cpu_throttling:
-        description: "1 = CPU throttled outside requests (cheapest, safe: the tick joins its prediction thread)"
+        description: "0 = CPU always allocated during active container lifetime (required for background backfill threads); 1 = CPU throttled outside requests"
         required: false
-        default: "1"
+        default: "0"
         type: choice
         options:
-          - "1"
           - "0"
+          - "1"
       stage_only:
         description: "Stage a warm zero-traffic candidate and stop; do not validate or promote (for tagged backfill runs)"
         type: boolean
@@ -73,7 +73,7 @@ jobs:
       MIN_INSTANCES: ${{ github.event.inputs.min_instances || '0' }}
       CPU: ${{ github.event.inputs.cpu || '2' }}
       MEMORY: ${{ github.event.inputs.memory || '8Gi' }}
-      CPU_THROTTLING_FLAG: ${{ (github.event.inputs.cpu_throttling || '1') == '1' && 'cpu-throttling' || 'no-cpu-throttling' }}
+      CPU_THROTTLING_FLAG: ${{ (github.event.inputs.cpu_throttling || '0') == '1' && 'cpu-throttling' || 'no-cpu-throttling' }}
       PROJECT_ID: indian-market-trading
       REGION: asia-south1
     steps:

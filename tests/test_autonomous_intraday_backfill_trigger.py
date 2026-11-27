@@ -206,7 +206,7 @@ def test_backfill_job_retries_after_transient_failure_and_resumes(monkeypatch):
     assert status["error"] is None or "Transient attempt" in status["error"]
 
 
-def test_backfill_pauses_until_1600_on_trading_days(monkeypatch):
+def test_backfill_pauses_until_post_close_on_trading_days(monkeypatch):
     monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
 
     from datetime import datetime
@@ -218,7 +218,8 @@ def test_backfill_pauses_until_1600_on_trading_days(monkeypatch):
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
     assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
-    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 31, tzinfo=ist))
+    assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 15, 32, tzinfo=ist))
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
     assert not service._is_nse_live_priority_window(datetime(2026, 11, 6, 23, 59, tzinfo=ist))
 
@@ -237,7 +238,8 @@ def test_backfill_start_allowed_outside_live_priority_window_on_trading_days(mon
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 9, 15, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 29, tzinfo=ist))
     assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 30, tzinfo=ist))
-    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 59, tzinfo=ist))
+    assert not service._backfill_start_allowed(datetime(2026, 11, 6, 15, 31, tzinfo=ist))
+    assert service._backfill_start_allowed(datetime(2026, 11, 6, 15, 32, tzinfo=ist))
     assert service._backfill_start_allowed(datetime(2026, 11, 6, 16, 0, tzinfo=ist))
     assert service._backfill_start_allowed(datetime(2026, 11, 6, 23, 59, tzinfo=ist))
 
@@ -378,3 +380,115 @@ def test_backfill_persists_requested_target_end_date_in_status(monkeypatch):
     with service.STATE_LOCK:
         assert service.STATE["five_minute_backfill"]["target_end_date"] == "2026-11-25"
     assert service.BACKFILL_OPTIONS["end_date"] == "2026-11-25"
+
+
+def test_maybe_start_post_close_backfill_starts_after_session_close_when_gaps_exist(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_has_post_close_backfill_gaps",
+        lambda _day: {
+            "needs_backfill": True,
+            "missing_live_history_slots": [],
+            "missing_snapshot_slots": ["20261127_1415"],
+            "reason": "missing_snapshot_slots",
+        },
+    )
+
+    created = []
+
+    class StubThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+    monkeypatch.setattr(service.threading, "Thread", StubThread)
+
+    # During live session: not due.
+    before_close = service._maybe_start_post_close_backfill(datetime(2026, 11, 27, 15, 25, tzinfo=ist))
+    assert before_close["status"] == "NOT_DUE"
+    assert created == []
+
+    # At 15:32 IST right after market close: starts backfill automatically.
+    after_close = service._maybe_start_post_close_backfill(datetime(2026, 11, 27, 15, 32, tzinfo=ist))
+    assert after_close["status"] == "BACKFILL_STARTED"
+    assert after_close["target_end_date"] == "2026-11-27"
+    assert after_close["reason"] == "missing_snapshot_slots"
+    assert after_close["missing_snapshot_count"] == 1
+    assert len(created) == 1
+    assert created[0].started is True
+    assert service.BACKFILL_OPTIONS == {"end_date": "2026-11-27", "replace_existing_history": False}
+
+    # A repeat tick on the same session does not start a duplicate backfill.
+    repeat = service._maybe_start_post_close_backfill(datetime(2026, 11, 27, 15, 35, tzinfo=ist))
+    assert repeat["status"] == "BACKFILL_ALREADY_RUNNING"
+    assert len(created) == 1
+
+
+def test_maybe_start_post_close_backfill_skips_when_no_gaps(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_has_post_close_backfill_gaps",
+        lambda _day: {
+            "needs_backfill": False,
+            "missing_live_history_slots": [],
+            "missing_snapshot_slots": [],
+            "reason": "none",
+        },
+    )
+
+    result = service._maybe_start_post_close_backfill(datetime(2026, 11, 27, 15, 32, tzinfo=ist))
+    assert result["status"] == "NO_GAPS_DETECTED"
+    assert service.BACKFILL_THREAD is None
+
+
+def test_run_five_minute_backfill_repairs_missing_snapshots_for_target_date(monkeypatch):
+    import indstocks_backfill_all_nse_5m_history as backfill
+    import repair_missing_minute_snapshots
+
+    monkeypatch.setattr(indstocks_client, "configured", lambda: True)
+    monkeypatch.setattr(service, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(backfill, "main", lambda _argv: 0)
+
+    repair_calls = []
+    monkeypatch.setattr(
+        repair_missing_minute_snapshots,
+        "run_repair",
+        lambda session_day: repair_calls.append(session_day) or {
+            "repair_status": "COMPLETED",
+            "repaired_count": 3,
+            "archive_repaired_count": 3,
+            "skipped_count": 0,
+        },
+    )
+    service.BACKFILL_OPTIONS = {"end_date": "2026-11-27", "replace_existing_history": False}
+
+    service._run_five_minute_backfill()
+
+    assert len(repair_calls) == 1
+    assert repair_calls[0].isoformat() == "2026-11-27"
+    with service.STATE_LOCK:
+        state = dict(service.STATE["five_minute_backfill"])
+    assert state["status"] == "COMPLETED"
+    assert state["snapshot_repair"]["repair_status"] == "COMPLETED"
+    assert state["snapshot_repair"]["repaired_count"] == 3

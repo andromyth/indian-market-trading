@@ -188,12 +188,15 @@ def _backfill_progress(progress: dict[str, Any]) -> None:
     _log("indstocks_5m_backfill_progress", **progress)
 
 
+POST_CLOSE_BACKFILL_TIME = (15, 32)
+
+
 def _is_nse_live_priority_window(now: datetime) -> bool:
-    """Pause historical backfill from market open until the 16:00 IST backfill window."""
+    """Pause historical backfill from market open until the 15:32 IST post-close boundary."""
     return (
         is_nse_trading_day(now.date())
         and (now.hour, now.minute) >= (9, 15)
-        and (now.hour, now.minute) < (16, 0)
+        and (now.hour, now.minute) < POST_CLOSE_BACKFILL_TIME
     )
 
 
@@ -201,11 +204,11 @@ def _backfill_start_allowed(now: datetime) -> bool:
     """Allow starts outside the live-priority window.
 
     On NSE trading days historical backfill must not compete with the live
-    market, so starts are blocked between 09:15 and 16:00 IST.  Before the
-    open and after the close are safe; the runner itself also pauses during
-    the live window.  This keeps delayed overnight schedules (which often
-    slip past midnight) working instead of rejecting them with HTTP 423.
-    The recovery workflow deploys this guard before it requests a backfill.
+    market, so starts are blocked between 09:15 and 15:31 IST.  Before the
+    open and right after the 15:30 close (starting at 15:32 IST) are safe;
+    the runner itself also pauses during the live window.  This keeps delayed
+    overnight schedules (which often slip past midnight) working instead of
+    rejecting them with HTTP 423.
     """
     return not _is_nse_live_priority_window(now)
 
@@ -260,16 +263,157 @@ def _wait_for_backfill_request_slot() -> None:
         _log("indstocks_5m_backfill_resumed_after_market")
 
 
+def _run_post_backfill_snapshot_repair(target_end_date: str) -> dict[str, Any] | None:
+    """Reconstruct missing canonical snapshots from Drive 5m archive after backfill."""
+    if not target_end_date:
+        return None
+    try:
+        session_day = date.fromisoformat(target_end_date[:10])
+    except ValueError:
+        return {"repair_status": "INVALID_END_DATE", "target_end_date": target_end_date}
+    if not is_nse_trading_day(session_day):
+        return {"repair_status": "SKIPPED_NON_TRADING_DAY", "session_date": session_day.isoformat()}
+    try:
+        _update_backfill_status(phase="REPAIRING_SNAPSHOTS")
+        from repair_missing_minute_snapshots import run_repair
+
+        result = run_repair(session_day)
+        _log(
+            "indstocks_5m_post_backfill_snapshot_repair",
+            session_date=session_day.isoformat(),
+            repair_status=result.get("repair_status"),
+            repaired_count=result.get("repaired_count"),
+            archive_repaired_count=result.get("archive_repaired_count"),
+            skipped_count=result.get("skipped_count"),
+        )
+        return result
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+        _log(
+            "indstocks_5m_post_backfill_snapshot_repair_failed",
+            session_date=session_day.isoformat(),
+            error=detail,
+        )
+        return {"repair_status": "ERROR", "error": detail}
+
+
+def _has_post_close_backfill_gaps(session_date: date) -> dict[str, Any]:
+    """Inspect today's Drive folders for missing 5m captures or daily snapshots."""
+    from persistent_store import GoogleDriveStore
+    from scripts.same_day_gap_backfill import (
+        _load_live_history_files,
+        _load_snapshot_files,
+        missing_live_history_slots,
+        missing_snapshot_slots,
+    )
+
+    store = GoogleDriveStore()
+    missing_history = missing_live_history_slots(
+        _load_live_history_files(store, session_date), session_date
+    )
+    missing_snapshots = missing_snapshot_slots(
+        _load_snapshot_files(store, session_date), session_date
+    )
+    needs_backfill = bool(missing_history or missing_snapshots)
+    return {
+        "needs_backfill": needs_backfill,
+        "missing_live_history_slots": missing_history,
+        "missing_snapshot_slots": missing_snapshots,
+        "reason": (
+            "missing_live_history_slots"
+            if missing_history
+            else "missing_snapshot_slots"
+            if missing_snapshots
+            else "none"
+        ),
+    }
+
+
+def _maybe_start_post_close_backfill(now_ist: datetime) -> dict[str, Any]:
+    """Start same-day backfill automatically once the trading session ends (15:32 IST)."""
+    global BACKFILL_OPTIONS, BACKFILL_THREAD
+
+    if not _env_flag("ALL_NSE_POST_CLOSE_AUTO_BACKFILL", True):
+        return {"status": "DISABLED"}
+    if not (
+        is_nse_trading_day(now_ist.date())
+        and (now_ist.hour, now_ist.minute) >= POST_CLOSE_BACKFILL_TIME
+    ):
+        return {"status": "NOT_DUE", "nse_time_ist": now_ist.isoformat()}
+    if not BACKFILL_START_LOCK.acquire(blocking=False):
+        return {"status": "BACKFILL_START_IN_PROGRESS"}
+    try:
+        thread_alive = BACKFILL_THREAD is not None and BACKFILL_THREAD.is_alive()
+        today_str = now_ist.date().isoformat()
+        with STATE_LOCK:
+            backfill_state = dict(STATE.get("five_minute_backfill") or {})
+            backfill_status = str(backfill_state.get("status") or "IDLE").upper()
+            backfill_target = str(backfill_state.get("target_end_date") or "").strip()
+        if thread_alive:
+            return {"status": "BACKFILL_ALREADY_RUNNING", "target_end_date": backfill_target}
+        if backfill_target == today_str and backfill_status in {
+            "RUNNING", "PAUSED_FOR_LIVE_MARKET", "COMPLETED", "COMPLETED_WITH_GAPS"
+        }:
+            return {
+                "status": "BACKFILL_ALREADY_HANDLED",
+                "target_end_date": today_str,
+                "five_minute_backfill_status": backfill_status,
+            }
+        from indstocks_client import configured
+        if not configured():
+            return {"status": "INDSTOCKS_CREDENTIALS_NOT_CONFIGURED"}
+        try:
+            gap_state = _has_post_close_backfill_gaps(now_ist.date())
+        except Exception as exc:
+            gap_state = {
+                "needs_backfill": True,
+                "missing_live_history_slots": [],
+                "missing_snapshot_slots": [],
+                "reason": f"gap_check_error:{type(exc).__name__}",
+            }
+        if not gap_state.get("needs_backfill"):
+            return {"status": "NO_GAPS_DETECTED", "target_end_date": today_str}
+
+        BACKFILL_OPTIONS = {
+            "end_date": today_str,
+            "replace_existing_history": False,
+        }
+        _update_backfill_status(target_end_date=today_str)
+        BACKFILL_THREAD = threading.Thread(
+            target=_run_five_minute_backfill,
+            name="indstocks-native-5m-backfill",
+            daemon=True,
+        )
+        BACKFILL_THREAD.start()
+        _log(
+            "cloud_run_post_close_backfill_started",
+            target_end_date=today_str,
+            reason=gap_state.get("reason"),
+            missing_live_history_count=len(gap_state.get("missing_live_history_slots") or []),
+            missing_snapshot_count=len(gap_state.get("missing_snapshot_slots") or []),
+        )
+        return {
+            "status": "BACKFILL_STARTED",
+            "target_end_date": today_str,
+            "reason": gap_state.get("reason"),
+            "missing_live_history_count": len(gap_state.get("missing_live_history_slots") or []),
+            "missing_snapshot_count": len(gap_state.get("missing_snapshot_slots") or []),
+        }
+    finally:
+        BACKFILL_START_LOCK.release()
+
+
 def _run_five_minute_backfill() -> None:
     """Run in this process to share INDstocks TOTP token cache with live capture."""
     global BACKFILL_OPTIONS
+    target_end_date = str(BACKFILL_OPTIONS.get("end_date") or "").strip()
     _reset_backfill_counters()
     _update_backfill_status(
         counters={},
         status="RUNNING",
         phase="DOWNLOADING",
         started_at_utc=datetime.now(timezone.utc).isoformat(),
-        target_end_date=(BACKFILL_OPTIONS.get("end_date") or datetime.now(IST).date().isoformat()),
+        target_end_date=(target_end_date or datetime.now(IST).date().isoformat()),
         finished_at_utc=None,
         progress={},
         last_heartbeat_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -277,6 +421,7 @@ def _run_five_minute_backfill() -> None:
         last_progress_at_utc=None,
         last_provider_response_at_utc=None,
         last_checkpoint_write_at_utc=None,
+        snapshot_repair=None,
         error=None,
         exit_code=None,
     )
@@ -326,10 +471,12 @@ def _run_five_minute_backfill() -> None:
                     error=detail,
                 )
                 time.sleep(delay_seconds)
+        snapshot_repair = _run_post_backfill_snapshot_repair(target_end_date)
         _update_backfill_status(
             status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS",
             exit_code=exit_code,
             error=None,
+            snapshot_repair=snapshot_repair,
             finished_at_utc=datetime.now(timezone.utc).isoformat(),
         )
         _log("indstocks_5m_backfill_finished", status="COMPLETED" if exit_code == 0 else "COMPLETED_WITH_GAPS", exit_code=exit_code)
@@ -1347,7 +1494,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     self._send_json(423, {
                         "status": "BACKFILL_OUTSIDE_ALLOWED_WINDOW",
                         "nse_time_ist": now_ist.isoformat(),
-                        "next_allowed_time_ist": "16:00 IST today",
+                        "next_allowed_time_ist": "15:32 IST today",
                     })
                     return
 
@@ -1403,7 +1550,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "end_date": options.get("end_date"),
                     "replace_existing_history": options.get("replace_existing_history"),
                     "symbols": options.get("symbols"),
-                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; historical requests pause from 09:15 through 15:59 IST on NSE trading days and resume after 16:00, or run throughout non-trading days.",
+                    "note": "Runs in the Cloud Run process to reuse its INDstocks token cache; historical requests pause from 09:15 through 15:31 IST on NSE trading days and resume at 15:32 IST right after session close, or run throughout non-trading days.",
                 })
                 return
             finally:
@@ -1480,7 +1627,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             # persisted Drive artifacts as before.
             capture_result = result.get("all_universe_capture") or {}
             prediction_started = time.monotonic()
-            if capture_result.get("status") == "NOT_SCHEDULED":
+            if not capture_result or capture_result.get("status") == "NOT_SCHEDULED":
                 result["all_nse_minute_predictions"] = {
                     "status": "NOT_SCHEDULED",
                     "reason": "No scheduled five-minute quote snapshot was captured.",
@@ -1494,6 +1641,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             # scheduler collision can never permanently lose a slot.
             drain = _drain_missing_prediction_slots()
             result["backlog_drain"] = drain
+            post_close_backfill = _maybe_start_post_close_backfill(datetime.now(IST))
+            result["post_close_backfill"] = post_close_backfill
             result["metrics"] = _prediction_metrics(
                 capture_result,
                 result.get("all_nse_minute_predictions") or {},
@@ -1555,6 +1704,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "error": result.get("error"),
                 "flush": result.get("flush"),
                 "all_universe_capture": result.get("all_universe_capture"),
+                "post_close_backfill": result.get("post_close_backfill"),
             })
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

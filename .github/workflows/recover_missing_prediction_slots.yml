@@ -10,12 +10,12 @@ name: Recover missing ALL-NSE prediction slots
 # already has model predictions.
 
 on:
-  # 16:20 IST (10:50 UTC) on weekdays, after the 16:05 provider gap backfill
-  # (bounded to 12 minutes) and before the 16:30 consolidation. A second slot at
-  # 18:50 IST is a late-start fallback: GitHub cron can throttle this repository
-  # by hours, but a delayed run still lands after the session and repairs gaps.
+  # 15:50 IST (10:20 UTC) and 16:20 IST (10:50 UTC) on weekdays, after the
+  # post-close provider gap backfill and before the 16:30 consolidation. A late
+  # slot at 19:20 IST (13:50 UTC) is a fallback if GitHub cron throttles.
   schedule:
-    - cron: "50 10,13 * * 1-5"
+    - cron: "20,50 10 * * 1-5"
+    - cron: "50 13 * * 1-5"
   # Chain immediately after the backfill workflow so snapshot repair never
   # depends on a second, independently throttled cron entry.
   workflow_run:

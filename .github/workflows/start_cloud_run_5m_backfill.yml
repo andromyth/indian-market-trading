@@ -66,7 +66,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Gate backfill by NSE trading calendar and 16:00 IST start
+      - name: Gate backfill by NSE trading calendar and 15:32 IST post-close start
         id: schedule_gate
         shell: bash
         run: |
@@ -80,7 +80,7 @@ jobs:
 
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           trading_day = is_nse_trading_day(now.date())
-          # Manual dispatch with confirm_backfill=yes bypasses the 16:00 IST
+          # Manual dispatch with confirm_backfill=yes bypasses the 15:32 IST
           # trading-hours gate: the operator explicitly authorizes the backfill
           # and accepts any rate-limit or contention risk.
           event_name = os.environ.get("GITHUB_EVENT_NAME", "")
@@ -89,14 +89,14 @@ jobs:
           event = json.load(open(event_path, encoding="utf-8")) if event_path else {}
           operator_marker = event_name == "push" and "[start-native-5m-backfill]" in str((event.get("head_commit") or {}).get("message") or "")
           manual = manual_dispatch or operator_marker
-          allowed = manual or (not trading_day) or (now.hour, now.minute) >= (16, 0)
+          allowed = manual or (not trading_day) or (now.hour, now.minute) >= (15, 32)
           requested = (os.environ.get("REQUESTED_END_DATE") or "").strip()
           if requested:
               target = requested
           else:
-              # Blank input: latest completed session. Today counts only after 16:00 IST.
+              # Blank input: latest completed session. Today counts after the 15:32 IST post-close window opens.
               day = now.date()
-              if not manual and not (is_nse_trading_day(day) and (now.hour, now.minute) >= (16, 0)):
+              if not manual and not (is_nse_trading_day(day) and (now.hour, now.minute) >= (15, 32)):
                   day -= timedelta(days=1)
               while not is_nse_trading_day(day):
                   day -= timedelta(days=1)
@@ -104,11 +104,11 @@ jobs:
           reason = (
               "Explicit operator authorization: manual dispatch or signed-off recovery commit marker"
               if manual
-              else "NSE trading day before 16:00 IST: backfill is not eligible"
+              else "NSE trading day before 15:32 IST: backfill is not eligible"
               if trading_day and not allowed
               else "NSE non-trading day: backfill is eligible all day"
               if not trading_day
-              else "NSE trading day at or after 16:00 IST: backfill is eligible"
+              else "NSE trading day at or after 15:32 IST: backfill is eligible"
           )
           print(f"IST_NOW={now.isoformat()} TRADING_DAY={trading_day} MANUAL={manual} ALLOWED={allowed} TARGET_END_DATE={target} REASON={reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
