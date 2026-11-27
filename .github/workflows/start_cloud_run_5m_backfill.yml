@@ -122,7 +122,7 @@ jobs:
           echo "REQUESTING_WORKER_DEPLOYMENT_SHA=$EXPECTED_DEPLOY_SHA"
           gh workflow run deploy_intraday_worker_recovery.yml --ref "$GITHUB_REF_NAME" \
             -f in_worker_prediction=1 -f min_instances=0 -f cpu=2 -f memory=8Gi \
-            -f cpu_throttling=1 -f stage_only=false
+            -f cpu_throttling=1
           for attempt in $(seq 1 180); do
             RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&event=workflow_dispatch&per_page=20")"
             MATCH="$(printf '%s' "$RUNS" | EXPECTED_DEPLOY_SHA="$EXPECTED_DEPLOY_SHA" DISPATCHED_AT="$DISPATCHED_AT" python -c 'import json,os,sys; sha=os.environ["EXPECTED_DEPLOY_SHA"]; started=os.environ["DISPATCHED_AT"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha and r.get("created_at","") >= started]; print(json.dumps(max(runs,key=lambda r:r.get("created_at","")) if runs else {}))')"
