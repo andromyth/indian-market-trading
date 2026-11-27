@@ -39,7 +39,7 @@ on:
   # at 16:00 IST. This workflow is retained for manual and staged/preflight runs.
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 concurrency:
   group: start-cloud-run-native-5m-backfill
@@ -109,6 +109,38 @@ jobs:
               output.write("should_run=" + ("true" if allowed else "false") + "\n")
               output.write("end_date=" + target + "\n")
           PY
+
+      - name: Deploy and verify the current worker before manual backfill
+        if: github.event_name == 'workflow_dispatch' && steps.schedule_gate.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_DEPLOY_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "REQUESTING_WORKER_DEPLOYMENT_SHA=$EXPECTED_DEPLOY_SHA"
+          gh workflow run deploy_intraday_worker_recovery.yml --ref "$GITHUB_REF_NAME" \
+            -f in_worker_prediction=1 -f min_instances=0 -f cpu=2 -f memory=8Gi \
+            -f cpu_throttling=1
+          for attempt in $(seq 1 180); do
+            RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy_intraday_worker_recovery.yml/runs?branch=main&event=workflow_dispatch&per_page=20")"
+            MATCH="$(printf '%s' "$RUNS" | EXPECTED_DEPLOY_SHA="$EXPECTED_DEPLOY_SHA" DISPATCHED_AT="$DISPATCHED_AT" python -c 'import json,os,sys; sha=os.environ["EXPECTED_DEPLOY_SHA"]; started=os.environ["DISPATCHED_AT"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("head_sha")==sha and r.get("created_at","") >= started]; print(json.dumps(max(runs,key=lambda r:r.get("created_at","")) if runs else {}))')"
+            RUN_ID="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            STATUS="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            CONCLUSION="$(printf '%s' "$MATCH" | python -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              echo "WORKER_DEPLOY_RUN_ID=$RUN_ID STATUS=$STATUS CONCLUSION=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                [[ "$CONCLUSION" == "success" ]] || { echo "Backfill blocked: current worker deployment failed."; exit 1; }
+                echo "CURRENT_WORKER_DEPLOYMENT=SUCCESS"
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Backfill blocked: timed out waiting for current worker deployment."
+          exit 1
 
       - name: Require successful deployment when worker code changed
         if: github.event_name == 'push' && steps.schedule_gate.outputs.should_run == 'true'
