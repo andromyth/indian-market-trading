@@ -1,0 +1,159 @@
+name: Dispatch Cloud Run 5m backfill once at target IST
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ist:
+        description: "Target IST ISO-8601 timestamp (e.g. 2026-11-27T20:30:00+05:30)"
+        required: true
+      end_date:
+        description: "Inclusive backfill end date in IST (blank = latest completed NSE session)"
+        type: string
+        required: false
+        default: ""
+      replace_existing_history:
+        description: "Passed to start_cloud_run_5m_backfill.yml (auto, yes, no)"
+        type: choice
+        required: false
+        default: "auto"
+        options:
+          - "auto"
+          - "yes"
+          - "no"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: dispatch-cloud-run-5m-backfill-once
+  cancel-in-progress: false
+
+jobs:
+  wait-phase-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      TARGET_IST: ${{ github.event.inputs.target_ist }}
+    steps:
+      - name: Wait first half if target is more than 3 hours away
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          ist = ZoneInfo("Asia/Kolkata")
+          target = datetime.fromisoformat(os.environ["TARGET_IST"].strip())
+          if target.tzinfo is None:
+              target = target.replace(tzinfo=ist)
+          now = datetime.now(ist)
+          remaining = (target - now).total_seconds()
+          print(f"PHASE1_NOW_IST={now.isoformat()} TARGET_IST={target.isoformat()} REMAINING_S={int(remaining)}", flush=True)
+          # Leave <= 3 hours (10800s) for phase 2 so neither job nears the 360-min limit.
+          sleep_total = max(0.0, remaining - 10800.0)
+          if sleep_total <= 0:
+              print("PHASE1_NO_WAIT_NEEDED", flush=True)
+          else:
+              deadline = time.monotonic() + sleep_total
+              while True:
+                  left = deadline - time.monotonic()
+                  if left <= 0:
+                      break
+                  time.sleep(min(900.0, left))
+                  print(f"PHASE1_HEARTBEAT now_ist={datetime.now(ist).isoformat()} remaining_to_phase2_s={int(max(0.0, deadline - time.monotonic()))}", flush=True)
+          PY
+
+  wait-phase-2-and-dispatch:
+    needs: wait-phase-1
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_IST: ${{ github.event.inputs.target_ist }}
+      END_DATE: ${{ github.event.inputs.end_date }}
+      REPLACE_EXISTING_HISTORY: ${{ github.event.inputs.replace_existing_history || 'auto' }}
+    steps:
+      - name: Wait until target IST timestamp
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          ist = ZoneInfo("Asia/Kolkata")
+          target = datetime.fromisoformat(os.environ["TARGET_IST"].strip())
+          if target.tzinfo is None:
+              target = target.replace(tzinfo=ist)
+          while True:
+              now = datetime.now(ist)
+              left = (target - now).total_seconds()
+              if left <= 0:
+                  print(f"TARGET_REACHED now_ist={now.isoformat()} target_ist={target.isoformat()}", flush=True)
+                  break
+              print(f"PHASE2_HEARTBEAT now_ist={now.isoformat()} remaining_s={int(left)}", flush=True)
+              time.sleep(min(900.0, left))
+          PY
+
+      - name: Wait briefly if a scheduled backfill/consolidation workflow is finishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          WATCH_WORKFLOWS=(
+            "same_day_gap_backfill.yml"
+            "recover_missing_prediction_slots.yml"
+            "consolidate_live_5m_into_archive.yml"
+            "retrain_to_close.yml"
+            "start_cloud_run_5m_backfill.yml"
+          )
+          for attempt in $(seq 1 30); do
+            ACTIVE=0
+            for wf in "${WATCH_WORKFLOWS[@]}"; do
+              COUNT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=10" \
+                --jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null || echo 0)"
+              if [[ "$COUNT" -gt 0 ]]; then
+                echo "WAITING_FOR_CONFLICTING_WORKFLOW=$wf count=$COUNT attempt=$attempt/30"
+                ACTIVE=$((ACTIVE + COUNT))
+              fi
+            done
+            if [[ "$ACTIVE" -eq 0 ]]; then
+              echo "CLASH_CHECK=CLEAR"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "CLASH_CHECK=PROCEEDING_AFTER_15M_WAIT"
+
+      - name: Trigger non-scheduled one-time Cloud Run 5m backfill
+        shell: bash
+        run: |
+          set -euo pipefail
+          DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          args=(
+            workflow run start_cloud_run_5m_backfill.yml
+            --repo "$GITHUB_REPOSITORY"
+            --ref "$GITHUB_REF_NAME"
+            -f "confirm_backfill=yes"
+            -f "replace_existing_history=${REPLACE_EXISTING_HISTORY}"
+          )
+          if [[ -n "${END_DATE}" ]]; then
+            args+=(-f "end_date=${END_DATE}")
+          fi
+          gh "${args[@]}"
+          for attempt in $(seq 1 12); do
+            sleep 5
+            RUN_INFO="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/start_cloud_run_5m_backfill.yml/runs?branch=${GITHUB_REF_NAME}&event=workflow_dispatch&per_page=5" \
+              --jq "[.workflow_runs[] | select(.created_at >= \"${DISPATCHED_AT}\")][0] // {}")"
+            RUN_ID="$(printf '%s' "$RUN_INFO" | python -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            if [[ -n "$RUN_ID" ]]; then
+              RUN_URL="$(printf '%s' "$RUN_INFO" | python -c 'import json,sys; print(json.load(sys.stdin).get("html_url",""))')"
+              echo "DISPATCHED_BACKFILL_RUN_ID=$RUN_ID"
+              echo "DISPATCHED_BACKFILL_RUN_URL=$RUN_URL"
+              exit 0
+            fi
+          done
+          echo "DISPATCH_ACCEPTED_RUN_ID_NOT_YET_LISTED"
