@@ -1,11 +1,11 @@
 name: Backfill same-day missing 5m history
 
 # Runs after the 15:30 cash close and before the 16:20 recovery / 16:30
-# consolidation. It only fills genuine provider 5m bars for symbols affected by
-# missing slots. The recovery workflow then rebuilds canonical snapshots (from
-# persisted shards, or from the refreshed archive when the live worker wrote no
-# shard) and compiles predictions. It never touches the live Cloud Run worker
-# during market hours.
+# consolidation. It discovers missing 5m live history, warming prediction slots,
+# and missing canonical daily snapshots, triggers the private Cloud Run provider
+# backfill (the only authorized caller to INDstocks API), and automatically
+# reconstructs/repairs missing canonical snapshots from genuine provider archive bars.
+# It never touches the live Cloud Run worker during market hours.
 on:
   schedule:
     # 16:05 IST (10:35 UTC) on weekdays, plus late-start fallbacks because
@@ -21,6 +21,11 @@ on:
         description: "Maximum minutes to wait for provider backfill"
         required: false
         default: "12"
+      repair_snapshots:
+        description: "Repair missing canonical snapshots after backfill"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -96,9 +101,15 @@ jobs:
         env:
           SESSION_DATE: ${{ steps.session.outputs.date }}
           MAX_WAIT_MINUTES: ${{ github.event.inputs.max_wait_minutes || '12' }}
+          REPAIR_SNAPSHOTS: ${{ github.event.inputs.repair_snapshots != 'false' && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          REPAIR_FLAG="--repair-snapshots"
+          if [ "$REPAIR_SNAPSHOTS" = "false" ]; then
+            REPAIR_FLAG="--no-repair-snapshots"
+          fi
           python -u scripts/same_day_gap_backfill.py \
             --date "$SESSION_DATE" \
             --max-wait-minutes "$MAX_WAIT_MINUTES" \
+            "$REPAIR_FLAG" \
             | tee /tmp/same_day_gap_backfill.log

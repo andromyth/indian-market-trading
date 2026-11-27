@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-import resource
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is POSIX-only
+    resource = None
 import threading
 import time
 from datetime import date, datetime, timezone

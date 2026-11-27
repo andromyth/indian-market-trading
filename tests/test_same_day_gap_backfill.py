@@ -182,6 +182,7 @@ def test_main_exits_zero_when_backfill_is_deferred(monkeypatch, capsys):
     monkeypatch.setattr(prediction_universe, "authoritative_roster", lambda: ["AAA", "BBB"])
     monkeypatch.setattr(gap, "_load_live_history_files", lambda store, session: [])
     monkeypatch.setattr(gap, "_load_prediction_manifests", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_snapshot_files", lambda store, session: [])
     monkeypatch.setattr(
         gap,
         "discover_gap_state",
@@ -270,3 +271,152 @@ def test_backfill_session_ownership_falls_back_to_started_at_when_target_missing
     current = {"state": {"started_at_utc": "2026-11-25T10:35:00+00:00"}}
     assert gap._belongs_to_session(current, date(2026, 11, 25))
     assert not gap._belongs_to_session(current, date(2026, 11, 26))
+
+
+def test_missing_snapshot_slots_detects_absent_snapshots():
+    from audit_all_universe_minute_snapshots import expected_minutes
+
+    session_date = date(2026, 11, 23)
+    expected = expected_minutes(session_date)
+    all_files = [{"name": f"snapshot_{key}.parquet"} for key in expected]
+
+    assert gap.missing_snapshot_slots(all_files, session_date) == []
+
+    # One missing slot
+    with_gap = [f for f in all_files if "1210" not in f["name"]]
+    missing = gap.missing_snapshot_slots(with_gap, session_date)
+    assert missing == ["20261123_1210"]
+
+
+def test_discover_gap_state_detects_missing_snapshots():
+    from audit_all_universe_minute_snapshots import expected_minutes
+
+    session_date = date(2026, 11, 23)
+    roster = ["AAA", "BBB", "CCC"]
+    expected = expected_minutes(session_date)
+    all_snapshots = [{"name": f"snapshot_{key}.parquet"} for key in expected]
+    missing_one_snapshot = [f for f in all_snapshots if "1210" not in f["name"]]
+
+    state = gap.discover_gap_state(
+        session_date=session_date,
+        live_history_files=[
+            {"name": f"capture_20261123_{slot:%H%M}.parquet"}
+            for slot in expected_session_slots()
+        ],
+        prediction_manifests=[],
+        snapshot_files=missing_one_snapshot,
+        roster=roster,
+    )
+    assert state["needs_backfill"] is True
+    assert state["gap_symbol_count"] == len(roster)
+    assert state["reason"] == "missing_snapshot_slots"
+    assert state["missing_snapshot_slots"] == ["20261123_1210"]
+
+
+def test_post_backfill_snapshot_repair_invoked_on_missing_snapshots(monkeypatch, capsys):
+    import market_session_guard
+    import persistent_store
+    import prediction_universe
+
+    monkeypatch.setattr(gap, "resolve_session_date", lambda raw=None: date(2026, 11, 23))
+    monkeypatch.setattr(market_session_guard, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(persistent_store, "GoogleDriveStore", lambda: object())
+    monkeypatch.setattr(prediction_universe, "authoritative_roster", lambda: ["AAA", "BBB"])
+    monkeypatch.setattr(gap, "_load_live_history_files", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_prediction_manifests", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_snapshot_files", lambda store, session: [])
+    monkeypatch.setattr(
+        gap,
+        "discover_gap_state",
+        lambda **kwargs: {
+            "needs_backfill": True,
+            "gap_symbol_count": 2,
+            "reason": "missing_snapshot_slots",
+            "missing_snapshot_slots": ["20261123_1210"],
+        },
+    )
+    monkeypatch.setattr(gap, "service_url", lambda: "https://example.test")
+    monkeypatch.setattr(gap, "identity_token", lambda url: "token")
+    monkeypatch.setattr(
+        gap,
+        "backfill_state",
+        lambda url, token: {
+            "status": "COMPLETED",
+            "state": {"started_at_utc": "2026-11-23T10:35:00+00:00"},
+        },
+    )
+
+    repaired_calls = []
+    import repair_missing_minute_snapshots
+    monkeypatch.setattr(
+        repair_missing_minute_snapshots,
+        "run_repair",
+        lambda session_date, minutes=None, expected_universe=None: (
+            repaired_calls.append((session_date, minutes, expected_universe)) or {
+                "repair_status": "COMPLETED",
+                "repaired_count": 1,
+            }
+        ),
+    )
+
+    monkeypatch.setattr(sys, "argv", ["same_day_gap_backfill.py", "--date", "2026-11-23"])
+    code = gap.main()
+
+    assert code == 0
+    assert len(repaired_calls) == 1
+    assert repaired_calls[0][0] == date(2026, 11, 23)
+    assert repaired_calls[0][1] == ["20261123_1210"]
+    assert "POST_BACKFILL_SNAPSHOT_REPAIR=" in capsys.readouterr().out
+
+
+def test_post_backfill_snapshot_repair_can_be_disabled(monkeypatch, capsys):
+    import market_session_guard
+    import persistent_store
+    import prediction_universe
+
+    monkeypatch.setattr(gap, "resolve_session_date", lambda raw=None: date(2026, 11, 23))
+    monkeypatch.setattr(market_session_guard, "is_nse_trading_day", lambda _date: True)
+    monkeypatch.setattr(persistent_store, "GoogleDriveStore", lambda: object())
+    monkeypatch.setattr(prediction_universe, "authoritative_roster", lambda: ["AAA", "BBB"])
+    monkeypatch.setattr(gap, "_load_live_history_files", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_prediction_manifests", lambda store, session: [])
+    monkeypatch.setattr(gap, "_load_snapshot_files", lambda store, session: [])
+    monkeypatch.setattr(
+        gap,
+        "discover_gap_state",
+        lambda **kwargs: {
+            "needs_backfill": True,
+            "gap_symbol_count": 2,
+            "reason": "missing_snapshot_slots",
+            "missing_snapshot_slots": ["20261123_1210"],
+        },
+    )
+    monkeypatch.setattr(gap, "service_url", lambda: "https://example.test")
+    monkeypatch.setattr(gap, "identity_token", lambda url: "token")
+    monkeypatch.setattr(
+        gap,
+        "backfill_state",
+        lambda url, token: {
+            "status": "COMPLETED",
+            "state": {"started_at_utc": "2026-11-23T10:35:00+00:00"},
+        },
+    )
+
+    repaired_calls = []
+    import repair_missing_minute_snapshots
+    monkeypatch.setattr(
+        repair_missing_minute_snapshots,
+        "run_repair",
+        lambda *args, **kwargs: repaired_calls.append(args),
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["same_day_gap_backfill.py", "--date", "2026-11-23", "--no-repair-snapshots"],
+    )
+    code = gap.main()
+
+    assert code == 0
+    assert len(repaired_calls) == 0
+    assert "POST_BACKFILL_SNAPSHOT_REPAIR=" not in capsys.readouterr().out

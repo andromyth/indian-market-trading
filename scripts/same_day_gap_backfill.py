@@ -31,6 +31,7 @@ REGION = os.getenv("REGION", "asia-south1")
 SERVICE = os.getenv("SERVICE", "indian-market-intraday-worker")
 LIVE_HISTORY_ROOT = "production_data/nse_official/intraday_5m_live"
 PREDICTION_ROOT = "production_data/all_nse_minute_predictions"
+SNAPSHOT_ROOT = "production_data/all_universe_minute_snapshots"
 CONFIRM = "START_NATIVE_5M_BACKFILL"
 DONE_STATUSES = {"COMPLETED", "COMPLETED_WITH_GAPS"}
 FAILED_STATUSES = {"FAILED", "ERROR"}
@@ -65,6 +66,21 @@ def missing_live_history_slots(files: list[dict[str, Any]], session_date: date) 
     return missing
 
 
+def missing_snapshot_slots(
+    files: list[dict[str, Any]],
+    session_date: date,
+    as_of: datetime | None = None,
+) -> list[str]:
+    from audit_all_universe_minute_snapshots import expected_minutes
+
+    present = {str(item.get("name") or "") for item in files}
+    missing: list[str] = []
+    for key in expected_minutes(session_date, as_of=as_of):
+        if f"snapshot_{key}.parquet" not in present:
+            missing.append(key)
+    return missing
+
+
 def warming_prediction_slots(
     manifests: list[tuple[str, dict[str, Any]]],
 ) -> list[str]:
@@ -86,22 +102,32 @@ def discover_gap_state(
     session_date: date,
     live_history_files: list[dict[str, Any]],
     prediction_manifests: list[tuple[str, dict[str, Any]]],
+    snapshot_files: list[dict[str, Any]] | None = None,
     roster: list[str],
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     missing_history = missing_live_history_slots(live_history_files, session_date)
     warming = warming_prediction_slots(prediction_manifests)
-    needs_backfill = bool(missing_history or warming)
+    missing_snapshots = (
+        missing_snapshot_slots(snapshot_files, session_date, as_of=as_of)
+        if snapshot_files is not None
+        else []
+    )
+    needs_backfill = bool(missing_history or warming or missing_snapshots)
     return {
         "session_date": session_date.isoformat(),
         "needs_backfill": needs_backfill,
         "missing_live_history_slots": missing_history,
         "warming_prediction_slots": warming,
+        "missing_snapshot_slots": missing_snapshots,
         "gap_symbol_count": len(roster) if needs_backfill else 0,
         "reason": (
             "missing_live_history_slots"
             if missing_history
             else "warming_prediction_slots"
             if warming
+            else "missing_snapshot_slots"
+            if missing_snapshots
             else "none"
         ),
     }
@@ -359,6 +385,17 @@ def _load_prediction_manifests(
     return manifests
 
 
+def _load_snapshot_files(store: Any, session_date: date) -> list[dict[str, Any]]:
+    from audit_all_universe_minute_snapshots import _find_folder, _list_children
+
+    folder_id = _find_folder(
+        store,
+        SNAPSHOT_ROOT.split("/")
+        + [f"{session_date:%Y}", f"{session_date:%m}", f"{session_date:%d}"],
+    )
+    return _list_children(store, folder_id) if folder_id else []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", default="", help="NSE session date YYYY-MM-DD")
@@ -366,6 +403,12 @@ def main() -> int:
     parser.add_argument("--wait-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--symbols", default="", help="Comma-separated override")
+    parser.add_argument(
+        "--repair-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Repair missing canonical snapshots from archive after backfill (default: true)",
+    )
     args = parser.parse_args()
 
     session_date = resolve_session_date(args.date or None)
@@ -404,10 +447,12 @@ def main() -> int:
 
     store = GoogleDriveStore()
     roster = authoritative_roster()
+    snapshot_files = _load_snapshot_files(store, session_date)
     state = discover_gap_state(
         session_date=session_date,
         live_history_files=_load_live_history_files(store, session_date),
         prediction_manifests=_load_prediction_manifests(store, session_date),
+        snapshot_files=snapshot_files,
         roster=roster,
     )
     print(
@@ -500,6 +545,34 @@ def main() -> int:
         flush=True,
     )
     status = str(current.get("status") or "").upper()
+    repair_result = None
+    if (
+        args.repair_snapshots
+        and classify_backfill_status(status) == "DONE"
+        and state.get("missing_snapshot_slots")
+    ):
+        try:
+            from repair_missing_minute_snapshots import run_repair
+
+            print(
+                f"Starting post-backfill snapshot repair for {len(state['missing_snapshot_slots'])} missing slot(s)...",
+                flush=True,
+            )
+            repair_result = run_repair(
+                session_date,
+                minutes=state["missing_snapshot_slots"],
+                expected_universe=roster,
+            )
+            print(
+                "POST_BACKFILL_SNAPSHOT_REPAIR="
+                + json.dumps(repair_result, sort_keys=True),
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"POST_BACKFILL_SNAPSHOT_REPAIR_ERROR={type(exc).__name__}: {exc}",
+                flush=True,
+            )
     print(
         "SAME_DAY_BACKFILL_JSON="
         + json.dumps(
@@ -508,6 +581,7 @@ def main() -> int:
                 "trigger": started,
                 "symbols": len(symbols),
                 "symbols_mode": symbols_mode,
+                "snapshot_repair": repair_result,
                 **state,
             },
             sort_keys=True,
