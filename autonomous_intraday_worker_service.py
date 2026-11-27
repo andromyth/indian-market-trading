@@ -202,6 +202,7 @@ def _backfill_start_allowed(now: datetime) -> bool:
     open and after the close are safe; the runner itself also pauses during
     the live window.  This keeps delayed overnight schedules (which often
     slip past midnight) working instead of rejecting them with HTTP 423.
+    The recovery workflow deploys this guard before it requests a backfill.
     """
     return not _is_nse_live_priority_window(now)
 
