@@ -513,8 +513,8 @@ def _cached_all_nse_session_close_predictions(
     # Start from the current 5-minute slot (or 09:15 if before market open).
     current = now_ist.floor("5min")
     if current.time() < market_open_time:
-        current = pd.Timestamp.combine(today, market_open_time)
-    close_ts = pd.Timestamp.combine(today, market_close_time)
+        current = pd.Timestamp.combine(today, market_open_time).tz_localize("Asia/Kolkata")
+    close_ts = pd.Timestamp.combine(today, market_close_time).tz_localize("Asia/Kolkata")
 
     prediction_folder = folder_id([
         "production_data", "all_nse_minute_predictions",
@@ -2651,7 +2651,7 @@ if interface_mode == "Live Test":
             # ---- Per-slot session-close predictions (all remaining 5-min slots) ----
             _render_slot_predictions_table(slot_predictions, selected_root)
 
-    _render_selected_intraday_panel()
+        _render_selected_intraday_panel()
 
     st.caption(
         "Decision-support only · no orders are placed · the model may abstain when data or validation is inadequate."
