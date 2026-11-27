@@ -1,6 +1,12 @@
 name: Deploy intraday worker recovery revision
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "autonomous_intraday_worker_service.py"
+      - ".github/workflows/deploy_intraday_worker_recovery.yml"
   workflow_dispatch:
     inputs:
       in_worker_prediction:
