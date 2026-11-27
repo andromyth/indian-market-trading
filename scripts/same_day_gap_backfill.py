@@ -241,7 +241,14 @@ def backfill_state(url: str, token: str) -> dict[str, Any]:
 
 
 def _belongs_to_session(current: dict[str, Any], session_date: date) -> bool:
-    started = str((current.get("state") or {}).get("started_at_utc") or "")
+    state = current.get("state") or {}
+    target_end_date = str(state.get("target_end_date") or "").strip()
+    if target_end_date:
+        try:
+            return date.fromisoformat(target_end_date[:10]) == session_date
+        except ValueError:
+            pass
+    started = str(state.get("started_at_utc") or "")
     return bool(started) and started[:10] == session_date.isoformat()
 
 

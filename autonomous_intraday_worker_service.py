@@ -48,6 +48,7 @@ STATE: dict[str, Any] = {
     "drive_preflight": {"reason": "Drive startup preflight is pending."},
     "five_minute_backfill": {
         "status": "IDLE",
+        "target_end_date": None,
         "started_at_utc": None,
         "updated_at_utc": None,
         "finished_at_utc": None,
@@ -264,6 +265,7 @@ def _run_five_minute_backfill() -> None:
         status="RUNNING",
         phase="DOWNLOADING",
         started_at_utc=datetime.now(timezone.utc).isoformat(),
+        target_end_date=(BACKFILL_OPTIONS.get("end_date") or datetime.now(IST).date().isoformat()),
         finished_at_utc=None,
         progress={},
         last_heartbeat_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -1381,7 +1383,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 if not configured():
                     self._send_json(503, {"status": "INDSTOCKS_CREDENTIALS_NOT_CONFIGURED"})
                     return
+                target_end_date = options.get("end_date") or now_ist.date().isoformat()
+                options["end_date"] = target_end_date
                 BACKFILL_OPTIONS = options
+                _update_backfill_status(target_end_date=target_end_date)
                 BACKFILL_THREAD = threading.Thread(
                     target=_run_five_minute_backfill,
                     name="indstocks-native-5m-backfill",
